@@ -99,6 +99,11 @@ pub enum BaseSource {
     Guess,
     /// `git merge-base --fork-point` (needs reflog).
     ForkPoint,
+    /// The nearest ancestor branch (a branch whose merge-base with HEAD is the most
+    /// recent common commit). This is the default when no upstream is configured.
+    Ancestor,
+    /// The user picked this base explicitly (overrides inference).
+    Override,
 }
 
 /// The base ref branch changes are compared against.
@@ -138,6 +143,8 @@ pub enum ChangeScope {
     Staged,
     /// Worktree vs index (`git diff`); untracked files live in this set.
     Unstaged,
+    /// All uncommitted changes: HEAD vs worktree (staged + unstaged, incl. untracked).
+    Working,
 }
 
 /// One independently computed set of file changes for a scope.

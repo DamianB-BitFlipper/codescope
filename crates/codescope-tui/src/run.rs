@@ -94,6 +94,29 @@ async fn dispatch(app: &mut App, action: Action, tx: &mpsc::Sender<Action>) {
                 let _ = tx.send(Action::ModelPicker).await;
             }
         }
+        Action::BaseSelected(name) => {
+            // The modal sends an empty name; resolve it from the current selection.
+            let name = if name.is_empty() {
+                app.snapshot
+                    .available_bases
+                    .get(app.base_sel)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                name
+            };
+            if !name.is_empty() {
+                let _ = tx.send(Action::BaseSelected(name)).await;
+            }
+            app.show_base_picker = false;
+        }
+        Action::BasePicker => {
+            // Toggle locally, and ask the dispatcher to fetch base candidates on open.
+            app.apply(Action::BasePicker);
+            if app.show_base_picker {
+                let _ = tx.send(Action::BasePicker).await;
+            }
+        }
         other => app.apply(other),
     }
 }

@@ -29,6 +29,11 @@ pub struct UiSnapshot {
     pub ai_model: String,
     /// Models the provider advertises (for the picker modal; empty until fetched).
     pub available_models: Vec<String>,
+    /// The base ref the `Branch` scope compares against (empty until known). Shown in the
+    /// top bar; defaults to the nearest ancestor branch, overridable via the base picker.
+    pub base_ref: String,
+    /// Base candidates for the picker modal (empty until fetched).
+    pub available_bases: Vec<String>,
     /// Transient status/help message for the bottom bar.
     pub message: String,
     /// The repo-state epoch this snapshot describes.
@@ -50,6 +55,8 @@ impl Default for UiSnapshot {
             ai: AiStatus::Disabled,
             ai_model: String::new(),
             available_models: Vec::new(),
+            base_ref: String::new(),
+            available_bases: Vec::new(),
             message: String::new(),
             epoch: Epoch::ZERO,
             refreshing: false,

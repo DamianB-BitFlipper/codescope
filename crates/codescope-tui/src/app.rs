@@ -59,6 +59,10 @@ pub struct App {
     pub show_model_picker: bool,
     /// Selected row in the model picker.
     pub model_sel: usize,
+    /// Whether the comparison-base picker modal is open.
+    pub show_base_picker: bool,
+    /// Selected row in the base picker.
+    pub base_sel: usize,
     /// Set when the user asked to quit.
     pub should_quit: bool,
 }
@@ -111,6 +115,7 @@ impl App {
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
             Action::ScopeUnstaged => self.set_scope(ChangeScope::Unstaged),
             Action::ScopeBranch => self.set_scope(ChangeScope::Branch),
+            Action::ScopeWorking => self.set_scope(ChangeScope::Working),
             Action::ScopeCycle => self.set_scope(next_scope(self.snapshot.scope)),
             Action::NextHunk => self.jump_hunk(1),
             Action::PrevHunk => self.jump_hunk(-1),
@@ -118,9 +123,15 @@ impl App {
                 self.show_model_picker = !self.show_model_picker;
                 self.model_sel = 0;
             }
-            // ModelSelected is applied by the dispatcher (it owns the AiService).
+            Action::BasePicker => {
+                self.show_base_picker = !self.show_base_picker;
+                self.base_sel = 0;
+            }
+            // ModelSelected/BaseSelected are applied by the dispatcher (it owns the
+            // AiService / base override).
             // RefreshGit / AiToggle / AiRefresh are dispatcher concerns; nothing to do here.
             Action::ModelSelected(_)
+            | Action::BaseSelected(_)
             | Action::RefreshGit
             | Action::AiToggle
             | Action::AiRefresh
@@ -140,6 +151,11 @@ impl App {
         if self.show_model_picker {
             let len = self.snapshot.available_models.len();
             self.model_sel = step(self.model_sel, delta, len);
+            return;
+        }
+        if self.show_base_picker {
+            let len = self.snapshot.available_bases.len();
+            self.base_sel = step(self.base_sel, delta, len);
             return;
         }
         match self.focused {
@@ -339,6 +355,29 @@ mod tests {
         app.apply(Action::ScopeUnstaged);
         assert_eq!(app.snapshot.scope, ChangeScope::Unstaged);
         assert_eq!(app.file_sel, 0);
+        app.apply(Action::ScopeWorking);
+        assert_eq!(app.snapshot.scope, ChangeScope::Working);
+    }
+
+    #[test]
+    fn scope_cycle_visits_all_scopes() {
+        let mut app = App::new();
+        assert_eq!(app.snapshot.scope, ChangeScope::Branch);
+        let mut seen = vec![app.snapshot.scope];
+        for _ in 0..4 {
+            app.apply(Action::ScopeCycle);
+            seen.push(app.snapshot.scope);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ChangeScope::Branch,
+                ChangeScope::Staged,
+                ChangeScope::Unstaged,
+                ChangeScope::Working,
+                ChangeScope::Branch,
+            ]
+        );
     }
 
     #[test]
@@ -361,6 +400,32 @@ mod tests {
             app.apply(Action::ExpandLess);
         }
         assert_eq!(app.sem_depth, 0);
+    }
+
+    #[test]
+    fn base_picker_toggle_and_navigation_clamps() {
+        let mut app = App::new();
+        let snap = UiSnapshot {
+            available_bases: vec![
+                "main".to_string(),
+                "origin/main".to_string(),
+                "develop".to_string(),
+            ],
+            ..UiSnapshot::default()
+        };
+        app.update(snap);
+        app.apply(Action::BasePicker);
+        assert!(app.show_base_picker);
+        for _ in 0..10 {
+            app.apply(Action::Down);
+        }
+        assert_eq!(app.base_sel, 2); // clamped at last candidate
+        for _ in 0..10 {
+            app.apply(Action::Up);
+        }
+        assert_eq!(app.base_sel, 0);
+        app.apply(Action::BasePicker);
+        assert!(!app.show_base_picker);
     }
 
     #[test]

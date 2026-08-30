@@ -57,7 +57,9 @@ pub enum Action {
     ScopeUnstaged,
     /// Show the branch-vs-base scope.
     ScopeBranch,
-    /// Cycle scope (branch → staged → unstaged).
+    /// Show the working scope (all uncommitted changes: staged + unstaged).
+    ScopeWorking,
+    /// Cycle scope (branch → staged → unstaged → working).
     ScopeCycle,
     /// Re-scan git data.
     RefreshGit,
@@ -69,6 +71,10 @@ pub enum Action {
     ModelPicker,
     /// The user picked a model in the picker (the dispatcher applies it).
     ModelSelected(String),
+    /// Open/close the comparison-base picker modal.
+    BasePicker,
+    /// The user picked a base ref in the picker (the dispatcher applies it).
+    BaseSelected(String),
     /// Jump to the next / previous diff hunk.
     NextHunk,
     /// Jump to the previous diff hunk.
@@ -101,6 +107,15 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
             _ => Action::None,
         };
     }
+    if app.show_base_picker {
+        return match key.code {
+            KeyCode::Esc => Action::BasePicker,
+            KeyCode::Char('j') | KeyCode::Down => Action::Down,
+            KeyCode::Char('k') | KeyCode::Up => Action::Up,
+            KeyCode::Enter => Action::BaseSelected(String::new()), // app fills the name
+            _ => Action::None,
+        };
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Action::Quit,
@@ -121,11 +136,13 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('s') => Action::ScopeStaged,
         KeyCode::Char('u') => Action::ScopeUnstaged,
         KeyCode::Char('B') => Action::ScopeBranch,
+        KeyCode::Char('w') => Action::ScopeWorking,
         KeyCode::Char('S') => Action::ScopeCycle,
         KeyCode::Char('R') => Action::RefreshGit,
         KeyCode::Char('a') => Action::AiToggle,
         KeyCode::Char('A') => Action::AiRefresh,
         KeyCode::Char('m') => Action::ModelPicker,
+        KeyCode::Char('b') => Action::BasePicker,
         KeyCode::Char('j') | KeyCode::Down => Action::Down,
         KeyCode::Char('k') | KeyCode::Up => Action::Up,
         KeyCode::Enter => Action::Activate,
@@ -150,7 +167,8 @@ pub fn next_scope(scope: ChangeScope) -> ChangeScope {
     match scope {
         ChangeScope::Branch => ChangeScope::Staged,
         ChangeScope::Staged => ChangeScope::Unstaged,
-        ChangeScope::Unstaged => ChangeScope::Branch,
+        ChangeScope::Unstaged => ChangeScope::Working,
+        ChangeScope::Working => ChangeScope::Branch,
     }
 }
 
@@ -195,6 +213,7 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('s')), &app()), Action::ScopeStaged);
         assert_eq!(map_key(key(KeyCode::Char('u')), &app()), Action::ScopeUnstaged);
         assert_eq!(map_key(key(KeyCode::Char('B')), &app()), Action::ScopeBranch);
+        assert_eq!(map_key(key(KeyCode::Char('w')), &app()), Action::ScopeWorking);
         assert_eq!(map_key(key(KeyCode::Char('S')), &app()), Action::ScopeCycle);
     }
 
@@ -236,9 +255,29 @@ mod tests {
     }
 
     #[test]
+    fn b_opens_base_picker() {
+        assert_eq!(map_key(key(KeyCode::Char('b')), &app()), Action::BasePicker);
+    }
+
+    #[test]
+    fn base_picker_modal_swallows_keys() {
+        let mut a = app();
+        a.show_base_picker = true;
+        assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
+        assert_eq!(map_key(key(KeyCode::Esc), &a), Action::BasePicker);
+        assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::Down);
+        assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::Up);
+        assert_eq!(
+            map_key(key(KeyCode::Enter), &a),
+            Action::BaseSelected(String::new())
+        );
+    }
+
+    #[test]
     fn scope_cycle_order() {
         assert_eq!(next_scope(ChangeScope::Branch), ChangeScope::Staged);
         assert_eq!(next_scope(ChangeScope::Staged), ChangeScope::Unstaged);
-        assert_eq!(next_scope(ChangeScope::Unstaged), ChangeScope::Branch);
+        assert_eq!(next_scope(ChangeScope::Unstaged), ChangeScope::Working);
+        assert_eq!(next_scope(ChangeScope::Working), ChangeScope::Branch);
     }
 }

@@ -129,6 +129,16 @@ impl<S: SemanticSource> AnalysisEngine<S> {
         epoch: Epoch,
     ) -> Result<AnalysisSnapshot, AnalysisError> {
         let repo_ctx = self.repo.repo_context().await?;
+        self.refresh_with_ctx(changeset, epoch, repo_ctx).await
+    }
+
+    /// Refresh with a caller-supplied [`RepoContext`] (so a base override flows through).
+    pub async fn refresh_with_ctx(
+        &self,
+        changeset: &ChangeSet,
+        epoch: Epoch,
+        repo_ctx: RepoContext,
+    ) -> Result<AnalysisSnapshot, AnalysisError> {
         let base_spec = base_revspec(changeset.scope, &repo_ctx);
 
         let mut files = Vec::with_capacity(changeset.len());
@@ -284,14 +294,15 @@ impl<S: SemanticSource> AnalysisEngine<S> {
 }
 
 /// The revision whose content is the "old side" of hunks for `scope` (research 02):
-/// merge-base for `Branch`, `HEAD` for `Staged`, the index (`:0`) for `Unstaged`.
+/// merge-base for `Branch`, `HEAD` for `Staged`, the index (`:0`) for `Unstaged`,
+/// and `HEAD` for `Working` (all uncommitted changes diff against HEAD).
 fn base_revspec(scope: ChangeScope, repo_ctx: &RepoContext) -> Option<String> {
     match scope {
         ChangeScope::Branch => repo_ctx
             .base
             .as_ref()
             .map(|b| b.merge_base.as_str().to_string()),
-        ChangeScope::Staged => match repo_ctx.head {
+        ChangeScope::Staged | ChangeScope::Working => match repo_ctx.head {
             HeadState::Unborn => None,
             _ => Some("HEAD".to_string()),
         },
@@ -538,6 +549,11 @@ mod tests {
             base_revspec(ChangeScope::Unstaged, &ctx(None, HeadState::Unborn)),
             Some(":0".to_string())
         );
+        assert_eq!(
+            base_revspec(ChangeScope::Working, &ctx(None, HeadState::Branch("x".into()))),
+            Some("HEAD".to_string())
+        );
+        assert_eq!(base_revspec(ChangeScope::Working, &ctx(None, HeadState::Unborn)), None);
     }
 
     #[test]

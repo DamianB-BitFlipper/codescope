@@ -269,19 +269,26 @@ impl AiClient {
         }
     }
 
+    /// The `GET {base}/models` URL, derived per provider (one path segment stripped for
+    /// Anthropic, two for OpenAI-compatible). Split out for testing.
+    fn models_url(&self) -> String {
+        let strip = match self.provider {
+            ProviderKind::OpenAiCompatible => 2,
+            ProviderKind::Anthropic => 1,
+        };
+        let mut base = self.endpoint.as_str();
+        for _ in 0..strip {
+            base = base.rsplit_once('/').map(|(b, _)| b).unwrap_or(base);
+        }
+        format!("{base}/models")
+    }
+
     /// List the models the provider exposes (`GET {base}/models`).
     ///
     /// Both OpenAI-compatible providers and Anthropic implement this endpoint; the response
     /// is normalized to plain id strings. Returns an empty list on a provider that errors.
     pub async fn list_models(&self) -> Result<Vec<String>, AiError> {
-        let base = self
-            .endpoint
-            .rsplit_once('/')
-            .map(|(b, _)| b)
-            .unwrap_or(&self.endpoint);
-        // endpoint is {base}/chat/completions or {base}/messages; go up one segment.
-        let base = base.rsplit_once('/').map(|(b, _)| b).unwrap_or(base);
-        let url = format!("{base}/models");
+        let url = self.models_url();
         self.check_breaker()?;
         self.check_limiter()?;
         let request = self.apply_auth(self.http.get(&url).timeout(self.timeout));
@@ -964,5 +971,21 @@ mod tests {
         let merged = merge_same_role(msgs);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn list_models_url_respects_provider() {
+        // OpenAI-compatible: {base}/chat/completions -> {base}/models
+        let mut cfg = enabled_config();
+        cfg.base_url = "https://api.openai.com/v1".into();
+        let client = AiClient::new(&cfg).unwrap();
+        let url = client.models_url();
+        assert_eq!(url, "https://api.openai.com/v1/models");
+
+        // Anthropic: {base}/messages -> {base}/models (only one segment stripped)
+        let mut cfg = enabled_config();
+        cfg.base_url = "https://api.anthropic.com/v1".into();
+        let client = AiClient::new(&cfg).unwrap();
+        assert_eq!(client.models_url(), "https://api.anthropic.com/v1/models");
     }
 }

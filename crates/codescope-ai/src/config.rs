@@ -33,8 +33,16 @@ pub const PRIME_BASE_URL: &str = "https://api.pinference.ai/api/v1";
 /// `ANTHROPIC_API_KEY`).
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 
-/// Default model: plans are schema-constrained, so a small model suffices (research 05 §5).
+/// Default model for Prime Inference: plans are schema-constrained, so a small model suffices
+/// (research 05 §5). The provider-specific default follows the resolved key — a Prime model id
+/// is not valid on OpenAI/Anthropic (review 09 finding F2).
 pub const DEFAULT_MODEL: &str = "openai/gpt-5-mini";
+
+/// Default model when the key came from `OPENAI_API_KEY`.
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-mini";
+
+/// Default model when the key came from `ANTHROPIC_API_KEY` (a `-latest` alias stays valid).
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-latest";
 
 /// Default per-request timeout (research 07 §4: 20 s budget).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(20_000);
@@ -153,9 +161,14 @@ impl AiConfig {
             )));
         }
 
+        let default_model = match key_source {
+            Some(KeySource::OpenaiApiKey) => DEFAULT_OPENAI_MODEL,
+            Some(KeySource::AnthropicApiKey) => DEFAULT_ANTHROPIC_MODEL,
+            _ => DEFAULT_MODEL, // Prime, file-named, or keyless local
+        };
         let model = env("CODESCOPE_AI_MODEL")
             .or_else(|| file.and_then(|f| f.model.clone()))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            .unwrap_or_else(|| default_model.to_string());
 
         let timeout_ms = match env("CODESCOPE_AI_TIMEOUT_MS") {
             Some(v) => v.parse::<u64>().map_err(|e| {
@@ -404,6 +417,30 @@ mod tests {
         assert_eq!(cfg.base_url, ANTHROPIC_BASE_URL);
         assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-ant");
         assert_eq!(cfg.provider(), ProviderKind::Anthropic);
+        // The default model is a valid Anthropic id, not a Prime-only one (review 09 F2).
+        assert_eq!(cfg.model, DEFAULT_ANTHROPIC_MODEL);
+    }
+
+    #[test]
+    fn openai_key_defaults_to_an_openai_model_id() {
+        let cfg = AiConfig::resolve(None, env_of(&[("OPENAI_API_KEY", "sk-o")])).unwrap();
+        assert_eq!(cfg.model, DEFAULT_OPENAI_MODEL);
+    }
+
+    #[test]
+    fn prime_key_defaults_to_prime_model_id() {
+        let cfg = AiConfig::resolve(None, env_of(&[("PRIME_API_KEY", "sk-p")])).unwrap();
+        assert_eq!(cfg.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn explicit_model_override_wins() {
+        let cfg = AiConfig::resolve(
+            None,
+            env_of(&[("ANTHROPIC_API_KEY", "sk-a"), ("CODESCOPE_AI_MODEL", "claude-opus-4-6")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "claude-opus-4-6");
     }
 
     #[test]

@@ -197,6 +197,44 @@ async fn staged_vs_unstaged_modification() {
 }
 
 #[tokio::test]
+async fn working_scope_combines_staged_unstaged_and_untracked() {
+    let (_tmp, top) = scratch_repo();
+    let repo = open_repo(&top).await;
+
+    // Staged edit to a.go, unstaged edit to b.txt, untracked c.txt.
+    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 42 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    git(top.as_std_path(), &["add", "a.go"]);
+    write(
+        top.as_std_path(),
+        "b.txt",
+        "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\n",
+    );
+    write(top.as_std_path(), "c.txt", "brand new\n");
+
+    let cs = repo.changeset(ChangeScope::Working).await.expect("working");
+    assert_eq!(cs.scope, ChangeScope::Working);
+    let paths: Vec<_> = cs.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["a.go", "b.txt", "c.txt"]);
+
+    // Staged edit shows up as a real diff hunk against HEAD.
+    let a = &cs.files[0];
+    assert_eq!(a.status, FileStatus::Modified);
+    assert_eq!(a.hunks.len(), 1);
+    assert_eq!(a.hunks[0].count_added(), 1);
+    assert_eq!(a.hunks[0].count_deleted(), 1);
+
+    // Unstaged edit is in the same set.
+    let b = &cs.files[1];
+    assert_eq!(b.status, FileStatus::Modified);
+    assert_eq!(b.hunks.len(), 1);
+
+    // Untracked file is present with no hunks.
+    let c = &cs.files[2];
+    assert_eq!(c.status, FileStatus::Untracked);
+    assert!(c.hunks.is_empty());
+}
+
+#[tokio::test]
 async fn untracked_files_reported_per_file() {
     let (_tmp, top) = scratch_repo();
     let repo = open_repo(&top).await;
@@ -356,7 +394,7 @@ async fn gitlink_staged_without_submodule_machinery() {
 }
 
 #[tokio::test]
-async fn branch_scope_via_fork_point() {
+async fn branch_scope_via_nearest_ancestor() {
     let (_tmp, top) = scratch_repo();
     let repo = open_repo(&top).await;
     git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
@@ -366,9 +404,11 @@ async fn branch_scope_via_fork_point() {
     git(top.as_std_path(), &["add", "c.go"]);
     git(top.as_std_path(), &["commit", "-q", "-m", "add c"]);
 
+    // No upstream and no remotes: the nearest ancestor branch (`main`) is the default
+    // base — it outranks the origin/HEAD, guess, and fork-point fallbacks.
     let ctx = repo.repo_context().await.expect("context");
     let base = ctx.base.expect("base inferred");
-    assert_eq!(base.source, BaseSource::ForkPoint);
+    assert_eq!(base.source, BaseSource::Ancestor);
     assert_eq!(base.ref_name, "main");
     let main_sha = git(top.as_std_path(), &["rev-parse", "main"]);
     assert_eq!(base.merge_base.as_str(), main_sha.trim());
@@ -389,7 +429,7 @@ async fn branch_scope_via_fork_point() {
 }
 
 #[tokio::test]
-async fn base_inference_upstream_originhead_guess() {
+async fn base_inference_ancestor_default_upstream_wins() {
     let (_tmp, top) = scratch_repo();
     let remote_tmp = TempDir::new().unwrap();
     git(remote_tmp.path(), &["init", "-q", "--bare", "-b", "main"]);
@@ -402,20 +442,27 @@ async fn base_inference_upstream_originhead_guess() {
 
     let repo = open_repo(&top).await;
 
-    // 3) Guess: origin/main exists, but no upstream and no origin/HEAD.
+    // 2) No upstream: the nearest ancestor branch wins (`main` / its remote-tracking
+    //    twin point at the same commit), ahead of origin/HEAD and the guess fallbacks.
     git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
     write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 9 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
     git(top.as_std_path(), &["commit", "-q", "-am", "edit"]);
+    let main_sha = git(top.as_std_path(), &["rev-parse", "main"]);
     let ctx = repo.repo_context().await.expect("context");
     let base = ctx.base.expect("base");
-    assert_eq!(base.source, BaseSource::Guess);
-    assert_eq!(base.ref_name, "origin/main");
+    assert_eq!(base.source, BaseSource::Ancestor);
+    assert!(
+        base.ref_name == "main" || base.ref_name == "origin/main",
+        "ancestor is main (or its remote-tracking ref), got {}",
+        base.ref_name
+    );
+    assert_eq!(base.merge_base.as_str(), main_sha.trim());
 
-    // 2) OriginHead: set refs/remotes/origin/HEAD.
+    // origin/HEAD existing does not usurp the nearest-ancestor default.
     git(top.as_std_path(), &["remote", "set-head", "origin", "main"]);
     let base = repo.repo_context().await.unwrap().base.expect("base");
-    assert_eq!(base.source, BaseSource::OriginHead);
-    assert_eq!(base.ref_name, "origin/main");
+    assert_eq!(base.source, BaseSource::Ancestor);
+    assert_eq!(base.merge_base.as_str(), main_sha.trim());
 
     // 1) Upstream wins over everything.
     git(

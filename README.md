@@ -39,6 +39,20 @@ Open a Go repository with uncommitted or branch changes. The left pane lists cha
 and the symbols inside them; the center shows a focused diff; the right shows callers,
 callees, implementations, or an impact view for the selection.
 
+## Comparison base
+
+The branch scope compares your branch against a **base**. By default codescope uses the
+configured `@{upstream}` when it exists, and otherwise the **nearest ancestor branch** —
+the branch whose merge-base with `HEAD` is the most recent common commit — rather than the
+repository's default branch. For stacked branches `main ← feature-a ← feature-b`, the
+default base of `feature-b` is `feature-a`, not `main`. Only when neither exists does it
+fall back to `origin/HEAD`, `origin/main`/`origin/master`, or a fork-point guess.
+
+Press `b` to open the base picker: it lists the upstream, ancestor branches, and the usual
+default-branch candidates, marks the current base, and re-runs the whole analysis against
+whichever ref you select (`j`/`k` move, `Enter` selects, `Esc` closes). The top bar always
+shows the active pair as `branch ◂ base`.
+
 ## Keyboard controls
 
 | key(s) | action |
@@ -48,7 +62,7 @@ callees, implementations, or an impact view for the selection.
 | `Tab` / `Shift-Tab`, `1` `2` `3` | focus files / diff / semantic pane |
 | `j`/`k` · `↑`/`↓` | move selection / scroll |
 | `Ctrl-d`/`Ctrl-u`, `PgDn`/`PgUp` | half / full page in diff |
-| `s` / `u` / `B` | scope: staged / unstaged / branch-vs-base |
+| `s` / `u` / `B` / `w` | scope: staged / unstaged / branch-vs-base / working (all uncommitted) |
 | `S` | cycle scope |
 | `Enter` | jump to symbol / re-center semantic view |
 | `Space`, `h`/`l` | expand / collapse |
@@ -56,6 +70,7 @@ callees, implementations, or an impact view for the selection.
 | `n` / `N` | next / previous diff hunk |
 | `g` / `G` | top / bottom |
 | `R` | rescan git |
+| `b` | pick the comparison base for the branch scope |
 | `a` / `A` | AI toggle / force AI refresh |
 
 ## AI

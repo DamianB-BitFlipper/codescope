@@ -3,6 +3,7 @@
 use crate::diff::{parse_unified_diff, unmerged_change};
 use crate::error::{GitError, Result};
 use crate::runner::GitCommand;
+use std::collections::HashSet;
 use crate::status::{parse_status_z, StatusSnapshot};
 use camino::{Utf8Path, Utf8PathBuf};
 use codescope_core::{
@@ -154,6 +155,12 @@ impl GitRepo {
     /// Repository context for the status bar: HEAD state, upstream tracking, inferred base.
     #[tracing::instrument(skip(self), err)]
     pub async fn repo_context(&self) -> Result<RepoContext> {
+        self.repo_context_with_base(None).await
+    }
+
+    /// Repo context with an explicit base override (`Some(ref)`) instead of inference.
+    /// The override ref must yield a merge base with HEAD, else it is rejected.
+    pub async fn repo_context_with_base(&self, base_override: Option<&str>) -> Result<RepoContext> {
         let status = self.status_snapshot().await?;
         let head = status.head_state();
         let upstream = status.upstream.clone().map(|name| {
@@ -164,7 +171,20 @@ impl GitRepo {
                 behind,
             }
         });
-        let base = self.infer_base(&status).await?;
+        let base = match base_override {
+            Some(reference) => {
+                // The user picked a base explicitly; it must share a merge base with HEAD.
+                match self.merge_base(reference).await? {
+                    Some(mb) => Some(BaseInfo {
+                        source: BaseSource::Override,
+                        ref_name: reference.to_string(),
+                        merge_base: mb,
+                    }),
+                    None => return Err(GitError::NoBase),
+                }
+            }
+            None => self.infer_base(&status).await?,
+        };
         Ok(RepoContext {
             toplevel: self.toplevel.clone(),
             head,
@@ -189,6 +209,13 @@ impl GitRepo {
                     merge_base: mb,
                 }));
             }
+        }
+
+        // Nearest ancestor branch: a branch whose tip shares the most recent common commit
+        // with HEAD. This is preferred over the repo's default branch — for X <- A <- B, the
+        // base of B is A, not X.
+        if let Some(base) = self.nearest_ancestor(status).await? {
+            return Ok(Some(base));
         }
 
         let origin_head = self
@@ -244,6 +271,114 @@ impl GitRepo {
         }
 
         Ok(None)
+    }
+
+    /// All plausible base branches for the picker: upstream first, then ancestor branches
+    /// (most recent common commit first), then the conventional default branches. The current
+    /// branch is excluded.
+    pub async fn base_candidates(&self) -> Result<Vec<BaseInfo>> {
+        let status = self.status_snapshot().await?;
+        let mut out: Vec<BaseInfo> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        if let Some(up) = &status.upstream {
+            if let Some(mb) = self.merge_base(up).await? {
+                seen.insert(up.clone());
+                out.push(BaseInfo {
+                    source: BaseSource::Upstream,
+                    ref_name: up.clone(),
+                    merge_base: mb,
+                });
+            }
+        }
+        // ancestor_branches returns oldest-merge-base first; reverse so the picker lists the
+        // nearest ancestor first (matching its documented order).
+        for b in self.ancestor_branches(&status).await?.into_iter().rev() {
+            if seen.insert(b.ref_name.clone()) {
+                out.push(b);
+            }
+        }
+        for guess in ["origin/main", "origin/master", "main", "master"] {
+            if status.branch.as_deref() == Some(guess) || seen.contains(guess) {
+                continue;
+            }
+            if self.ref_exists(guess).await? {
+                if let Some(mb) = self.merge_base(guess).await? {
+                    seen.insert(guess.to_string());
+                    out.push(BaseInfo {
+                        source: BaseSource::Guess,
+                        ref_name: guess.to_string(),
+                        merge_base: mb,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The nearest ancestor branch, if any: the branch (not the current one) whose
+    /// merge-base with HEAD is the most recent common commit.
+    async fn nearest_ancestor(&self, status: &StatusSnapshot) -> Result<Option<BaseInfo>> {
+        let mut ancestors = self.ancestor_branches(status).await?;
+        Ok(ancestors.pop().map(|mut b| {
+            b.source = BaseSource::Ancestor;
+            b
+        }))
+    }
+
+    /// Branches whose tip is an ancestor of HEAD (or shares a recent fork), most recent
+    /// merge-base LAST (so `pop` gives the nearest). Excludes the current branch.
+    async fn ancestor_branches(&self, status: &StatusSnapshot) -> Result<Vec<BaseInfo>> {
+        let Some(_head) = status.oid.clone() else {
+            return Ok(Vec::new());
+        };
+        let head = status.oid.clone().expect("checked above");
+        // Candidate branch tips (local + remote-tracking). Full refnames let us drop symbolic
+        // refs (refs/remotes/*/HEAD) that refname:short would render as a bare remote name.
+        let out = self
+            .cmd(&[
+                "for-each-ref",
+                "--format=%(refname) %(refname:short) %(objectname)",
+                "refs/heads",
+                "refs/remotes",
+            ])
+            .run()
+            .await?;
+        let text = out.stdout_trimmed("for-each-ref")?;
+        let current = status.branch.clone();
+        let mut candidates: Vec<(String, Oid, i64)> = Vec::new();
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(full), Some(name), Some(_tip)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            if full.ends_with("/HEAD") {
+                continue; // symbolic remote HEAD (renders as bare `origin`)
+            }
+            if Some(name) == current.as_deref() {
+                continue; // the current branch is never its own base
+            }
+            // merge-base HEAD <branch>: the common commit; skip when none.
+            let Some(mb) = self.merge_base(name).await? else { continue };
+            // Exclude refs whose merge-base IS HEAD: a pushed same-name remote branch, a backup
+            // branch made at HEAD, or any descendant — those yield a silently empty branch diff.
+            if mb == head {
+                continue;
+            }
+            // Recency of the merge-base (committer date) — nearest ancestor has the newest.
+            let ts = self.cmd(&["show", "-s", "--format=%ct", mb.as_str()]).run().await?;
+            let ts = ts.stdout_trimmed("show %ct")?.parse::<i64>().unwrap_or(0);
+            candidates.push((name.to_string(), mb, ts));
+        }
+        // Sort ascending by merge-base commit time; pop() yields the nearest.
+        candidates.sort_by_key(|(_, _, ts)| *ts);
+        Ok(candidates
+            .into_iter()
+            .map(|(name, mb, _)| BaseInfo {
+                source: BaseSource::Ancestor,
+                ref_name: name,
+                merge_base: mb,
+            })
+            .collect())
     }
 
     async fn ref_exists(&self, name: &str) -> Result<bool> {
@@ -346,9 +481,56 @@ impl GitRepo {
                 }
                 files
             }
+            ChangeScope::Working => {
+                // All uncommitted changes: worktree vs HEAD (staged + unstaged), plus untracked.
+                // On an unborn HEAD, diff against the empty tree instead (HEAD doesn't resolve).
+                let target = if self.cmd(&["rev-parse", "--verify", "--quiet", "HEAD"]).output().await?.success() {
+                    "HEAD".to_string()
+                } else {
+                    // The well-known empty tree object id.
+                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+                };
+                let mut args = vec!["diff", &target];
+                args.extend_from_slice(DIFF_FLAGS);
+                let out = self.cmd(&args).run().await?;
+                let text = String::from_utf8_lossy(out.stdout_bytes());
+                let mut files = parse_unified_diff(&text)?;
+                let status = self.status_snapshot().await?;
+                merge_unmerged(&mut files, &status);
+                for path in status.untracked_paths() {
+                    if !files.iter().any(|f| &f.path == path) {
+                        files.push(FileChange {
+                            path: path.clone(),
+                            old_path: None,
+                            status: FileStatus::Untracked,
+                            hunks: Vec::new(),
+                            binary: false,
+                        });
+                    }
+                }
+                files
+            }
         };
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(ChangeSet::new(scope, files))
+    }
+
+    /// Branch-scope changeset against an explicit base ref (a picker override). The ref
+    /// must yield a merge base with HEAD.
+    pub async fn branch_changeset_with_base(&self, base_ref: &str) -> Result<ChangeSet> {
+        let mb = self
+            .merge_base(base_ref)
+            .await?
+            .ok_or(GitError::NoBase)?;
+        let range = format!("{}...HEAD", mb);
+        let mut args = vec!["diff"];
+        args.extend_from_slice(DIFF_FLAGS);
+        args.push(&range);
+        let out = self.cmd(&args).run().await?;
+        let text = String::from_utf8_lossy(out.stdout_bytes());
+        let mut files = parse_unified_diff(&text)?;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(ChangeSet::new(ChangeScope::Branch, files))
     }
 
     /// Content of `path` at revision `base` (`git show <base>:<path>`).

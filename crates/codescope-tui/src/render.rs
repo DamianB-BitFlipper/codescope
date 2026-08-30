@@ -67,6 +67,9 @@ pub fn render(frame: &mut Frame, app: &App, snap: &UiSnapshot) {
     if app.show_model_picker {
         render_model_picker(frame, area, app, snap);
     }
+    if app.show_base_picker {
+        render_base_picker(frame, area, app, snap);
+    }
 }
 
 fn render_too_small(frame: &mut Frame, area: Rect) {
@@ -91,7 +94,13 @@ fn pane_block(title: String, focused: bool) -> Block<'static> {
 
 fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     let r = &snap.repo;
-    let base = r.base.as_deref().unwrap_or("?");
+    // The comparison base: `base_ref` is authoritative (dispatcher-owned; reflects a picker
+    // override); fall back to the repo-bar base for snapshots that never set it.
+    let base = if snap.base_ref.is_empty() {
+        r.base.as_deref().unwrap_or("?")
+    } else {
+        snap.base_ref.as_str()
+    };
     let mut spans = vec![
         Span::styled(" codescope ", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw(" "),
@@ -129,6 +138,7 @@ fn scope_label(scope: ChangeScope) -> &'static str {
         ChangeScope::Branch => "branch",
         ChangeScope::Staged => "staged",
         ChangeScope::Unstaged => "unstaged",
+        ChangeScope::Working => "working",
     }
 }
 
@@ -156,7 +166,7 @@ fn ai_label(ai: &AiStatus) -> String {
 // -- bottom bar ---------------------------------------------------------------
 
 fn render_bottom_bar(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
-    let help = " q quit · ? help · Tab pane · s/u/B scope · a AI · n/N hunk ";
+    let help = " q quit · ? help · Tab pane · s/u/B/w scope · b base · a AI · n/N hunk ";
     let text = if snap.message.is_empty() {
         help.to_string()
     } else {
@@ -340,8 +350,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  Tab / 1 2 3     focus files / diff / semantic"),
         Line::from("  j/k · ↑/↓       move selection · scroll"),
         Line::from("  Ctrl-d/u · Pg   half / full page in diff"),
-        Line::from("  s / u / B       staged / unstaged / branch scope"),
+        Line::from("  s / u / B / w   staged / unstaged / branch / working scope"),
         Line::from("  S               cycle scope"),
+        Line::from("  b               pick comparison base (default: nearest ancestor)"),
         Line::from("  Enter           jump to symbol / re-center view"),
         Line::from("  Space h l       expand / collapse"),
         Line::from("  + / -           semantic depth"),
@@ -454,4 +465,111 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
         .block(block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, popup, &mut state);
+}
+
+// -- base picker modal --------------------------------------------------------
+
+fn render_base_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
+    let popup = centered(area, 50, 50);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let title = if snap.base_ref.is_empty() {
+        " comparison base ".to_string()
+    } else {
+        format!(" comparison base (current: {}) ", snap.base_ref)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(title);
+    let mut items: Vec<ListItem> = if snap.available_bases.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  fetching base candidates…",
+            Style::new().fg(Color::DarkGray),
+        )))]
+    } else {
+        snap.available_bases
+            .iter()
+            .map(|b| {
+                let cur = if *b == snap.base_ref { " ●" } else { "  " };
+                ListItem::new(Line::from(vec![
+                    Span::styled(cur, Style::new().fg(Color::Green)),
+                    Span::raw(format!(" {b}")),
+                ]))
+            })
+            .collect()
+    };
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  ↑/↓ move · Enter select · Esc close",
+        Style::new().fg(Color::DarkGray),
+    ))));
+    let mut state = ListState::default();
+    if !snap.available_bases.is_empty() {
+        state.select(Some(
+            app.base_sel.min(snap.available_bases.len().saturating_sub(1)),
+        ));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn buffer_text(t: &Terminal<TestBackend>) -> String {
+        t.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
+
+    fn snap_with_base() -> UiSnapshot {
+        let mut snap = UiSnapshot::default();
+        snap.repo.repo_name = "demo".to_string();
+        snap.repo.branch = "feature/x".to_string();
+        snap.repo.base = Some("origin/main".to_string());
+        snap.base_ref = "release/2.0".to_string();
+        snap.available_bases = vec![
+            "release/2.0".to_string(),
+            "main".to_string(),
+            "origin/main".to_string(),
+        ];
+        snap
+    }
+
+    #[test]
+    fn top_bar_reads_base_ref() {
+        let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let app = App::new();
+        t.draw(|f| render(f, &app, &snap_with_base())).unwrap();
+        let text = buffer_text(&t);
+        assert!(
+            text.contains("feature/x ◂ release/2.0"),
+            "top bar shows the base from base_ref: {text}"
+        );
+    }
+
+    #[test]
+    fn top_bar_falls_back_to_repo_bar_base() {
+        let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let app = App::new();
+        let mut snap = snap_with_base();
+        snap.base_ref.clear();
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        assert!(buffer_text(&t).contains("feature/x ◂ origin/main"));
+    }
+
+    #[test]
+    fn base_picker_renders_candidates_and_current() {
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = App::new();
+        app.show_base_picker = true;
+        t.draw(|f| render(f, &app, &snap_with_base())).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("comparison base"), "picker title: {text}");
+        assert!(text.contains("release/2.0"), "current base listed");
+        assert!(text.contains("origin/main"), "a candidate listed");
+        assert!(text.contains("●"), "current-base marker");
+    }
 }

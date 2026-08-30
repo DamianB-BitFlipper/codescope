@@ -48,7 +48,12 @@ pub enum DispatchEvent {
     EngineUnavailable(String),
     /// The provider's model list was fetched for the picker.
     ModelsLoaded(Vec<String>),
+    /// The repo's base candidates were fetched for the base picker.
+    BaseLoaded(Vec<String>),
 }
+
+/// Picker entry that returns base selection to inference.
+const AUTO_BASE: &str = "(auto / inferred)";
 
 /// The dispatcher actor. Single writer of all published state.
 pub struct Dispatcher {
@@ -70,6 +75,10 @@ pub struct Dispatcher {
     message: String,
     /// Available AI models for the picker (from the provider).
     available_models: Vec<String>,
+    /// User-picked comparison base (overrides inference until cleared).
+    base_override: Option<String>,
+    /// Base candidates for the picker (from `git base_candidates`).
+    available_bases: Vec<String>,
     /// Latest repo context (cheap to re-read).
     repo_ctx: Option<codescope_core::RepoContext>,
     /// Latest raw changeset for the current scope (for the diff pane before analysis lands).
@@ -109,6 +118,8 @@ impl Dispatcher {
             analysis: None,
             ai_rows: None,
             available_models: Vec::new(),
+            base_override: None,
+            available_bases: Vec::new(),
             snapshot_tx,
             job_tx,
             message: String::new(),
@@ -143,6 +154,13 @@ impl Dispatcher {
                 self.available_models = models;
                 self.publish();
             }
+            DispatchEvent::BaseLoaded(bases) => {
+                // The picker always offers "(auto / inferred)" first to escape an override.
+                let mut list = vec![AUTO_BASE.to_string()];
+                list.extend(bases);
+                self.available_bases = list;
+                self.publish();
+            }
         }
     }
 
@@ -161,17 +179,19 @@ impl Dispatcher {
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
             Action::ScopeUnstaged => self.set_scope(ChangeScope::Unstaged),
             Action::ScopeBranch => self.set_scope(ChangeScope::Branch),
+            Action::ScopeWorking => self.set_scope(ChangeScope::Working),
             Action::ScopeCycle => {
                 let next = match self.scope {
                     ChangeScope::Branch => ChangeScope::Staged,
                     ChangeScope::Staged => ChangeScope::Unstaged,
-                    ChangeScope::Unstaged => ChangeScope::Branch,
+                    ChangeScope::Unstaged => ChangeScope::Working,
+                    ChangeScope::Working => ChangeScope::Branch,
                 };
                 self.set_scope(next);
             }
             Action::AiToggle => {
                 if self.ai.is_none() {
-                    self.message = "AI not configured (set CODESCOPE_AI_API_KEY)".to_string();
+                    self.message = "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)".to_string();
                     self.publish();
                     return;
                 }
@@ -186,6 +206,8 @@ impl Dispatcher {
             Action::AiRefresh => self.spawn_ai(),
             Action::ModelPicker => self.spawn_list_models(),
             Action::ModelSelected(name) => self.set_model(&name),
+            Action::BasePicker => self.spawn_list_bases(),
+            Action::BaseSelected(name) => self.set_base(name),
             _ => {}
         }
     }
@@ -193,7 +215,7 @@ impl Dispatcher {
     /// Fetch the provider's model list for the picker (spawned; non-blocking).
     fn spawn_list_models(&mut self) {
         let Some(ai) = &self.ai else {
-            self.message = "AI not configured (set an API key)".to_string();
+            self.message = "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)".to_string();
             self.publish();
             return;
         };
@@ -213,10 +235,41 @@ impl Dispatcher {
                 self.message = format!("AI model: {name}");
             }
             None => {
-                self.message = "AI not configured (set an API key)".to_string();
+                self.message = "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)".to_string();
             }
         }
         self.publish();
+    }
+
+    /// Fetch base candidates for the base picker (spawned; non-blocking).
+    fn spawn_list_bases(&mut self) {
+        let repo = self.repo.clone();
+        let tx = self.job_tx.clone();
+        tokio::spawn(async move {
+            let bases = repo
+                .base_candidates()
+                .await
+                .map(|c| c.into_iter().map(|b| b.ref_name).collect())
+                .unwrap_or_default();
+            let _ = tx.send(DispatchEvent::BaseLoaded(bases)).await;
+        });
+    }
+
+    /// Apply a base selection from the picker: everything downstream (repo context,
+    /// branch changeset, analysis) is recomputed against the chosen ref.
+    fn set_base(&mut self, name: String) {
+        if name.is_empty() {
+            return;
+        }
+        if name == AUTO_BASE {
+            self.base_override = None;
+            self.message = "base: auto (inferred)".to_string();
+            self.spawn_refresh();
+            return;
+        }
+        self.message = format!("base: {name}");
+        self.base_override = Some(name);
+        self.spawn_refresh();
     }
 
     fn set_scope(&mut self, scope: ChangeScope) {
@@ -228,9 +281,13 @@ impl Dispatcher {
 
     /// Spawn a git+analysis job tagged with the current epoch.
     fn spawn_refresh(&mut self) {
+        // Bump the epoch so a superseded in-flight refresh is dropped on apply (F4): the
+        // newest base/scope/repo state always wins.
+        self.epoch = self.epoch.next();
         let epoch = self.epoch;
         let repo = self.repo.clone();
         let scope = self.scope;
+        let base_override = self.base_override.clone();
         // Publish immediately: show the git-level view with a refreshing marker.
         self.repo_ctx = None;
         self.changeset = None;
@@ -240,7 +297,7 @@ impl Dispatcher {
         // The engine is Arc-shared; the job runs the full git+analysis pipeline without
         // blocking the dispatcher. Result is epoch-gated at apply time (on_analysis_done).
         tokio::spawn(async move {
-            let result = run_pipeline(repo, scope, engine, epoch).await;
+            let result = run_pipeline(repo, scope, engine, epoch, base_override).await;
             let _ = tx
                 .send(DispatchEvent::AnalysisDone {
                     epoch,
@@ -277,6 +334,16 @@ impl Dispatcher {
         // Apply-time epoch gate: drop results computed against an older repo state.
         if epoch != self.epoch {
             return;
+        }
+        // A chosen base that no longer yields a merge base (branch deleted, history rewritten)
+        // must not wedge every refresh: drop the override and re-run inference once (F5).
+        if let Err(e) = &result {
+            if self.base_override.is_some() && e.to_string().contains("no base") {
+                self.base_override = None;
+                self.message = "base branch gone; reverted to inferred base".to_string();
+                self.spawn_refresh();
+                return;
+            }
         }
         match result {
             Ok(snap) => {
@@ -329,6 +396,15 @@ impl Dispatcher {
         let (repo_bar, counts) = repo_bar(self.repo_ctx.as_ref());
         let files = self.analysis.as_ref().map(file_rows).unwrap_or_default();
         let (diff, semantic) = self.panes();
+        // The base shown in the top bar: the latest repo context's base (which already
+        // reflects any override), else the pending override while a refresh is in flight.
+        let base_ref = self
+            .repo_ctx
+            .as_ref()
+            .and_then(|c| c.base.as_ref())
+            .map(|b| b.ref_name.clone())
+            .or_else(|| self.base_override.clone())
+            .unwrap_or_default();
         UiSnapshot {
             repo: repo_bar,
             scope: self.scope,
@@ -340,6 +416,8 @@ impl Dispatcher {
             ai: self.ai_status.clone(),
             ai_model: self.ai.as_ref().map(|a| a.model()).unwrap_or_default(),
             available_models: self.available_models.clone(),
+            base_ref,
+            available_bases: self.available_bases.clone(),
             message: self.message.clone(),
             epoch: self.epoch,
             refreshing: false,
@@ -373,20 +451,29 @@ impl Dispatcher {
     }
 }
 
-/// The git+analysis pipeline, run as one spawned job.
+/// The git+analysis pipeline, run as one spawned job. A base override (from the base
+/// picker) flows into the repo context and, for the `Branch` scope, into the diff itself.
 async fn run_pipeline(
     repo: GitRepo,
     scope: ChangeScope,
     engine: Option<std::sync::Arc<AnalysisEngine<LanguageService>>>,
     epoch: Epoch,
+    base_override: Option<String>,
 ) -> anyhow::Result<AnalysisSnapshot> {
-    let ctx = repo.repo_context().await?;
-    let changeset = repo.changeset(scope).await?;
+    let ctx = repo.repo_context_with_base(base_override.as_deref()).await?;
+    let changeset = match (scope, &base_override) {
+        (ChangeScope::Branch, Some(base)) => repo.branch_changeset_with_base(base).await?,
+        _ => repo.changeset(scope).await?,
+    };
     let Some(engine) = engine else {
         // No language service: fabricate an analysis carrying just git state.
         return Ok(git_only_snapshot(epoch, ctx, changeset));
     };
-    engine.refresh(&changeset, epoch).await.map_err(Into::into)
+    // The override-aware context rides along so the UI reports the chosen base.
+    engine
+        .refresh_with_ctx(&changeset, epoch, ctx)
+        .await
+        .map_err(Into::into)
 }
 
 fn git_only_snapshot(
@@ -726,5 +813,125 @@ pub async fn run(
         if let Ok(engine) = std::sync::Arc::try_unwrap(engine) {
             engine.into_service().shutdown().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Build a throwaway repo: one commit on `main`, one more on `feature` (checked out).
+    /// Plain git CLI so the test needs no extra dev-dependencies.
+    fn scratch_repo() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "codescope-base-picker-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@test.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@test.invalid")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        std::fs::write(dir.join("a.txt"), "one\n").expect("write a.txt");
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "--no-verify", "-m", "base"]);
+        git(&["checkout", "--quiet", "-b", "feature"]);
+        std::fs::write(dir.join("a.txt"), "two\n").expect("edit a.txt");
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "--no-verify", "-m", "feature work"]);
+        dir
+    }
+
+    async fn dispatcher_for(
+        root: &std::path::Path,
+    ) -> (Dispatcher, watch::Receiver<UiSnapshot>, mpsc::Receiver<DispatchEvent>) {
+        let repo_root = camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
+            .expect("utf-8 temp path");
+        let repo = GitRepo::discover(&repo_root).await.expect("discover scratch repo");
+        let (snapshot_tx, snapshot_rx) = watch::channel(UiSnapshot::placeholder());
+        let (job_tx, job_rx) = mpsc::channel(16);
+        (Dispatcher::new(repo, None, None, snapshot_tx, job_tx), snapshot_rx, job_rx)
+    }
+
+    /// Receive dispatcher events until `pred` matches (spawned jobs report back here).
+    async fn recv_until(
+        rx: &mut mpsc::Receiver<DispatchEvent>,
+        pred: fn(&DispatchEvent) -> bool,
+    ) -> DispatchEvent {
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                .await
+                .expect("timed out waiting for a dispatcher event")
+                .expect("event channel closed");
+            if pred(&ev) {
+                return ev;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn base_selected_sets_override_and_updates_top_bar_base() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+
+        disp.handle(DispatchEvent::Work(Action::BaseSelected("main".to_string()))).await;
+        assert_eq!(disp.base_override.as_deref(), Some("main"), "override recorded");
+        // The refreshing snapshot already advertises the pending base.
+        assert_eq!(snapshot_rx.borrow().base_ref, "main");
+
+        // The spawned pipeline reports back; apply it and check the re-published snapshot.
+        let done = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::AnalysisDone { .. })
+        })
+        .await;
+        disp.handle(done).await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.base_ref, "main", "top-bar base comes from the override");
+        assert_eq!(snap.repo.base.as_deref(), Some("main"));
+        assert_eq!(snap.repo.branch, "feature");
+        assert_eq!(snap.files.len(), 1, "one file changed vs main");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn base_picker_loads_candidates() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+
+        disp.handle(DispatchEvent::Work(Action::BasePicker)).await;
+        let loaded =
+            recv_until(&mut job_rx, |e| matches!(e, DispatchEvent::BaseLoaded(_))).await;
+        disp.handle(loaded).await;
+        let snap = snapshot_rx.borrow().clone();
+        assert!(
+            snap.available_bases.contains(&"main".to_string()),
+            "candidates include the ancestor branch: {:?}",
+            snap.available_bases
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
