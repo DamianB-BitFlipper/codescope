@@ -15,7 +15,7 @@
 
 use codescope_core::{
     ChangeScope, ChangeSet, ChangedSymbol, Diagnostic, Epoch, Evidence, FileChange, FileId,
-    FileStatus, HeadState, ImpactGraph, RepoContext, SymbolTree,
+    FileStatus, HeadState, ImpactGraph, Position, RepoContext, SymbolRef, SymbolTree,
 };
 use codescope_git::GitRepo;
 
@@ -101,6 +101,26 @@ impl<S: SemanticSource> AnalysisEngine<S> {
     #[must_use]
     pub fn svc(&self) -> &S {
         &self.svc
+    }
+
+    /// Lazily fetch the 1-hop callers of the symbol at `pos` in `file`
+    /// (`callHierarchy/incomingCalls`, on selection — research 06 §4 T3; not part of
+    /// the refresh-time shallow graph).
+    ///
+    /// Delegates to [`crate::graph::expand_symbol_relations`], which also fetches
+    /// callees; callers needing both directions should call that once instead.
+    pub async fn callers_of(&self, file: &FileId, pos: Position) -> Evidence<Vec<SymbolRef>> {
+        crate::graph::expand_symbol_relations(&self.svc, file, pos)
+            .await
+            .0
+    }
+
+    /// Lazily fetch the 1-hop callees of the symbol at `pos` in `file`
+    /// (`callHierarchy/outgoingCalls`); see [`AnalysisEngine::callers_of`].
+    pub async fn callees_of(&self, file: &FileId, pos: Position) -> Evidence<Vec<SymbolRef>> {
+        crate::graph::expand_symbol_relations(&self.svc, file, pos)
+            .await
+            .1
     }
 
     /// Consume the engine and return the semantic service (for graceful shutdown).
@@ -412,6 +432,15 @@ mod tests {
                 kind: SymbolKind::Method,
             }])),
         );
+        // Callees of (MemoryRepo).Get (lazy expansion path).
+        svc.outgoing.insert(
+            (FileId::new(MEMSTORE).unwrap(), Position::new(13, 5)),
+            Reply::Ok(codescope_core::Evidence::complete(vec![SymbolRef {
+                file: FileId::new("internal/store/helpers.go").unwrap(),
+                name: "lookup".to_string(),
+                kind: SymbolKind::Function,
+            }])),
+        );
         svc
     }
 
@@ -481,22 +510,56 @@ mod tests {
         assert!(health.worktree.is_none());
         assert!(!health.notes.is_empty());
 
-        // Graph got the scripted caller edge and kept change annotations.
+        // The shallow graph carries the changed node with its annotation; call edges are lazy
+        // (expand_symbol_relations), not part of the refresh-time graph.
         let get_id = format!("{MEMSTORE}:(MemoryRepo).Get");
-        assert!(snap.graph.value.contains_edge(
-            "internal/service/service.go:(Service).GetUser",
-            &get_id,
-            codescope_core::RelationKind::Calls
-        ));
+        assert!(
+            !snap.graph.value.contains_edge(
+                "internal/service/service.go:(Service).GetUser",
+                &get_id,
+                codescope_core::RelationKind::Calls
+            ),
+            "call-hierarchy is lazy; the refresh-time graph must not carry call edges"
+        );
         assert_eq!(
             snap.graph.value.node(&get_id).unwrap().change,
             Some(ChangeKind::Modified)
         );
+        // The perf fix: refresh must not issue any call-hierarchy requests at all.
+        assert_eq!(engine.svc().calls_of("incoming_calls"), 0);
+        assert_eq!(engine.svc().calls_of("outgoing_calls"), 0);
 
         // Digest builds from the snapshot and mentions the changed symbol.
         let digest = snap.digest();
         assert!(digest.render().contains("(MemoryRepo).Get"));
         assert_eq!(digest.scope, ChangeScope::Unstaged);
+    }
+
+    #[tokio::test]
+    async fn callers_and_callees_of_expand_lazily() {
+        let (_tmp, engine) = fixture_engine().await;
+        let file = FileId::new(MEMSTORE).unwrap();
+        let pos = Position::new(13, 5); // (MemoryRepo).Get selection start
+
+        let callers = engine.callers_of(&file, pos).await;
+        assert_eq!(callers.completeness, codescope_core::Completeness::Complete);
+        assert_eq!(callers.value.len(), 1);
+        assert_eq!(callers.value[0].name, "(Service).GetUser");
+        assert_eq!(
+            callers.value[0].file,
+            FileId::new("internal/service/service.go").unwrap()
+        );
+
+        let callees = engine.callees_of(&file, pos).await;
+        assert_eq!(callees.completeness, codescope_core::Completeness::Complete);
+        assert_eq!(callees.value.len(), 1);
+        assert_eq!(callees.value[0].name, "lookup");
+
+        // Each thin method delegates to `expand_symbol_relations`, which fetches both
+        // directions — the dispatcher should call `expand_symbol_relations` once when it
+        // needs both.
+        assert_eq!(engine.svc().calls_of("incoming_calls"), 2);
+        assert_eq!(engine.svc().calls_of("outgoing_calls"), 2);
     }
 
     #[tokio::test]

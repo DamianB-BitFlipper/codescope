@@ -47,6 +47,15 @@ pub enum DispatchEvent {
     ModelsLoaded(Vec<String>),
     /// The repo's base candidates were fetched for the base picker.
     BaseLoaded(Vec<String>),
+    /// The selected symbol's lazy callers/callees resolved.
+    RelationsLoaded {
+        /// Symbol label (for the pane title).
+        label: String,
+        /// Callers of the symbol.
+        callers: Vec<SemRow>,
+        /// Callees of the symbol.
+        callees: Vec<SemRow>,
+    },
 }
 
 /// Picker entry that returns base selection to inference.
@@ -65,6 +74,8 @@ pub struct Dispatcher {
     analysis: Option<AnalysisSnapshot>,
     /// Validated AI plan rows with the epoch they were validated against.
     ai_rows: Option<(Epoch, Vec<SemRow>, String)>,
+    /// The selected symbol's lazily-expanded callers/callees (semantic pane).
+    selected_relations: Option<(String, Vec<SemRow>, Vec<SemRow>)>,
     snapshot_tx: watch::Sender<UiSnapshot>,
     /// Where completed jobs report back.
     job_tx: mpsc::Sender<DispatchEvent>,
@@ -115,6 +126,7 @@ impl Dispatcher {
             analysis: None,
             ai_rows: None,
             available_models: Vec::new(),
+            selected_relations: None,
             base_override: None,
             available_bases: Vec::new(),
             snapshot_tx,
@@ -153,6 +165,10 @@ impl Dispatcher {
             }
             DispatchEvent::ModelsLoaded(models) => {
                 self.available_models = models;
+                self.publish();
+            }
+            DispatchEvent::RelationsLoaded { label, callers, callees } => {
+                self.selected_relations = Some((label, callers, callees));
                 self.publish();
             }
             DispatchEvent::BaseLoaded(bases) => {
@@ -207,6 +223,9 @@ impl Dispatcher {
             Action::AiRefresh => self.spawn_ai(),
             Action::ModelPicker => self.spawn_list_models(),
             Action::ModelSelected(name) => self.set_model(&name),
+            Action::SelectSymbol { file, name, line, col } => {
+                self.spawn_expand(file, name, line, col);
+            }
             Action::BasePicker => self.spawn_list_bases(),
             Action::BaseSelected(name) => self.set_base(name),
             _ => {}
@@ -262,6 +281,31 @@ impl Dispatcher {
 
     /// Apply a base selection from the picker: everything downstream (repo context,
     /// branch changeset, analysis) is recomputed against the chosen ref.
+    /// Lazily expand a selected symbol's callers/callees (spawned; non-blocking).
+    fn spawn_expand(&mut self, file: String, name: String, line: u32, col: u32) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let engine = engine.clone();
+        let tx = self.job_tx.clone();
+        let label = name.clone();
+        let file_id = match codescope_core::FileId::new(file.clone()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let pos = codescope_core::Position::new(line, col);
+            let (callers, callees) = relations_for(&engine, &file_id, pos).await;
+            let _ = tx
+                .send(DispatchEvent::RelationsLoaded {
+                    label,
+                    callers,
+                    callees,
+                })
+                .await;
+        });
+    }
+
     fn set_base(&mut self, name: String) {
         if name.is_empty() {
             return;
@@ -434,6 +478,35 @@ impl Dispatcher {
 
     fn panes(&self) -> (DiffPane, SemanticPane) {
         let diff = self.changeset.as_ref().map(first_diff).unwrap_or_default();
+        // A selected symbol's lazily-expanded callers/callees take precedence over the
+        // shallow impact graph (the "who calls this" view; restored after the perf split).
+        if let Some((label, callers, callees)) = &self.selected_relations {
+            let mut rows = Vec::new();
+            rows.push(SemRow {
+                depth: 0,
+                label: label.clone(),
+                relation: "selected",
+                changed: true,
+                has_diagnostic: false,
+            });
+            for c in callers {
+                let mut r = c.clone();
+                r.relation = "called by";
+                rows.push(r);
+            }
+            for c in callees {
+                let mut r = c.clone();
+                r.relation = "calls";
+                rows.push(r);
+            }
+            let semantic = SemanticPane {
+                title: format!("relations of {label}"),
+                rows,
+                note: String::new(),
+                ai_generated: false,
+            };
+            return (diff, semantic);
+        }
         // AI rows render only while their epoch matches the current repo state (H3).
         let semantic = match (&self.ai_rows, &self.analysis) {
             (Some((ep, rows, title)), _) if *ep == self.epoch => SemanticPane {
@@ -565,6 +638,7 @@ fn file_rows(a: &AnalysisSnapshot) -> Vec<FileRow> {
                 change,
                 confidence,
                 has_diagnostic: has_diag,
+                position: Some((c.selection.start_line, c.selection.start_col)),
             });
     }
     a.changeset
@@ -808,6 +882,30 @@ impl FactView for SnapshotFacts {
     }
 }
 
+
+/// Fetch a symbol's callers + callees lazily and shape them as semantic-pane rows.
+pub(crate) async fn relations_for(
+    engine: &std::sync::Arc<codescope_analysis::AnalysisEngine<codescope_lsp::LanguageService>>,
+    file: &codescope_core::FileId,
+    pos: codescope_core::Position,
+) -> (Vec<SemRow>, Vec<SemRow>) {
+    let callers = engine.callers_of(file, pos).await;
+    let callees = engine.callees_of(file, pos).await;
+    let to_rows = |ev: codescope_core::Evidence<Vec<codescope_core::SymbolRef>>| {
+        ev.value
+            .iter()
+            .map(|r| SemRow {
+                depth: 1,
+                label: r.name.clone(),
+                relation: "",
+                changed: false,
+                has_diagnostic: false,
+            })
+            .collect::<Vec<_>>()
+    };
+    (to_rows(callers), to_rows(callees))
+}
+
 /// Run the dispatcher loop until the TUI closes the action channel.
 pub async fn run(
     mut disp: Dispatcher,
@@ -817,8 +915,28 @@ pub async fn run(
     let _ = disp.handle(DispatchEvent::RepoChanged).await;
     loop {
         tokio::select! {
-            e = events.recv() => match e { Some(e) => disp.handle(e).await, None => break },
-            a = actions.recv() => match a { Some(a) => disp.handle(DispatchEvent::Work(a)).await, None => break },
+            e = events.recv() => match e {
+                Some(e) => {
+                    // Coalesce a burst of RepoChanged events into one refresh: drain everything
+                    // pending, then handle a single change-set. Without this, an editing/build
+                    // storm bumps the epoch faster than a refresh can complete, and the
+                    // epoch-gate drops every result (the TUI never gets data).
+                    let mut ev = e;
+                    while let Ok(next) = events.try_recv() {
+                        ev = next; // keep the latest
+                    }
+                    disp.handle(ev).await;
+                }
+                None => break,
+            },
+            a = actions.recv() => match a {
+                Some(a) => {
+                    let mut act = a;
+                    while let Ok(next) = actions.try_recv() { act = next; }
+                    disp.handle(DispatchEvent::Work(act)).await;
+                }
+                None => break,
+            },
         }
     }
     // Graceful language-server shutdown (rv-lsp F3): do not leave gopls to kill_on_drop.

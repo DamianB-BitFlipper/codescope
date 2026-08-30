@@ -106,6 +106,14 @@ async fn dispatch(
     pending_scope: &mut PendingScope,
 ) {
     match action {
+        Action::Activate => {
+            // If the files-pane selection is a symbol row with a position, forward a
+            // SelectSymbol so the dispatcher lazily expands its callers/callees.
+            if let Some(sel) = selected_symbol(app) {
+                let _ = tx.send(sel).await;
+            }
+            app.apply(Action::Activate);
+        }
         Action::ModelSelected(name) => {
             // The modal sends an empty name; resolve it from the current selection.
             let name = if name.is_empty() {
@@ -169,6 +177,34 @@ async fn dispatch(
         }
         other => app.apply(other),
     }
+}
+
+/// Resolve the currently selected symbol row to a [`Action::SelectSymbol`], if the files-pane
+/// selection is on an expandable symbol (one with a position).
+fn selected_symbol(app: &App) -> Option<Action> {
+    if app.focused != crate::app::Pane::Files {
+        return None;
+    }
+    let mut idx = app.file_sel;
+    for f in &app.snapshot.files {
+        if idx == 0 {
+            return None; // a file row, not a symbol
+        }
+        idx -= 1;
+        if f.expanded {
+            if idx < f.symbols.len() {
+                let s = &f.symbols[idx];
+                return s.position.map(|(line, col)| Action::SelectSymbol {
+                    file: f.path.clone(),
+                    name: s.name.clone(),
+                    line,
+                    col,
+                });
+            }
+            idx -= f.symbols.len();
+        }
+    }
+    None
 }
 
 #[cfg(test)]

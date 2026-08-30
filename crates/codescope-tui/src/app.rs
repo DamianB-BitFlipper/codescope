@@ -132,6 +132,7 @@ impl App {
             // RefreshGit / AiToggle / AiRefresh are dispatcher concerns; nothing to do here.
             Action::ModelSelected(_)
             | Action::BaseSelected(_)
+            | Action::SelectSymbol { .. }
             | Action::RefreshGit
             | Action::AiToggle
             | Action::AiRefresh
@@ -297,6 +298,7 @@ mod tests {
                     change: "modified",
                     confidence: "",
                     has_diagnostic: false,
+                    position: None,
                 })
                 .collect(),
             expanded,

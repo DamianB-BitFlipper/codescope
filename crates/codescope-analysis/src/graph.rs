@@ -1,8 +1,11 @@
 //! 1-hop impact graph over the language service (research 03 / architecture).
 //!
-//! [`build_impact_graph`] lazily fetches, per changed symbol: callers
-//! (`callHierarchy/incomingCalls`), callees (`outgoingCalls`), and — for interfaces —
-//! implementers (`textDocument/implementation`, falling back to `typeHierarchy/subtypes`).
+//! [`build_impact_graph`] builds a SHALLOW graph per refresh: changed-symbol nodes
+//! plus — for interfaces — implementer edges (`textDocument/implementation`, falling
+//! back to `typeHierarchy/subtypes`). Call hierarchy (`callHierarchy/incomingCalls` /
+//! `outgoingCalls`) is deliberately NOT fetched here: one call-hierarchy request per
+//! changed symbol is the dominant refresh cost, so callers/callees of a symbol are
+//! fetched lazily, on selection, via [`expand_symbol_relations`].
 //! Every query is gated on the resolved [`FeatureSet`](codescope_core::FeatureSet):
 //! unsupported relations are skipped silently and recorded in the graph-level notes.
 //!
@@ -26,12 +29,14 @@ use crate::source::SemanticSource;
 /// [`Completeness::Partial`] with a note.
 pub const MAX_NEIGHBORS_PER_QUERY: usize = 50;
 
-/// Build the 1-hop impact graph around `changed` symbols using `svc`.
+/// Build the shallow 1-hop impact graph around `changed` symbols using `svc`:
+/// changed-symbol nodes plus interface implementer edges. Call hierarchy is lazy —
+/// see [`expand_symbol_relations`].
 ///
 /// Deleted symbols (base revision) get a node but no live queries — the language server
-/// only knows the worktree. Duplicate nodes/edges from symmetric queries (A calls B where
-/// both changed) are collapsed via [`ImpactGraph::dedupe`]; changed nodes are inserted
-/// first, so dedupe keeps their change annotation.
+/// only knows the worktree. Duplicate nodes/edges are collapsed via
+/// [`ImpactGraph::dedupe`]; changed nodes are inserted first, so dedupe keeps their
+/// change annotation.
 pub async fn build_impact_graph<S: SemanticSource>(
     changed: &[ChangedSymbolInfo],
     svc: &S,
@@ -59,45 +64,15 @@ pub async fn build_impact_graph<S: SemanticSource>(
         let id = node_id_for(info);
         let pos = info.selection.start();
 
-        // Callers.
-        if features.is_supported(Feature::CallHierarchyIncoming) {
-            if let Some(callers) = acc.run(
-                "incoming calls",
-                &id,
-                svc.incoming_calls(&info.file, pos).await,
-            ) {
-                for peer in callers {
-                    let peer_id = ref_id(&peer);
-                    add_neighbor(&mut graph, &peer, &peer_id);
-                    graph.add_edge(ImpactEdge {
-                        from: peer_id,
-                        to: id.clone(),
-                        kind: RelationKind::Calls,
-                    });
-                }
-            }
-        } else {
+        // Call-hierarchy (incoming/outgoing calls) is deliberately NOT fetched here: on a real
+        // change-set, one call-hierarchy request per changed symbol is the dominant cost (tens
+        // of sequential LSP round-trips, each with a 10 s timeout). Those are fetched lazily for
+        // the selected symbol via [`expand_symbol_relations`]. The shallow graph carries changed
+        // nodes plus interface implementer edges only.
+        if !features.is_supported(Feature::CallHierarchyIncoming) {
             acc.skip(Feature::CallHierarchyIncoming);
         }
-
-        // Callees.
-        if features.is_supported(Feature::CallHierarchyOutgoing) {
-            if let Some(callees) = acc.run(
-                "outgoing calls",
-                &id,
-                svc.outgoing_calls(&info.file, pos).await,
-            ) {
-                for peer in callees {
-                    let peer_id = ref_id(&peer);
-                    add_neighbor(&mut graph, &peer, &peer_id);
-                    graph.add_edge(ImpactEdge {
-                        from: id.clone(),
-                        to: peer_id,
-                        kind: RelationKind::Calls,
-                    });
-                }
-            }
-        } else {
+        if !features.is_supported(Feature::CallHierarchyOutgoing) {
             acc.skip(Feature::CallHierarchyOutgoing);
         }
 
@@ -168,6 +143,53 @@ async fn query_implementers<S: SemanticSource>(
     }
     acc.skip(Feature::Implementation);
     None
+}
+
+/// Truncate an evidence list to [`MAX_NEIGHBORS_PER_QUERY`], degrading to partial with a note.
+fn cap_evidence(mut ev: Evidence<Vec<SymbolRef>>, what: &str) -> Evidence<Vec<SymbolRef>> {
+    if ev.value.len() > MAX_NEIGHBORS_PER_QUERY {
+        let total = ev.value.len();
+        ev.value.truncate(MAX_NEIGHBORS_PER_QUERY);
+        ev.completeness = Completeness::Partial;
+        ev.push_note(format!(
+            "{what}: kept {MAX_NEIGHBORS_PER_QUERY} of {total} results"
+        ));
+    }
+    ev
+}
+
+/// Lazily fetch the 1-hop callers and callees of a single symbol (research 06 §4 T3: on
+/// selection, not for every changed symbol). Returns `(callers, callees)`; each is an
+/// `Evidence<Vec<SymbolRef>>` so partial/unsupported relations stay honest.
+pub async fn expand_symbol_relations<S: SemanticSource>(
+    svc: &S,
+    file: &codescope_core::FileId,
+    pos: Position,
+) -> (Evidence<Vec<SymbolRef>>, Evidence<Vec<SymbolRef>>) {
+    let features = svc.features();
+    let callers = if features.is_supported(Feature::CallHierarchyIncoming) {
+        match svc.incoming_calls(file, pos).await {
+            Ok(ev) => cap_evidence(ev, "incoming calls"),
+            Err(e) => Evidence::partial(Vec::new(), vec![format!("incoming calls failed: {e}")]),
+        }
+    } else {
+        Evidence::partial(
+            Vec::new(),
+            vec!["incoming calls unsupported by this language server".to_string()],
+        )
+    };
+    let callees = if features.is_supported(Feature::CallHierarchyOutgoing) {
+        match svc.outgoing_calls(file, pos).await {
+            Ok(ev) => cap_evidence(ev, "outgoing calls"),
+            Err(e) => Evidence::partial(Vec::new(), vec![format!("outgoing calls failed: {e}")]),
+        }
+    } else {
+        Evidence::partial(
+            Vec::new(),
+            vec!["outgoing calls unsupported by this language server".to_string()],
+        )
+    };
+    (callers, callees)
 }
 
 /// Annotate graph nodes with the worst diagnostic severity touching their entity.
@@ -338,24 +360,21 @@ mod tests {
 
     #[tokio::test]
     async fn dedupes_symmetric_edges_and_keeps_change_annotations() {
-        // main calls Hello; both changed → incoming(Hello)=main, outgoing(main)=Hello
-        // produce the same edge twice and re-introduce existing nodes.
-        let main = info("cmd/main.go", "main", SymbolKind::Function, 3);
-        let hello = info("pkg/greet.go", "Hello", SymbolKind::Function, 10);
+        // Shallow graph: a changed interface with an implementer → one Implements edge; the
+        // implementer node dedupes against a changed node of the same identity.
+        let iface = info("pkg/iface.go", "Repository", SymbolKind::Interface, 10);
+        let mem = info("pkg/mem.go", "MemoryRepo", SymbolKind::Struct, 20);
         let mut svc = ScriptedSource {
             features: call_features(),
             ..ScriptedSource::default()
         };
-        svc.outgoing.insert(
-            key(&main),
-            Reply::Ok(Evidence::complete(vec![sref("pkg/greet.go", "Hello")])),
-        );
-        svc.incoming.insert(
-            key(&hello),
-            Reply::Ok(Evidence::complete(vec![sref("cmd/main.go", "main")])),
+        // The interface's implementers include the (changed) MemoryRepo struct.
+        svc.impls.insert(
+            key(&iface),
+            Reply::Ok(Evidence::complete(vec![sref("pkg/mem.go", "MemoryRepo")])),
         );
 
-        let ev = build_impact_graph(&[main, hello], &svc).await;
+        let ev = build_impact_graph(&[iface, mem], &svc).await;
         assert_eq!(ev.completeness, Completeness::Complete);
         let g = &ev.value;
         assert_eq!(
@@ -363,52 +382,46 @@ mod tests {
             2,
             "neighbor nodes dedupe into changed nodes"
         );
-        assert_eq!(g.edge_count(), 1, "symmetric queries dedupe into one edge");
+        assert_eq!(g.edge_count(), 1, "implementer edge");
         assert!(g.contains_edge(
-            "cmd/main.go:main",
-            "pkg/greet.go:Hello",
-            RelationKind::Calls
+            "pkg/mem.go:MemoryRepo",
+            "pkg/iface.go:Repository",
+            RelationKind::Implements
         ));
         // First-inserted (changed) nodes keep their annotations.
         assert_eq!(
-            g.node("cmd/main.go:main").unwrap().change,
+            g.node("pkg/iface.go:Repository").unwrap().change,
             Some(ChangeKind::Modified)
         );
         assert_eq!(
-            g.node("pkg/greet.go:Hello").unwrap().change,
+            g.node("pkg/mem.go:MemoryRepo").unwrap().change,
             Some(ChangeKind::Modified)
         );
     }
 
     #[tokio::test]
     async fn unsupported_features_are_skipped_silently_with_notes() {
+        // Call-hierarchy unsupported → the shallow build records skip notes and never queries.
         let mut features = FeatureSet::new();
-        features.set(Feature::CallHierarchyIncoming, Availability::Supported);
+        features.set(Feature::CallHierarchyIncoming, Availability::Unsupported);
         features.set(Feature::CallHierarchyOutgoing, Availability::Unsupported);
         let main = info("cmd/main.go", "main", SymbolKind::Function, 3);
-        let mut svc = ScriptedSource {
+        let svc = ScriptedSource {
             features,
             ..ScriptedSource::default()
         };
-        svc.incoming.insert(
-            key(&main),
-            Reply::Ok(Evidence::complete(vec![sref("pkg/api.go", "Serve")])),
-        );
 
         let ev = build_impact_graph(&[main], &svc).await;
         assert_eq!(ev.completeness, Completeness::Complete);
+        assert_eq!(svc.calls_of("incoming_calls"), 0, "gated before the wire");
         assert_eq!(svc.calls_of("outgoing_calls"), 0, "gated before the wire");
-        assert_eq!(svc.calls_of("implementations"), 0, "not an interface");
+        assert!(ev.notes.iter().any(|n| n.contains("CallHierarchyIncoming")));
         assert!(ev.notes.iter().any(|n| n.contains("CallHierarchyOutgoing")));
-        assert!(ev.value.contains_edge(
-            "pkg/api.go:Serve",
-            "cmd/main.go:main",
-            RelationKind::Calls
-        ));
     }
 
     #[tokio::test]
     async fn partial_evidence_and_query_errors_degrade_completeness() {
+        // The lazy expansion surfaces partial results and query failures as honest Evidence.
         let main = info("cmd/main.go", "main", SymbolKind::Function, 3);
         let mut svc = ScriptedSource {
             features: call_features(),
@@ -423,16 +436,70 @@ mod tests {
         );
         svc.outgoing.insert(key(&main), Reply::Timeout);
 
-        let ev = build_impact_graph(&[main], &svc).await;
-        assert_eq!(ev.completeness, Completeness::Partial);
-        assert!(ev.notes.iter().any(|n| n.contains("truncated by server")));
-        assert!(ev.notes.iter().any(|n| n.contains("timed out")));
-        // The successful query still contributed its edge.
-        assert!(ev.value.contains_edge(
-            "pkg/api.go:Serve",
-            "cmd/main.go:main",
-            RelationKind::Calls
-        ));
+        let (callers, callees) =
+            expand_symbol_relations(&svc, &main.file, main.selection.start()).await;
+        assert_eq!(callers.completeness, Completeness::Partial);
+        assert!(callers
+            .notes
+            .iter()
+            .any(|n| n.contains("truncated by server")));
+        assert_eq!(callees.completeness, Completeness::Partial);
+        assert!(callees.notes.iter().any(|n| n.contains("timed out")));
+        // The successful query still returned its caller.
+        assert!(callers.value.iter().any(|c| c.name == "Serve"));
+    }
+
+    #[tokio::test]
+    async fn expand_symbol_relations_returns_scripted_callers_and_callees() {
+        let main = info("cmd/main.go", "main", SymbolKind::Function, 3);
+        let mut svc = ScriptedSource {
+            features: call_features(),
+            ..ScriptedSource::default()
+        };
+        svc.incoming.insert(
+            key(&main),
+            Reply::Ok(Evidence::complete(vec![sref("pkg/api.go", "Serve")])),
+        );
+        svc.outgoing.insert(
+            key(&main),
+            Reply::Ok(Evidence::complete(vec![sref("pkg/greet.go", "Hello")])),
+        );
+
+        let (callers, callees) =
+            expand_symbol_relations(&svc, &main.file, main.selection.start()).await;
+        assert_eq!(svc.calls_of("incoming_calls"), 1);
+        assert_eq!(svc.calls_of("outgoing_calls"), 1);
+        assert_eq!(callers.completeness, Completeness::Complete);
+        assert_eq!(callers.value, vec![sref("pkg/api.go", "Serve")]);
+        assert_eq!(callees.completeness, Completeness::Complete);
+        assert_eq!(callees.value, vec![sref("pkg/greet.go", "Hello")]);
+    }
+
+    #[tokio::test]
+    async fn expand_symbol_relations_unsupported_features_are_partial_with_notes() {
+        let mut features = FeatureSet::new();
+        features.set(Feature::CallHierarchyIncoming, Availability::Unsupported);
+        features.set(Feature::CallHierarchyOutgoing, Availability::Supported);
+        let main = info("cmd/main.go", "main", SymbolKind::Function, 3);
+        let mut svc = ScriptedSource {
+            features,
+            ..ScriptedSource::default()
+        };
+        svc.outgoing.insert(
+            key(&main),
+            Reply::Ok(Evidence::complete(vec![sref("pkg/greet.go", "Hello")])),
+        );
+
+        let (callers, callees) =
+            expand_symbol_relations(&svc, &main.file, main.selection.start()).await;
+        // Unsupported direction: gated before the wire, honest partial + note.
+        assert_eq!(svc.calls_of("incoming_calls"), 0, "gated before the wire");
+        assert_eq!(callers.completeness, Completeness::Partial);
+        assert!(callers.value.is_empty());
+        assert!(callers.notes.iter().any(|n| n.contains("unsupported")));
+        // Supported direction is unaffected.
+        assert_eq!(callees.completeness, Completeness::Complete);
+        assert_eq!(callees.value, vec![sref("pkg/greet.go", "Hello")]);
     }
 
     #[tokio::test]
@@ -491,6 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_answers_are_capped_with_partial_note() {
+        // The lazy expansion caps oversized answers at MAX_NEIGHBORS_PER_QUERY with a note.
         let main = info("cmd/main.go", "main", SymbolKind::Function, 3);
         let callers: Vec<SymbolRef> = (0..60)
             .map(|i| sref("pkg/x.go", &format!("f{i}")))
@@ -502,12 +570,10 @@ mod tests {
         svc.incoming
             .insert(key(&main), Reply::Ok(Evidence::complete(callers)));
 
-        let ev = build_impact_graph(&[main], &svc).await;
-        assert_eq!(ev.completeness, Completeness::Partial);
-        assert!(ev.notes.iter().any(|n| n.contains("kept 50 of 60")));
-        // 1 changed node + 50 capped neighbors.
-        assert_eq!(ev.value.node_count(), 51);
-        assert_eq!(ev.value.edge_count(), 50);
+        let (callers, _) = expand_symbol_relations(&svc, &main.file, main.selection.start()).await;
+        assert_eq!(callers.completeness, Completeness::Partial);
+        assert!(callers.notes.iter().any(|n| n.contains("kept 50 of 60")));
+        assert_eq!(callers.value.len(), MAX_NEIGHBORS_PER_QUERY);
     }
 
     #[tokio::test]
@@ -534,12 +600,13 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostics_annotate_worst_severity() {
-        let main = info("cmd/main.go", "main", SymbolKind::Function, 3);
+        // Shallow graph: a changed interface with an implementer neighbor node.
+        let main = info("cmd/main.go", "main", SymbolKind::Interface, 3);
         let mut svc = ScriptedSource {
             features: call_features(),
             ..ScriptedSource::default()
         };
-        svc.incoming.insert(
+        svc.impls.insert(
             key(&main),
             Reply::Ok(Evidence::complete(vec![sref("pkg/api.go", "Serve")])),
         );

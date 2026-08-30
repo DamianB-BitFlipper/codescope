@@ -34,6 +34,7 @@ fn sample() -> UiSnapshot {
                 change: "modified",
                 confidence: "",
                 has_diagnostic: false,
+                position: None,
             }],
         }],
         diff: DiffPane {

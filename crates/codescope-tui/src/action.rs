@@ -41,6 +41,17 @@ pub enum Action {
     Bottom,
     /// Activate the selection (jump diff+semantic to it / re-center impact view).
     Activate,
+    /// The user selected a changed symbol; the dispatcher lazily expands its callers/callees.
+    SelectSymbol {
+        /// Repo-relative file of the symbol.
+        file: String,
+        /// Symbol name.
+        name: String,
+        /// Line (0-based) of the symbol's identifier.
+        line: u32,
+        /// Column (0-based, utf-8) of the identifier.
+        col: u32,
+    },
     /// Expand / collapse the selected tree node.
     ToggleExpand,
     /// Collapse the selected node.

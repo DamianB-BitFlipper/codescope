@@ -337,11 +337,14 @@ fn analyze_fixture_full_snapshot() {
                 && c["record"]["change_kind"] == "modified"),
             "changed symbols: {changed:?}"
         );
+        // The refresh-time impact graph is shallow (call-hierarchy is lazy since the perf fix):
+        // it carries the changed-symbol nodes; callers/callees are fetched on selection via
+        // AnalysisEngine::callers_of/callees_of, not eagerly into the graph.
         assert!(
-            json["graph"]["value"]["edges"]
+            json["graph"]["value"]["nodes"]
                 .as_array()
-                .is_some_and(|e| !e.is_empty()),
-            "impact graph has callers of the changed method"
+                .is_some_and(|n| !n.is_empty()),
+            "impact graph has the changed-symbol nodes"
         );
         assert!(
             json["digest"]["changed_symbols"]

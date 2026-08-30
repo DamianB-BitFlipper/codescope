@@ -132,6 +132,9 @@ pub struct SymbolRow {
     pub confidence: &'static str,
     /// `true` when a diagnostic touches this symbol.
     pub has_diagnostic: bool,
+    /// Position of the symbol identifier (for lazy relationship expansion on select).
+    /// `None` for rows that can't be expanded (unmapped).
+    pub position: Option<(u32, u32)>,
 }
 
 /// The center diff pane: a focused unified diff for the current selection.
