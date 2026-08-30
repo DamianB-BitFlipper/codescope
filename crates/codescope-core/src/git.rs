@@ -155,13 +155,25 @@ pub struct ChangeSet {
     /// Changed files, in git output order (sorted by path).
     #[serde(default)]
     pub files: Vec<FileChange>,
+    /// `true` when this scope's committed diff was empty and the set was filled from the
+    /// working tree instead (a branch fully pushed to its base with a dirty tree). Consumers
+    /// must not misattribute these as committed branch changes (review 11 F2).
+    #[serde(default)]
+    pub fallback: bool,
 }
 
 impl ChangeSet {
     /// Create a change-set for `scope`.
     #[must_use]
     pub fn new(scope: ChangeScope, files: Vec<FileChange>) -> Self {
-        ChangeSet { scope, files }
+        ChangeSet { scope, files, fallback: false }
+    }
+
+    /// Mark this set as a working-tree fallback for an empty committed diff.
+    #[must_use]
+    pub fn into_fallback(mut self) -> Self {
+        self.fallback = true;
+        self
     }
 
     /// Number of changed files.

@@ -3,6 +3,7 @@
 //! Read-only: never edits files, stages, commits, or changes branches. AI is opt-in
 //! (`CODESCOPE_AI_*` / an API key); the app is fully functional without it.
 
+mod backend;
 mod dispatcher;
 mod terminal;
 mod watcher;
@@ -22,10 +23,19 @@ use tokio::sync::{mpsc, watch};
 use watcher::RepoWatchers;
 
 /// Understand what your current code changes do to the system.
+///
+/// With no subcommand, the interactive TUI starts. The subcommands are the
+/// non-interactive JSON backend (for scripts and LLM/tool consumers); they never
+/// start the TUI.
 #[derive(Parser, Debug)]
 #[command(name = "codescope", version, about)]
 struct Cli {
-    /// Repository path (defaults to the current directory).
+    /// Non-interactive JSON backend subcommand (scan/changeset/analyze/digest/bases).
+    #[command(subcommand)]
+    command: Option<backend::BackendCommand>,
+
+    /// Repository path (defaults to the current directory). TUI mode only; the
+    /// backend subcommands take their own PATH argument.
     #[arg(default_value = ".")]
     path: PathBuf,
 
@@ -42,6 +52,15 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.log_file.as_deref());
+
+    // Non-interactive JSON backend: print JSON to stdout and exit, never starting the TUI.
+    if let Some(command) = &cli.command {
+        let code = backend::run(command).await;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
 
     // Test hook (terminal-restore proof): initialize the terminal then panic before any repo
     // work, so the panic-restoration path is exercised without needing a repository.
@@ -143,5 +162,40 @@ fn init_tracing(log_file: Option<&std::path::Path>) {
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
             .try_init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn bare_path_stays_on_the_tui() {
+        let cli = Cli::try_parse_from(["codescope"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.path, PathBuf::from("."));
+        let cli = Cli::try_parse_from(["codescope", "/some/repo"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.path, PathBuf::from("/some/repo"));
+        let cli = Cli::try_parse_from(["codescope", "--no-ai", "/some/repo"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(cli.no_ai);
+    }
+
+    #[test]
+    fn subcommand_names_route_to_the_backend() {
+        for name in ["scan", "changeset", "analyze", "digest", "bases"] {
+            let cli = Cli::try_parse_from(["codescope", name]).unwrap();
+            assert!(cli.command.is_some(), "{name} must be a subcommand");
+        }
+        let cli = Cli::try_parse_from(["codescope", "analyze", "/repo", "--scope", "staged"])
+            .unwrap();
+        match cli.command {
+            Some(backend::BackendCommand::Analyze(args)) => {
+                assert_eq!(args.path, camino::Utf8PathBuf::from("/repo"));
+            }
+            other => panic!("expected analyze, got {other:?}"),
+        }
     }
 }

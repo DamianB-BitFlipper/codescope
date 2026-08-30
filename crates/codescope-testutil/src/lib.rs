@@ -28,6 +28,7 @@ pub mod fake_ai;
 pub mod fake_lsp;
 pub mod go_fixture;
 pub mod helpers;
+pub mod scenarios;
 
 pub use error::{Result, TestutilError};
 pub use go_fixture::{build_fixture, reset_fixture, FixtureInfo};

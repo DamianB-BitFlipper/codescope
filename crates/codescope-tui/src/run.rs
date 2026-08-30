@@ -9,6 +9,8 @@ use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use tokio::sync::{mpsc, watch};
 
+use codescope_core::ChangeScope;
+
 use crate::action::{map_key, Action};
 use crate::app::App;
 use crate::render::render;
@@ -18,7 +20,8 @@ use crate::snapshot::UiSnapshot;
 ///
 /// - `rx` carries new snapshots from the dispatcher (watch = latest-wins).
 /// - `tx` receives Actions that require work the TUI cannot do itself
-///   (RefreshGit, AiToggle, AiRefresh); view-only actions are applied locally.
+///   (RefreshGit, AiToggle, AiRefresh, scope changes); view-only actions are applied
+///   locally.
 pub async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
@@ -30,6 +33,7 @@ pub async fn run(
     let _ = crossterm::terminal::enable_raw_mode();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(33));
+    let mut pending_scope = PendingScope::default();
 
     loop {
         terminal.draw(|frame| render(frame, &app, &app.snapshot.clone()))?;
@@ -44,7 +48,7 @@ pub async fn run(
                 match maybe {
                     Some(Ok(Event::Key(key))) => {
                         let action = map_key(key, &app);
-                        dispatch(&mut app, action, &tx).await;
+                        dispatch(&mut app, action, &tx, &mut pending_scope).await;
                     }
                     Some(Ok(Event::Resize(_, _))) => { /* redrawn next pass */ }
                     Some(Ok(_)) | Some(Err(_)) | None => {}
@@ -56,7 +60,8 @@ pub async fn run(
                     // Dispatcher dropped the sender: keep rendering the last state.
                     continue;
                 }
-                let snapshot = rx.borrow_and_update().clone();
+                let mut snapshot = rx.borrow_and_update().clone();
+                pending_scope.reconcile(&mut snapshot);
                 app.update(snapshot);
             }
             // Spinner/redraw heartbeat.
@@ -65,8 +70,41 @@ pub async fn run(
     }
 }
 
+/// A scope the user picked that the dispatcher has not yet confirmed.
+///
+/// The dispatcher owns the scope: scope actions are forwarded to it and every published
+/// snapshot carries its scope. Between the keypress and the dispatcher's next publish, a
+/// snapshot computed *before* the dispatcher saw the action can still arrive; without this
+/// guard it would carry the old scope and `App::update` would flip the label back (the
+/// "scope resets to branch on every refresh" bug).
+#[derive(Debug, Default)]
+struct PendingScope(Option<ChangeScope>);
+
+impl PendingScope {
+    /// Record a user-picked scope (already applied locally and forwarded).
+    fn record(&mut self, scope: ChangeScope) {
+        self.0 = Some(scope);
+    }
+
+    /// Reconcile an incoming snapshot with the pending pick: a snapshot that confirms it
+    /// clears the pending state (the dispatcher is the source of truth again); a stale
+    /// one is patched to the user's scope so the choice cannot flicker back.
+    fn reconcile(&mut self, snapshot: &mut UiSnapshot) {
+        match self.0 {
+            Some(scope) if snapshot.scope == scope => self.0 = None,
+            Some(scope) => snapshot.scope = scope,
+            None => {}
+        }
+    }
+}
+
 /// Apply view-only actions locally and forward work actions to the dispatcher.
-async fn dispatch(app: &mut App, action: Action, tx: &mpsc::Sender<Action>) {
+async fn dispatch(
+    app: &mut App,
+    action: Action,
+    tx: &mpsc::Sender<Action>,
+    pending_scope: &mut PendingScope,
+) {
     match action {
         Action::ModelSelected(name) => {
             // The modal sends an empty name; resolve it from the current selection.
@@ -117,6 +155,84 @@ async fn dispatch(app: &mut App, action: Action, tx: &mpsc::Sender<Action>) {
                 let _ = tx.send(Action::BasePicker).await;
             }
         }
+        // The dispatcher owns the scope: apply locally for instant feedback (selection
+        // reset + label), remember the pick until a snapshot confirms it, and forward so
+        // every future publish carries the user's scope.
+        scope @ (Action::ScopeStaged
+        | Action::ScopeUnstaged
+        | Action::ScopeBranch
+        | Action::ScopeWorking
+        | Action::ScopeCycle) => {
+            app.apply(scope.clone());
+            pending_scope.record(app.snapshot.scope);
+            let _ = tx.send(scope).await;
+        }
         other => app.apply(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug 2 regression: a scope set via action must persist across refresh snapshots,
+    /// including one published before the dispatcher processed the forwarded action.
+    #[tokio::test]
+    async fn user_scope_persists_across_refresh_snapshots() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = App::new();
+        let mut pending = PendingScope::default();
+
+        // Set the scope via action: applied locally AND forwarded to the dispatcher.
+        dispatch(&mut app, Action::ScopeStaged, &tx, &mut pending).await;
+        assert_eq!(app.snapshot.scope, ChangeScope::Staged);
+        assert_eq!(
+            rx.recv().await,
+            Some(Action::ScopeStaged),
+            "scope actions must be forwarded to the dispatcher (it owns the scope)"
+        );
+
+        // A snapshot published before the dispatcher saw the action still carries the old
+        // scope; applying it must not reset the user's pick (the flicker/reset bug).
+        let mut stale = UiSnapshot {
+            scope: ChangeScope::Branch,
+            ..UiSnapshot::default()
+        };
+        pending.reconcile(&mut stale);
+        app.update(stale);
+        assert_eq!(app.snapshot.scope, ChangeScope::Staged);
+
+        // The dispatcher's confirming snapshot clears the pending state; from then on the
+        // published scope is the source of truth again.
+        let mut confirmed = UiSnapshot {
+            scope: ChangeScope::Staged,
+            ..UiSnapshot::default()
+        };
+        pending.reconcile(&mut confirmed);
+        app.update(confirmed);
+        assert_eq!(app.snapshot.scope, ChangeScope::Staged);
+        assert!(
+            pending.0.is_none(),
+            "a confirming snapshot clears the pending scope"
+        );
+    }
+
+    /// ScopeCycle forwards as-is (the dispatcher cycles its own scope); the guard records
+    /// the concrete scope the app cycled to, so stale snapshots cannot undo it.
+    #[tokio::test]
+    async fn scope_cycle_is_forwarded_and_guarded() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = App::new();
+        let mut pending = PendingScope::default();
+
+        dispatch(&mut app, Action::ScopeCycle, &tx, &mut pending).await;
+        assert_eq!(app.snapshot.scope, ChangeScope::Staged); // Branch -> Staged
+        assert_eq!(rx.recv().await, Some(Action::ScopeCycle));
+        assert_eq!(pending.0, Some(ChangeScope::Staged));
+
+        let mut stale = UiSnapshot::default(); // scope: Branch
+        pending.reconcile(&mut stale);
+        app.update(stale);
+        assert_eq!(app.snapshot.scope, ChangeScope::Staged);
     }
 }

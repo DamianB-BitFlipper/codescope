@@ -18,6 +18,8 @@ codescope-ai = { path = "../codescope-ai" }
 codescope-tui = { path = "../codescope-tui" }
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
@@ -30,4 +32,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 
 [dev-dependencies]
+codescope-testutil = { path = "../codescope-testutil" }
 portable-pty.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

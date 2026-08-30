@@ -445,7 +445,10 @@ impl GitRepo {
     /// Compute the [`ChangeSet`] for one scope (research 02: scopes stay independent).
     ///
     /// - [`ChangeScope::Branch`]: `git diff -M -U3 <merge-base>...HEAD`; errors with
-    ///   [`GitError::NoBase`] when no base can be inferred.
+    ///   [`GitError::NoBase`] when no base can be inferred. When that committed diff is
+    ///   empty but the worktree is dirty (e.g. the branch is fully pushed: merge-base ==
+    ///   HEAD), the uncommitted changes are merged in so the branch view is not
+    ///   misleadingly empty.
     /// - [`ChangeScope::Staged`]: `git diff --cached -M -U3` (works on unborn HEAD too:
     ///   git diffs the index against the empty tree).
     /// - [`ChangeScope::Unstaged`]: `git diff -M -U3` plus untracked files from porcelain
@@ -455,6 +458,7 @@ impl GitRepo {
     /// pairing (verified pitfall). Unmerged paths are marked, never hunk-parsed.
     #[tracing::instrument(skip(self), err)]
     pub async fn changeset(&self, scope: ChangeScope) -> Result<ChangeSet> {
+        let mut fell_back = false;
         let mut files = match scope {
             ChangeScope::Branch => {
                 let status = self.status_snapshot().await?;
@@ -465,7 +469,15 @@ impl GitRepo {
                 args.push(&range);
                 let out = self.cmd(&args).run().await?;
                 let text = String::from_utf8_lossy(out.stdout_bytes());
-                parse_unified_diff(&text)?
+                let mut files = parse_unified_diff(&text)?;
+                if files.is_empty() {
+                    // A fully pushed branch has merge-base == HEAD, so the committed diff
+                    // is empty even when the worktree is dirty. Surface the uncommitted
+                    // changes rather than a misleading "no changes" pane.
+                    files = self.working_tree_files().await?;
+                    fell_back = true;
+                }
+                files
             }
             ChangeScope::Staged => {
                 let mut args = vec!["diff", "--cached"];
@@ -498,47 +510,55 @@ impl GitRepo {
                 }
                 files
             }
-            ChangeScope::Working => {
-                // All uncommitted changes: worktree vs HEAD (staged + unstaged), plus untracked.
-                // On an unborn HEAD, diff against the empty tree instead (HEAD doesn't resolve).
-                let target = if self
-                    .cmd(&["rev-parse", "--verify", "--quiet", "HEAD"])
-                    .output()
-                    .await?
-                    .success()
-                {
-                    "HEAD".to_string()
-                } else {
-                    // The well-known empty tree object id.
-                    "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
-                };
-                let mut args = vec!["diff", &target];
-                args.extend_from_slice(DIFF_FLAGS);
-                let out = self.cmd(&args).run().await?;
-                let text = String::from_utf8_lossy(out.stdout_bytes());
-                let mut files = parse_unified_diff(&text)?;
-                let status = self.status_snapshot().await?;
-                merge_unmerged(&mut files, &status);
-                for path in status.untracked_paths() {
-                    if !files.iter().any(|f| &f.path == path) {
-                        files.push(FileChange {
-                            path: path.clone(),
-                            old_path: None,
-                            status: FileStatus::Untracked,
-                            hunks: Vec::new(),
-                            binary: false,
-                        });
-                    }
-                }
-                files
-            }
+            ChangeScope::Working => self.working_tree_files().await?,
         };
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(ChangeSet::new(scope, files))
+        let set = ChangeSet::new(scope, files);
+        Ok(if fell_back { set.into_fallback() } else { set })
+    }
+
+    /// All uncommitted changes as one list: `git diff HEAD` (staged + unstaged) plus
+    /// untracked paths from porcelain status ([`FileStatus::Untracked`], no hunks), with
+    /// unmerged paths marked. On an unborn HEAD, diffs against the empty tree instead
+    /// (HEAD does not resolve).
+    async fn working_tree_files(&self) -> Result<Vec<FileChange>> {
+        // All uncommitted changes: worktree vs HEAD (staged + unstaged), plus untracked.
+        // On an unborn HEAD, diff against the empty tree instead (HEAD doesn't resolve).
+        let target = if self
+            .cmd(&["rev-parse", "--verify", "--quiet", "HEAD"])
+            .output()
+            .await?
+            .success()
+        {
+            "HEAD".to_string()
+        } else {
+            // The well-known empty tree object id.
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+        };
+        let mut args = vec!["diff", &target];
+        args.extend_from_slice(DIFF_FLAGS);
+        let out = self.cmd(&args).run().await?;
+        let text = String::from_utf8_lossy(out.stdout_bytes());
+        let mut files = parse_unified_diff(&text)?;
+        let status = self.status_snapshot().await?;
+        merge_unmerged(&mut files, &status);
+        for path in status.untracked_paths() {
+            if !files.iter().any(|f| &f.path == path) {
+                files.push(FileChange {
+                    path: path.clone(),
+                    old_path: None,
+                    status: FileStatus::Untracked,
+                    hunks: Vec::new(),
+                    binary: false,
+                });
+            }
+        }
+        Ok(files)
     }
 
     /// Branch-scope changeset against an explicit base ref (a picker override). The ref
-    /// must yield a merge base with HEAD.
+    /// must yield a merge base with HEAD. As with [`GitRepo::changeset`], an empty
+    /// committed diff merges in the uncommitted (working-tree) changes.
     pub async fn branch_changeset_with_base(&self, base_ref: &str) -> Result<ChangeSet> {
         let mb = self.merge_base(base_ref).await?.ok_or(GitError::NoBase)?;
         let range = format!("{}...HEAD", mb);
@@ -548,8 +568,13 @@ impl GitRepo {
         let out = self.cmd(&args).run().await?;
         let text = String::from_utf8_lossy(out.stdout_bytes());
         let mut files = parse_unified_diff(&text)?;
+        let fell_back = files.is_empty();
+        if fell_back {
+            files = self.working_tree_files().await?;
+        }
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(ChangeSet::new(ChangeScope::Branch, files))
+        let set = ChangeSet::new(ChangeScope::Branch, files);
+        Ok(if fell_back { set.into_fallback() } else { set })
     }
 
     /// Content of `path` at revision `base` (`git show <base>:<path>`).
@@ -655,5 +680,129 @@ fn merge_unmerged(files: &mut Vec<FileChange>, status: &StatusSnapshot) {
         } else {
             files.push(unmerged_change(path.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Run a git command for test setup (not through the crate under test); returns stdout.
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@test.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@test.invalid")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("utf8 stdout")
+    }
+
+    /// Build a throwaway repo on `main` with two tracked files, plus a local `upstream`
+    /// ref at the same commit that `main` tracks — i.e. the branch is fully pushed
+    /// (merge-base(upstream, HEAD) == HEAD, ahead/behind 0/0).
+    fn fully_pushed_repo() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "codescope-fully-pushed-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        git(&dir, &["init", "--quiet", "-b", "main"]);
+        std::fs::write(dir.join("tracked.txt"), "one\n").expect("write tracked.txt");
+        std::fs::write(dir.join("staged.txt"), "one\n").expect("write staged.txt");
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "--quiet", "--no-verify", "-m", "base"]);
+        // A local 'upstream' ref at HEAD, tracked by main: fully pushed, 0/0.
+        git(&dir, &["branch", "upstream"]);
+        git(&dir, &["branch", "--set-upstream-to=upstream"]);
+        dir
+    }
+
+    /// Regression: a fully pushed branch diffs empty against its base even when the
+    /// worktree is dirty; the Branch scope must surface the uncommitted changes instead
+    /// of a misleading "no changes" pane.
+    #[tokio::test]
+    async fn branch_scope_includes_dirty_worktree_when_fully_pushed() {
+        let root = fully_pushed_repo();
+        let repo_root = Utf8PathBuf::from_path_buf(root.clone()).expect("utf-8 temp path");
+        let repo = GitRepo::discover(&repo_root)
+            .await
+            .expect("discover scratch repo");
+
+        // Setup sanity: the base is the upstream ref, and its merge-base IS HEAD
+        // (fully pushed — the committed branch diff is empty).
+        let ctx = repo.repo_context().await.expect("repo context");
+        let base = ctx.base.expect("base inferred from upstream");
+        assert_eq!(base.source, BaseSource::Upstream);
+        assert_eq!(base.ref_name, "upstream");
+        let head = git(&root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            base.merge_base.as_str(),
+            head.trim(),
+            "fully pushed: merge-base == HEAD"
+        );
+        let commits = repo.branch_commits(&base.merge_base).await.expect("log");
+        assert!(commits.is_empty(), "no commits ahead of the upstream");
+
+        // Dirty the worktree: one unstaged edit, one staged edit, one untracked file.
+        std::fs::write(root.join("tracked.txt"), "two\n").expect("edit tracked.txt");
+        std::fs::write(root.join("staged.txt"), "two\n").expect("edit staged.txt");
+        git(&root, &["add", "staged.txt"]);
+        std::fs::write(root.join("new.txt"), "brand new\n").expect("write new.txt");
+
+        let cs = repo
+            .changeset(ChangeScope::Branch)
+            .await
+            .expect("branch changeset");
+        assert_eq!(cs.scope, ChangeScope::Branch);
+        let paths: Vec<_> = cs.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["new.txt", "staged.txt", "tracked.txt"],
+            "dirty worktree files must surface in the (otherwise empty) branch scope"
+        );
+        assert_eq!(cs.files[0].status, FileStatus::Untracked);
+        assert!(cs.files[0].hunks.is_empty(), "untracked files carry no hunks");
+        assert_eq!(cs.files[1].status, FileStatus::Modified);
+        assert!(!cs.files[1].hunks.is_empty(), "staged edit diffs against HEAD");
+        assert_eq!(cs.files[2].status, FileStatus::Modified);
+        assert!(!cs.files[2].hunks.is_empty(), "unstaged edit diffs against HEAD");
+
+        // Once the dirty files are committed, the branch is ahead again and the normal
+        // committed diff takes over (the fallback only fires on an empty branch diff).
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--quiet", "--no-verify", "-m", "work"]);
+        let cs = repo
+            .changeset(ChangeScope::Branch)
+            .await
+            .expect("branch changeset after commit");
+        let paths: Vec<_> = cs.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["new.txt", "staged.txt", "tracked.txt"]);
+        assert!(
+            cs.files.iter().all(|f| f.status != FileStatus::Untracked),
+            "committed files are real diff entries"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -952,6 +952,35 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The dispatcher owns the scope: a forwarded scope action must update its state and
+    /// every published snapshot from then on (the TUI renders the published scope as the
+    /// source of truth). Regression test for the scope flicker/reset bug.
+    #[tokio::test]
+    async fn scope_action_updates_published_scope() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+        assert_eq!(snapshot_rx.borrow().scope, ChangeScope::Branch);
+
+        disp.handle(DispatchEvent::Work(Action::ScopeStaged)).await;
+        assert_eq!(disp.scope, ChangeScope::Staged);
+        // The refreshing snapshot (published synchronously) already carries the new scope.
+        assert_eq!(snapshot_rx.borrow().scope, ChangeScope::Staged);
+
+        // The spawned refresh reports back; the re-published snapshot keeps the scope.
+        let done = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::AnalysisDone { .. })
+        })
+        .await;
+        disp.handle(done).await;
+        assert_eq!(snapshot_rx.borrow().scope, ChangeScope::Staged);
+
+        // A repo-state refresh must not reset the scope either.
+        disp.handle(DispatchEvent::RepoChanged).await;
+        assert_eq!(snapshot_rx.borrow().scope, ChangeScope::Staged);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn base_picker_loads_candidates() {
         let root = scratch_repo();
