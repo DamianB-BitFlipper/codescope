@@ -1,0 +1,488 @@
+//! AI-assisted visualization: plan schema, validation report, AI status (research 05).
+//!
+//! The AI only *chooses and parameterizes* views; codescope owns facts, validation, and
+//! rendering. Plans arrive as JSON via a single required `submit_visualization_plan` tool
+//! call and must pass the deterministic validation boundary (epoch gate, entity resolution,
+//! edge existence, hunks by reference) before render.
+//!
+//! Field names and enum values serialize exactly as in the research 05 §2 schema
+//! (`snake_case` kinds, flat [`LineRange`](crate::LineRange) entities).
+
+use crate::epoch::Epoch;
+use crate::relation::DiagnosticSeverity;
+use crate::semantic::EntityRef;
+
+/// Current [`VisualizationPlan::plan_version`]. Bump on any schema change.
+pub const PLAN_VERSION: u32 = 1;
+
+/// Hard cap on nodes per form (Show Me rule S4; enforced at validation).
+pub const MAX_FORM_NODES: usize = 12;
+
+/// Hard cap on tree depth within a form (Show Me rule S4).
+pub const MAX_FORM_DEPTH: usize = 3;
+
+/// Maximum forms per plan ("one form per plan, two max").
+pub const MAX_FORMS_PER_PLAN: usize = 2;
+
+/// Maximum summary length in rendered lines (Show Me rule S5).
+pub const MAX_SUMMARY_LINES: usize = 3;
+
+/// A visualization plan: the AI's answer to one focus question, as renderable forms.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VisualizationPlan {
+    /// Schema version; must equal [`PLAN_VERSION`].
+    pub plan_version: u32,
+    /// Repo-state epoch echoed from the prompt; the validator gates on it.
+    pub epoch: Epoch,
+    /// The single question this plan answers (one sentence, required).
+    pub focus: String,
+    /// One or two forms ([`MAX_FORMS_PER_PLAN`]).
+    #[serde(default)]
+    pub forms: Vec<VizForm>,
+}
+
+impl VisualizationPlan {
+    /// A new empty plan at the current schema version.
+    #[must_use]
+    pub fn new(epoch: Epoch, focus: impl Into<String>) -> Self {
+        VisualizationPlan {
+            plan_version: PLAN_VERSION,
+            epoch,
+            focus: focus.into(),
+            forms: Vec::new(),
+        }
+    }
+
+    /// `true` when the plan carries no forms.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.forms.is_empty()
+    }
+
+    /// Number of forms in the plan.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.forms.len()
+    }
+}
+
+/// The 8 fixed visualization forms (Show Me decision table adapted to code change impact).
+///
+/// Serializes as `snake_case` (`"call_tree"`, `changed_symbol_tree`, …), matching the plan
+/// JSON schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormKind {
+    /// Diff-shaped symbol tree of the changed files.
+    ChangedSymbolTree,
+    /// Callers/callees tree around a focus symbol.
+    CallTree,
+    /// Type ↔ implementation tree (interfaces, implementers).
+    TypeImplTree,
+    /// Relationship flow graph (calls/imports/implements/contains edges).
+    RelationshipFlow,
+    /// Grouped counts + entry points (≤8 bullets).
+    ImpactSummary,
+    /// Subset of real hunks, ordered, with a one-line rationale each. Hunks are referenced
+    /// by [`HunkId`](crate::HunkId) and re-read from git — never written by the AI.
+    FocusedDiff,
+    /// Two structural trees/diffs side by side (base vs worktree).
+    BeforeAfter,
+    /// Time-ordered interaction; nodes are participants.
+    Sequence,
+}
+
+impl FormKind {
+    /// Tree forms drop invalid nodes and re-parent children at validation; a bad root or
+    /// >20% invalid nodes rejects the form (research 05 §3).
+    #[must_use]
+    pub fn is_tree_form(self) -> bool {
+        matches!(
+            self,
+            FormKind::ChangedSymbolTree
+                | FormKind::CallTree
+                | FormKind::TypeImplTree
+                | FormKind::BeforeAfter
+        )
+    }
+
+    /// Flow/sequence forms: an invalid endpoint breaks ordering semantics → reject the form.
+    #[must_use]
+    pub fn is_flow_form(self) -> bool {
+        matches!(self, FormKind::RelationshipFlow | FormKind::Sequence)
+    }
+}
+
+/// One renderable form inside a [`VisualizationPlan`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VizForm {
+    /// Which form to render.
+    pub kind: FormKind,
+    /// Short title.
+    pub title: String,
+    /// Prose summary, ≤ [`MAX_SUMMARY_LINES`] lines, rendered next to the visual.
+    #[serde(default)]
+    pub summary: String,
+    /// Plan nodes, keyed by [`PlanNode::id`] (≤ [`MAX_FORM_NODES`]).
+    #[serde(default)]
+    pub nodes: Vec<PlanNode>,
+    /// Plan edges (flow/sequence/relationship forms).
+    #[serde(default)]
+    pub edges: Vec<PlanEdge>,
+}
+
+impl VizForm {
+    /// Look up a node by plan-local id.
+    #[must_use]
+    pub fn node(&self, id: &str) -> Option<&PlanNode> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// Number of nodes in the form.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+/// One node in a form. Ids are plan-local strings (`"n1"`, …) referenced by
+/// [`PlanEdge`]s and [`PlanNode::children`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlanNode {
+    /// Plan-local id.
+    pub id: String,
+    /// The fact-store entity this node represents; must resolve to exactly one entry
+    /// (unresolvable = hallucination). `None` only for purely presentational nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<EntityRef>,
+    /// Short display label (the TUI may re-derive it from the entity).
+    pub label: String,
+    /// Change badge.
+    pub change: PlanNodeChange,
+    /// Optional diagnostic badge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<DiagnosticSeverity>,
+    /// Child node ids for tree forms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<String>,
+    /// Render hints only; never semantic.
+    #[serde(default)]
+    pub hint: NodeHint,
+}
+
+impl PlanNode {
+    /// A node with no entity, severity, children, or hints.
+    #[must_use]
+    pub fn new(id: impl Into<String>, label: impl Into<String>, change: PlanNodeChange) -> Self {
+        PlanNode {
+            id: id.into(),
+            entity: None,
+            label: label.into(),
+            change,
+            severity: None,
+            children: Vec::new(),
+            hint: NodeHint::default(),
+        }
+    }
+
+    /// Attach a fact-store entity.
+    #[must_use]
+    pub fn with_entity(mut self, entity: EntityRef) -> Self {
+        self.entity = Some(entity);
+        self
+    }
+}
+
+/// Change badge on a [`PlanNode`] (research 05 §2: `added|modified|removed|unchanged|diagnostic`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanNodeChange {
+    /// Added by the change-set.
+    Added,
+    /// Modified by the change-set.
+    Modified,
+    /// Removed by the change-set.
+    Removed,
+    /// Present for context, unchanged.
+    Unchanged,
+    /// Flagged because a diagnostic touches it.
+    Diagnostic,
+}
+
+/// Render hints for a [`PlanNode`] — presentation only, never semantic.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct NodeHint {
+    /// Visually highlight the node.
+    #[serde(default)]
+    pub highlight: bool,
+    /// Render the node collapsed.
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// Kind of edge the AI may draw between plan nodes (research 05 §2).
+///
+/// Edges asserting `calls`/`implements`/`imports` must exist in the impact graph —
+/// the AI selects edges, it never asserts new ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEdgeKind {
+    /// Call relationship.
+    Calls,
+    /// Import dependency.
+    Imports,
+    /// Interface/trait implementation.
+    Implements,
+    /// Containment (file ⊃ symbol, type ⊃ member).
+    Contains,
+    /// Data read.
+    Reads,
+    /// Data write.
+    Writes,
+}
+
+/// A directed edge between plan nodes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanEdge {
+    /// Source plan-local node id.
+    pub from: String,
+    /// Target plan-local node id.
+    pub to: String,
+    /// Edge kind.
+    pub kind: PlanEdgeKind,
+    /// Optional edge label (e.g. "on cache miss").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Verdict of the deterministic plan-validation boundary (research 05 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationVerdict {
+    /// Everything resolved; render as-is.
+    Valid,
+    /// Some nodes/edges/bullets were dropped; render the remainder.
+    ValidWithDrops,
+    /// The plan's epoch no longer matches the repo state; show the last valid render with a
+    /// "regenerating" badge and re-request.
+    Stale,
+    /// The plan (or a form) is unusable; render the deterministic fallback.
+    Rejected,
+}
+
+/// One item dropped during validation, for the plan-validation debug pane.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DroppedItem {
+    /// What was dropped (e.g. `node n3 in form 0`, `form 1`, `bullet 2`).
+    pub subject: String,
+    /// Why it was dropped (e.g. "entity does not resolve", "edge not in impact graph").
+    pub reason: String,
+}
+
+/// Result of validating a [`VisualizationPlan`] against the fact store.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ValidationReport {
+    /// Overall verdict.
+    pub verdict: ValidationVerdict,
+    /// Everything that was dropped, with reasons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<DroppedItem>,
+    /// Free-form notes (re-parented children, re-resolved entities, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl ValidationReport {
+    /// A clean validation.
+    #[must_use]
+    pub fn valid() -> Self {
+        ValidationReport {
+            verdict: ValidationVerdict::Valid,
+            dropped: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// Validation succeeded but dropped items.
+    #[must_use]
+    pub fn with_drops(dropped: Vec<DroppedItem>) -> Self {
+        ValidationReport {
+            verdict: ValidationVerdict::ValidWithDrops,
+            dropped,
+            notes: Vec::new(),
+        }
+    }
+
+    /// The plan is stale (epoch mismatch).
+    #[must_use]
+    pub fn stale() -> Self {
+        ValidationReport {
+            verdict: ValidationVerdict::Stale,
+            dropped: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// The plan is unusable; `reason` is recorded as a note.
+    #[must_use]
+    pub fn rejected(reason: impl Into<String>) -> Self {
+        ValidationReport {
+            verdict: ValidationVerdict::Rejected,
+            dropped: Vec::new(),
+            notes: vec![reason.into()],
+        }
+    }
+
+    /// `true` when the plan may be rendered ([`ValidationVerdict::Valid`] or
+    /// [`ValidationVerdict::ValidWithDrops`]).
+    #[must_use]
+    pub fn is_renderable(&self) -> bool {
+        matches!(
+            self.verdict,
+            ValidationVerdict::Valid | ValidationVerdict::ValidWithDrops
+        )
+    }
+}
+
+/// Lifecycle of the optional AI subsystem, for the status bar (research 05: AI is off
+/// unless configured; the app is fully functional without it).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiStatus {
+    /// No API key configured / `CODESCOPE_AI=off`.
+    Disabled,
+    /// Enabled, no plan requested or in flight.
+    Idle,
+    /// A plan request is in flight (started at `since_epoch`).
+    Loading {
+        /// Epoch the in-flight request was started against.
+        since_epoch: Epoch,
+    },
+    /// A validated plan is available for `epoch`.
+    Ready {
+        /// Epoch the rendered plan was validated against.
+        epoch: Epoch,
+    },
+    /// The displayed plan's epoch no longer matches the repo state; regenerating.
+    Stale {
+        /// Epoch of the stale plan still being displayed.
+        epoch: Epoch,
+    },
+    /// The last request failed (validation/render falls back deterministically).
+    Failed {
+        /// Human-readable failure reason (never contains secrets).
+        reason: String,
+    },
+}
+
+impl AiStatus {
+    /// `true` when a validated plan can be displayed (`Ready`; `Stale` still shows the last
+    /// valid render with a badge).
+    #[must_use]
+    pub fn has_plan(&self) -> bool {
+        matches!(self, AiStatus::Ready { .. } | AiStatus::Stale { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::FileId;
+    use crate::position::LineRange;
+
+    #[test]
+    fn form_kind_classification() {
+        assert!(FormKind::CallTree.is_tree_form());
+        assert!(FormKind::ChangedSymbolTree.is_tree_form());
+        assert!(FormKind::TypeImplTree.is_tree_form());
+        assert!(FormKind::BeforeAfter.is_tree_form());
+        assert!(!FormKind::Sequence.is_tree_form());
+        assert!(FormKind::RelationshipFlow.is_flow_form());
+        assert!(FormKind::Sequence.is_flow_form());
+        assert!(!FormKind::ImpactSummary.is_flow_form());
+        assert!(!FormKind::FocusedDiff.is_tree_form());
+    }
+
+    #[test]
+    fn form_kind_serde_matches_research_schema() {
+        let cases = [
+            (FormKind::ChangedSymbolTree, "changed_symbol_tree"),
+            (FormKind::CallTree, "call_tree"),
+            (FormKind::TypeImplTree, "type_impl_tree"),
+            (FormKind::RelationshipFlow, "relationship_flow"),
+            (FormKind::ImpactSummary, "impact_summary"),
+            (FormKind::FocusedDiff, "focused_diff"),
+            (FormKind::BeforeAfter, "before_after"),
+            (FormKind::Sequence, "sequence"),
+        ];
+        assert_eq!(cases.len(), 8);
+        for (kind, json) in cases {
+            assert_eq!(serde_json::to_value(kind).unwrap(), serde_json::json!(json));
+            assert_eq!(
+                serde_json::from_value::<FormKind>(serde_json::json!(json)).unwrap(),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn plan_node_builder() {
+        let n = PlanNode::new("n1", "load", PlanNodeChange::Modified).with_entity(
+            EntityRef::for_symbol(
+                FileId::new("src/session/store.rs").unwrap(),
+                "session::store::SessionStore::load",
+                Some(LineRange::new(121, 4, 140, 5)),
+            ),
+        );
+        assert!(n.entity.is_some());
+        assert_eq!(n.children.len(), 0);
+        assert!(!n.hint.highlight);
+    }
+
+    #[test]
+    fn validation_report_states() {
+        assert!(ValidationReport::valid().is_renderable());
+        let drops = ValidationReport::with_drops(vec![DroppedItem {
+            subject: "node n3".into(),
+            reason: "entity does not resolve".into(),
+        }]);
+        assert!(drops.is_renderable());
+        assert_eq!(drops.dropped.len(), 1);
+        assert!(!ValidationReport::stale().is_renderable());
+        let rej = ValidationReport::rejected("root entity invalid");
+        assert!(!rej.is_renderable());
+        assert_eq!(rej.notes, ["root entity invalid"]);
+    }
+
+    #[test]
+    fn ai_status_plan_availability() {
+        assert!(!AiStatus::Disabled.has_plan());
+        assert!(!AiStatus::Idle.has_plan());
+        assert!(!AiStatus::Loading {
+            since_epoch: Epoch(1)
+        }
+        .has_plan());
+        assert!(AiStatus::Ready { epoch: Epoch(1) }.has_plan());
+        assert!(AiStatus::Stale { epoch: Epoch(1) }.has_plan());
+        assert!(!AiStatus::Failed {
+            reason: "boom".into()
+        }
+        .has_plan());
+    }
+
+    #[test]
+    fn viz_form_helpers() {
+        let form = VizForm {
+            kind: FormKind::CallTree,
+            title: "Callers of load".into(),
+            summary: "load has 3 callers".into(),
+            nodes: vec![PlanNode::new("n1", "load", PlanNodeChange::Modified)],
+            edges: vec![],
+        };
+        assert_eq!(form.node_count(), 1);
+        assert!(form.node("n1").is_some());
+        assert!(form.node("n9").is_none());
+    }
+}

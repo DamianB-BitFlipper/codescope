@@ -1,0 +1,33 @@
+[package]
+name = "codescope"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codescope: understand what your code changes do to the system"
+
+[[bin]]
+name = "codescope"
+path = "src/main.rs"
+
+[dependencies]
+codescope-core = { path = "../codescope-core" }
+codescope-git = { path = "../codescope-git" }
+codescope-lsp = { path = "../codescope-lsp" }
+codescope-analysis = { path = "../codescope-analysis" }
+codescope-ai = { path = "../codescope-ai" }
+codescope-tui = { path = "../codescope-tui" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+notify.workspace = true
+notify-debouncer-mini.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+camino.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[dev-dependencies]
+portable-pty.workspace = true

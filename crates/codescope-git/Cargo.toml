@@ -1,0 +1,18 @@
+[package]
+name = "codescope-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only git CLI subprocess layer for codescope"
+
+[dependencies]
+codescope-core = { path = "../codescope-core" }
+camino.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

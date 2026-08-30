@@ -1,0 +1,15 @@
+[package]
+name = "codescope-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codescope shared domain types: git changes, symbols, impact graph, viz plans (no async, no I/O)"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+camino = { workspace = true, features = ["serde1"] }
+lsp-types.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

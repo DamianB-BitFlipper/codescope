@@ -1,0 +1,18 @@
+[package]
+name = "codescope-testutil"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codescope dev-facing test support: deterministic Go fixture repo, fake LSP server, scripted fake AI provider"
+
+[dependencies]
+codescope-core = { path = "../codescope-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

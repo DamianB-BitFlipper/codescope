@@ -1,0 +1,25 @@
+[package]
+name = "codescope-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codescope AI layer: provider-neutral chat-completions client, visualization-plan schema, fact-validation boundary"
+
+[dependencies]
+codescope-core = { path = "../codescope-core" }
+backon.workspace = true
+camino.workspace = true
+futures.workspace = true
+governor.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+codescope-testutil = { path = "../codescope-testutil" }

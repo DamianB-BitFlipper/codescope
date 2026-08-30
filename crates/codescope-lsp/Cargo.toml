@@ -1,0 +1,28 @@
+[package]
+name = "codescope-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codescope LSP layer: generic stdio JSON-RPC client + gopls adapter"
+
+[features]
+# Exposes `FakeService` to downstream crates' tests (unit tests inside this
+# crate see it via #[cfg(test)] regardless).
+testing = []
+
+[dependencies]
+codescope-core = { path = "../codescope-core" }
+camino.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+codescope-core = { path = "../codescope-core" }
+tempfile.workspace = true
+tracing-subscriber.workspace = true

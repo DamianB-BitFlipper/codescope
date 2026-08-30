@@ -1,0 +1,17 @@
+[package]
+name = "codescope-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codescope Ratatui interface: renders UiSnapshot, emits Actions"
+
+[dependencies]
+codescope-core = { path = "../codescope-core" }
+ratatui.workspace = true
+crossterm.workspace = true
+tui-tree-widget.workspace = true
+tokio.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+unicode-width.workspace = true
