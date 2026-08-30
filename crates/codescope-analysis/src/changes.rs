@@ -136,7 +136,8 @@ pub fn changed_symbols_detailed(
                     m.mapping.confidence,
                 );
             } else {
-                let kind = worktree_change_kind(&wt_keys, base_keys.as_ref(), target, whole_file_added);
+                let kind =
+                    worktree_change_kind(&wt_keys, base_keys.as_ref(), target, whole_file_added);
                 agg.record(
                     TreeSide::Worktree,
                     target.clone(),
@@ -154,7 +155,12 @@ pub fn changed_symbols_detailed(
     if let Some(base_keys) = &base_keys {
         for (key, id) in ordered_keys(wt) {
             if !base_keys.contains_key(&key) {
-                agg.record_if_absent(TreeSide::Worktree, id, ChangeKind::Added, MappingConfidence::Exact);
+                agg.record_if_absent(
+                    TreeSide::Worktree,
+                    id,
+                    ChangeKind::Added,
+                    MappingConfidence::Exact,
+                );
             }
         }
         if let Some(base_tree) = base {
@@ -172,7 +178,12 @@ pub fn changed_symbols_detailed(
     } else if whole_file_added {
         // New/untracked file without a base tree: every symbol is added (research 03).
         for (_, id) in ordered_keys(wt) {
-            agg.record_if_absent(TreeSide::Worktree, id, ChangeKind::Added, MappingConfidence::Exact);
+            agg.record_if_absent(
+                TreeSide::Worktree,
+                id,
+                ChangeKind::Added,
+                MappingConfidence::Exact,
+            );
         }
     }
 
@@ -245,9 +256,7 @@ fn worktree_change_kind(
     let Some(base_keys) = base_keys else {
         return ChangeKind::Modified;
     };
-    let key = wt_keys
-        .iter()
-        .find_map(|(k, v)| (v == target).then_some(k));
+    let key = wt_keys.iter().find_map(|(k, v)| (v == target).then_some(k));
     match key {
         Some(k) if !base_keys.contains_key(k) => ChangeKind::Added,
         _ => ChangeKind::Modified,
@@ -483,7 +492,11 @@ mod tests {
         SymbolTree::new(
             FileId::new("main.go").unwrap(),
             Revision::Worktree,
-            vec![node("0", "main", 5, 15), greeter, node("2", "(Greeter).Hello", 40, 50)],
+            vec![
+                node("0", "main", 5, 15),
+                greeter,
+                node("2", "(Greeter).Hello", 40, 50),
+            ],
         )
     }
 
@@ -498,7 +511,11 @@ mod tests {
         SymbolTree::new(
             FileId::new("main.go").unwrap(),
             Revision::Base,
-            vec![node("0", "main", 5, 15), greeter, node("2", "Legacy", 32, 38)],
+            vec![
+                node("0", "main", 5, 15),
+                greeter,
+                node("2", "Legacy", 32, 38),
+            ],
         )
     }
 
@@ -602,8 +619,12 @@ mod tests {
         let change = file_change(FileStatus::Untracked, vec![]);
         let out = changed_symbols_detailed(Some(&worktree()), None, &change);
         assert_eq!(out.len(), 5); // main, Greeter, Name, Email, Hello
-        assert!(out.iter().all(|c| c.record.change_kind == ChangeKind::Added));
-        assert!(out.iter().all(|c| c.record.confidence == MappingConfidence::Exact));
+        assert!(out
+            .iter()
+            .all(|c| c.record.change_kind == ChangeKind::Added));
+        assert!(out
+            .iter()
+            .all(|c| c.record.confidence == MappingConfidence::Exact));
         assert!(out.iter().all(|c| c.record.hunks.is_empty()));
     }
 
@@ -630,7 +651,9 @@ mod tests {
         };
         let out = changed_symbols_detailed(None, Some(&base()), &change);
         assert_eq!(out.len(), 4); // main, Greeter, Greeter.Name, Legacy
-        assert!(out.iter().all(|c| c.record.change_kind == ChangeKind::Deleted));
+        assert!(out
+            .iter()
+            .all(|c| c.record.change_kind == ChangeKind::Deleted));
         assert!(out.iter().all(|c| c.revision == Revision::Base));
         // Symbols intersected by the deletion hunk carry it.
         let main = out.iter().find(|c| c.name == "main").unwrap();

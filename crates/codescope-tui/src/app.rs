@@ -267,7 +267,9 @@ impl App {
 
     fn clamp(&mut self) {
         self.file_sel = self.file_sel.min(self.flat_file_rows().saturating_sub(1));
-        self.sem_sel = self.sem_sel.min(self.snapshot.semantic.rows.len().saturating_sub(1));
+        self.sem_sel = self
+            .sem_sel
+            .min(self.snapshot.semantic.rows.len().saturating_sub(1));
         let max_scroll = self.snapshot.diff.rows.len().saturating_sub(1) as u16;
         self.diff_scroll = self.diff_scroll.min(max_scroll);
     }

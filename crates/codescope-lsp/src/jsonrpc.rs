@@ -191,10 +191,9 @@ mod tests {
 
     #[test]
     fn classifies_error_response() {
-        let msg = classify(
-            json!({"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"not found"}}),
-        )
-        .unwrap();
+        let msg =
+            classify(json!({"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"not found"}}))
+                .unwrap();
         assert_eq!(
             msg,
             Incoming::Response {

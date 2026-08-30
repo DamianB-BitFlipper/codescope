@@ -10,8 +10,8 @@ mod watcher;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use camino::Utf8PathBuf;
+use clap::Parser;
 use codescope_ai::{AiConfig, AiService};
 use codescope_analysis::AnalysisEngine;
 use codescope_git::GitRepo;
@@ -53,7 +53,10 @@ async fn main() -> Result<()> {
     let start = Utf8PathBuf::from_path_buf(cli.path.clone())
         .map_err(|p| anyhow::anyhow!("non-UTF-8 path: {}", p.display()))?;
     let start = std::fs::canonicalize(&start)
-        .and_then(|p| Utf8PathBuf::from_path_buf(p).map_err(|e| std::io::Error::other(e.display().to_string())))
+        .and_then(|p| {
+            Utf8PathBuf::from_path_buf(p)
+                .map_err(|e| std::io::Error::other(e.display().to_string()))
+        })
         .unwrap_or(start);
     let repo = GitRepo::discover(&start)
         .await
@@ -99,8 +102,12 @@ async fn main() -> Result<()> {
                     let _ = tx.send(DispatchEvent::EngineReady(Box::new(engine))).await;
                 }
                 Err(e) => {
-                    tracing::warn!(%e, "language server unavailable; deterministic git-only mode");
-                    let _ = tx.send(DispatchEvent::EngineUnavailable(e.to_string())).await;
+                    // Expected when no supported language is detected. Not an error for the user:
+                    // the app simply runs in git-only mode. The TUI surfaces this in the status bar.
+                    tracing::info!(%e, "no language server for this repo; git-only mode");
+                    let _ = tx
+                        .send(DispatchEvent::EngineUnavailable(e.to_string()))
+                        .await;
                 }
             }
         });
@@ -129,8 +136,8 @@ fn init_tracing(log_file: Option<&std::path::Path>) {
     use tracing_subscriber::EnvFilter;
     let Some(path) = log_file else { return };
     if let Ok(file) = std::fs::File::create(path) {
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("codescope=info"));
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("codescope=info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::sync::Mutex::new(file))

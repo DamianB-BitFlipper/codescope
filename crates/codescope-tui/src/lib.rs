@@ -13,7 +13,7 @@ pub mod render;
 pub mod run;
 pub mod snapshot;
 
-pub use action::{Action, map_key};
+pub use action::{map_key, Action};
 pub use app::{App, Pane};
 pub use render::render;
 pub use snapshot::UiSnapshot;

@@ -174,7 +174,12 @@ impl AiService {
             }
 
             // No plan yet: execute the read-only tool calls under the budget.
-            tracing::debug!(turn, calls = response.tool_calls.len(), remaining, "tool turn");
+            tracing::debug!(
+                turn,
+                calls = response.tool_calls.len(),
+                remaining,
+                "tool turn"
+            );
             let assistant = ChatMessage::assistant_raw(response.message.clone());
             let mut tool_messages = Vec::new();
             for call in response.read_only_calls() {
@@ -230,7 +235,9 @@ impl AiService {
     async fn execute_tool(&self, tools: &dyn ToolExecutor, name: &str, arguments: &str) -> String {
         if !is_read_only_tool(name) {
             tracing::warn!(tool = name, "model requested an unknown tool");
-            return error_result(format!("unknown tool {name:?}: only the read-only tools offered may be called"));
+            return error_result(format!(
+                "unknown tool {name:?}: only the read-only tools offered may be called"
+            ));
         }
         let args: serde_json::Value = match serde_json::from_str(arguments) {
             Ok(v) => v,
@@ -321,8 +328,14 @@ mod tests {
             "x"
         );
         // Empty root: no-op.
-        assert_eq!(redact_repo_root("keep /a/b", Utf8Path::new("")), "keep /a/b");
-        assert_eq!(redact_repo_root("keep /a/b", Utf8Path::new("/")), "keep /a/b");
+        assert_eq!(
+            redact_repo_root("keep /a/b", Utf8Path::new("")),
+            "keep /a/b"
+        );
+        assert_eq!(
+            redact_repo_root("keep /a/b", Utf8Path::new("/")),
+            "keep /a/b"
+        );
     }
 
     #[test]

@@ -189,7 +189,10 @@ impl<S: SemanticSource> AnalysisEngine<S> {
         let mut notes = Vec::new();
 
         if fc.binary || matches!(fc.status, FileStatus::Gitlink | FileStatus::Unmerged) {
-            notes.push(format!("skipped semantic analysis ({:?}/binary)", fc.status));
+            notes.push(format!(
+                "skipped semantic analysis ({:?}/binary)",
+                fc.status
+            ));
             return Ok(FileAnalysis {
                 file,
                 status: fc.status,
@@ -430,7 +433,9 @@ mod tests {
         .await
         .expect("changeset timed out")
         .unwrap();
-        assert!(changeset.find_file(camino::Utf8Path::new(MEMSTORE)).is_some());
+        assert!(changeset
+            .find_file(camino::Utf8Path::new(MEMSTORE))
+            .is_some());
         assert!(changeset.find_file(camino::Utf8Path::new(HEALTH)).is_some());
 
         let snap = tokio::time::timeout(
@@ -445,9 +450,17 @@ mod tests {
         assert_eq!(snap.files.len(), changeset.len());
 
         // memstore.go: worktree + base (index overlay) trees, mapped hunks.
-        let mem = snap.files.iter().find(|f| f.file.as_path() == MEMSTORE).unwrap();
+        let mem = snap
+            .files
+            .iter()
+            .find(|f| f.file.as_path() == MEMSTORE)
+            .unwrap();
         assert!(mem.worktree.is_some());
-        assert!(mem.base.is_some(), "index overlay tree expected: {:?}", mem.notes);
+        assert!(
+            mem.base.is_some(),
+            "index overlay tree expected: {:?}",
+            mem.notes
+        );
         assert!(!mem.mappings.is_empty());
 
         // The nil-guard edit lands on (MemoryRepo).Get.
@@ -460,7 +473,11 @@ mod tests {
         assert_eq!(get.revision, Revision::Worktree);
 
         // health.go is untracked and unscripted: degraded with a note, not fatal.
-        let health = snap.files.iter().find(|f| f.file.as_path() == HEALTH).unwrap();
+        let health = snap
+            .files
+            .iter()
+            .find(|f| f.file.as_path() == HEALTH)
+            .unwrap();
         assert!(health.worktree.is_none());
         assert!(!health.notes.is_empty());
 
@@ -513,7 +530,11 @@ mod tests {
             .find(|f| f.file.as_path() == MEMSTORE)
             .expect("renamed file analysed");
         assert!(matches!(renamed.status, FileStatus::Renamed { .. }));
-        assert!(renamed.base.is_some(), "base tree via old path: {:?}", renamed.notes);
+        assert!(
+            renamed.base.is_some(),
+            "base tree via old path: {:?}",
+            renamed.notes
+        );
     }
 
     #[test]
@@ -537,23 +558,38 @@ mod tests {
             Some("cafe12".to_string())
         );
         assert_eq!(
-            base_revspec(ChangeScope::Branch, &ctx(None, HeadState::Branch("x".into()))),
+            base_revspec(
+                ChangeScope::Branch,
+                &ctx(None, HeadState::Branch("x".into()))
+            ),
             None
         );
         assert_eq!(
-            base_revspec(ChangeScope::Staged, &ctx(None, HeadState::Branch("x".into()))),
+            base_revspec(
+                ChangeScope::Staged,
+                &ctx(None, HeadState::Branch("x".into()))
+            ),
             Some("HEAD".to_string())
         );
-        assert_eq!(base_revspec(ChangeScope::Staged, &ctx(None, HeadState::Unborn)), None);
+        assert_eq!(
+            base_revspec(ChangeScope::Staged, &ctx(None, HeadState::Unborn)),
+            None
+        );
         assert_eq!(
             base_revspec(ChangeScope::Unstaged, &ctx(None, HeadState::Unborn)),
             Some(":0".to_string())
         );
         assert_eq!(
-            base_revspec(ChangeScope::Working, &ctx(None, HeadState::Branch("x".into()))),
+            base_revspec(
+                ChangeScope::Working,
+                &ctx(None, HeadState::Branch("x".into()))
+            ),
             Some("HEAD".to_string())
         );
-        assert_eq!(base_revspec(ChangeScope::Working, &ctx(None, HeadState::Unborn)), None);
+        assert_eq!(
+            base_revspec(ChangeScope::Working, &ctx(None, HeadState::Unborn)),
+            None
+        );
     }
 
     #[test]

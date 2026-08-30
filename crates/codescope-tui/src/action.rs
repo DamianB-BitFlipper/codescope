@@ -210,10 +210,22 @@ mod tests {
 
     #[test]
     fn scope_keys() {
-        assert_eq!(map_key(key(KeyCode::Char('s')), &app()), Action::ScopeStaged);
-        assert_eq!(map_key(key(KeyCode::Char('u')), &app()), Action::ScopeUnstaged);
-        assert_eq!(map_key(key(KeyCode::Char('B')), &app()), Action::ScopeBranch);
-        assert_eq!(map_key(key(KeyCode::Char('w')), &app()), Action::ScopeWorking);
+        assert_eq!(
+            map_key(key(KeyCode::Char('s')), &app()),
+            Action::ScopeStaged
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('u')), &app()),
+            Action::ScopeUnstaged
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('B')), &app()),
+            Action::ScopeBranch
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('w')), &app()),
+            Action::ScopeWorking
+        );
         assert_eq!(map_key(key(KeyCode::Char('S')), &app()), Action::ScopeCycle);
     }
 
@@ -221,12 +233,18 @@ mod tests {
     fn focus_keys() {
         assert_eq!(map_key(key(KeyCode::Tab), &app()), Action::FocusNext);
         assert_eq!(map_key(key(KeyCode::BackTab), &app()), Action::FocusPrev);
-        assert_eq!(map_key(key(KeyCode::Char('2')), &app()), Action::Focus(Pane::Diff));
+        assert_eq!(
+            map_key(key(KeyCode::Char('2')), &app()),
+            Action::Focus(Pane::Diff)
+        );
     }
 
     #[test]
     fn tree_keys() {
-        assert_eq!(map_key(key(KeyCode::Char(' ')), &app()), Action::ToggleExpand);
+        assert_eq!(
+            map_key(key(KeyCode::Char(' ')), &app()),
+            Action::ToggleExpand
+        );
         assert_eq!(map_key(key(KeyCode::Char('h')), &app()), Action::Collapse);
         assert_eq!(map_key(key(KeyCode::Char('l')), &app()), Action::Expand);
         assert_eq!(map_key(key(KeyCode::Char('+')), &app()), Action::ExpandMore);

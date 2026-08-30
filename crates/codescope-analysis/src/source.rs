@@ -91,7 +91,6 @@ pub trait SemanticSource {
     ) -> impl Future<Output = Result<Evidence<Vec<SymbolRef>>, SemanticError>> + Send;
 }
 
-
 // ---------------------------------------------------------------------------
 // Binding to the real language service.
 // ---------------------------------------------------------------------------

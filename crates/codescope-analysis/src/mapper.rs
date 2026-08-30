@@ -109,7 +109,11 @@ fn map_one(
 
     if let Some(sym) = tree.find_smallest_containing(&target) {
         let signature_touch = sym.selection.intersects_lines(&target);
-        return (vec![sym.id.clone()], MappingConfidence::Exact, signature_touch);
+        return (
+            vec![sym.id.clone()],
+            MappingConfidence::Exact,
+            signature_touch,
+        );
     }
 
     // No single container: either the hunk covers whole symbols, spans several, or sits
@@ -127,7 +131,11 @@ fn map_one(
                 // The hunk fully covers the symbol: a whole-symbol addition/rewrite
                 // (research 03: "whole symbol added → Exact on that symbol").
                 let signature_touch = sym.selection.intersects_lines(&target);
-                (vec![sym.id.clone()], MappingConfidence::Exact, signature_touch)
+                (
+                    vec![sym.id.clone()],
+                    MappingConfidence::Exact,
+                    signature_touch,
+                )
             } else {
                 // Partial overlap hanging into a gap (typically the symbol plus its doc
                 // comment, which gopls excludes from the range).
@@ -285,7 +293,11 @@ mod tests {
         SymbolTree::new(
             FileId::new("main.go").unwrap(),
             Revision::Worktree,
-            vec![node("0", "main", 5, 15), greeter, node("2", "(Greeter).Hello", 40, 50)],
+            vec![
+                node("0", "main", 5, 15),
+                greeter,
+                node("2", "(Greeter).Hello", 40, 50),
+            ],
         )
     }
 
@@ -403,7 +415,10 @@ mod tests {
             maps[0].confidence,
             MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped)
         );
-        assert_eq!(maps[0].targets, vec![SymbolId::new("0"), SymbolId::new("1")]);
+        assert_eq!(
+            maps[0].targets,
+            vec![SymbolId::new("0"), SymbolId::new("1")]
+        );
     }
 
     #[test]
@@ -446,7 +461,10 @@ mod tests {
             maps[0].confidence,
             MappingConfidence::Approximate(ApproxReason::HunkSpansSymbols)
         );
-        assert_eq!(maps[0].targets, vec![SymbolId::new("0"), SymbolId::new("1")]);
+        assert_eq!(
+            maps[0].targets,
+            vec![SymbolId::new("0"), SymbolId::new("1")]
+        );
     }
 
     #[test]
@@ -500,6 +518,8 @@ mod tests {
     fn empty_tree_maps_everything_unmapped() {
         let empty = SymbolTree::new(FileId::new("empty.go").unwrap(), Revision::Worktree, vec![]);
         let maps = map_changes(&empty, &[hunk(1, 1, 1, 1), hunk(5, 3, 4, 0)]);
-        assert!(maps.iter().all(|m| m.confidence == MappingConfidence::Unmapped));
+        assert!(maps
+            .iter()
+            .all(|m| m.confidence == MappingConfidence::Unmapped));
     }
 }

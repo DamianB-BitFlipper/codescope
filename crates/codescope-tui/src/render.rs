@@ -45,8 +45,7 @@ pub fn render(frame: &mut Frame, app: &App, snap: &UiSnapshot) {
         render_semantic(frame, panes[2], app, snap);
     } else if area.width >= 80 {
         // Medium: files + diff; semantic as an overlay when focused.
-        let panes =
-            Layout::horizontal([Constraint::Length(26), Constraint::Min(30)]).split(main);
+        let panes = Layout::horizontal([Constraint::Length(26), Constraint::Min(30)]).split(main);
         render_files(frame, panes[0], app, snap);
         render_diff(frame, panes[1], app, snap);
         if app.focused == Pane::Semantic {
@@ -117,10 +116,7 @@ fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
         "  │  scope: {}",
         scope_label(snap.scope)
     )));
-    spans.push(Span::raw(format!(
-        "  │  lsp: {}",
-        ls_label(snap.ls)
-    )));
+    spans.push(Span::raw(format!("  │  lsp: {}", ls_label(snap.ls))));
     let ai_text = if snap.ai_model.is_empty() {
         ai_label(&snap.ai)
     } else {
@@ -458,7 +454,8 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
     let mut state = ListState::default();
     if !snap.available_models.is_empty() {
         state.select(Some(
-            app.model_sel.min(snap.available_models.len().saturating_sub(1)),
+            app.model_sel
+                .min(snap.available_models.len().saturating_sub(1)),
         ));
     }
     let list = List::new(items)
@@ -505,7 +502,8 @@ fn render_base_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsho
     let mut state = ListState::default();
     if !snap.available_bases.is_empty() {
         state.select(Some(
-            app.base_sel.min(snap.available_bases.len().saturating_sub(1)),
+            app.base_sel
+                .min(snap.available_bases.len().saturating_sub(1)),
         ));
     }
     let list = List::new(items)
@@ -521,7 +519,12 @@ mod tests {
     use ratatui::Terminal;
 
     fn buffer_text(t: &Terminal<TestBackend>) -> String {
-        t.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+        t.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
     }
 
     fn snap_with_base() -> UiSnapshot {

@@ -116,7 +116,11 @@ impl AiConfig {
         file: Option<&AiFileConfig>,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, AiError> {
-        let env = |name: &str| env(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let env = |name: &str| {
+            env(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
 
         if let Some(file) = file {
             if file.api_key.is_some() {
@@ -125,9 +129,13 @@ impl AiConfig {
         }
 
         let mode = match env("CODESCOPE_AI") {
-            None => file
-                .and_then(|f| f.enabled)
-                .map_or(AiMode::Auto, |on| if on { AiMode::On } else { AiMode::Off }),
+            None => file.and_then(|f| f.enabled).map_or(AiMode::Auto, |on| {
+                if on {
+                    AiMode::On
+                } else {
+                    AiMode::Off
+                }
+            }),
             Some(v) => AiMode::parse(&v)?,
         };
 
@@ -248,10 +256,7 @@ impl fmt::Debug for AiConfig {
             .field("enabled", &self.enabled)
             .field("base_url", &self.base_url)
             .field("model", &self.model)
-            .field(
-                "api_key",
-                &self.api_key.as_ref().map(|_| "«redacted»"),
-            )
+            .field("api_key", &self.api_key.as_ref().map(|_| "«redacted»"))
             .field("timeout", &self.timeout)
             .field("max_tool_calls", &self.max_tool_calls)
             .finish()
@@ -411,8 +416,7 @@ mod tests {
 
     #[test]
     fn anthropic_key_selects_anthropic_base_url_and_provider() {
-        let cfg =
-            AiConfig::resolve(None, env_of(&[("ANTHROPIC_API_KEY", "sk-ant")])).unwrap();
+        let cfg = AiConfig::resolve(None, env_of(&[("ANTHROPIC_API_KEY", "sk-ant")])).unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.base_url, ANTHROPIC_BASE_URL);
         assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-ant");
@@ -437,7 +441,10 @@ mod tests {
     fn explicit_model_override_wins() {
         let cfg = AiConfig::resolve(
             None,
-            env_of(&[("ANTHROPIC_API_KEY", "sk-a"), ("CODESCOPE_AI_MODEL", "claude-opus-4-6")]),
+            env_of(&[
+                ("ANTHROPIC_API_KEY", "sk-a"),
+                ("CODESCOPE_AI_MODEL", "claude-opus-4-6"),
+            ]),
         )
         .unwrap();
         assert_eq!(cfg.model, "claude-opus-4-6");
@@ -609,11 +616,8 @@ mod tests {
 
     #[test]
     fn debug_never_leaks_the_key() {
-        let cfg = AiConfig::resolve(
-            None,
-            env_of(&[("PRIME_API_KEY", "sk-supersecret-123")]),
-        )
-        .unwrap();
+        let cfg =
+            AiConfig::resolve(None, env_of(&[("PRIME_API_KEY", "sk-supersecret-123")])).unwrap();
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("supersecret"), "debug leaked key: {debug}");
         assert!(debug.contains("redacted"));

@@ -9,14 +9,11 @@ use std::collections::HashSet;
 
 use codescope_ai::{AiOutcome, AiService, FactView, NoToolExecutor};
 use codescope_analysis::{AnalysisEngine, AnalysisSnapshot};
-use codescope_core::{
-    AiStatus, ChangeScope, EntityRef, Epoch, LineRange, LsStatus, PlanEdgeKind,
-};
+use codescope_core::{AiStatus, ChangeScope, EntityRef, Epoch, LineRange, LsStatus, PlanEdgeKind};
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
 use codescope_tui::snapshot::{
-    DiffPane, DiffRow, FileRow, RepoBar, ScopeCounts, SemRow, SemanticPane, SymbolRow,
-    UiSnapshot,
+    DiffPane, DiffRow, FileRow, RepoBar, ScopeCounts, SemRow, SemanticPane, SymbolRow, UiSnapshot,
 };
 use codescope_tui::Action;
 use tokio::sync::{mpsc, watch};
@@ -147,7 +144,11 @@ impl Dispatcher {
             }
             DispatchEvent::EngineUnavailable(reason) => {
                 self.ls_status = LsStatus::Failed;
-                self.message = format!("language server unavailable: {reason}; git-only");
+                if reason.contains("no supported language detected") {
+                    self.message = "git-only (no supported language detected)".to_string();
+                } else {
+                    self.message = format!("git-only (language server failed: {reason})");
+                }
                 self.publish();
             }
             DispatchEvent::ModelsLoaded(models) => {
@@ -215,7 +216,9 @@ impl Dispatcher {
     /// Fetch the provider's model list for the picker (spawned; non-blocking).
     fn spawn_list_models(&mut self) {
         let Some(ai) = &self.ai else {
-            self.message = "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)".to_string();
+            self.message =
+                "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)"
+                    .to_string();
             self.publish();
             return;
         };
@@ -235,7 +238,9 @@ impl Dispatcher {
                 self.message = format!("AI model: {name}");
             }
             None => {
-                self.message = "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)".to_string();
+                self.message =
+                    "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)"
+                        .to_string();
             }
         }
         self.publish();
@@ -323,7 +328,10 @@ impl Dispatcher {
         let tx = self.job_tx.clone();
         tokio::spawn(async move {
             let outcome = match &ai {
-                Some(ai) => ai.request_plan(&digest, &NoToolExecutor, &facts, epoch).await,
+                Some(ai) => {
+                    ai.request_plan(&digest, &NoToolExecutor, &facts, epoch)
+                        .await
+                }
                 None => AiOutcome::Unavailable,
             };
             let _ = tx.send(DispatchEvent::AiDone { epoch, outcome }).await;
@@ -425,11 +433,7 @@ impl Dispatcher {
     }
 
     fn panes(&self) -> (DiffPane, SemanticPane) {
-        let diff = self
-            .changeset
-            .as_ref()
-            .map(first_diff)
-            .unwrap_or_default();
+        let diff = self.changeset.as_ref().map(first_diff).unwrap_or_default();
         // AI rows render only while their epoch matches the current repo state (H3).
         let semantic = match (&self.ai_rows, &self.analysis) {
             (Some((ep, rows, title)), _) if *ep == self.epoch => SemanticPane {
@@ -460,7 +464,9 @@ async fn run_pipeline(
     epoch: Epoch,
     base_override: Option<String>,
 ) -> anyhow::Result<AnalysisSnapshot> {
-    let ctx = repo.repo_context_with_base(base_override.as_deref()).await?;
+    let ctx = repo
+        .repo_context_with_base(base_override.as_deref())
+        .await?;
     let changeset = match (scope, &base_override) {
         (ChangeScope::Branch, Some(base)) => repo.branch_changeset_with_base(base).await?,
         _ => repo.changeset(scope).await?,
@@ -747,7 +753,9 @@ impl SnapshotFacts {
         }
         for c in &a.changed {
             facts.files.insert(c.file.to_string());
-            facts.symbols.insert((c.file.to_string(), c.name.clone()), c.range);
+            facts
+                .symbols
+                .insert((c.file.to_string(), c.name.clone()), c.range);
         }
         let graph = &a.graph.value;
         for e in &graph.edges {
@@ -785,13 +793,18 @@ impl FactView for SnapshotFacts {
         self.files.contains(&file.to_string())
     }
     fn resolve_symbol(&self, file: &codescope_core::FileId, name: &str) -> Option<LineRange> {
-        self.symbols.get(&(file.to_string(), name.to_string())).copied()
+        self.symbols
+            .get(&(file.to_string(), name.to_string()))
+            .copied()
     }
     fn edge_exists(&self, from: &EntityRef, to: &EntityRef, kind: PlanEdgeKind) -> bool {
-        self.edges.contains(&(entity_key(from), entity_key(to), kind))
+        self.edges
+            .contains(&(entity_key(from), entity_key(to), kind))
     }
     fn hunk(&self, file: &codescope_core::FileId, index: u32) -> Option<()> {
-        self.hunks.get(&file.to_string()).and_then(|&n| (index < n as u32).then_some(()))
+        self.hunks
+            .get(&file.to_string())
+            .and_then(|&n| (index < n as u32).then_some(()))
     }
 }
 
@@ -840,7 +853,10 @@ mod tests {
                 .args(args)
                 .current_dir(&dir)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@test.invalid")
                 .env("GIT_COMMITTER_NAME", "t")
@@ -866,13 +882,23 @@ mod tests {
 
     async fn dispatcher_for(
         root: &std::path::Path,
-    ) -> (Dispatcher, watch::Receiver<UiSnapshot>, mpsc::Receiver<DispatchEvent>) {
-        let repo_root = camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
-            .expect("utf-8 temp path");
-        let repo = GitRepo::discover(&repo_root).await.expect("discover scratch repo");
+    ) -> (
+        Dispatcher,
+        watch::Receiver<UiSnapshot>,
+        mpsc::Receiver<DispatchEvent>,
+    ) {
+        let repo_root =
+            camino::Utf8PathBuf::from_path_buf(root.to_path_buf()).expect("utf-8 temp path");
+        let repo = GitRepo::discover(&repo_root)
+            .await
+            .expect("discover scratch repo");
         let (snapshot_tx, snapshot_rx) = watch::channel(UiSnapshot::placeholder());
         let (job_tx, job_rx) = mpsc::channel(16);
-        (Dispatcher::new(repo, None, None, snapshot_tx, job_tx), snapshot_rx, job_rx)
+        (
+            Dispatcher::new(repo, None, None, snapshot_tx, job_tx),
+            snapshot_rx,
+            job_rx,
+        )
     }
 
     /// Receive dispatcher events until `pred` matches (spawned jobs report back here).
@@ -896,8 +922,15 @@ mod tests {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
 
-        disp.handle(DispatchEvent::Work(Action::BaseSelected("main".to_string()))).await;
-        assert_eq!(disp.base_override.as_deref(), Some("main"), "override recorded");
+        disp.handle(DispatchEvent::Work(Action::BaseSelected(
+            "main".to_string(),
+        )))
+        .await;
+        assert_eq!(
+            disp.base_override.as_deref(),
+            Some("main"),
+            "override recorded"
+        );
         // The refreshing snapshot already advertises the pending base.
         assert_eq!(snapshot_rx.borrow().base_ref, "main");
 
@@ -908,7 +941,10 @@ mod tests {
         .await;
         disp.handle(done).await;
         let snap = snapshot_rx.borrow().clone();
-        assert_eq!(snap.base_ref, "main", "top-bar base comes from the override");
+        assert_eq!(
+            snap.base_ref, "main",
+            "top-bar base comes from the override"
+        );
         assert_eq!(snap.repo.base.as_deref(), Some("main"));
         assert_eq!(snap.repo.branch, "feature");
         assert_eq!(snap.files.len(), 1, "one file changed vs main");
@@ -922,8 +958,7 @@ mod tests {
         let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
 
         disp.handle(DispatchEvent::Work(Action::BasePicker)).await;
-        let loaded =
-            recv_until(&mut job_rx, |e| matches!(e, DispatchEvent::BaseLoaded(_))).await;
+        let loaded = recv_until(&mut job_rx, |e| matches!(e, DispatchEvent::BaseLoaded(_))).await;
         disp.handle(loaded).await;
         let snap = snapshot_rx.borrow().clone();
         assert!(

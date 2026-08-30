@@ -14,8 +14,7 @@ use crate::error::LspError;
 pub fn uri_from_path(path: &Utf8Path) -> Result<lsp_types::Uri, LspError> {
     let url = url::Url::from_file_path(path.as_std_path())
         .map_err(|()| LspError::InvalidUri(format!("not an absolute path: {path}")))?;
-    lsp_types::Uri::from_str(url.as_str())
-        .map_err(|e| LspError::InvalidUri(format!("{url}: {e}")))
+    lsp_types::Uri::from_str(url.as_str()).map_err(|e| LspError::InvalidUri(format!("{url}: {e}")))
 }
 
 /// Resolve a `file://` URI back to an absolute UTF-8 path.

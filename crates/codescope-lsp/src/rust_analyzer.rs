@@ -1,14 +1,15 @@
-//! The gopls adapter: spawn, initialize, overlay management, and translation of gopls
-//! responses into `codescope-core` domain types behind the common semantic surface.
+//! The rust-analyzer adapter: spawn, initialize, overlay management, and
+//! translation of rust-analyzer responses into `codescope-core` domain types behind the
+//! common semantic surface.
 //!
 //! Verified quirks honored here (docs/research/01-lsp-abstraction.md):
-//! - gopls does not negotiate `positionEncoding` → the wire is **utf-16**; all
-//!   conversion happens at the boundary via [`crate::encoding`].
-//! - Diagnostics are push-only; they come from the client's publish cache.
-//! - Hierarchical `DocumentSymbol[]` requires `hierarchicalDocumentSymbolSupport`; a
-//!   flat `SymbolInformation[]` response is a degraded, top-level-only fallback
-//!   (research 03, verified fact 5).
-//! - Go method symbol names carry the receiver: `(Greeter).Hello`.
+//! - rust-analyzer negotiates `positionEncoding: "utf-8"` when offered `["utf-8",
+//!   "utf-16"]`. The wire therefore uses **utf-8**; conversions through
+//!   [`crate::encoding`] are identity functions for this session.
+//! - rust-analyzer has NO `typeHierarchy` provider; queries are gated at initialize.
+//! - Diagnostics are push-only (publishDiagnostics) and cached by the generic client.
+//! - Hierarchical `DocumentSymbol[]` requires `hierarchicalDocumentSymbolSupport`; the
+//!   fallback path is the same top-level-only degradation as gopls.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,24 +26,25 @@ use tokio::sync::Mutex;
 
 use crate::capabilities::{parse_text_document_sync, require, resolve_features};
 use crate::client::{LspClient, ShutdownOutcome};
-use crate::detect::go_module_folders;
+use crate::detect::rust_project_root;
 use crate::encoding::{line_at, position_from_wire, position_to_wire, PositionEncoding};
 use crate::error::{LspError, SemanticError};
 use crate::uri::{path_from_uri, uri_from_path};
 
-/// Deadline for the very first request (gopls loads the workspace lazily).
+/// Deadline for the very first request (rust-analyzer loads the workspace eagerly).
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Steady-state request deadline.
-const STEADY_TIMEOUT: Duration = Duration::from_secs(10);
+const STEADY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// gopls session state.
+/// rust-analyzer session state.
 #[derive(Debug)]
-pub struct GoplsService {
+pub struct RustAnalyzerService {
     client: LspClient,
-    /// Absolute repository toplevel (git root). FileIds are relative to this path.
+    /// Absolute git/repository toplevel. Repo-relative [`FileId`]s are interpreted
+    /// against this path.
     repo_root: Utf8PathBuf,
-    /// Directories containing a `go.mod` or `go.work` that gopls loaded as workspace folders.
-    go_roots: Vec<Utf8PathBuf>,
+    /// The Cargo package/workspace root that rust-analyzer was started in.
+    cargo_root: Utf8PathBuf,
     features: FeatureSet,
     encoding: PositionEncoding,
     /// Open document versions by absolute path (for didChange versioning).
@@ -51,42 +53,30 @@ pub struct GoplsService {
     request_count: AtomicU64,
 }
 
-impl GoplsService {
-    /// Spawn gopls rooted at `repo_root` (the git toplevel), loading every `go.mod`
-    /// and `go.work` under it as a workspace folder.
+impl RustAnalyzerService {
+    /// Spawn rust-analyzer for the repository `repo_root`.
+    ///
+    /// The actual server `rootUri` is the nearest `Cargo.toml` directory under
+    /// `repo_root`, walking up to a `[workspace]` root if one exists.
     #[tracing::instrument(err)]
     pub async fn start(repo_root: &Utf8Path) -> Result<Self, SemanticError> {
-        let mut go_roots = go_module_folders(repo_root);
-        if go_roots.is_empty() {
-            // This should normally be caught by LanguageService::start, but keep the
-            // gopls-specific diagnostic for robustness.
-            return Err(SemanticError::NoRoot(repo_root.to_path_buf()));
-        }
-        // If the repo root itself has a go.work, let gopls run in workspace mode with a
-        // single root; it will discover the modules listed in the work file.
-        if go_roots.iter().any(|r| r == repo_root) {
-            go_roots = vec![repo_root.to_path_buf()];
-        }
+        let cargo_root = rust_project_root(repo_root).ok_or_else(|| {
+            SemanticError::Client(LspError::Protocol(format!(
+                "no Cargo.toml found under {repo_root}"
+            )))
+        })?;
+        let program = std::env::var("CODESCOPE_RUST_ANALYZER")
+            .unwrap_or_else(|_| "rust-analyzer".to_string());
 
-        let program = std::env::var("CODESCOPE_GOPLS").unwrap_or_else(|_| "gopls".to_string());
         let mut command = Command::new(&program);
-        command.arg("serve").current_dir(repo_root.as_std_path());
-        let client = LspClient::spawn(command, "gopls")?;
+        command.current_dir(cargo_root.as_std_path());
+        let client = LspClient::spawn(command, "rust-analyzer")?;
 
-        let root_uri = uri_from_path(repo_root)?;
-        let workspace_folders: Vec<Value> = go_roots
-            .iter()
-            .map(|dir| {
-                let uri = uri_from_path(dir)
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|_| String::new());
-                json!({ "uri": uri, "name": dir.file_name().unwrap_or("workspace") })
-            })
-            .collect();
+        let root_uri = uri_from_path(&cargo_root)?;
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri.as_str(),
-            "workspaceFolders": workspace_folders,
+            "workspaceFolders": [{ "uri": root_uri.as_str(), "name": cargo_root.file_name().unwrap_or("workspace") }],
             "capabilities": {
                 "general": { "positionEncodings": ["utf-8", "utf-16"] },
                 "textDocument": {
@@ -102,9 +92,8 @@ impl GoplsService {
         let init = client
             .request("initialize", params, FIRST_REQUEST_TIMEOUT)
             .await?;
-        let _ = parse_text_document_sync(&init["capabilities"]); // gopls: incremental; we close+open instead.
+        let _ = parse_text_document_sync(&init["capabilities"]);
         let mut features = resolve_features(&init["capabilities"])?;
-        // gopls pushes diagnostics (research 01 quirk 6); LSP has no capability key for it.
         features.set(
             codescope_core::Feature::PushDiagnostics,
             codescope_core::Availability::Supported,
@@ -113,11 +102,11 @@ impl GoplsService {
             PositionEncoding::from_response_value(init["capabilities"].get("positionEncoding"));
         client.notify("initialized", json!({})).await?;
 
-        tracing::info!(repo_root = %repo_root, ?go_roots, ?encoding, "gopls session initialized");
-        Ok(GoplsService {
+        tracing::info!(repo_root = %repo_root, cargo_root = %cargo_root, ?encoding, "rust-analyzer session initialized");
+        Ok(RustAnalyzerService {
             client,
             repo_root: repo_root.to_path_buf(),
-            go_roots,
+            cargo_root,
             features,
             encoding,
             versions: Mutex::new(HashMap::new()),
@@ -131,10 +120,16 @@ impl GoplsService {
         &self.features
     }
 
-    /// Absolute repository root that FileIds are relative to.
+    /// Absolute repository root that [`FileId`]s are relative to.
     #[must_use]
     pub fn repo_root(&self) -> &Utf8Path {
         &self.repo_root
+    }
+
+    /// The Cargo package/workspace root passed as rust-analyzer's `rootUri`.
+    #[must_use]
+    pub fn cargo_root(&self) -> &Utf8Path {
+        &self.cargo_root
     }
 
     /// `true` while the server process is alive.
@@ -157,11 +152,6 @@ impl GoplsService {
             .map(|rel| FileId::new_unchecked(rel.to_path_buf()))
     }
 
-    /// `true` when `abs` is under any of the loaded Go module/workspace folders.
-    fn covers(&self, abs: &Utf8Path) -> bool {
-        self.go_roots.iter().any(|root| abs.starts_with(root))
-    }
-
     fn timeout(&self) -> Duration {
         if self.request_count.fetch_add(1, Ordering::SeqCst) == 0 {
             FIRST_REQUEST_TIMEOUT
@@ -170,9 +160,7 @@ impl GoplsService {
         }
     }
 
-    /// Ensure gopls has the current disk content of `file` as an open document.
-    /// gopls advertises incremental sync only; the simplest correct overlay update is
-    /// close + reopen with the full text (research 01: documented choice).
+    /// Ensure rust-analyzer has the current disk content of `file` as an open document.
     async fn sync_worktree(&self, file: &FileId) -> Result<Utf8PathBuf, SemanticError> {
         let abs = self.abs_path(file);
         let text = std::fs::read_to_string(&abs).map_err(|source| SemanticError::FileRead {
@@ -217,7 +205,7 @@ impl GoplsService {
                 json!({
                     "textDocument": {
                         "uri": uri.as_str(),
-                        "languageId": "go",
+                        "languageId": "rust",
                         "version": 1,
                         "text": text,
                     }
@@ -247,7 +235,7 @@ impl GoplsService {
             .collect()
     }
 
-    // -- position conversion (wire utf-16 <-> internal utf-8) -------------------
+    // -- position conversion (wire utf-8 <-> internal utf-8) ------------------
 
     fn pos_to_wire(&self, text: &str, pos: Position) -> lsp_types::Position {
         let line = line_at(text, pos.line).unwrap_or("");
@@ -303,7 +291,6 @@ impl GoplsService {
         require(&self.features, codescope_core::Feature::DocumentSymbols)?;
         let abs = self.abs_path(file);
         let disk = std::fs::read_to_string(&abs).ok();
-        // Overlay with the base content, query, then restore the worktree view.
         self.reopen(&abs, content).await?;
         let uri = uri_from_path(&abs)?;
         let result = self
@@ -314,15 +301,12 @@ impl GoplsService {
                 self.timeout(),
             )
             .await;
-        // Restore the worktree view. For a deleted file, close the overlay instead of
-        // reopening an empty document (F2: an empty overlay produces phantom diagnostics).
         let restore = match &disk {
             Some(text) => self.reopen(&abs, text).await,
             None => self.close(&abs).await,
         };
         let result = result?;
         restore?;
-        // Wire positions refer to the overlay `content`, not the disk text.
         self.symbol_tree(file.clone(), Revision::Base, result, content, &abs)
     }
 
@@ -345,8 +329,6 @@ impl GoplsService {
                 Ok(Evidence::complete(tree))
             }
             Ok(Some(lsp_types::DocumentSymbolResponse::Flat(infos))) => {
-                // Degraded fallback (research 03 fact 5): flat SymbolInformation drops
-                // struct fields. Build a top-level-only tree and mark it partial.
                 let mut roots: Vec<SymbolNode> = Vec::new();
                 for (i, info) in infos.into_iter().enumerate() {
                     if path_from_uri(&info.location.uri).ok().as_ref() != Some(&abs.to_path_buf()) {
@@ -387,7 +369,6 @@ impl GoplsService {
         text: &str,
         sym: lsp_types::DocumentSymbol,
     ) -> lsp_types::DocumentSymbol {
-        // Convert position encoding recursively; core's from_document_symbols only renames fields.
         let mut sym = sym;
         sym.range = self.range_lsp_from_wire(text, sym.range);
         sym.selection_range = self.range_lsp_from_wire(text, sym.selection_range);
@@ -520,7 +501,7 @@ impl GoplsService {
         Ok(Evidence::complete(refs))
     }
 
-    /// Implementations of the interface-ish symbol at `pos`.
+    /// Implementations of the symbol at `pos` (`textDocument/implementation`).
     pub async fn implementations(
         &self,
         file: &FileId,
@@ -546,35 +527,47 @@ impl GoplsService {
         Ok(Evidence::complete(refs))
     }
 
-    /// Subtypes of the type symbol at `pos` (for a Go interface: its implementers).
+    /// Subtypes of the type symbol at `pos`.
+    ///
+    /// rust-analyzer advertises no `typeHierarchy` provider, so this is gated to
+    /// [`SemanticError::Unsupported`] without any wire traffic.
     pub async fn type_subtypes(
+        &self,
+        _file: &FileId,
+        _pos: Position,
+    ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
+        require(&self.features, codescope_core::Feature::TypeHierarchySub)?;
+        // RA advertises no typeHierarchy today, so the gate above returns Unsupported before
+        // any wire traffic. If a future RA adds it, this query is not yet implemented — return
+        // Unknown rather than fabricating a complete-empty result (review 10 F4).
+        Ok(Evidence::unknown(Vec::new()))
+    }
+
+    /// Hover text for the symbol at `pos`.
+    pub async fn hover(
         &self,
         file: &FileId,
         pos: Position,
-    ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
-        require(&self.features, codescope_core::Feature::TypeHierarchySub)?;
-        let item = match self.prepare_type_hierarchy(file, pos).await? {
-            Some(i) => i,
-            None => return Ok(Evidence::complete(Vec::new())),
-        };
+    ) -> Result<Option<String>, SemanticError> {
+        require(&self.features, codescope_core::Feature::Hover)?;
+        let abs = self.sync_worktree(file).await?;
+        let text = std::fs::read_to_string(&abs).unwrap_or_default();
+        let uri = uri_from_path(&abs)?;
+        let wire = self.pos_to_wire(&text, pos);
         let result = self
             .client
             .request(
-                "typeHierarchy/subtypes",
-                json!({ "item": item }),
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "position": { "line": wire.line, "character": wire.character }
+                }),
                 self.timeout(),
             )
             .await?;
-        let refs = match serde_json::from_value::<Option<Vec<lsp_types::TypeHierarchyItem>>>(result)
-        {
-            Ok(Some(items)) => items
-                .into_iter()
-                .filter_map(|i| self.type_item_to_ref(i))
-                .collect(),
-            Ok(None) => Vec::new(),
-            Err(e) => return Err(LspError::Protocol(format!("subtypes response: {e}")).into()),
-        };
-        Ok(Evidence::complete(refs))
+        let hover: Option<lsp_types::Hover> = serde_json::from_value(result)
+            .map_err(|e| LspError::Protocol(format!("hover response: {e}")))?;
+        Ok(hover.map(|h| hover_text(&h.contents)))
     }
 
     // -- prepare helpers ---------------------------------------------------------
@@ -606,33 +599,6 @@ impl GoplsService {
         }
     }
 
-    async fn prepare_type_hierarchy(
-        &self,
-        file: &FileId,
-        pos: Position,
-    ) -> Result<Option<lsp_types::TypeHierarchyItem>, SemanticError> {
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
-        let result = self
-            .client
-            .request(
-                "textDocument/prepareTypeHierarchy",
-                json!({
-                    "textDocument": { "uri": uri.as_str() },
-                    "position": { "line": wire.line, "character": wire.character }
-                }),
-                self.timeout(),
-            )
-            .await?;
-        match serde_json::from_value::<Option<Vec<lsp_types::TypeHierarchyItem>>>(result) {
-            Ok(Some(items)) => Ok(items.into_iter().next()),
-            Ok(None) => Ok(None),
-            Err(e) => Err(LspError::Protocol(format!("prepareTypeHierarchy: {e}")).into()),
-        }
-    }
-
     // -- wire → domain conversion ------------------------------------------------
 
     fn location_from_wire(&self, loc: lsp_types::Location) -> Option<Location> {
@@ -655,16 +621,6 @@ impl GoplsService {
         })
     }
 
-    fn type_item_to_ref(&self, item: lsp_types::TypeHierarchyItem) -> Option<SymbolRef> {
-        let abs = path_from_uri(&item.uri).ok()?;
-        let file = self.file_id(&abs)?;
-        Some(SymbolRef {
-            file,
-            name: item.name,
-            kind: SymbolKind::from(item.kind),
-        })
-    }
-
     fn goto_response_to_refs(
         &self,
         result: Value,
@@ -677,8 +633,6 @@ impl GoplsService {
             if let Some(location) = self.location_from_wire(loc) {
                 out.push(SymbolRef {
                     file: location.file,
-                    // Implementation responses carry locations, not names; use the
-                    // range-derived placeholder name (enrichment is a later step).
                     name: format!("{}:{}", location.range.start_line, location.range.start_col),
                     kind: SymbolKind::Unknown,
                 });
@@ -713,18 +667,32 @@ impl GoplsService {
         Ok(out)
     }
 
-    /// `true` for Go source files under any loaded Go module/workspace folder.
+    /// `true` for Rust source files.
     #[must_use]
     pub fn handles(&self, file: &FileId) -> bool {
-        if file.extension() != Some("go") {
-            return false;
-        }
-        let abs = self.abs_path(file);
-        self.covers(&abs)
+        file.extension() == Some("rs")
     }
 
     /// Graceful teardown.
     pub async fn shutdown(self) {
         let _outcome: ShutdownOutcome = self.client.shutdown().await;
+    }
+}
+
+fn hover_text(contents: &lsp_types::HoverContents) -> String {
+    match contents {
+        lsp_types::HoverContents::Scalar(lsp_types::MarkedString::String(s)) => s.clone(),
+        lsp_types::HoverContents::Scalar(lsp_types::MarkedString::LanguageString(ls)) => {
+            ls.value.clone()
+        }
+        lsp_types::HoverContents::Markup(m) => m.value.clone(),
+        lsp_types::HoverContents::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                lsp_types::MarkedString::String(s) => s.clone(),
+                lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }

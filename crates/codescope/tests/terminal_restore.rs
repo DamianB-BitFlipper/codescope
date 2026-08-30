@@ -44,7 +44,9 @@ fn terminal_is_restored_on_panic() {
         if let Ok(Some(_)) = child.try_wait() {
             // drain whatever remains
             while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 output.extend_from_slice(&buf[..n]);
             }
             break;
@@ -54,7 +56,10 @@ fn terminal_is_restored_on_panic() {
     let status = child.wait().expect("wait");
     let text = String::from_utf8_lossy(&output);
     // The terminal must enter and then LEAVE the alternate screen even on panic.
-    assert!(text.contains("\u{1b}[?1049h"), "should enter alt screen; got: {text:?}");
+    assert!(
+        text.contains("\u{1b}[?1049h"),
+        "should enter alt screen; got: {text:?}"
+    );
     assert!(
         text.contains("\u{1b}[?1049l"),
         "must leave alt screen on panic; got: {text:?}"

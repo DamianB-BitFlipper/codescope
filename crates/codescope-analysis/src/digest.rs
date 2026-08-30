@@ -265,7 +265,8 @@ fn build_diagnostics(
             .any(|(id, spans)| *id == d.file && spans.iter().any(|r| r.intersects_lines(&d.range)))
     };
 
-    let mut touching: Vec<&Diagnostic> = diagnostics.iter().filter(|d| touches_changed(d)).collect();
+    let mut touching: Vec<&Diagnostic> =
+        diagnostics.iter().filter(|d| touches_changed(d)).collect();
     // Errors first (severity derives Ord with Error as the least value), then file/line.
     touching.sort_by_key(|d| (d.severity, d.file.clone(), d.range.start_line));
     if touching.len() > MAX_DIGEST_DIAGNOSTICS {
@@ -404,14 +405,21 @@ impl ChangeDigest {
             out.push_str(&format!("- {dir} ({count} changed files)\n"));
         }
 
-        out.push_str(&format!("## changed symbols ({})\n", self.changed_symbols.len()));
+        out.push_str(&format!(
+            "## changed symbols ({})\n",
+            self.changed_symbols.len()
+        ));
         for s in &self.changed_symbols {
             let marker = match s.confidence {
                 MappingConfidence::Exact => "",
                 MappingConfidence::Approximate(_) => "~",
                 MappingConfidence::Unmapped => "?",
             };
-            let sig = if s.signature_touch { " [signature]" } else { "" };
+            let sig = if s.signature_touch {
+                " [signature]"
+            } else {
+                ""
+            };
             let diag = if s.diagnostic_count > 0 {
                 format!(" ({} diagnostics)", s.diagnostic_count)
             } else {
@@ -430,7 +438,11 @@ impl ChangeDigest {
 
         out.push_str(&format!("## diagnostics ({})\n", self.diagnostics.len()));
         for d in &self.diagnostics {
-            let code = d.code.as_deref().map(|c| format!(" [{c}]")).unwrap_or_default();
+            let code = d
+                .code
+                .as_deref()
+                .map(|c| format!(" [{c}]"))
+                .unwrap_or_default();
             out.push_str(&format!(
                 "- {:?} {}:{}{code} {}\n",
                 d.severity, d.file, d.line, d.message
@@ -455,10 +467,7 @@ impl ChangeDigest {
         for r in &self.relations {
             let fc = if r.from_changed { " (changed)" } else { "" };
             let tc = if r.to_changed { " (changed)" } else { "" };
-            out.push_str(&format!(
-                "- {}{fc} -{:?}-> {}{tc}\n",
-                r.from, r.kind, r.to
-            ));
+            out.push_str(&format!("- {}{fc} -{:?}-> {}{tc}\n", r.from, r.kind, r.to));
         }
 
         if !self.notes.is_empty() {
@@ -491,8 +500,11 @@ impl ChangeDigest {
         let mut cut = [0usize; 3];
         loop {
             self.notes.truncate(base_notes);
-            for (n, tier) in [(cut[0], "repo sketch dirs"), (cut[1], "relations"), (cut[2], "hunks")]
-            {
+            for (n, tier) in [
+                (cut[0], "repo sketch dirs"),
+                (cut[1], "relations"),
+                (cut[2], "hunks"),
+            ] {
                 if n > 0 {
                     self.notes.push(format!("budget cut {n} {tier}"));
                 }
@@ -514,7 +526,11 @@ impl ChangeDigest {
                 break;
             }
         }
-        tracing::debug!(budget, est = self.estimated_tokens(), "truncated digest to budget");
+        tracing::debug!(
+            budget,
+            est = self.estimated_tokens(),
+            "truncated digest to budget"
+        );
     }
 }
 
@@ -613,7 +629,10 @@ mod tests {
             to: "pkg/main.go:main".to_string(),
             kind: RelationKind::Calls,
         });
-        Evidence::partial(g, vec!["call hierarchy timed out for one symbol".to_string()])
+        Evidence::partial(
+            g,
+            vec!["call hierarchy timed out for one symbol".to_string()],
+        )
     }
 
     fn diag(file: &str, line: u32, severity: DiagnosticSeverity, message: &str) -> Diagnostic {
@@ -631,9 +650,19 @@ mod tests {
     fn digest_assembles_all_five_tiers() {
         let changed = vec![info("pkg/main.go", "main", ChangeKind::Modified, 8, 20)];
         let diagnostics = vec![
-            diag("pkg/main.go", 11, DiagnosticSeverity::Warning, "shadowed var"),
+            diag(
+                "pkg/main.go",
+                11,
+                DiagnosticSeverity::Warning,
+                "shadowed var",
+            ),
             diag("pkg/main.go", 9, DiagnosticSeverity::Error, "type mismatch"),
-            diag("pkg/other.go", 3, DiagnosticSeverity::Error, "unrelated file"),
+            diag(
+                "pkg/other.go",
+                3,
+                DiagnosticSeverity::Error,
+                "unrelated file",
+            ),
         ];
         let d = change_digest(&changed, &changeset(), &graph(), &diagnostics, &repo_ctx());
 
@@ -687,7 +716,10 @@ mod tests {
             &[diag("pkg/main.go", 10, DiagnosticSeverity::Error, &long)],
             &repo_ctx(),
         );
-        assert_eq!(d.diagnostics[0].message.chars().count(), MAX_DIAGNOSTIC_MESSAGE_CHARS);
+        assert_eq!(
+            d.diagnostics[0].message.chars().count(),
+            MAX_DIAGNOSTIC_MESSAGE_CHARS
+        );
         assert!(d.diagnostics[0].message.ends_with('…'));
     }
 
@@ -713,8 +745,14 @@ mod tests {
         );
         assert_eq!(d.changed_symbols.len(), MAX_DIGEST_SYMBOLS);
         assert_eq!(d.relations.len(), MAX_DIGEST_RELATIONS);
-        assert!(d.notes.iter().any(|n| n.contains("changed symbols truncated: 50 of 60")));
-        assert!(d.notes.iter().any(|n| n.contains("relations truncated: 100 of 120")));
+        assert!(d
+            .notes
+            .iter()
+            .any(|n| n.contains("changed symbols truncated: 50 of 60")));
+        assert!(d
+            .notes
+            .iter()
+            .any(|n| n.contains("relations truncated: 100 of 120")));
     }
 
     #[test]
@@ -729,7 +767,13 @@ mod tests {
             });
         }
         let diagnostics = vec![diag("pkg/main.go", 10, DiagnosticSeverity::Error, "broken")];
-        let mut d = change_digest(&changed, &changeset(), &Evidence::complete(g), &diagnostics, &repo_ctx());
+        let mut d = change_digest(
+            &changed,
+            &changeset(),
+            &Evidence::complete(g),
+            &diagnostics,
+            &repo_ctx(),
+        );
         let before = d.estimated_tokens();
         assert!(before > 200);
 
@@ -812,10 +856,15 @@ mod tests {
                 binary: false,
             }],
         );
-        let d = change_digest(&[], &cs, &Evidence::complete(ImpactGraph::new()), &[], &repo_ctx());
+        let d = change_digest(
+            &[],
+            &cs,
+            &Evidence::complete(ImpactGraph::new()),
+            &[],
+            &repo_ctx(),
+        );
         assert_eq!(d.repo.dirs, vec![(".".to_string(), 1)]);
     }
-
 
     #[test]
     fn token_estimate_heuristic() {

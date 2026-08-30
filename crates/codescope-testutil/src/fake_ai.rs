@@ -21,7 +21,9 @@
 //! explanatory JSON error rather than panicking.
 
 use crate::error::{Result, TestutilError};
-use codescope_core::{Epoch, EntityRef, FileId, FormKind, PlanNode, PlanNodeChange, VisualizationPlan, VizForm};
+use codescope_core::{
+    EntityRef, Epoch, FileId, FormKind, PlanNode, PlanNodeChange, VisualizationPlan, VizForm,
+};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -122,12 +124,13 @@ impl AiScriptStep {
 #[must_use]
 pub fn sample_plan(epoch: Epoch) -> VisualizationPlan {
     let mut plan = VisualizationPlan::new(epoch, "What changed on feature/api-changes?");
-    let middleware = PlanNode::new("n1", "LoggingMiddleware", PlanNodeChange::Added)
-        .with_entity(EntityRef::for_symbol(
+    let middleware = PlanNode::new("n1", "LoggingMiddleware", PlanNodeChange::Added).with_entity(
+        EntityRef::for_symbol(
             FileId::new_unchecked(crate::go_fixture::MIDDLEWARE_FILE),
             "LoggingMiddleware",
             None,
-        ));
+        ),
+    );
     let postgres_get = PlanNode::new("n2", "(PostgresRepo).Get", PlanNodeChange::Modified)
         .with_entity(EntityRef::for_symbol(
             FileId::new_unchecked(crate::go_fixture::POSTGRES_FILE),
@@ -303,8 +306,17 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
     let request = match read_request(&mut stream).await {
         Ok(req) => req,
         Err(e) => {
-            let body = json!({"error": {"message": format!("bad request: {e}"), "type": "bad_request"}});
-            write_http(&mut stream, 400, "Bad Request", &[], "application/json", body.to_string().as_bytes()).await?;
+            let body =
+                json!({"error": {"message": format!("bad request: {e}"), "type": "bad_request"}});
+            write_http(
+                &mut stream,
+                400,
+                "Bad Request",
+                &[],
+                "application/json",
+                body.to_string().as_bytes(),
+            )
+            .await?;
             return Err(e);
         }
     };
@@ -332,10 +344,30 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
                 "error": {"message": "rate limited by script", "type": "rate_limit_exceeded"}
             });
             let headers = [("Retry-After".to_string(), retry_after_secs.to_string())];
-            write_http(&mut stream, 429, "Too Many Requests", &headers, "application/json", body.to_string().as_bytes()).await
+            write_http(
+                &mut stream,
+                429,
+                "Too Many Requests",
+                &headers,
+                "application/json",
+                body.to_string().as_bytes(),
+            )
+            .await
         }
-        Some(AiScriptStep::Raw { status, content_type, body }) => {
-            write_http(&mut stream, status, "Scripted", &[], &content_type, body.as_bytes()).await
+        Some(AiScriptStep::Raw {
+            status,
+            content_type,
+            body,
+        }) => {
+            write_http(
+                &mut stream,
+                status,
+                "Scripted",
+                &[],
+                &content_type,
+                body.as_bytes(),
+            )
+            .await
         }
         Some(AiScriptStep::Hang) => {
             tracing::debug!("fake-ai: hanging per script (until provider abort)");
@@ -394,7 +426,9 @@ async fn read_request(stream: &mut TcpStream) -> Result<RecordedRequest> {
             break pos;
         }
         if buf.len() > MAX_HEAD_BYTES {
-            return Err(TestutilError::Protocol("http head exceeds 64KiB".to_string()));
+            return Err(TestutilError::Protocol(
+                "http head exceeds 64KiB".to_string(),
+            ));
         }
         let mut chunk = [0u8; 4096];
         let n = stream
@@ -481,7 +515,15 @@ fn parse_head(head: &str) -> Result<(String, String, BTreeMap<String, String>)> 
 }
 
 async fn write_json(stream: &mut TcpStream, status: u16, reason: &str, body: &Value) -> Result<()> {
-    write_http(stream, status, reason, &[], "application/json", body.to_string().as_bytes()).await
+    write_http(
+        stream,
+        status,
+        reason,
+        &[],
+        "application/json",
+        body.to_string().as_bytes(),
+    )
+    .await
 }
 
 /// Write a complete HTTP/1.1 response and close the write side.
@@ -572,8 +614,12 @@ mod tests {
         let steps = vec![
             AiScriptStep::valid_plan(Epoch(3)).unwrap(),
             AiScriptStep::malformed_json(),
-            AiScriptStep::AssistantText { content: "hi".to_string() },
-            AiScriptStep::RateLimited { retry_after_secs: 2 },
+            AiScriptStep::AssistantText {
+                content: "hi".to_string(),
+            },
+            AiScriptStep::RateLimited {
+                retry_after_secs: 2,
+            },
             AiScriptStep::Raw {
                 status: 503,
                 content_type: "text/plain".to_string(),

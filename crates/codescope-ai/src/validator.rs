@@ -24,8 +24,8 @@
 //! "unverified" note when their endpoints resolve.
 
 use codescope_core::{
-    Epoch, FileId, LineRange, PlanEdgeKind, PlanNode, ValidationReport, ValidationVerdict,
-    VisualizationPlan, VizForm, DroppedItem, EntityRef, MAX_FORMS_PER_PLAN, MAX_FORM_DEPTH,
+    DroppedItem, EntityRef, Epoch, FileId, LineRange, PlanEdgeKind, PlanNode, ValidationReport,
+    ValidationVerdict, VisualizationPlan, VizForm, MAX_FORMS_PER_PLAN, MAX_FORM_DEPTH,
     MAX_FORM_NODES, MAX_SUMMARY_LINES, PLAN_VERSION,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -93,7 +93,10 @@ pub fn validate(
         return ValidationReport::rejected("plan has no forms");
     }
     while plan.forms.len() > MAX_FORMS_PER_PLAN {
-        let form = plan.forms.pop().unwrap_or_else(|| unreachable!("len checked"));
+        let form = plan
+            .forms
+            .pop()
+            .unwrap_or_else(|| unreachable!("len checked"));
         dropped.push(DroppedItem {
             subject: format!("form {} ({:?})", plan.forms.len(), form.kind),
             reason: format!("exceeds MAX_FORMS_PER_PLAN ({MAX_FORMS_PER_PLAN})"),
@@ -134,7 +137,11 @@ pub fn validate(
 }
 
 /// Why a node failed validation, or `None` when it is valid.
-fn node_invalid_reason(node: &PlanNode, form_kind: FormClass, facts: &dyn FactView) -> Option<String> {
+fn node_invalid_reason(
+    node: &PlanNode,
+    form_kind: FormClass,
+    facts: &dyn FactView,
+) -> Option<String> {
     match form_kind {
         FormClass::FocusedDiff => {
             let Some(entity) = &node.entity else {
@@ -146,9 +153,7 @@ fn node_invalid_reason(node: &PlanNode, form_kind: FormClass, facts: &dyn FactVi
                 .and_then(|s| s.strip_prefix("hunk:"))
                 .and_then(|s| s.parse::<u32>().ok())
             else {
-                return Some(
-                    "focused_diff entity.symbol must be \"hunk:<index>\"".to_string(),
-                );
+                return Some("focused_diff entity.symbol must be \"hunk:<index>\"".to_string());
             };
             if facts.hunk(&entity.file, index).is_none() {
                 return Some(format!("hunk {}#h{index} does not exist", entity.file));
@@ -164,7 +169,10 @@ fn node_invalid_reason(node: &PlanNode, form_kind: FormClass, facts: &dyn FactVi
             }
             if let Some(symbol) = &entity.symbol {
                 let Some(extent) = facts.resolve_symbol(&entity.file, symbol) else {
-                    return Some(format!("symbol {symbol} does not resolve in {}", entity.file));
+                    return Some(format!(
+                        "symbol {symbol} does not resolve in {}",
+                        entity.file
+                    ));
                 };
                 if let Some(range) = &entity.range {
                     if !extent.contains_lines(range) {
@@ -273,8 +281,12 @@ fn sanitize_form(
     }
 
     match class {
-        FormClass::Tree => sanitize_tree(form, form_idx, &validity, &id_to_idx, facts, dropped, notes),
-        FormClass::Flow => sanitize_flow(form, form_idx, &validity, &id_to_idx, facts, dropped, notes),
+        FormClass::Tree => {
+            sanitize_tree(form, form_idx, &validity, &id_to_idx, facts, dropped, notes)
+        }
+        FormClass::Flow => {
+            sanitize_flow(form, form_idx, &validity, &id_to_idx, facts, dropped, notes)
+        }
         FormClass::ImpactSummary | FormClass::FocusedDiff => {
             sanitize_list(form, form_idx, class, &validity, facts, dropped, notes)
         }
@@ -303,7 +315,10 @@ fn sanitize_tree(
         for child in &node.children {
             match id_to_idx.get(child) {
                 Some(&c) if c == i => {
-                    notes.push(format!("form {form_idx}: node {} self-reference dropped", ids[i]));
+                    notes.push(format!(
+                        "form {form_idx}: node {} self-reference dropped",
+                        ids[i]
+                    ));
                 }
                 Some(&c) => {
                     children_idx[i].push(c);
@@ -330,9 +345,7 @@ fn sanitize_tree(
     }
     let invalid_count = validity.iter().flatten().count();
     if invalid_count * 5 > n {
-        return Err(format!(
-            "{invalid_count}/{n} nodes invalid (>20%)"
-        ));
+        return Err(format!("{invalid_count}/{n} nodes invalid (>20%)"));
     }
 
     // Effective children of each valid node: invalid children are replaced by their own
@@ -471,10 +484,7 @@ fn sanitize_flow(
 ) -> Result<(), String> {
     for (i, reason) in validity.iter().enumerate() {
         if let Some(reason) = reason {
-            return Err(format!(
-                "endpoint {} invalid: {reason}",
-                form.nodes[i].id
-            ));
+            return Err(format!("endpoint {} invalid: {reason}", form.nodes[i].id));
         }
     }
     // Every edge endpoint must name a declared node.
@@ -840,7 +850,11 @@ mod tests {
         let mut plan = plan_with(vec![form(
             FormKind::TypeImplTree,
             vec![
-                node("n1", Some(sym_entity("ghost.go", "Ghost")), &["n2", "n3", "n4", "n5"]),
+                node(
+                    "n1",
+                    Some(sym_entity("ghost.go", "Ghost")),
+                    &["n2", "n3", "n4", "n5"],
+                ),
                 node("n2", Some(sym_entity("main.go", "A")), &[]),
                 node("n3", Some(sym_entity("main.go", "B")), &[]),
                 node("n4", Some(sym_entity("main.go", "C")), &[]),
@@ -881,10 +895,7 @@ mod tests {
         let facts = abc_facts(); // no edges at all
         let mut plan = plan_with(vec![form(
             FormKind::Sequence,
-            vec![
-                node("n1", Some(a), &[]),
-                node("n2", Some(b), &[]),
-            ],
+            vec![node("n1", Some(a), &[]), node("n2", Some(b), &[])],
             vec![edge("n1", "n2", PlanEdgeKind::Calls)],
         )]);
         let report = validate(&mut plan, &facts, Epoch(1));
@@ -902,7 +913,10 @@ mod tests {
         let facts = abc_facts().with_edge(&a, &b, PlanEdgeKind::Calls);
         let mut plan = plan_with(vec![form(
             FormKind::RelationshipFlow,
-            vec![node("n1", Some(a.clone()), &[]), node("n2", Some(b.clone()), &[])],
+            vec![
+                node("n1", Some(a.clone()), &[]),
+                node("n2", Some(b.clone()), &[]),
+            ],
             vec![edge("n1", "n2", PlanEdgeKind::Calls)],
         )]);
         let report = validate(&mut plan, &facts, Epoch(1));
@@ -1021,7 +1035,11 @@ mod tests {
             ],
         )];
         for i in 1..=13 {
-            nodes.push(node(&format!("c{i}"), Some(sym_entity("main.go", "B")), &[]));
+            nodes.push(node(
+                &format!("c{i}"),
+                Some(sym_entity("main.go", "B")),
+                &[],
+            ));
         }
         let mut plan = plan_with(vec![form(FormKind::CallTree, nodes, vec![])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));

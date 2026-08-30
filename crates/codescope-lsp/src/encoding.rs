@@ -83,10 +83,9 @@ pub fn utf8_col_to_utf16(line: &str, utf8_col: usize) -> u32 {
 pub fn position_to_wire(line: &str, pos: Position, encoding: PositionEncoding) -> Position {
     match encoding {
         PositionEncoding::Utf8 => pos,
-        PositionEncoding::Utf16 => Position::new(
-            pos.line,
-            utf8_col_to_utf16(line, pos.character as usize),
-        ),
+        PositionEncoding::Utf16 => {
+            Position::new(pos.line, utf8_col_to_utf16(line, pos.character as usize))
+        }
     }
 }
 
@@ -94,10 +93,9 @@ pub fn position_to_wire(line: &str, pos: Position, encoding: PositionEncoding) -
 pub fn position_from_wire(line: &str, pos: Position, encoding: PositionEncoding) -> Position {
     match encoding {
         PositionEncoding::Utf8 => pos,
-        PositionEncoding::Utf16 => Position::new(
-            pos.line,
-            utf16_col_to_utf8(line, pos.character) as u32,
-        ),
+        PositionEncoding::Utf16 => {
+            Position::new(pos.line, utf16_col_to_utf8(line, pos.character) as u32)
+        }
     }
 }
 

@@ -6,9 +6,9 @@ use codescope_analysis::digest::{change_digest, DIGEST_DEFAULT_TOKEN_BUDGET};
 use codescope_analysis::{changed_symbols_detailed, map_changes_with_base};
 use codescope_core::{
     ApproxReason, BaseInfo, BaseSource, ChangeKind, ChangeScope, ChangeSet, DiffLine, EntityRef,
-    Evidence, FileChange, FileId, FileStatus, HeadState, Hunk, ImpactEdge, ImpactGraph,
-    ImpactNode, LineRange, MappingConfidence, Oid, RelationKind, RepoContext, Revision, SymbolId,
-    SymbolKind, SymbolNode, SymbolTree,
+    Evidence, FileChange, FileId, FileStatus, HeadState, Hunk, ImpactEdge, ImpactGraph, ImpactNode,
+    LineRange, MappingConfidence, Oid, RelationKind, RepoContext, Revision, SymbolId, SymbolKind,
+    SymbolNode, SymbolTree,
 };
 
 fn node(id: &str, name: &str, kind: SymbolKind, start: u32, end: u32) -> SymbolNode {
@@ -117,7 +117,10 @@ fn pure_pipeline_produces_digest() {
     assert!(names.contains(&"SpanishGreeter"));
     assert!(names.contains(&"(SpanishGreeter).Hello"));
     assert!(names.contains(&"LegacyGreeter"));
-    let legacy = greet_changed.iter().find(|c| c.name == "LegacyGreeter").unwrap();
+    let legacy = greet_changed
+        .iter()
+        .find(|c| c.name == "LegacyGreeter")
+        .unwrap();
     assert_eq!(legacy.record.change_kind, ChangeKind::Deleted);
     assert_eq!(legacy.revision, Revision::Base);
 
@@ -169,7 +172,10 @@ fn pure_pipeline_produces_digest() {
     assert!(text.contains("pkg/greet.go:SpanishGreeter"));
     assert!(text.contains("-Implements->"));
     assert!(text.contains("head=feature/spanish"));
-    assert_eq!(digest.repo.dirs, vec![("cmd".to_string(), 1), ("pkg".to_string(), 1)]);
+    assert_eq!(
+        digest.repo.dirs,
+        vec![("cmd".to_string(), 1), ("pkg".to_string(), 1)]
+    );
     assert!(digest.estimated_tokens() <= DIGEST_DEFAULT_TOKEN_BUDGET);
 }
 

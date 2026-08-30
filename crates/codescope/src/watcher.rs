@@ -23,8 +23,18 @@ pub struct RepoWatchers {
 impl RepoWatchers {
     /// Start watching the repo's working tree and git dir, forwarding change events.
     pub fn start(repo: &GitRepo, tx: mpsc::Sender<DispatchEvent>) -> anyhow::Result<Self> {
-        let tree = watch_path(repo.toplevel().as_std_path(), Duration::from_millis(300), tx.clone(), WatchKind::Tree)?;
-        let git = watch_path(repo.git_dir().as_std_path(), Duration::from_millis(100), tx, WatchKind::Git)?;
+        let tree = watch_path(
+            repo.toplevel().as_std_path(),
+            Duration::from_millis(300),
+            tx.clone(),
+            WatchKind::Tree,
+        )?;
+        let git = watch_path(
+            repo.git_dir().as_std_path(),
+            Duration::from_millis(100),
+            tx,
+            WatchKind::Git,
+        )?;
         Ok(RepoWatchers {
             _tree: tree,
             _git: git,
@@ -46,7 +56,9 @@ fn watch_path(
     let path = path.to_path_buf();
     let mut debouncer = new_debouncer(debounce, move |result: DebounceEventResult| {
         let Ok(events) = result else { return };
-        let relevant = events.iter().any(|e| is_relevant(e.path.as_path(), &kind, &e.kind));
+        let relevant = events
+            .iter()
+            .any(|e| is_relevant(e.path.as_path(), &kind, &e.kind));
         if relevant {
             let _ = tx.try_send(DispatchEvent::RepoChanged);
         }

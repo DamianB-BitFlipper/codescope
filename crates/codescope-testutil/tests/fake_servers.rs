@@ -43,8 +43,11 @@ async fn lsp_handshake_diagnostics_and_method_not_found() {
     let (mut reader, mut writer) = client_halves(session.client_io);
 
     // initialize → canned gopls-like result, matched by id.
-    send(&mut writer, &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
-        .await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+    )
+    .await;
     let response = recv(&mut reader).await;
     assert_eq!(response["id"], 1);
     assert_eq!(
@@ -53,7 +56,11 @@ async fn lsp_handshake_diagnostics_and_method_not_found() {
     );
 
     // initialized notification triggers the diagnostics push.
-    send(&mut writer, &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})).await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    )
+    .await;
     let push = recv(&mut reader).await;
     assert_eq!(push["method"], "textDocument/publishDiagnostics");
     assert_eq!(push["params"]["uri"], "file:///fx/internal/api/api.go");
@@ -69,7 +76,11 @@ async fn lsp_handshake_diagnostics_and_method_not_found() {
     assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
 
     // shutdown → null result; exit → session ends.
-    send(&mut writer, &json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"})).await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    )
+    .await;
     let response = recv(&mut reader).await;
     assert_eq!(response["id"], 3);
     assert!(response["result"].is_null());
@@ -79,7 +90,13 @@ async fn lsp_handshake_diagnostics_and_method_not_found() {
     let methods: Vec<&str> = log.iter().map(|m| m.method.as_str()).collect();
     assert_eq!(
         methods,
-        ["initialize", "initialized", "textDocument/monikers", "shutdown", "exit"]
+        [
+            "initialize",
+            "initialized",
+            "textDocument/monikers",
+            "shutdown",
+            "exit"
+        ]
     );
     assert!(log[0].is_request());
     assert!(!log[1].is_request());
@@ -98,8 +115,11 @@ async fn lsp_null_capabilities_and_canned_document_symbols() {
     let session = spawn_in_process(config);
     let (mut reader, mut writer) = client_halves(session.client_io);
 
-    send(&mut writer, &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
-        .await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+    )
+    .await;
     let response = recv(&mut reader).await;
     assert!(response["result"]["capabilities"].is_null());
 
@@ -122,9 +142,16 @@ async fn lsp_malformed_json_body_reaches_client_verbatim() {
     let session = spawn_in_process(config);
     let (mut reader, mut writer) = client_halves(session.client_io);
 
-    send(&mut writer, &json!({"jsonrpc": "2.0", "id": 1, "method": "textDocument/hover"})).await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "textDocument/hover"}),
+    )
+    .await;
     let bytes = read_frame(&mut reader).await.unwrap().expect("frame");
-    assert!(serde_json::from_slice::<Value>(&bytes).is_err(), "body must not parse");
+    assert!(
+        serde_json::from_slice::<Value>(&bytes).is_err(),
+        "body must not parse"
+    );
 }
 
 #[tokio::test]
@@ -139,7 +166,11 @@ async fn lsp_wrong_content_length_starves_the_client() {
     let session = spawn_in_process(config);
     let (mut reader, mut writer) = client_halves(session.client_io);
 
-    send(&mut writer, &json!({"jsonrpc": "2.0", "id": 1, "method": "textDocument/hover"})).await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "textDocument/hover"}),
+    )
+    .await;
     // The header promises 66 bytes but only 2 arrive: a spec-following reader must block.
     let starved = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut reader)).await;
     assert!(starved.is_err(), "read must time out on a short frame");
@@ -157,9 +188,16 @@ async fn lsp_truncate_and_close_ends_the_stream_mid_frame() {
     let session = spawn_in_process(config);
     let (mut reader, mut writer) = client_halves(session.client_io);
 
-    send(&mut writer, &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"})).await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+    )
+    .await;
     let result = read_frame(&mut reader).await;
-    assert!(result.is_err(), "truncated stream must error, got {result:?}");
+    assert!(
+        result.is_err(),
+        "truncated stream must error, got {result:?}"
+    );
     session.handle.await.unwrap().unwrap();
 }
 
@@ -170,7 +208,11 @@ async fn lsp_response_delay_is_applied() {
     let (mut reader, mut writer) = client_halves(session.client_io);
 
     let start = Instant::now();
-    send(&mut writer, &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"})).await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+    )
+    .await;
     let response = recv(&mut reader).await;
     assert_eq!(response["id"], 1);
     assert!(
@@ -186,7 +228,11 @@ async fn lsp_ignored_shutdown_forces_kill_path() {
     let session = spawn_in_process(config);
     let (mut reader, mut writer) = client_halves(session.client_io);
 
-    send(&mut writer, &json!({"jsonrpc": "2.0", "id": 1, "method": "shutdown"})).await;
+    send(
+        &mut writer,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "shutdown"}),
+    )
+    .await;
     let silence = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut reader)).await;
     assert!(silence.is_err(), "shutdown must be ignored");
     // The client's escalation: drop the transport (≙ kill); the server ends cleanly.
@@ -228,14 +274,23 @@ fn parse_response(raw: &[u8]) -> HttpResponse {
     let (head, body) = text.split_once("\r\n\r\n").expect("http head/body split");
     let mut lines = head.split("\r\n");
     let status_line = lines.next().expect("status line");
-    let status: u16 = status_line.split_whitespace().nth(1).expect("code").parse().expect("numeric status");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .expect("code")
+        .parse()
+        .expect("numeric status");
     let mut headers = BTreeMap::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
         }
     }
-    HttpResponse { status, headers, body: body.to_string() }
+    HttpResponse {
+        status,
+        headers,
+        body: body.to_string(),
+    }
 }
 
 fn chat_request() -> Value {
@@ -266,7 +321,11 @@ async fn ai_valid_plan_round_trips_through_core_types() {
 
     let plan: VisualizationPlan =
         serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
-    assert_eq!(plan.epoch, Epoch(9), "provider must echo the scripted epoch");
+    assert_eq!(
+        plan.epoch,
+        Epoch(9),
+        "provider must echo the scripted epoch"
+    );
     assert!(!plan.forms.is_empty());
 
     // The client's request was recorded.
@@ -284,8 +343,12 @@ async fn ai_scripted_failure_modes_in_order() {
     let provider = ScriptedProvider::start([
         AiScriptStep::malformed_json(),
         AiScriptStep::hallucinated_plan(Epoch(1)).unwrap(),
-        AiScriptStep::AssistantText { content: "cannot help".to_string() },
-        AiScriptStep::RateLimited { retry_after_secs: 7 },
+        AiScriptStep::AssistantText {
+            content: "cannot help".to_string(),
+        },
+        AiScriptStep::RateLimited {
+            retry_after_secs: 7,
+        },
         AiScriptStep::Raw {
             status: 503,
             content_type: "text/html".to_string(),
@@ -314,7 +377,12 @@ async fn ai_scripted_failure_modes_in_order() {
     )
     .unwrap();
     assert_eq!(
-        plan.forms[0].nodes[0].entity.as_ref().unwrap().file.to_string(),
+        plan.forms[0].nodes[0]
+            .entity
+            .as_ref()
+            .unwrap()
+            .file
+            .to_string(),
         "internal/api/quantum_flux.go"
     );
 
@@ -322,7 +390,10 @@ async fn ai_scripted_failure_modes_in_order() {
     let response = post_chat(&provider, &chat_request()).await;
     let completion: Value = serde_json::from_str(&response.body).unwrap();
     assert_eq!(completion["choices"][0]["finish_reason"], "stop");
-    assert_eq!(completion["choices"][0]["message"]["content"], "cannot help");
+    assert_eq!(
+        completion["choices"][0]["message"]["content"],
+        "cannot help"
+    );
     assert!(completion["choices"][0]["message"]["tool_calls"].is_null());
 
     // 4. 429 + Retry-After.
@@ -350,8 +421,7 @@ async fn ai_hang_step_hangs_until_abort() {
     let provider = ScriptedProvider::start([AiScriptStep::Hang]).await.unwrap();
 
     let mut stream = TcpStream::connect(provider.addr()).await.unwrap();
-    let request =
-        "POST /v1/chat/completions HTTP/1.1\r\nhost: fake\r\ncontent-length: 2\r\n\r\n{}";
+    let request = "POST /v1/chat/completions HTTP/1.1\r\nhost: fake\r\ncontent-length: 2\r\n\r\n{}";
     stream.write_all(request.as_bytes()).await.unwrap();
 
     // No response while the script says Hang…
@@ -365,9 +435,9 @@ async fn ai_hang_step_hangs_until_abort() {
     provider.abort();
     let ended = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
     match ended {
-        Ok(Ok(0)) => {}                 // clean EOF
+        Ok(Ok(0)) => {} // clean EOF
         Ok(Ok(n)) => panic!("unexpected {n} bytes after abort"),
-        Ok(Err(_)) => {}                // reset — also fine
+        Ok(Err(_)) => {} // reset — also fine
         Err(_) => panic!("connection must end after abort"),
     }
 }
@@ -381,6 +451,8 @@ async fn ai_steps_can_be_pushed_while_serving() {
     let response = post_chat(&provider, &chat_request()).await;
     assert_eq!(response.status, 200);
     assert_eq!(provider.remaining_steps(), 0);
-    assert!(provider.chat_completions_url().ends_with("/v1/chat/completions"));
+    assert!(provider
+        .chat_completions_url()
+        .ends_with("/v1/chat/completions"));
     assert!(provider.base_url().starts_with("http://127.0.0.1:"));
 }

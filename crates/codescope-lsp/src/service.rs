@@ -14,51 +14,86 @@ use codescope_core::{
     Diagnostic, Evidence, FeatureSet, FileId, Location, Position, SymbolRef, SymbolTree,
 };
 
+use crate::detect::{detect_languages, Language};
 use crate::error::SemanticError;
 use crate::gopls::GoplsService;
+use crate::rust_analyzer::RustAnalyzerService;
 
 /// One running language-server session behind the common semantic surface.
 #[derive(Debug)]
 pub enum LanguageService {
     /// gopls (Go). The prototype's production adapter.
     Gopls(GoplsService),
+    /// rust-analyzer (Rust). Proves the adapter-pluggability claim.
+    RustAnalyzer(RustAnalyzerService),
 }
 
 impl LanguageService {
-    /// Start the language service appropriate for `root`.
+    /// Start the language service(s) appropriate for `root` (the git toplevel).
     ///
-    /// Detection for the prototype: a `go.mod` at or above `root` selects gopls.
+    /// Detection for the prototype: if any `go.mod`/`go.work` is present under `root`,
+    /// gopls is started in multi-root mode (Go wins ties). If no Go is detected but a
+    /// `Cargo.toml` is found under `root`, rust-analyzer is started at the Cargo
+    /// package/workspace root. If no supported language is detected, a clear
+    /// [`SemanticError::NoSupportedLanguage`] error is returned so the binary can
+    /// distinguish "no language" from a real language-server failure.
     pub async fn start(root: &Utf8Path) -> Result<Self, SemanticError> {
-        Ok(LanguageService::Gopls(GoplsService::start(root).await?))
+        let languages = detect_languages(root);
+        if languages.contains(&Language::Go) {
+            return Ok(LanguageService::Gopls(GoplsService::start(root).await?));
+        }
+        if languages.contains(&Language::Rust) {
+            return Ok(LanguageService::RustAnalyzer(
+                RustAnalyzerService::start(root).await?,
+            ));
+        }
+        Err(SemanticError::NoSupportedLanguage(languages))
     }
 
     /// Capabilities resolved from the initialize handshake.
     #[must_use]
     pub fn features(&self) -> &FeatureSet {
-        let LanguageService::Gopls(s) = self;
-        s.features()
+        match self {
+            LanguageService::Gopls(s) => s.features(),
+            LanguageService::RustAnalyzer(s) => s.features(),
+        }
     }
 
-    /// Absolute workspace root this session is anchored at.
+    /// Display name of the active language for the TUI top bar.
+    #[must_use]
+    pub fn language_name(&self) -> &'static str {
+        match self {
+            LanguageService::Gopls(_) => Language::Go.as_str(),
+            LanguageService::RustAnalyzer(_) => Language::Rust.as_str(),
+        }
+    }
+
+    /// Absolute repository root this session is anchored at.
     #[must_use]
     pub fn root(&self) -> &Utf8Path {
-        let LanguageService::Gopls(s) = self;
-        s.root()
+        match self {
+            LanguageService::Gopls(s) => s.repo_root(),
+            LanguageService::RustAnalyzer(s) => s.repo_root(),
+        }
     }
 
     /// `true` while the server process is believed alive.
     #[must_use]
     pub fn is_alive(&self) -> bool {
-        let LanguageService::Gopls(s) = self;
-        s.is_alive()
+        match self {
+            LanguageService::Gopls(s) => s.is_alive(),
+            LanguageService::RustAnalyzer(s) => s.is_alive(),
+        }
     }
 
     /// Current push-diagnostics for `file` (empty when none), converted to the
     /// internal utf-8 position model.
     #[must_use]
     pub fn diagnostics(&self, file: &FileId) -> Vec<Diagnostic> {
-        let LanguageService::Gopls(s) = self;
-        s.diagnostics(file)
+        match self {
+            LanguageService::Gopls(s) => s.diagnostics(file),
+            LanguageService::RustAnalyzer(s) => s.diagnostics(file),
+        }
     }
 
     /// Hierarchical symbol tree of the current worktree content of `file`.
@@ -66,20 +101,24 @@ impl LanguageService {
         &self,
         file: &FileId,
     ) -> Result<Evidence<SymbolTree>, SemanticError> {
-        let LanguageService::Gopls(s) = self;
-        s.document_symbols(file).await
+        match self {
+            LanguageService::Gopls(s) => s.document_symbols(file).await,
+            LanguageService::RustAnalyzer(s) => s.document_symbols(file).await,
+        }
     }
 
     /// Symbol tree of `content` opened as a temporary in-memory overlay for `file`
-    /// (base-revision analysis; research 03, verified gopls fact 6). The worktree view
-    /// is restored before returning.
+    /// (base-revision analysis; research 03, verified fact 6). The resulting tree's
+    /// revision is [`codescope_core::Revision::Base`].
     pub async fn base_document_symbols(
         &self,
         file: &FileId,
         content: &str,
     ) -> Result<Evidence<SymbolTree>, SemanticError> {
-        let LanguageService::Gopls(s) = self;
-        s.base_document_symbols(file, content).await
+        match self {
+            LanguageService::Gopls(s) => s.base_document_symbols(file, content).await,
+            LanguageService::RustAnalyzer(s) => s.base_document_symbols(file, content).await,
+        }
     }
 
     /// Reference sites of the symbol at `pos` in `file`.
@@ -88,8 +127,10 @@ impl LanguageService {
         file: &FileId,
         pos: Position,
     ) -> Result<Evidence<Vec<Location>>, SemanticError> {
-        let LanguageService::Gopls(s) = self;
-        s.references(file, pos).await
+        match self {
+            LanguageService::Gopls(s) => s.references(file, pos).await,
+            LanguageService::RustAnalyzer(s) => s.references(file, pos).await,
+        }
     }
 
     /// Callers of the symbol at `pos` (`callHierarchy/incomingCalls`).
@@ -98,8 +139,10 @@ impl LanguageService {
         file: &FileId,
         pos: Position,
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
-        let LanguageService::Gopls(s) = self;
-        s.incoming_calls(file, pos).await
+        match self {
+            LanguageService::Gopls(s) => s.incoming_calls(file, pos).await,
+            LanguageService::RustAnalyzer(s) => s.incoming_calls(file, pos).await,
+        }
     }
 
     /// Callees of the symbol at `pos` (`callHierarchy/outgoingCalls`).
@@ -108,8 +151,10 @@ impl LanguageService {
         file: &FileId,
         pos: Position,
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
-        let LanguageService::Gopls(s) = self;
-        s.outgoing_calls(file, pos).await
+        match self {
+            LanguageService::Gopls(s) => s.outgoing_calls(file, pos).await,
+            LanguageService::RustAnalyzer(s) => s.outgoing_calls(file, pos).await,
+        }
     }
 
     /// Implementations of the interface-ish symbol at `pos`
@@ -119,47 +164,74 @@ impl LanguageService {
         file: &FileId,
         pos: Position,
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
-        let LanguageService::Gopls(s) = self;
-        s.implementations(file, pos).await
+        match self {
+            LanguageService::Gopls(s) => s.implementations(file, pos).await,
+            LanguageService::RustAnalyzer(s) => s.implementations(file, pos).await,
+        }
     }
 
-    /// Subtypes of the type symbol at `pos` (`typeHierarchy/subtypes`); for a Go
-    /// interface these are its implementers.
+    /// Subtypes of the type symbol at `pos` (`typeHierarchy/subtypes`).
     pub async fn type_subtypes(
         &self,
         file: &FileId,
         pos: Position,
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
-        let LanguageService::Gopls(s) = self;
-        s.type_subtypes(file, pos).await
+        match self {
+            LanguageService::Gopls(s) => s.type_subtypes(file, pos).await,
+            LanguageService::RustAnalyzer(s) => s.type_subtypes(file, pos).await,
+        }
     }
 
-    /// Repo-relative [`FileId`] for an absolute path inside the root; `None` outside
-    /// (dependency/module-cache locations are out of scope by design).
+    /// Hover text for the symbol at `pos` in `file`.
+    ///
+    /// Note: the gopls adapter currently does not expose hover, so the Gopls variant
+    /// returns [`SemanticError::Unsupported`].
+    pub async fn hover(
+        &self,
+        file: &FileId,
+        pos: Position,
+    ) -> Result<Option<String>, SemanticError> {
+        match self {
+            LanguageService::Gopls(_) => {
+                Err(SemanticError::Unsupported(codescope_core::Feature::Hover))
+            }
+            LanguageService::RustAnalyzer(s) => s.hover(file, pos).await,
+        }
+    }
+
+    /// Repo-relative [`FileId`] for an absolute path inside the repo toplevel; `None`
+    /// outside (dependency/module-cache locations are out of scope by design).
     #[must_use]
     pub fn file_id(&self, abs: &Utf8Path) -> Option<FileId> {
-        let LanguageService::Gopls(s) = self;
-        s.file_id(abs)
+        match self {
+            LanguageService::Gopls(s) => s.file_id(abs),
+            LanguageService::RustAnalyzer(s) => s.file_id(abs),
+        }
     }
 
     /// Absolute path of a repo-relative file id.
     #[must_use]
     pub fn abs_path(&self, file: &FileId) -> Utf8PathBuf {
-        let LanguageService::Gopls(s) = self;
-        s.abs_path(file)
+        match self {
+            LanguageService::Gopls(s) => s.abs_path(file),
+            LanguageService::RustAnalyzer(s) => s.abs_path(file),
+        }
     }
 
-    /// `true` when this service owns `file` (gopls owns `*.go`). Non-owned files are
-    /// skipped by the analysis engine instead of being mislabeled as Go.
+    /// `true` when this service owns `file`.
     #[must_use]
     pub fn handles(&self, file: &FileId) -> bool {
-        let LanguageService::Gopls(s) = self;
-        s.handles(file)
+        match self {
+            LanguageService::Gopls(s) => s.handles(file),
+            LanguageService::RustAnalyzer(s) => s.handles(file),
+        }
     }
 
     /// Graceful teardown (shutdown → exit → kill after grace).
     pub async fn shutdown(self) {
-        let LanguageService::Gopls(s) = self;
-        s.shutdown().await;
+        match self {
+            LanguageService::Gopls(s) => s.shutdown().await,
+            LanguageService::RustAnalyzer(s) => s.shutdown().await,
+        }
     }
 }

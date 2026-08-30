@@ -269,12 +269,14 @@ impl LspClient {
             source,
         })?;
 
-        let stdin = child.stdin.take().ok_or_else(|| LspError::Protocol(
-            "child stdin not captured".to_string(),
-        ))?;
-        let stdout = child.stdout.take().ok_or_else(|| LspError::Protocol(
-            "child stdout not captured".to_string(),
-        ))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| LspError::Protocol("child stdin not captured".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| LspError::Protocol("child stdout not captured".to_string()))?;
         let stderr = child.stderr.take();
 
         tracing::info!(program, pid = child.id(), "language server spawned");
@@ -660,10 +662,7 @@ mod tests {
         let request = tokio::spawn({
             let client = Arc::new(client);
             let c = Arc::clone(&client);
-            async move {
-                c.request("ping", Value::Null, Duration::from_secs(5))
-                    .await
-            }
+            async move { c.request("ping", Value::Null, Duration::from_secs(5)).await }
         });
 
         let msg = server.recv().await;
@@ -848,4 +847,3 @@ mod tests {
         assert!(matches!(err, LspError::ServerExited { .. }));
     }
 }
-

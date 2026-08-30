@@ -218,8 +218,10 @@ impl AiClient {
             .build()
             .map_err(|e| AiError::Config(format!("http client: {}", e.without_url())))?;
         let clock = QuantaClock::default();
-        let limiter =
-            RateLimiter::direct_with_clock(Quota::per_minute(rpm).allow_burst(burst), clock.clone());
+        let limiter = RateLimiter::direct_with_clock(
+            Quota::per_minute(rpm).allow_burst(burst),
+            clock.clone(),
+        );
         let base = config.base_url.trim_end_matches('/');
         let provider = config.provider();
         let endpoint = match provider {
@@ -586,7 +588,9 @@ fn anthropic_assistant_message(v: &Value) -> Value {
     if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
             let args = match call["function"]["arguments"].clone() {
-                Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Object(Default::default())),
+                Value::String(s) => {
+                    serde_json::from_str(&s).unwrap_or(Value::Object(Default::default()))
+                }
                 other => other,
             };
             content.push(json!({
@@ -619,7 +623,11 @@ fn anthropic_tools(tool_values: &[Value]) -> Vec<Value> {
 fn merge_same_role(messages: Vec<Value>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for m in messages {
-        let role = m.get("role").and_then(Value::as_str).unwrap_or("user").to_string();
+        let role = m
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            .to_string();
         if let Some(last) = out.last_mut() {
             if last.get("role").and_then(Value::as_str) == Some(role.as_str()) {
                 let mut content = last.get("content").cloned().unwrap_or(Value::Array(vec![]));
@@ -652,7 +660,10 @@ fn parse_anthropic_response(body: Value) -> Result<RawPlanResponse, AiError> {
                 if name.is_empty() {
                     return Err(AiError::MalformedResponse("tool_use without a name".into()));
                 }
-                let input = b.get("input").cloned().unwrap_or(Value::Object(Default::default()));
+                let input = b
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default()));
                 tool_calls.push(RawToolCall {
                     id: b["id"].as_str().unwrap_or_default().to_string(),
                     name: name.to_string(),
@@ -703,9 +714,7 @@ fn parse_completion(completion: Value) -> Result<RawPlanResponse, AiError> {
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .cloned()
-        .ok_or_else(|| {
-            AiError::MalformedResponse("completion has no choices[0].message".into())
-        })?;
+        .ok_or_else(|| AiError::MalformedResponse("completion has no choices[0].message".into()))?;
 
     let mut tool_calls = Vec::new();
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -787,7 +796,11 @@ mod tests {
             reqwest::header::RETRY_AFTER,
             "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
         );
-        assert_eq!(parse_retry_after(&headers), None, "http-date form unsupported");
+        assert_eq!(
+            parse_retry_after(&headers),
+            None,
+            "http-date form unsupported"
+        );
     }
 
     #[test]

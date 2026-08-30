@@ -84,8 +84,12 @@ pub enum SemanticError {
     BrokenSession(String),
 
     /// No workspace root could be determined.
-    #[error("no workspace root found for {0}")]
+    #[error("no Go module (go.mod) found at or above {0} — gopls only serves Go projects")]
     NoRoot(Utf8PathBuf),
+
+    /// No supported language was detected in the repo.
+    #[error("no supported language detected (found: {0:?})")]
+    NoSupportedLanguage(Vec<crate::detect::Language>),
 
     /// A file involved in a query could not be read (needed for position
     /// encoding conversion or overlay/worktree sync).

@@ -31,19 +31,19 @@ mod service;
 pub mod tools;
 mod validator;
 
+pub use client::{
+    AiClient, AiClientOptions, ChatMessage, RawPlanResponse, RawToolCall, RETRY_AFTER_CAP,
+};
 pub use config::{
     AiConfig, AiFileConfig, ProviderKind, ANTHROPIC_BASE_URL, DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_TIMEOUT, OPENAI_BASE_URL, PRIME_BASE_URL,
-};
-pub use client::{
-    AiClient, AiClientOptions, ChatMessage, RawPlanResponse, RawToolCall, RETRY_AFTER_CAP,
 };
 pub use error::AiError;
 pub use plan::{parse_plan, plan_tool, PlanParams};
 pub use scrub::{scrub_secrets, REDACTED};
 pub use service::{redact_repo_root, AiOutcome, AiService, RetryPolicy};
-pub use validator::{validate, FactView, IMPACT_SUMMARY_MAX_BULLETS};
 pub use tools::{
     is_read_only_tool, read_only_tools, NoToolExecutor, ToolDef, ToolExecError, ToolExecutor,
     MAX_TOOL_CALLS, PLAN_TOOL_NAME,
 };
+pub use validator::{validate, FactView, IMPACT_SUMMARY_MAX_BULLETS};

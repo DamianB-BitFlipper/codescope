@@ -7,9 +7,7 @@ use codescope_ai::{
     AiClient, AiClientOptions, AiConfig, AiError, AiOutcome, AiService, ChatMessage, FactView,
     RetryPolicy, ToolExecError, ToolExecutor, PLAN_TOOL_NAME,
 };
-use codescope_core::{
-    EntityRef, Epoch, FileId, LineRange, PlanEdgeKind, ValidationVerdict,
-};
+use codescope_core::{EntityRef, Epoch, FileId, LineRange, PlanEdgeKind, ValidationVerdict};
 use codescope_testutil::fake_ai::{
     hallucinated_sample_plan, sample_plan, AiScriptStep, ScriptedProvider,
 };
@@ -148,7 +146,12 @@ async fn valid_plan_end_to_end_with_redaction_and_wire_shape() {
     let digest = format!("changed file {REPO_ROOT}/{MIDDLEWARE_FILE}: added LoggingMiddleware");
 
     let outcome = service
-        .request_plan(&digest, &RecordingExecutor::default(), &FixtureFacts, Epoch(7))
+        .request_plan(
+            &digest,
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(7),
+        )
         .await;
 
     let AiOutcome::Plan(plan, report) = outcome else {
@@ -204,7 +207,12 @@ async fn malformed_plan_json_fails_without_retry() {
         .unwrap();
     let service = service_for(&provider);
     let outcome = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(1))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(1),
+        )
         .await;
     let AiOutcome::Failed(reason) = outcome else {
         panic!("expected failure, got {outcome:?}");
@@ -222,7 +230,12 @@ async fn assistant_text_without_tool_call_fails() {
     .unwrap();
     let service = service_for(&provider);
     let outcome = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(1))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(1),
+        )
         .await;
     let AiOutcome::Failed(reason) = outcome else {
         panic!("expected failure, got {outcome:?}");
@@ -234,7 +247,9 @@ async fn assistant_text_without_tool_call_fails() {
 #[tokio::test]
 async fn rate_limited_then_success_honors_retry_after() {
     let provider = ScriptedProvider::start([
-        AiScriptStep::RateLimited { retry_after_secs: 1 },
+        AiScriptStep::RateLimited {
+            retry_after_secs: 1,
+        },
         AiScriptStep::valid_plan(Epoch(3)).unwrap(),
     ])
     .await
@@ -244,7 +259,12 @@ async fn rate_limited_then_success_honors_retry_after() {
     let service = service_for(&provider);
     let started = Instant::now();
     let outcome = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(3))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(3),
+        )
         .await;
     let elapsed = started.elapsed();
     assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
@@ -253,7 +273,10 @@ async fn rate_limited_then_success_honors_retry_after() {
         elapsed >= Duration::from_millis(950),
         "Retry-After not honored: {elapsed:?}"
     );
-    assert!(elapsed < Duration::from_secs(5), "took too long: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "took too long: {elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -271,7 +294,12 @@ async fn hang_times_out() {
     .unwrap();
     let started = Instant::now();
     let outcome = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(1))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(1),
+        )
         .await;
     let elapsed = started.elapsed();
     let AiOutcome::Failed(reason) = outcome else {
@@ -383,7 +411,9 @@ async fn tool_loop_executes_reads_and_submits_plan() {
 async fn tool_call_budget_enforced() {
     // One message requesting 9 tool calls: the 9th exceeds the budget of 8.
     let names: Vec<&str> = std::iter::repeat_n("get_file_outline", 9).collect();
-    let provider = ScriptedProvider::start([tool_call_step(&names)]).await.unwrap();
+    let provider = ScriptedProvider::start([tool_call_step(&names)])
+        .await
+        .unwrap();
     let service = service_for(&provider);
     let executor = RecordingExecutor::default();
     let outcome = service
@@ -427,20 +457,29 @@ async fn stale_epoch_yields_stale_outcome() {
         .unwrap();
     let service = service_for(&provider);
     let outcome = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(2))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(2),
+        )
         .await;
     assert_eq!(outcome, AiOutcome::Stale);
 }
 
 #[tokio::test]
 async fn hallucinated_plan_is_rejected_by_validation() {
-    let provider =
-        ScriptedProvider::start([AiScriptStep::hallucinated_plan(Epoch(1)).unwrap()])
-            .await
-            .unwrap();
+    let provider = ScriptedProvider::start([AiScriptStep::hallucinated_plan(Epoch(1)).unwrap()])
+        .await
+        .unwrap();
     let service = service_for(&provider);
     let outcome = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(1))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(1),
+        )
         .await;
     let AiOutcome::Failed(reason) = outcome else {
         panic!("expected failure, got {outcome:?}");
@@ -474,11 +513,21 @@ async fn local_throttle_maps_to_unavailable() {
     )
     .unwrap();
     let first = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(1))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(1),
+        )
         .await;
     assert!(matches!(first, AiOutcome::Plan(..)), "got {first:?}");
     let second = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(1))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(1),
+        )
         .await;
     assert_eq!(second, AiOutcome::Unavailable);
     assert_eq!(provider.requests().len(), 1);
@@ -495,7 +544,12 @@ async fn keyless_local_provider_sends_no_authorization() {
         AiService::with_options(config, REPO_ROOT, AiClientOptions::default(), fast_retry())
             .unwrap();
     let outcome = service
-        .request_plan("digest", &RecordingExecutor::default(), &FixtureFacts, Epoch(1))
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(1),
+        )
         .await;
     assert!(matches!(outcome, AiOutcome::Plan(..)));
     assert!(!provider.requests()[0].headers.contains_key("authorization"));

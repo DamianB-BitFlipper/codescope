@@ -61,9 +61,11 @@ pub async fn build_impact_graph<S: SemanticSource>(
 
         // Callers.
         if features.is_supported(Feature::CallHierarchyIncoming) {
-            if let Some(callers) =
-                acc.run("incoming calls", &id, svc.incoming_calls(&info.file, pos).await)
-            {
+            if let Some(callers) = acc.run(
+                "incoming calls",
+                &id,
+                svc.incoming_calls(&info.file, pos).await,
+            ) {
                 for peer in callers {
                     let peer_id = ref_id(&peer);
                     add_neighbor(&mut graph, &peer, &peer_id);
@@ -80,9 +82,11 @@ pub async fn build_impact_graph<S: SemanticSource>(
 
         // Callees.
         if features.is_supported(Feature::CallHierarchyOutgoing) {
-            if let Some(callees) =
-                acc.run("outgoing calls", &id, svc.outgoing_calls(&info.file, pos).await)
-            {
+            if let Some(callees) = acc.run(
+                "outgoing calls",
+                &id,
+                svc.outgoing_calls(&info.file, pos).await,
+            ) {
                 for peer in callees {
                     let peer_id = ref_id(&peer);
                     add_neighbor(&mut graph, &peer, &peer_id);
@@ -147,12 +151,20 @@ async fn query_implementers<S: SemanticSource>(
 ) -> Option<Vec<SymbolRef>> {
     let features = svc.features();
     if features.is_supported(Feature::Implementation) {
-        return acc.run("implementations", id, svc.implementations(&info.file, pos).await);
+        return acc.run(
+            "implementations",
+            id,
+            svc.implementations(&info.file, pos).await,
+        );
     }
     if features.is_supported(Feature::TypeHierarchySub) {
         acc.notes
             .insert("implementation unsupported; used type-hierarchy subtypes".to_string());
-        return acc.run("type subtypes", id, svc.type_subtypes(&info.file, pos).await);
+        return acc.run(
+            "type subtypes",
+            id,
+            svc.type_subtypes(&info.file, pos).await,
+        );
     }
     acc.skip(Feature::Implementation);
     None
@@ -254,7 +266,8 @@ impl EvidenceAccumulator {
             }
             Err(err) => {
                 self.merge_completeness(Completeness::Partial);
-                self.notes.insert(format!("{what} for {node} failed: {err}"));
+                self.notes
+                    .insert(format!("{what} for {node} failed: {err}"));
                 tracing::warn!(query = what, node, error = %err, "impact-graph query failed");
                 None
             }
@@ -345,12 +358,26 @@ mod tests {
         let ev = build_impact_graph(&[main, hello], &svc).await;
         assert_eq!(ev.completeness, Completeness::Complete);
         let g = &ev.value;
-        assert_eq!(g.node_count(), 2, "neighbor nodes dedupe into changed nodes");
+        assert_eq!(
+            g.node_count(),
+            2,
+            "neighbor nodes dedupe into changed nodes"
+        );
         assert_eq!(g.edge_count(), 1, "symmetric queries dedupe into one edge");
-        assert!(g.contains_edge("cmd/main.go:main", "pkg/greet.go:Hello", RelationKind::Calls));
+        assert!(g.contains_edge(
+            "cmd/main.go:main",
+            "pkg/greet.go:Hello",
+            RelationKind::Calls
+        ));
         // First-inserted (changed) nodes keep their annotations.
-        assert_eq!(g.node("cmd/main.go:main").unwrap().change, Some(ChangeKind::Modified));
-        assert_eq!(g.node("pkg/greet.go:Hello").unwrap().change, Some(ChangeKind::Modified));
+        assert_eq!(
+            g.node("cmd/main.go:main").unwrap().change,
+            Some(ChangeKind::Modified)
+        );
+        assert_eq!(
+            g.node("pkg/greet.go:Hello").unwrap().change,
+            Some(ChangeKind::Modified)
+        );
     }
 
     #[tokio::test]
@@ -373,7 +400,11 @@ mod tests {
         assert_eq!(svc.calls_of("outgoing_calls"), 0, "gated before the wire");
         assert_eq!(svc.calls_of("implementations"), 0, "not an interface");
         assert!(ev.notes.iter().any(|n| n.contains("CallHierarchyOutgoing")));
-        assert!(ev.value.contains_edge("pkg/api.go:Serve", "cmd/main.go:main", RelationKind::Calls));
+        assert!(ev.value.contains_edge(
+            "pkg/api.go:Serve",
+            "cmd/main.go:main",
+            RelationKind::Calls
+        ));
     }
 
     #[tokio::test]
@@ -397,7 +428,11 @@ mod tests {
         assert!(ev.notes.iter().any(|n| n.contains("truncated by server")));
         assert!(ev.notes.iter().any(|n| n.contains("timed out")));
         // The successful query still contributed its edge.
-        assert!(ev.value.contains_edge("pkg/api.go:Serve", "cmd/main.go:main", RelationKind::Calls));
+        assert!(ev.value.contains_edge(
+            "pkg/api.go:Serve",
+            "cmd/main.go:main",
+            RelationKind::Calls
+        ));
     }
 
     #[tokio::test]
@@ -409,7 +444,10 @@ mod tests {
         };
         svc.impls.insert(
             key(&iface),
-            Reply::Ok(Evidence::complete(vec![sref("pkg/postgres.go", "PostgresRepo")])),
+            Reply::Ok(Evidence::complete(vec![sref(
+                "pkg/postgres.go",
+                "PostgresRepo",
+            )])),
         );
 
         let ev = build_impact_graph(&[iface], &svc).await;
@@ -434,7 +472,10 @@ mod tests {
         };
         svc.subtypes.insert(
             key(&iface),
-            Reply::Ok(Evidence::complete(vec![sref("pkg/memory.go", "MemoryRepo")])),
+            Reply::Ok(Evidence::complete(vec![sref(
+                "pkg/memory.go",
+                "MemoryRepo",
+            )])),
         );
 
         let ev = build_impact_graph(&[iface], &svc).await;
@@ -451,12 +492,15 @@ mod tests {
     #[tokio::test]
     async fn oversized_answers_are_capped_with_partial_note() {
         let main = info("cmd/main.go", "main", SymbolKind::Function, 3);
-        let callers: Vec<SymbolRef> = (0..60).map(|i| sref("pkg/x.go", &format!("f{i}"))).collect();
+        let callers: Vec<SymbolRef> = (0..60)
+            .map(|i| sref("pkg/x.go", &format!("f{i}")))
+            .collect();
         let mut svc = ScriptedSource {
             features: call_features(),
             ..ScriptedSource::default()
         };
-        svc.incoming.insert(key(&main), Reply::Ok(Evidence::complete(callers)));
+        svc.incoming
+            .insert(key(&main), Reply::Ok(Evidence::complete(callers)));
 
         let ev = build_impact_graph(&[main], &svc).await;
         assert_eq!(ev.completeness, Completeness::Partial);
@@ -480,7 +524,10 @@ mod tests {
         assert_eq!(svc.calls_of("incoming_calls"), 0);
         assert_eq!(svc.calls_of("outgoing_calls"), 0);
         assert_eq!(ev.value.node_count(), 1);
-        assert_eq!(ev.value.node("pkg/old.go:Legacy").unwrap().change, Some(ChangeKind::Deleted));
+        assert_eq!(
+            ev.value.node("pkg/old.go:Legacy").unwrap().change,
+            Some(ChangeKind::Deleted)
+        );
         assert!(ev.notes.iter().any(|n| n.contains("deleted symbol")));
         assert_eq!(ev.completeness, Completeness::Complete);
     }
@@ -536,11 +583,17 @@ mod tests {
         ];
         annotate_diagnostics(&mut ev.value, &diags);
         assert_eq!(
-            ev.value.node("cmd/main.go:main").unwrap().diagnostic_severity,
+            ev.value
+                .node("cmd/main.go:main")
+                .unwrap()
+                .diagnostic_severity,
             Some(DiagnosticSeverity::Error)
         );
         assert_eq!(
-            ev.value.node("pkg/api.go:Serve").unwrap().diagnostic_severity,
+            ev.value
+                .node("pkg/api.go:Serve")
+                .unwrap()
+                .diagnostic_severity,
             Some(DiagnosticSeverity::Hint)
         );
     }

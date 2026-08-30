@@ -375,9 +375,7 @@ impl FakeLspServer {
         }
         match method {
             "initialize" => ScriptedResponse::result(self.config.initialize_result.clone()),
-            "shutdown" if self.config.respond_to_shutdown => {
-                ScriptedResponse::result(Value::Null)
-            }
+            "shutdown" if self.config.respond_to_shutdown => ScriptedResponse::result(Value::Null),
             "shutdown" => ScriptedResponse::Ignore,
             _ => ScriptedResponse::method_not_found(),
         }

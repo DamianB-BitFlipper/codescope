@@ -428,6 +428,31 @@ async fn branch_scope_via_nearest_ancestor() {
     assert_eq!(commits[1].subject, "feature edit");
 }
 
+/// Review 10 F1: on a stacked chain X <- A <- B (B checked out), the inferred base must be A
+/// (the nearest ancestor), not X (the repo default / farthest ancestor).
+#[tokio::test]
+async fn stacked_branch_infers_nearest_ancestor_not_default() {
+    let (_tmp, top) = scratch_repo();
+    let repo = open_repo(&top).await;
+    // main = X. Create A off main with a commit, then B off A with a commit.
+    git(top.as_std_path(), &["checkout", "-q", "-b", "a"]);
+    write(top.as_std_path(), "a.go", "package main\n\nfunc A() int { return 1 }\n");
+    git(top.as_std_path(), &["add", "a.go"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "a1"]);
+    git(top.as_std_path(), &["checkout", "-q", "-b", "b"]);
+    write(top.as_std_path(), "b.go", "package main\n\nfunc B() int { return 2 }\n");
+    git(top.as_std_path(), &["add", "b.go"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "b1"]);
+
+    let ctx = repo.repo_context().await.expect("repo_context");
+    let base = ctx.base.expect("a base must be inferred");
+    assert_eq!(
+        base.ref_name, "a",
+        "stacked branch B must default to its nearest ancestor A, not the default branch; got {}",
+        base.ref_name
+    );
+}
+
 #[tokio::test]
 async fn base_inference_ancestor_default_upstream_wins() {
     let (_tmp, top) = scratch_repo();
@@ -564,7 +589,10 @@ async fn fingerprint_stable_and_sensitive() {
     std::thread::sleep(std::time::Duration::from_millis(5));
     write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\nfunc A() int { return 6 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
     let f3b = repo.fingerprint().await.expect("fp3b");
-    assert_ne!(f3, f3b, "repeat edit of a modified file must change the fingerprint");
+    assert_ne!(
+        f3, f3b,
+        "repeat edit of a modified file must change the fingerprint"
+    );
 
     git(top.as_std_path(), &["add", "a.go"]);
     let f4 = repo.fingerprint().await.expect("fp4");
