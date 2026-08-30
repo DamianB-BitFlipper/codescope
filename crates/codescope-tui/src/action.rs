@@ -11,7 +11,7 @@ use crate::app::{App, Pane};
 
 /// A user intent. The dispatcher turns these into work; [`crate::app::App::apply`] turns
 /// them into view state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Quit (terminal restored by the caller).
     Quit,
@@ -65,6 +65,10 @@ pub enum Action {
     AiToggle,
     /// Force an AI refresh for the current view.
     AiRefresh,
+    /// Open/close the AI model picker modal.
+    ModelPicker,
+    /// The user picked a model in the picker (the dispatcher applies it).
+    ModelSelected(String),
     /// Jump to the next / previous diff hunk.
     NextHunk,
     /// Jump to the previous diff hunk.
@@ -85,6 +89,15 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
     if app.show_help {
         return match key.code {
             KeyCode::Char('?') | KeyCode::Esc => Action::ToggleHelp,
+            _ => Action::None,
+        };
+    }
+    if app.show_model_picker {
+        return match key.code {
+            KeyCode::Esc => Action::ModelPicker,
+            KeyCode::Char('j') | KeyCode::Down => Action::Down,
+            KeyCode::Char('k') | KeyCode::Up => Action::Up,
+            KeyCode::Enter => Action::ModelSelected(String::new()), // app fills the name
             _ => Action::None,
         };
     }
@@ -112,6 +125,7 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('R') => Action::RefreshGit,
         KeyCode::Char('a') => Action::AiToggle,
         KeyCode::Char('A') => Action::AiRefresh,
+        KeyCode::Char('m') => Action::ModelPicker,
         KeyCode::Char('j') | KeyCode::Down => Action::Down,
         KeyCode::Char('k') | KeyCode::Up => Action::Up,
         KeyCode::Enter => Action::Activate,

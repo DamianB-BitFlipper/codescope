@@ -54,8 +54,9 @@ structured, so they don't need a frontier model.
 
 ## Privacy
 
-- API keys come from **environment variables only** (`CODESCOPE_AI_API_KEY` > `PRIME_API_KEY` >
-  `OPENAI_API_KEY`); a literal key in a config file is a hard error.
+- API keys come from **environment variables only** (`PRIME_API_KEY` > `OPENAI_API_KEY` >
+  `ANTHROPIC_API_KEY`; first found wins, provider inferred from the key); a literal key in a
+  config file is a hard error.
 - Keys are wrapped in `secrecy::SecretString`; never logged, never shown.
 - Only the digest (repo-relative paths, symbol names, hunk summaries) leaves the machine; file
   bodies are sent only if the AI explicitly requests a hunk/symbol via a tool.

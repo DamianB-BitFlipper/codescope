@@ -25,6 +25,10 @@ pub struct UiSnapshot {
     pub ls: LsStatus,
     /// AI status for the top bar.
     pub ai: AiStatus,
+    /// The AI model currently selected (empty when AI is off).
+    pub ai_model: String,
+    /// Models the provider advertises (for the picker modal; empty until fetched).
+    pub available_models: Vec<String>,
     /// Transient status/help message for the bottom bar.
     pub message: String,
     /// The repo-state epoch this snapshot describes.
@@ -44,6 +48,8 @@ impl Default for UiSnapshot {
             semantic: SemanticPane::default(),
             ls: LsStatus::Starting,
             ai: AiStatus::Disabled,
+            ai_model: String::new(),
+            available_models: Vec::new(),
             message: String::new(),
             epoch: Epoch::ZERO,
             refreshing: false,

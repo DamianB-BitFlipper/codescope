@@ -110,6 +110,17 @@ impl AiService {
         &self.client
     }
 
+    /// The model currently in use.
+    #[must_use]
+    pub fn model(&self) -> String {
+        self.client.model()
+    }
+
+    /// Switch the model for subsequent plan requests (the TUI model picker).
+    pub fn set_model(&self, model: impl Into<String>) {
+        self.client.set_model(model);
+    }
+
     /// Request, execute tools for, parse, and validate one visualization plan.
     ///
     /// `digest` is the rendered change digest (tier 1–5 text; absolute repo paths are

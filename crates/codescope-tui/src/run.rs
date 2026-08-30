@@ -68,8 +68,31 @@ pub async fn run(
 /// Apply view-only actions locally and forward work actions to the dispatcher.
 async fn dispatch(app: &mut App, action: Action, tx: &mpsc::Sender<Action>) {
     match action {
+        Action::ModelSelected(name) => {
+            // The modal sends an empty name; resolve it from the current selection.
+            let name = if name.is_empty() {
+                app.snapshot
+                    .available_models
+                    .get(app.model_sel)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                name
+            };
+            if !name.is_empty() {
+                let _ = tx.send(Action::ModelSelected(name)).await;
+            }
+            app.show_model_picker = false;
+        }
         Action::RefreshGit | Action::AiToggle | Action::AiRefresh => {
             let _ = tx.send(action).await;
+        }
+        Action::ModelPicker => {
+            // Toggle locally, and ask the dispatcher to fetch the model list on open.
+            app.apply(Action::ModelPicker);
+            if app.show_model_picker {
+                let _ = tx.send(Action::ModelPicker).await;
+            }
         }
         other => app.apply(other),
     }

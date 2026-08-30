@@ -54,6 +54,7 @@ fn sample() -> UiSnapshot {
         message: String::new(),
         epoch: codescope_core::Epoch(3),
         refreshing: false,
+        ..UiSnapshot::default()
     }
 }
 
@@ -152,4 +153,76 @@ fn empty_state_is_graceful() {
         t.draw(|f| render(f, &app, &UiSnapshot::placeholder())).unwrap();
         let text = buffer_text(&t);
         assert!(text.contains("no changes") || text.contains("scanning repository"));
+}
+
+use codescope_tui::action::{map_key, Action};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn picker_snapshot() -> UiSnapshot {
+    let mut s = sample();
+    s.ai_model = "openai/gpt-5-mini".to_string();
+    s.available_models = vec![
+        "openai/gpt-5-mini".to_string(),
+        "openai/gpt-5".to_string(),
+        "anthropic/claude-fable-5".to_string(),
+    ];
+    s
+}
+
+#[test]
+fn m_opens_model_picker() {
+    let app = App::new();
+    assert_eq!(map_key(key(KeyCode::Char('m')), &app), Action::ModelPicker);
+}
+
+#[test]
+fn picker_modal_swallows_keys() {
+    let mut app = App::new();
+    app.show_model_picker = true;
+    assert_eq!(map_key(key(KeyCode::Char('q')), &app), Action::None);
+    assert_eq!(map_key(key(KeyCode::Esc), &app), Action::ModelPicker);
+    assert_eq!(map_key(key(KeyCode::Char('j')), &app), Action::Down);
+    assert_eq!(map_key(key(KeyCode::Enter), &app), Action::ModelSelected(String::new()));
+}
+
+#[test]
+fn picker_renders_models_and_current() {
+    let backend = TestBackend::new(120, 30);
+    let mut t = Terminal::new(backend).unwrap();
+    let mut app = App::new();
+    app.show_model_picker = true;
+    t.draw(|f| render(f, &app, &picker_snapshot())).unwrap();
+    let text = buffer_text(&t);
+    assert!(text.contains("AI model"), "picker title");
+    assert!(text.contains("openai/gpt-5"), "a listed model");
+    assert!(text.contains("claude-fable-5"), "another listed model");
+    assert!(text.contains("●"), "current-model marker");
+}
+
+#[test]
+fn top_bar_shows_current_model() {
+    let backend = TestBackend::new(160, 40);
+    let mut t = Terminal::new(backend).unwrap();
+    let app = App::new();
+    t.draw(|f| render(f, &app, &picker_snapshot())).unwrap();
+    assert!(buffer_text(&t).contains("gpt-5-mini"), "current model in top bar");
+}
+
+#[test]
+fn picker_navigation_clamps() {
+    let mut app = App::new();
+    app.update(picker_snapshot());
+    app.show_model_picker = true;
+    for _ in 0..10 {
+        app.apply(Action::Down);
+    }
+    assert_eq!(app.model_sel, 2); // clamped at last model
+    for _ in 0..10 {
+        app.apply(Action::Up);
+    }
+    assert_eq!(app.model_sel, 0);
 }

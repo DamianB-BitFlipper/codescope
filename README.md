@@ -60,9 +60,10 @@ callees, implementations, or an impact view for the selection.
 
 ## AI
 
-AI is **off unless configured**. Set one of `CODESCOPE_AI_API_KEY`, `PRIME_API_KEY`, or
-`OPENAI_API_KEY`, and optionally `CODESCOPE_AI_BASE_URL` / `CODESCOPE_AI_MODEL`. The app runs
-identically without it. AI output is a *visualization plan* that the app validates against
+AI is **off unless configured**. Set one of `PRIME_API_KEY`, `OPENAI_API_KEY`, or
+`ANTHROPIC_API_KEY` (the first one found wins; the provider is inferred from the key), and
+optionally `CODESCOPE_AI_BASE_URL` / `CODESCOPE_AI_MODEL`. The app runs identically without it.
+Press `m` in the TUI to switch models at runtime (fetches the provider's model list). AI output is a *visualization plan* that the app validates against
 known repository facts before rendering; the AI can never invent symbols, files, or calls.
 See [docs/ai-dataflow.md](docs/ai-dataflow.md).
 

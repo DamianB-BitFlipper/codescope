@@ -1,10 +1,11 @@
 //! AI opt-in configuration (research 05 §5, research 07 §2).
 //!
 //! Env-first: [`AiConfig::from_env`] reads `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`,
-//! `CODESCOPE_AI_MODEL`, `CODESCOPE_AI_API_KEY` (fallback `PRIME_API_KEY`, then
-//! `OPENAI_API_KEY`) and `CODESCOPE_AI_TIMEOUT_MS`. **AI is disabled by default**: with no
-//! explicit `CODESCOPE_AI=on|off` the subsystem enables itself only when an API key is
-//! found (auto mode).
+//! `CODESCOPE_AI_MODEL`, `CODESCOPE_AI_TIMEOUT_MS`, and the API key from the first of
+//! `PRIME_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` that is set. **AI is disabled by
+//! default**: with no explicit `CODESCOPE_AI=on|off` the subsystem enables itself only when
+//! an API key is found (auto mode). The default `base_url` follows the key's provider
+//! (Prime Inference / OpenAI / Anthropic); `CODESCOPE_AI_BASE_URL` overrides it.
 //!
 //! Key handling follows research 07 §2 exactly:
 //!
@@ -27,6 +28,10 @@ pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 /// Default chat-completions base for Prime Inference (used when the key came from
 /// `PRIME_API_KEY`).
 pub const PRIME_BASE_URL: &str = "https://api.pinference.ai/api/v1";
+
+/// Default base for Anthropic's native Messages API (used when the key came from
+/// `ANTHROPIC_API_KEY`).
+pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 
 /// Default model: plans are schema-constrained, so a small model suffices (research 05 §5).
 pub const DEFAULT_MODEL: &str = "openai/gpt-5-mini";
@@ -89,11 +94,12 @@ impl AiConfig {
     ///   enables AI iff a key resolves; explicit `on` enables even keyless (local
     ///   providers); `off` disables and drops any key material.
     /// - Key resolution order: [`AiFileConfig::api_key_env`]-named var, then
-    ///   `CODESCOPE_AI_API_KEY`, `PRIME_API_KEY`, `OPENAI_API_KEY`. A named
-    ///   `api_key_env` var that is unset is a hard [`AiError::Config`] (silent
-    ///   misconfiguration is worse than an error).
-    /// - Default `base_url` follows the key source: [`PRIME_BASE_URL`] when the key came
-    ///   from `PRIME_API_KEY`, otherwise [`OPENAI_BASE_URL`].
+    ///   `PRIME_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. A named `api_key_env` var
+    ///   that is unset is a hard [`AiError::Config`] (silent misconfiguration is worse than
+    ///   an error).
+    /// - Default `base_url` follows the key's provider: [`PRIME_BASE_URL`] from
+    ///   `PRIME_API_KEY`, [`ANTHROPIC_BASE_URL`] from `ANTHROPIC_API_KEY`, otherwise
+    ///   [`OPENAI_BASE_URL`]. `CODESCOPE_AI_BASE_URL` overrides.
     /// - A literal [`AiFileConfig::api_key`] in the file layer is
     ///   [`AiError::LiteralApiKeyInConfig`], even when AI ends up disabled.
     ///
@@ -133,10 +139,10 @@ impl AiConfig {
             return Ok(AiConfig::disabled());
         }
 
-        let default_base = if key_source == Some(KeySource::PrimeApiKey) {
-            PRIME_BASE_URL
-        } else {
-            OPENAI_BASE_URL
+        let default_base = match key_source {
+            Some(KeySource::PrimeApiKey) => PRIME_BASE_URL,
+            Some(KeySource::AnthropicApiKey) => ANTHROPIC_BASE_URL,
+            _ => OPENAI_BASE_URL,
         };
         let base_url = env("CODESCOPE_AI_BASE_URL")
             .or_else(|| file.and_then(|f| f.base_url.clone()))
@@ -192,6 +198,34 @@ impl AiConfig {
             max_tool_calls,
         })
     }
+}
+
+impl AiConfig {
+    /// The provider protocol the base URL speaks.
+    ///
+    /// Anthropic's native Messages API is **not** OpenAI-compatible (different envelope and
+    /// auth header), so the client must know which protocol to use. Inference: the default
+    /// Anthropic base URL, or any URL whose host contains `anthropic.com`, selects the
+    /// Anthropic protocol; everything else is OpenAI-compatible.
+    #[must_use]
+    pub fn provider(&self) -> ProviderKind {
+        if self.base_url.trim_end_matches('/') == ANTHROPIC_BASE_URL
+            || self.base_url.contains("anthropic.com")
+        {
+            ProviderKind::Anthropic
+        } else {
+            ProviderKind::OpenAiCompatible
+        }
+    }
+}
+
+/// The wire protocol a provider speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// OpenAI-compatible `POST {base}/chat/completions` (OpenAI, Prime Inference, Ollama, …).
+    OpenAiCompatible,
+    /// Anthropic's native `POST {base}/messages` with `x-api-key` auth.
+    Anthropic,
 }
 
 /// Hand-written `Debug`: never prints key material (research 07 §2).
@@ -267,9 +301,9 @@ impl AiMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeySource {
     FileNamedEnv,
-    CodescopeAiApiKey,
     PrimeApiKey,
     OpenaiApiKey,
+    AnthropicApiKey,
 }
 
 /// Resolve the API key: file-named env var first, then the built-in fallback chain.
@@ -286,9 +320,9 @@ fn resolve_key(
         };
     }
     let chain = [
-        ("CODESCOPE_AI_API_KEY", KeySource::CodescopeAiApiKey),
         ("PRIME_API_KEY", KeySource::PrimeApiKey),
         ("OPENAI_API_KEY", KeySource::OpenaiApiKey),
+        ("ANTHROPIC_API_KEY", KeySource::AnthropicApiKey),
     ];
     for (name, source) in chain {
         if let Some(v) = env(name) {
@@ -325,26 +359,24 @@ mod tests {
     }
 
     #[test]
-    fn auto_enables_with_key_and_prefers_codescope_key() {
+    fn auto_enables_with_key_and_prefers_prime_key() {
         let cfg = AiConfig::resolve(
             None,
             env_of(&[
-                ("CODESCOPE_AI_API_KEY", "sk-codescope"),
                 ("PRIME_API_KEY", "sk-prime"),
                 ("OPENAI_API_KEY", "sk-openai"),
+                ("ANTHROPIC_API_KEY", "sk-anthropic"),
             ]),
         )
         .unwrap();
         assert!(cfg.enabled);
-        assert_eq!(
-            cfg.api_key.as_ref().unwrap().expose_secret(),
-            "sk-codescope"
-        );
-        // Key did not come from PRIME_API_KEY → OpenAI default base.
-        assert_eq!(cfg.base_url, OPENAI_BASE_URL);
+        assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-prime");
+        // Key came from PRIME_API_KEY → Prime default base.
+        assert_eq!(cfg.base_url, PRIME_BASE_URL);
         assert_eq!(cfg.model, DEFAULT_MODEL);
         assert_eq!(cfg.timeout, DEFAULT_TIMEOUT);
         assert_eq!(cfg.max_tool_calls, MAX_TOOL_CALLS);
+        assert_eq!(cfg.provider(), ProviderKind::OpenAiCompatible);
     }
 
     #[test]
@@ -356,11 +388,33 @@ mod tests {
     }
 
     #[test]
-    fn openai_key_is_last_fallback() {
+    fn openai_key_selects_openai_base_url() {
         let cfg = AiConfig::resolve(None, env_of(&[("OPENAI_API_KEY", "sk-openai")])).unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.base_url, OPENAI_BASE_URL);
         assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-openai");
+        assert_eq!(cfg.provider(), ProviderKind::OpenAiCompatible);
+    }
+
+    #[test]
+    fn anthropic_key_selects_anthropic_base_url_and_provider() {
+        let cfg =
+            AiConfig::resolve(None, env_of(&[("ANTHROPIC_API_KEY", "sk-ant")])).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.base_url, ANTHROPIC_BASE_URL);
+        assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-ant");
+        assert_eq!(cfg.provider(), ProviderKind::Anthropic);
+    }
+
+    #[test]
+    fn openai_wins_over_anthropic() {
+        let cfg = AiConfig::resolve(
+            None,
+            env_of(&[("OPENAI_API_KEY", "sk-o"), ("ANTHROPIC_API_KEY", "sk-a")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-o");
+        assert_eq!(cfg.base_url, OPENAI_BASE_URL);
     }
 
     #[test]
@@ -444,7 +498,7 @@ mod tests {
     fn empty_env_values_are_unset() {
         let cfg = AiConfig::resolve(
             None,
-            env_of(&[("CODESCOPE_AI_API_KEY", "   "), ("CODESCOPE_AI", "auto")]),
+            env_of(&[("PRIME_API_KEY", "   "), ("CODESCOPE_AI", "auto")]),
         )
         .unwrap();
         assert!(!cfg.enabled);
@@ -520,7 +574,7 @@ mod tests {
     fn debug_never_leaks_the_key() {
         let cfg = AiConfig::resolve(
             None,
-            env_of(&[("CODESCOPE_AI_API_KEY", "sk-supersecret-123")]),
+            env_of(&[("PRIME_API_KEY", "sk-supersecret-123")]),
         )
         .unwrap();
         let debug = format!("{cfg:?}");

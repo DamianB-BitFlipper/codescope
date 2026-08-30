@@ -21,7 +21,7 @@
 //! time and marked sensitive; message/tool contents are never logged (counts only); reqwest
 //! errors are sanitized with [`reqwest::Error::without_url`].
 
-use crate::config::AiConfig;
+use crate::config::{AiConfig, ProviderKind};
 use crate::error::AiError;
 use crate::plan::plan_tool;
 use crate::tools::{ToolDef, PLAN_TOOL_NAME};
@@ -173,9 +173,10 @@ type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, QuantaClock>;
 pub struct AiClient {
     http: reqwest::Client,
     endpoint: String,
-    model: String,
+    model: Mutex<String>,
     api_key: Option<SecretString>,
     timeout: Duration,
+    provider: ProviderKind,
     limiter: DirectLimiter,
     clock: QuantaClock,
     breaker: Mutex<BreakerState>,
@@ -219,12 +220,19 @@ impl AiClient {
         let clock = QuantaClock::default();
         let limiter =
             RateLimiter::direct_with_clock(Quota::per_minute(rpm).allow_burst(burst), clock.clone());
+        let base = config.base_url.trim_end_matches('/');
+        let provider = config.provider();
+        let endpoint = match provider {
+            ProviderKind::OpenAiCompatible => format!("{base}/chat/completions"),
+            ProviderKind::Anthropic => format!("{base}/messages"),
+        };
         Ok(AiClient {
             http,
-            endpoint: format!("{}/chat/completions", config.base_url.trim_end_matches('/')),
-            model: config.model.clone(),
+            endpoint,
+            model: Mutex::new(config.model.clone()),
             api_key: config.api_key.clone(),
             timeout: config.timeout,
+            provider,
             limiter,
             clock,
             breaker: Mutex::new(BreakerState::default()),
@@ -236,6 +244,110 @@ impl AiClient {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// The provider protocol this client speaks.
+    #[must_use]
+    pub fn provider(&self) -> ProviderKind {
+        self.provider
+    }
+
+    /// The model currently sent in requests.
+    #[must_use]
+    pub fn model(&self) -> String {
+        self.model.lock().map(|m| m.clone()).unwrap_or_default()
+    }
+
+    /// Switch the model used for subsequent requests (the TUI model picker).
+    ///
+    /// Cheap: only the request-body `model` field changes; no reconnect is needed.
+    pub fn set_model(&self, model: impl Into<String>) {
+        let model = model.into();
+        tracing::info!(model = %model, "ai model changed");
+        if let Ok(mut m) = self.model.lock() {
+            *m = model;
+        }
+    }
+
+    /// List the models the provider exposes (`GET {base}/models`).
+    ///
+    /// Both OpenAI-compatible providers and Anthropic implement this endpoint; the response
+    /// is normalized to plain id strings. Returns an empty list on a provider that errors.
+    pub async fn list_models(&self) -> Result<Vec<String>, AiError> {
+        let base = self
+            .endpoint
+            .rsplit_once('/')
+            .map(|(b, _)| b)
+            .unwrap_or(&self.endpoint);
+        // endpoint is {base}/chat/completions or {base}/messages; go up one segment.
+        let base = base.rsplit_once('/').map(|(b, _)| b).unwrap_or(base);
+        let url = format!("{base}/models");
+        self.check_breaker()?;
+        self.check_limiter()?;
+        let request = self.apply_auth(self.http.get(&url).timeout(self.timeout));
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_timeout() {
+                    return Err(AiError::Timeout(self.timeout));
+                }
+                return Err(AiError::Transport(e.without_url().to_string()));
+            }
+        };
+        if !response.status().is_success() {
+            return Err(AiError::Http {
+                status: response.status().as_u16(),
+                message: body_snippet(response.text().await.unwrap_or_default()),
+            });
+        }
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| AiError::MalformedResponse(e.without_url().to_string()))?;
+        Ok(parse_model_list(&body))
+    }
+
+    /// Build the provider-shaped request body.
+    fn build_body(&self, messages: &[ChatMessage], tool_values: &[Value]) -> Value {
+        match self.provider {
+            ProviderKind::OpenAiCompatible => json!({
+                "model": self.model(),
+                "messages": messages,
+                "tools": tool_values,
+                "tool_choice": "required",
+                "stream": false,
+            }),
+            ProviderKind::Anthropic => build_anthropic_body(&self.model(), messages, tool_values),
+        }
+    }
+
+    /// Attach provider-appropriate auth headers. Key material is exposed only here, and the
+    /// header is marked sensitive so it is never logged (research 07 §2).
+    fn apply_auth(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(key) = &self.api_key {
+            match self.provider {
+                ProviderKind::OpenAiCompatible => {
+                    if let Ok(mut value) = reqwest::header::HeaderValue::from_str(&format!(
+                        "Bearer {}",
+                        key.expose_secret()
+                    )) {
+                        value.set_sensitive(true);
+                        request = request.header(reqwest::header::AUTHORIZATION, value);
+                    }
+                }
+                ProviderKind::Anthropic => {
+                    if let Ok(mut value) =
+                        reqwest::header::HeaderValue::from_str(key.expose_secret())
+                    {
+                        value.set_sensitive(true);
+                        request = request
+                            .header("x-api-key", value)
+                            .header("anthropic-version", "2023-06-01");
+                    }
+                }
+            }
+        }
+        request
     }
 
     /// `true` while the circuit breaker refuses requests.
@@ -266,28 +378,14 @@ impl AiClient {
         if !tools.iter().any(|t| t.name == PLAN_TOOL_NAME) {
             tool_values.push(plan_tool().to_openai());
         }
-        let body = json!({
-            "model": self.model,
-            "messages": messages,
-            "tools": tool_values,
-            "tool_choice": "required",
-            "stream": false,
-        });
+        let body = self.build_body(messages, &tool_values);
 
         let mut request = self
             .http
             .post(&self.endpoint)
             .timeout(self.timeout)
             .json(&body);
-        if let Some(key) = &self.api_key {
-            let mut value = reqwest::header::HeaderValue::from_str(&format!(
-                "Bearer {}",
-                key.expose_secret()
-            ))
-            .map_err(|_| AiError::Config("api key contains invalid header characters".into()))?;
-            value.set_sensitive(true);
-            request = request.header(reqwest::header::AUTHORIZATION, value);
-        }
+        request = self.apply_auth(request);
 
         let response = match request.send().await {
             Ok(r) => r,
@@ -334,7 +432,10 @@ impl AiClient {
             }
         };
         self.record_success();
-        parse_completion(completion)
+        match self.provider {
+            ProviderKind::OpenAiCompatible => parse_completion(completion),
+            ProviderKind::Anthropic => parse_anthropic_response(completion),
+        }
     }
 
     fn check_breaker(&self) -> Result<(), AiError> {
@@ -412,6 +513,182 @@ fn body_snippet(text: String) -> String {
 }
 
 /// Extract the assistant message and its tool calls from a completion object.
+/// Build an Anthropic Messages-API body from the OpenAI-shaped conversation.
+///
+/// The tool loop inside `AiService` builds OpenAI envelopes (`system` / `user` / `assistant`
+/// with `tool_calls` / `tool` results). Anthropic expects: `system` hoisted to a top-level
+/// field, `messages` alternating user/assistant, tool calls as assistant `tool_use` content
+/// blocks, and tool results as user `tool_result` blocks.
+fn build_anthropic_body(model: &str, messages: &[ChatMessage], tool_values: &[Value]) -> Value {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut out_messages: Vec<Value> = Vec::new();
+    for msg in messages {
+        let v = msg.as_value();
+        match v.get("role").and_then(Value::as_str) {
+            Some("system") => {
+                if let Some(c) = v.get("content").and_then(Value::as_str) {
+                    system_parts.push(c.to_string());
+                }
+            }
+            Some("user") => {
+                out_messages.push(json!({
+                    "role": "user",
+                    "content": v.get("content").cloned().unwrap_or(Value::String(String::new())),
+                }));
+            }
+            Some("assistant") => {
+                out_messages.push(anthropic_assistant_message(v));
+            }
+            Some("tool") => {
+                // OpenAI tool result → Anthropic user message carrying tool_result blocks.
+                out_messages.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": v.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                        "content": v.get("content").cloned().unwrap_or(Value::String(String::new())),
+                    }],
+                }));
+            }
+            _ => {}
+        }
+    }
+    // Anthropic requires alternating roles; merge consecutive same-role messages.
+    let merged = merge_same_role(out_messages);
+    let mut body = json!({
+        "model": model,
+        "max_tokens": 4096,
+        "messages": merged,
+        "tools": anthropic_tools(tool_values),
+        "tool_choice": { "type": "any" },
+    });
+    if !system_parts.is_empty() {
+        body["system"] = Value::String(system_parts.join("\n\n"));
+    }
+    body
+}
+
+/// Convert an OpenAI assistant message (content + tool_calls) into Anthropic content blocks.
+fn anthropic_assistant_message(v: &Value) -> Value {
+    let mut content: Vec<Value> = Vec::new();
+    if let Some(text) = v.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+    }
+    if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let args = match call["function"]["arguments"].clone() {
+                Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Object(Default::default())),
+                other => other,
+            };
+            content.push(json!({
+                "type": "tool_use",
+                "id": call["id"].clone(),
+                "name": call["function"]["name"].clone(),
+                "input": args,
+            }));
+        }
+    }
+    json!({"role": "assistant", "content": content})
+}
+
+/// Anthropic tool defs: `name`, `description`, `input_schema` (the OpenAI `parameters`).
+fn anthropic_tools(tool_values: &[Value]) -> Vec<Value> {
+    tool_values
+        .iter()
+        .map(|t| {
+            let f = t.get("function").cloned().unwrap_or(Value::Null);
+            json!({
+                "name": f.get("name").cloned().unwrap_or(Value::Null),
+                "description": f.get("description").cloned().unwrap_or(Value::Null),
+                "input_schema": f.get("parameters").cloned().unwrap_or(json!({"type":"object"})),
+            })
+        })
+        .collect()
+}
+
+/// Merge consecutive same-role messages (Anthropic requires strict alternation).
+fn merge_same_role(messages: Vec<Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for m in messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user").to_string();
+        if let Some(last) = out.last_mut() {
+            if last.get("role").and_then(Value::as_str) == Some(role.as_str()) {
+                let mut content = last.get("content").cloned().unwrap_or(Value::Array(vec![]));
+                let incoming = m.get("content").cloned().unwrap_or(Value::Null);
+                let mut arr = match content.as_array_mut() {
+                    Some(a) => std::mem::take(a),
+                    None => vec![json!({"type":"text","text":content})],
+                };
+                match incoming {
+                    Value::Array(a) => arr.extend(a),
+                    other => arr.push(json!({"type":"text","text":other})),
+                }
+                last["content"] = Value::Array(arr);
+                continue;
+            }
+        }
+        out.push(m);
+    }
+    out
+}
+
+/// Parse an Anthropic Messages response into the shared [`RawPlanResponse`] shape.
+fn parse_anthropic_response(body: Value) -> Result<RawPlanResponse, AiError> {
+    let model = body["model"].as_str().map(str::to_string);
+    let mut tool_calls = Vec::new();
+    if let Some(blocks) = body.get("content").and_then(Value::as_array) {
+        for b in blocks {
+            if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                let name = b["name"].as_str().unwrap_or_default();
+                if name.is_empty() {
+                    return Err(AiError::MalformedResponse("tool_use without a name".into()));
+                }
+                let input = b.get("input").cloned().unwrap_or(Value::Object(Default::default()));
+                tool_calls.push(RawToolCall {
+                    id: b["id"].as_str().unwrap_or_default().to_string(),
+                    name: name.to_string(),
+                    arguments: input.to_string(),
+                });
+            }
+        }
+    }
+    if tool_calls.is_empty() {
+        return Err(AiError::NoToolCall);
+    }
+    // Rebuild an OpenAI-shaped assistant message so the tool loop's echo path stays uniform.
+    let message = json!({
+        "role": "assistant",
+        "tool_calls": tool_calls.iter().map(|c| json!({
+            "id": c.id,
+            "type": "function",
+            "function": {"name": c.name, "arguments": c.arguments},
+        })).collect::<Vec<_>>(),
+    });
+    Ok(RawPlanResponse {
+        message,
+        tool_calls,
+        model,
+    })
+}
+
+/// Normalize a `GET {base}/models` response (OpenAI `data[].id` or Anthropic `data[].id`)
+/// into plain model id strings.
+fn parse_model_list(body: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(items) = body.get("data").and_then(Value::as_array) {
+        for item in items {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                out.push(id.to_string());
+            } else if let Some(id) = item.get("name").and_then(Value::as_str) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn parse_completion(completion: Value) -> Result<RawPlanResponse, AiError> {
     let model = completion["model"].as_str().map(str::to_string);
     let message = completion
@@ -608,5 +885,84 @@ mod tests {
         let s = body_snippet(long);
         assert!(s.len() <= 200);
         assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn anthropic_body_hoists_system_and_maps_tools() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant_raw(json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "get_hunk", "arguments": "{\"file\":\"a.go\"}"},
+                }],
+            })),
+            ChatMessage::tool("c1", "result text"),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "get_hunk", "description": "d", "parameters": {"type":"object"}},
+        })];
+        let body = build_anthropic_body("claude-x", &messages, &tools);
+        assert_eq!(body["model"], "claude-x");
+        assert_eq!(body["system"], "sys");
+        assert_eq!(body["tool_choice"]["type"], "any");
+        // user, assistant(tool_use), user(tool_result)
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "c1");
+        // tools mapped to input_schema
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn anthropic_response_parses_tool_use_blocks() {
+        let body = json!({
+            "model": "claude-x",
+            "content": [
+                {"type": "text", "text": "thinking"},
+                {"type": "tool_use", "id": "t1", "name": "submit_visualization_plan",
+                 "input": {"plan_version": 1}},
+            ],
+        });
+        let res = parse_anthropic_response(body).unwrap();
+        assert_eq!(res.tool_calls.len(), 1);
+        assert_eq!(res.tool_calls[0].name, "submit_visualization_plan");
+        assert!(res.tool_calls[0].arguments.contains("plan_version"));
+    }
+
+    #[test]
+    fn anthropic_response_without_tool_use_is_no_tool_call() {
+        let body = json!({"model": "claude-x", "content": [{"type": "text", "text": "hi"}]});
+        assert!(matches!(
+            parse_anthropic_response(body),
+            Err(AiError::NoToolCall)
+        ));
+    }
+
+    #[test]
+    fn parse_model_list_openai_and_anthropic_shapes() {
+        let openai = json!({"data": [{"id": "gpt-5"}, {"id": "gpt-5-mini"}]});
+        assert_eq!(parse_model_list(&openai), vec!["gpt-5", "gpt-5-mini"]);
+        let anthropic = json!({"data": [{"id": "claude-a"}, {"name": "claude-b"}]});
+        assert_eq!(parse_model_list(&anthropic), vec!["claude-a", "claude-b"]);
+        assert!(parse_model_list(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn merge_same_role_merges_consecutive() {
+        let msgs = vec![
+            json!({"role": "user", "content": [{"type":"text","text":"a"}]}),
+            json!({"role": "user", "content": [{"type":"text","text":"b"}]}),
+            json!({"role": "assistant", "content": [{"type":"text","text":"c"}]}),
+        ];
+        let merged = merge_same_role(msgs);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["content"].as_array().unwrap().len(), 2);
     }
 }

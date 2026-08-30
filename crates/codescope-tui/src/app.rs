@@ -55,6 +55,10 @@ pub struct App {
     pub sem_depth: u16,
     /// Whether the help modal is open.
     pub show_help: bool,
+    /// Whether the AI model picker modal is open.
+    pub show_model_picker: bool,
+    /// Selected row in the model picker.
+    pub model_sel: usize,
     /// Set when the user asked to quit.
     pub should_quit: bool,
 }
@@ -110,8 +114,17 @@ impl App {
             Action::ScopeCycle => self.set_scope(next_scope(self.snapshot.scope)),
             Action::NextHunk => self.jump_hunk(1),
             Action::PrevHunk => self.jump_hunk(-1),
+            Action::ModelPicker => {
+                self.show_model_picker = !self.show_model_picker;
+                self.model_sel = 0;
+            }
+            // ModelSelected is applied by the dispatcher (it owns the AiService).
             // RefreshGit / AiToggle / AiRefresh are dispatcher concerns; nothing to do here.
-            Action::RefreshGit | Action::AiToggle | Action::AiRefresh | Action::None => {}
+            Action::ModelSelected(_)
+            | Action::RefreshGit
+            | Action::AiToggle
+            | Action::AiRefresh
+            | Action::None => {}
         }
         self.clamp();
     }
@@ -124,6 +137,11 @@ impl App {
     }
 
     fn move_sel(&mut self, delta: i32) {
+        if self.show_model_picker {
+            let len = self.snapshot.available_models.len();
+            self.model_sel = step(self.model_sel, delta, len);
+            return;
+        }
         match self.focused {
             Pane::Files => {
                 let len = self.flat_file_rows();

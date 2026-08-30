@@ -64,6 +64,9 @@ pub fn render(frame: &mut Frame, app: &App, snap: &UiSnapshot) {
     if app.show_help {
         render_help(frame, area);
     }
+    if app.show_model_picker {
+        render_model_picker(frame, area, app, snap);
+    }
 }
 
 fn render_too_small(frame: &mut Frame, area: Rect) {
@@ -109,7 +112,12 @@ fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
         "  │  lsp: {}",
         ls_label(snap.ls)
     )));
-    spans.push(Span::raw(format!("  │  AI: {}", ai_label(&snap.ai))));
+    let ai_text = if snap.ai_model.is_empty() {
+        ai_label(&snap.ai)
+    } else {
+        format!("{} ({})", ai_label(&snap.ai), snap.ai_model)
+    };
+    spans.push(Span::raw(format!("  │  AI: {ai_text}")));
     if snap.refreshing {
         spans.push(Span::styled("  ⟳", Style::new().fg(Color::Yellow)));
     }
@@ -399,4 +407,51 @@ fn change_color(change: &str) -> Color {
         "removed" => Color::Red,
         _ => Color::Yellow,
     }
+}
+
+// -- model picker modal -------------------------------------------------------
+
+fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
+    let popup = centered(area, 50, 50);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let title = if snap.ai_model.is_empty() {
+        " AI model ".to_string()
+    } else {
+        format!(" AI model (current: {}) ", snap.ai_model)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(title);
+    let mut items: Vec<ListItem> = if snap.available_models.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  no models loaded (is AI configured?)",
+            Style::new().fg(Color::DarkGray),
+        )))]
+    } else {
+        snap.available_models
+            .iter()
+            .map(|m| {
+                let cur = if *m == snap.ai_model { " ●" } else { "  " };
+                ListItem::new(Line::from(vec![
+                    Span::styled(cur, Style::new().fg(Color::Green)),
+                    Span::raw(format!(" {m}")),
+                ]))
+            })
+            .collect()
+    };
+    items.push(ListItem::new(Line::from(Span::styled(
+        "  ↑/↓ move · Enter select · Esc close",
+        Style::new().fg(Color::DarkGray),
+    ))));
+    let mut state = ListState::default();
+    if !snap.available_models.is_empty() {
+        state.select(Some(
+            app.model_sel.min(snap.available_models.len().saturating_sub(1)),
+        ));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, popup, &mut state);
 }

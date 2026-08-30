@@ -32,7 +32,8 @@ pub mod tools;
 mod validator;
 
 pub use config::{
-    AiConfig, AiFileConfig, DEFAULT_MODEL, DEFAULT_TIMEOUT, OPENAI_BASE_URL, PRIME_BASE_URL,
+    AiConfig, AiFileConfig, ProviderKind, ANTHROPIC_BASE_URL, DEFAULT_MODEL, DEFAULT_TIMEOUT,
+    OPENAI_BASE_URL, PRIME_BASE_URL,
 };
 pub use client::{
     AiClient, AiClientOptions, ChatMessage, RawPlanResponse, RawToolCall, RETRY_AFTER_CAP,

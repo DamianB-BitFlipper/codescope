@@ -46,6 +46,8 @@ pub enum DispatchEvent {
     EngineReady(Box<AnalysisEngine<LanguageService>>),
     /// The language server failed to start; stay in git-only mode.
     EngineUnavailable(String),
+    /// The provider's model list was fetched for the picker.
+    ModelsLoaded(Vec<String>),
 }
 
 /// The dispatcher actor. Single writer of all published state.
@@ -66,6 +68,8 @@ pub struct Dispatcher {
     job_tx: mpsc::Sender<DispatchEvent>,
     /// Status message surfaced in the bottom bar.
     message: String,
+    /// Available AI models for the picker (from the provider).
+    available_models: Vec<String>,
     /// Latest repo context (cheap to re-read).
     repo_ctx: Option<codescope_core::RepoContext>,
     /// Latest raw changeset for the current scope (for the diff pane before analysis lands).
@@ -104,6 +108,7 @@ impl Dispatcher {
             ai_enabled,
             analysis: None,
             ai_rows: None,
+            available_models: Vec::new(),
             snapshot_tx,
             job_tx,
             message: String::new(),
@@ -132,6 +137,10 @@ impl Dispatcher {
             DispatchEvent::EngineUnavailable(reason) => {
                 self.ls_status = LsStatus::Failed;
                 self.message = format!("language server unavailable: {reason}; git-only");
+                self.publish();
+            }
+            DispatchEvent::ModelsLoaded(models) => {
+                self.available_models = models;
                 self.publish();
             }
         }
@@ -175,8 +184,39 @@ impl Dispatcher {
                 self.publish();
             }
             Action::AiRefresh => self.spawn_ai(),
+            Action::ModelPicker => self.spawn_list_models(),
+            Action::ModelSelected(name) => self.set_model(&name),
             _ => {}
         }
+    }
+
+    /// Fetch the provider's model list for the picker (spawned; non-blocking).
+    fn spawn_list_models(&mut self) {
+        let Some(ai) = &self.ai else {
+            self.message = "AI not configured (set an API key)".to_string();
+            self.publish();
+            return;
+        };
+        let ai = ai.clone();
+        let tx = self.job_tx.clone();
+        tokio::spawn(async move {
+            let models = ai.client().list_models().await.unwrap_or_default();
+            let _ = tx.send(DispatchEvent::ModelsLoaded(models)).await;
+        });
+    }
+
+    /// Apply a model selection from the picker.
+    fn set_model(&mut self, name: &str) {
+        match &self.ai {
+            Some(ai) => {
+                ai.set_model(name);
+                self.message = format!("AI model: {name}");
+            }
+            None => {
+                self.message = "AI not configured (set an API key)".to_string();
+            }
+        }
+        self.publish();
     }
 
     fn set_scope(&mut self, scope: ChangeScope) {
@@ -298,6 +338,8 @@ impl Dispatcher {
             semantic,
             ls: self.ls_status,
             ai: self.ai_status.clone(),
+            ai_model: self.ai.as_ref().map(|a| a.model()).unwrap_or_default(),
+            available_models: self.available_models.clone(),
             message: self.message.clone(),
             epoch: self.epoch,
             refreshing: false,
