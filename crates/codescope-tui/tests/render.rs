@@ -226,7 +226,7 @@ fn picker_modal_swallows_keys() {
         Action::PickerBackspace
     );
     assert_eq!(map_key(key(KeyCode::Esc), &app), Action::ModelPicker);
-    assert_eq!(map_key(key(KeyCode::Char('j')), &app), Action::Down);
+    assert_eq!(map_key(key(KeyCode::Char('j')), &app), Action::PickerInput('j'));
     assert_eq!(
         map_key(key(KeyCode::Enter), &app),
         Action::ModelSelected(String::new())

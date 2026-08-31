@@ -193,10 +193,13 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
 /// and any other plain character is appended to the query (`close`/`select` are the
 /// picker's toggle and selection actions; the selection name is filled in later).
 fn picker_key(key: KeyEvent, close: Action, select: Action) -> Action {
+    // A searchable picker is a text field: arrows navigate, every plain character is filter
+    // input (j/k included — otherwise refs containing them can't be searched), Backspace
+    // deletes, Enter accepts, Esc cancels.
     match key.code {
         KeyCode::Esc => close,
-        KeyCode::Char('j') | KeyCode::Down => Action::Down,
-        KeyCode::Char('k') | KeyCode::Up => Action::Up,
+        KeyCode::Up => Action::Up,
+        KeyCode::Down => Action::Down,
         KeyCode::Enter => select,
         KeyCode::Backspace => Action::PickerBackspace,
         KeyCode::Char(c)
@@ -351,8 +354,9 @@ mod tests {
         // Non-character keys stay swallowed; characters now feed the filter query.
         assert_eq!(map_key(key(KeyCode::Tab), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Esc), &a), Action::BasePicker);
-        assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::Down);
-        assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::Up);
+        // Plain chars (incl. j/k) are filter input; arrows navigate.
+        assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::PickerInput('j'));
+        assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::PickerInput('k'));
         assert_eq!(map_key(key(KeyCode::Down), &a), Action::Down);
         assert_eq!(map_key(key(KeyCode::Up), &a), Action::Up);
         assert_eq!(
@@ -386,9 +390,9 @@ mod tests {
             );
             assert_eq!(map_key(key(KeyCode::Esc), &a), close);
             assert_eq!(map_key(key(KeyCode::Enter), &a), select);
-            // j/k navigate instead of entering text; modified chars are swallowed.
-            assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::Down);
-            assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::Up);
+            // Plain chars (incl. j/k) are filter input; modified chars are swallowed.
+            assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::PickerInput('j'));
+            assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::PickerInput('k'));
             let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
             assert_eq!(map_key(ctrl_x, &a), Action::None);
         }
