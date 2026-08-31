@@ -840,4 +840,78 @@ mod tests {
             "field Email mapped: {names:?}"
         );
     }
+
+    /// Review 23 M1: a Del+Add replacement across two sibling fields (both present on both
+    /// sides) maps the deletion to the BASE fields and the addition to the WORKTREE fields —
+    /// the parent struct is NOT reported merely for containing the changed children.
+    #[test]
+    fn sibling_field_replacement_omits_the_parent() {
+        // Base and worktree both have Greeter { Name (22), Email (24) }.
+        let mut wt_greeter = node("1", "Greeter", 20, 28);
+        wt_greeter.kind = codescope_core::SymbolKind::Struct;
+        wt_greeter.children = vec![
+            SymbolNode {
+                kind: codescope_core::SymbolKind::Field,
+                ..node("1/0", "Name", 22, 22)
+            },
+            SymbolNode {
+                kind: codescope_core::SymbolKind::Field,
+                ..node("1/1", "Email", 24, 24)
+            },
+        ];
+        let wt = SymbolTree::new(
+            codescope_core::FileId::new("main.go").unwrap(),
+            Revision::Worktree,
+            vec![node("0", "main", 5, 15), wt_greeter],
+        );
+        let mut base_greeter = node("1", "Greeter", 20, 28);
+        base_greeter.kind = codescope_core::SymbolKind::Struct;
+        base_greeter.children = vec![
+            SymbolNode {
+                kind: codescope_core::SymbolKind::Field,
+                ..node("1/0", "Name", 22, 22)
+            },
+            SymbolNode {
+                kind: codescope_core::SymbolKind::Field,
+                ..node("1/1", "Email", 24, 24)
+            },
+        ];
+        let base = SymbolTree::new(
+            codescope_core::FileId::new("main.go").unwrap(),
+            Revision::Base,
+            vec![node("0", "main", 5, 15), base_greeter],
+        );
+
+        // Replace Name (old/new 23) and Email (old/new 25) — a Del+Add on each field.
+        let change = file_change(
+            FileStatus::Modified,
+            vec![hunk_with(
+                23,
+                3,
+                23,
+                3,
+                vec![
+                    codescope_core::DiffLine::del(23, ""),
+                    codescope_core::DiffLine::add(23, ""),
+                    codescope_core::DiffLine::context(24, 24, ""),
+                    codescope_core::DiffLine::del(25, ""),
+                    codescope_core::DiffLine::add(25, ""),
+                ],
+            )],
+        );
+        let out = changed_symbols_detailed(Some(&wt), Some(&base), &change);
+        let names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"Greeter.Name"),
+            "field Name mapped: {names:?}"
+        );
+        assert!(
+            names.contains(&"Greeter.Email"),
+            "field Email mapped: {names:?}"
+        );
+        assert!(
+            !out.iter().any(|c| c.name == "Greeter"),
+            "parent struct must not be reported for a child-only edit: {names:?}"
+        );
+    }
 }

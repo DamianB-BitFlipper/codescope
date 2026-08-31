@@ -131,10 +131,16 @@ fn changed_runs(hunk: &Hunk) -> Vec<ChangeRun> {
     use codescope_core::{ChangedSide, DiffLineKind};
     let mut runs: Vec<ChangeRun> = Vec::new();
     let mut cur: Option<ChangeRun> = None;
-    // The next new-side index where a deletion would be inserted. Before any line it is
-    // the hunk's new-side start (0-based); after a Context/Add at 1-based N it is N (the
-    // NEXT slot), so a deletion island anchors at the line that follows it (review 22 M3).
-    let mut last_new = hunk.new_start.saturating_sub(1);
+    // The next new-side index where a deletion would be inserted. For a pure deletion
+    // (new_len == 0) git's new_start IS the insertion line (0-based after the removed
+    // content); for a hunk with a nonempty new side, the cursor before the first body line
+    // is new_start - 1. After a Context/Add at 1-based N it is N (the NEXT slot)
+    // (review 23 M2).
+    let mut last_new = if hunk.new_len == 0 {
+        hunk.new_start
+    } else {
+        hunk.new_start.saturating_sub(1)
+    };
     for line in &hunk.lines {
         if let Some(nl) = line.new_ln {
             last_new = nl; // consumed new-side line N (1-based) -> next insertion slot N (0-based)
@@ -219,21 +225,37 @@ fn deepest_frontier<'t>(node: &'t SymbolNode, target: &LineRange, out: &mut Vec<
     // body, so the parent is the target — not the children (which would over-split one
     // edit and mislabel a genuinely-new sibling, review 22 M2).
     let own_decl_touched = node.selection.intersects_lines(target);
-    let spans_child_boundary = {
-        let mut hits: Vec<&LineRange> = node
+    let mut uncovered = false;
+    if !own_decl_touched {
+        // The parent owns a changed line that no child covers (a gap in its own body).
+        // Merge the intersecting children's line intervals over the run and look for an
+        // uncovered line in `target ∩ node.range` (review 23 M3).
+        let lo = node.range.start_line.max(target.start_line);
+        let hi = node.range.end_line.min(target.end_line);
+        let mut cursor = lo;
+        let mut intervals: Vec<&LineRange> = node
             .children
             .iter()
             .filter(|c| c.range.intersects_lines(target))
             .map(|c| &c.range)
             .collect();
-        hits.sort_by_key(|r| r.start_line);
-        let before = hits
-            .first()
-            .is_some_and(|r| target.start_line < r.start_line);
-        let after = hits.last().is_some_and(|r| target.end_line > r.end_line);
-        before || after
-    };
-    if own_decl_touched || spans_child_boundary {
+        intervals.sort_by_key(|r| r.start_line);
+        for iv in intervals {
+            let s = iv.start_line.max(lo);
+            let e = iv.end_line.min(hi);
+            if s > cursor {
+                uncovered = true; // a gap before this child belongs to the parent
+                break;
+            }
+            if e >= cursor {
+                cursor = e + 1;
+            }
+        }
+        if cursor <= hi {
+            uncovered = true; // trailing lines after the last child belong to the parent
+        }
+    }
+    if own_decl_touched || uncovered {
         out.push(node);
     }
 }
@@ -280,27 +302,23 @@ fn map_run_worktree(tree: &SymbolTree, target: &LineRange) -> RunMapping {
 fn map_run_base(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -> RunMapping {
     if let Some(base) = base {
         let target = &run.range;
-        if let Some(sym) = base.find_smallest_containing(target) {
-            let sig = sym.selection.intersects_lines(target);
-            return RunMapping {
-                revision: codescope_core::Revision::Base,
-                targets: vec![sym.id.clone()],
-                confidence: MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
-                signature_touches: if sig { vec![sym.id.clone()] } else { vec![] },
-            };
+        // Deepest semantic frontier on the BASE tree (review 23 M1): a deletion spanning
+        // sibling fields maps to the fields, not their parent — mirroring the worktree path.
+        let mut frontier: Vec<&SymbolNode> = Vec::new();
+        for root in &base.roots {
+            deepest_frontier(root, target, &mut frontier);
         }
-        let intersected: Vec<SymbolId> = base
-            .roots
-            .iter()
-            .filter(|n| n.range.intersects_lines(target))
-            .map(|n| n.id.clone())
-            .collect();
-        if !intersected.is_empty() {
+        if !frontier.is_empty() {
+            let touches: Vec<SymbolId> = frontier
+                .iter()
+                .filter(|n| n.selection.intersects_lines(target))
+                .map(|n| n.id.clone())
+                .collect();
             return RunMapping {
                 revision: codescope_core::Revision::Base,
-                targets: intersected,
+                targets: frontier.iter().map(|n| n.id.clone()).collect(),
                 confidence: MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
-                signature_touches: vec![],
+                signature_touches: touches,
             };
         }
         if let Some(sym) = nearest_within(base, target, GAP_ATTACH_LINES) {
