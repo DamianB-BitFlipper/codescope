@@ -1015,11 +1015,15 @@ impl Dispatcher {
         match outcome {
             AiOutcome::Plan(plan, report) if report.is_renderable() => {
                 let rows = plan_rows(&plan);
+                // Pane title: the first form's title, else the plan's focus question.
+                // (Rows carry per-form section headers, so the title is just the tab's
+                // headline.)
                 let title = plan
                     .forms
                     .first()
                     .map(|f| f.title.clone())
-                    .unwrap_or_default();
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| plan.focus.clone());
                 self.ai_rows = Some((epoch, rows, title));
                 self.ai_status = AiStatus::Ready { epoch };
             }
@@ -1532,23 +1536,116 @@ fn file_change_label(status: &codescope_core::FileStatus) -> &'static str {
     }
 }
 
+/// Flatten a validated plan into display rows. Every form renders, in plan order:
+/// a section header (the form's title + kind — the provenance of the rows beneath),
+/// its summary lines, then its nodes and edges. Tree forms nest via `children`;
+/// flow/sequence/other forms list their nodes flat and their edges as relationship
+/// rows (`from → to · kind [· edge label]`). Previously only the first form's tree
+/// roots rendered, silently dropping the second form, summaries, and every edge.
 fn plan_rows(plan: &codescope_core::VisualizationPlan) -> Vec<SemRow> {
     let mut rows = Vec::new();
-    if let Some(form) = plan.forms.first() {
+    for form in &plan.forms {
+        // Section header: which form this block answers with.
+        rows.push(SemRow {
+            depth: 0,
+            label: form.title.clone(),
+            relation: form_kind_label(form.kind),
+            changed: false,
+            has_diagnostic: false,
+        });
+        for line in form.summary.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                rows.push(SemRow {
+                    depth: 1,
+                    label: line.to_string(),
+                    relation: "",
+                    changed: false,
+                    has_diagnostic: false,
+                });
+            }
+        }
         let by_id: std::collections::HashMap<&str, &codescope_core::PlanNode> =
             form.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-        let is_child: HashSet<&str> = form
-            .nodes
-            .iter()
-            .flat_map(|n| n.children.iter().map(String::as_str))
-            .collect();
-        for n in &form.nodes {
-            if !is_child.contains(n.id.as_str()) {
-                push_plan_node(n, &by_id, 0, &mut rows);
+        if form.kind.is_tree_form() {
+            // Tree: roots (nodes nobody claims as a child) recurse through children.
+            let is_child: HashSet<&str> = form
+                .nodes
+                .iter()
+                .flat_map(|n| n.children.iter().map(String::as_str))
+                .collect();
+            for n in &form.nodes {
+                if !is_child.contains(n.id.as_str()) {
+                    push_plan_node(n, &by_id, 1, &mut rows);
+                }
             }
+        } else {
+            // Flow/sequence/summary/diff forms: nodes are peers, edges carry the shape.
+            for n in &form.nodes {
+                rows.push(plan_node_row(n, 1));
+            }
+        }
+        for e in &form.edges {
+            let from = by_id
+                .get(e.from.as_str())
+                .map(|n| n.label.as_str())
+                .unwrap_or(&e.from);
+            let to = by_id
+                .get(e.to.as_str())
+                .map(|n| n.label.as_str())
+                .unwrap_or(&e.to);
+            let label = match &e.label {
+                Some(l) if !l.is_empty() => format!("{from} → {to} · {l}"),
+                _ => format!("{from} → {to}"),
+            };
+            rows.push(SemRow {
+                depth: 1,
+                label,
+                relation: edge_kind_label(e.kind),
+                changed: false,
+                has_diagnostic: false,
+            });
         }
     }
     rows
+}
+
+/// A node as a display row (change badge + diagnostic marker preserved).
+fn plan_node_row(n: &codescope_core::PlanNode, depth: u16) -> SemRow {
+    SemRow {
+        depth,
+        label: n.label.clone(),
+        relation: "",
+        changed: !matches!(n.change, codescope_core::PlanNodeChange::Unchanged),
+        has_diagnostic: n.severity.is_some(),
+    }
+}
+
+/// Short static label for a form's kind (row provenance in the AI plan view).
+fn form_kind_label(kind: codescope_core::FormKind) -> &'static str {
+    use codescope_core::FormKind as F;
+    match kind {
+        F::ChangedSymbolTree => "changed symbols",
+        F::CallTree => "call tree",
+        F::TypeImplTree => "types",
+        F::RelationshipFlow => "flow",
+        F::ImpactSummary => "summary",
+        F::FocusedDiff => "diff",
+        F::BeforeAfter => "before/after",
+        F::Sequence => "sequence",
+    }
+}
+
+/// Short static label for a plan edge's relationship kind.
+fn edge_kind_label(kind: PlanEdgeKind) -> &'static str {
+    match kind {
+        PlanEdgeKind::Calls => "calls",
+        PlanEdgeKind::Imports => "imports",
+        PlanEdgeKind::Implements => "implements",
+        PlanEdgeKind::Contains => "contains",
+        PlanEdgeKind::Reads => "reads",
+        PlanEdgeKind::Writes => "writes",
+    }
 }
 
 fn push_plan_node(
@@ -1557,13 +1654,7 @@ fn push_plan_node(
     depth: u16,
     rows: &mut Vec<SemRow>,
 ) {
-    rows.push(SemRow {
-        depth,
-        label: n.label.clone(),
-        relation: "",
-        changed: !matches!(n.change, codescope_core::PlanNodeChange::Unchanged),
-        has_diagnostic: n.severity.is_some(),
-    });
+    rows.push(plan_node_row(n, depth));
     for c in &n.children {
         if let Some(child) = by_id.get(c.as_str()) {
             push_plan_node(child, by_id, depth + 1, rows);
@@ -2917,6 +3008,158 @@ mod tests {
         assert!(disp.selected_symbol.is_none());
         assert!(disp.selected_relations.is_none());
         assert!(!snapshot_rx.borrow().files[0].expanded);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// plan_rows renders EVERY validated form in order: a per-form section header
+    /// (title + kind), summary lines, tree nesting for tree forms, flat nodes plus
+    /// `from → to` edge rows for flow forms.
+    #[test]
+    fn plan_rows_covers_both_forms_with_summaries_and_edges() {
+        use codescope_core::{FormKind, PlanEdge, PlanEdgeKind, PlanNode, PlanNodeChange, VizForm};
+        let mut plan = codescope_core::VisualizationPlan::new(Epoch::ZERO, "what changed?");
+        // Form 1: a tree (roots nest children).
+        let mut root = PlanNode::new("r", "Server", PlanNodeChange::Modified);
+        root.children = vec!["c".to_string()];
+        let child = PlanNode::new("c", "handle", PlanNodeChange::Added);
+        plan.forms.push(VizForm {
+            kind: FormKind::ChangedSymbolTree,
+            title: "Changed symbols".to_string(),
+            summary: "Server changed.\nhandle is new.".to_string(),
+            nodes: vec![root, child],
+            edges: Vec::new(),
+        });
+        // Form 2: a flow — nodes are peers; the edge carries the relationship.
+        plan.forms.push(VizForm {
+            kind: FormKind::RelationshipFlow,
+            title: "Call flow".to_string(),
+            summary: String::new(),
+            nodes: vec![
+                PlanNode::new("a", "handle", PlanNodeChange::Added),
+                PlanNode::new("b", "store", PlanNodeChange::Unchanged),
+            ],
+            edges: vec![PlanEdge {
+                from: "a".to_string(),
+                to: "b".to_string(),
+                kind: PlanEdgeKind::Calls,
+                label: Some("on hit".to_string()),
+            }],
+        });
+        let rows = plan_rows(&plan);
+        let labels: Vec<(&str, u16, &str)> = rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.depth, r.relation))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("Changed symbols", 0, "changed symbols"),
+                ("Server changed.", 1, ""),
+                ("handle is new.", 1, ""),
+                ("Server", 1, ""),
+                ("handle", 2, ""),
+                ("Call flow", 0, "flow"),
+                ("handle", 1, ""),
+                ("store", 1, ""),
+                ("handle → store · on hit", 1, "calls"),
+            ],
+            "both forms render in order with headers, summaries, nesting, and edges"
+        );
+        // Change badges survive the mapping.
+        assert!(rows[3].changed, "Modified node marked changed");
+        assert!(rows[4].changed, "Added node marked changed");
+        assert!(rows[6].changed, "form-2 node keeps its Added badge");
+        assert!(!rows[7].changed, "Unchanged node is not marked");
+        assert!(!rows[8].changed, "edge rows carry no change badge");
+    }
+
+    /// Regression: a valid `AiOutcome::Plan` and a symbol's loaded relations coexist —
+    /// the Impact pane shows the relations while `semantic` (the AI Plan tab) keeps the
+    /// AI rows. Goes through the real `AiDone`/`RelationsLoaded` events, not direct
+    /// field writes.
+    #[tokio::test]
+    async fn ai_plan_and_loaded_relations_coexist_via_events() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.file_semantics.insert(
+            "a.txt".to_string(),
+            ready_semantics(
+                "a.txt",
+                vec![changed_symbol(
+                    "a.txt",
+                    "sym0",
+                    codescope_core::SymbolKind::Function,
+                    codescope_core::ChangeKind::Modified,
+                    1,
+                    false,
+                )],
+            ),
+        );
+        disp.expanded_files.insert("a.txt".to_string());
+
+        // A real validated plan lands via AiDone (as spawn_ai's job would report).
+        let mut plan = codescope_core::VisualizationPlan::new(disp.epoch, "What does sym0 affect?");
+        plan.forms.push(codescope_core::VizForm {
+            kind: codescope_core::FormKind::CallTree,
+            title: "call tree".to_string(),
+            summary: String::new(),
+            nodes: vec![codescope_core::PlanNode::new(
+                "n1",
+                "sym0",
+                codescope_core::PlanNodeChange::Modified,
+            )],
+            edges: Vec::new(),
+        });
+        let generation = disp.ai_request_seq;
+        disp.handle(DispatchEvent::AiDone {
+            epoch: disp.epoch,
+            generation,
+            outcome: AiOutcome::Plan(plan, codescope_core::ValidationReport::valid()),
+        })
+        .await;
+        {
+            let snap = snapshot_rx.borrow().clone();
+            assert!(snap.semantic.ai_generated, "plan published to semantic");
+            assert_eq!(snap.semantic.rows[0].label, "call tree");
+            assert_eq!(snap.semantic.rows[1].label, "sym0");
+        }
+
+        // The user selects sym0 and its relations land.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: Some(("sym0".to_string(), 2, 4)),
+        }))
+        .await;
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch: disp.epoch,
+            file: "a.txt".to_string(),
+            name: "sym0".to_string(),
+            line: 2,
+            col: 4,
+            callers: relation_rows(&["caller_fn"]),
+            callees: relation_rows(&["callee_fn"]),
+        })
+        .await;
+
+        let snap = snapshot_rx.borrow().clone();
+        // Impact view: the relations.
+        let callers: Vec<&str> = snap
+            .impact
+            .callers
+            .rows
+            .iter()
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(callers, ["caller_fn"], "impact shows the relations");
+        // AI Plan tab: the plan is NOT displaced by the relations.
+        assert!(snap.semantic.ai_generated, "plan survives loaded relations");
+        assert!(
+            snap.semantic.rows.iter().any(|r| r.label == "sym0"),
+            "AI rows still published"
+        );
+        assert_eq!(snap.ai, AiStatus::Ready { epoch: disp.epoch });
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -175,6 +175,13 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
     let mut t = Terminal::new(backend).unwrap();
     let mut app = App::new();
 
+    // The chain starts at the keypress: `A` is the AI refresh (never `a`, the toggle).
+    assert_eq!(
+        map_key(key(KeyCode::Char('A')), &app),
+        Action::AiRefresh,
+        "A requests an AI plan"
+    );
+
     let mut loading = sample();
     loading.ai = AiStatus::Loading {
         since_epoch: codescope_core::Epoch(3),
