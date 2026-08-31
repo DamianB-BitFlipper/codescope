@@ -1671,6 +1671,8 @@ struct SnapshotFacts {
     hunks: std::collections::HashMap<String, usize>,
 }
 
+use codescope_ai::Lookup;
+
 impl SnapshotFacts {
     /// Facts for the AI validator in the lazy world: the changeset's files/hunks plus
     /// the symbols of files the user has explicitly analyzed (Ready). Unloaded files
@@ -1712,22 +1714,45 @@ fn entity_key(e: &EntityRef) -> String {
 }
 
 impl FactView for SnapshotFacts {
-    fn file_exists(&self, file: &codescope_core::FileId) -> bool {
-        self.files.contains(&file.to_string())
+    fn file(&self, file: &codescope_core::FileId) -> Lookup<()> {
+        if self.files.contains(&file.to_string()) {
+            Lookup::Present(())
+        } else {
+            // The changeset enumerates every changed file, so a file outside it is
+            // authoritatively absent from this change context.
+            Lookup::Absent
+        }
     }
-    fn resolve_symbol(&self, file: &codescope_core::FileId, name: &str) -> Option<LineRange> {
-        self.symbols
+    fn symbol(&self, file: &codescope_core::FileId, name: &str) -> Lookup<LineRange> {
+        match self
+            .symbols
             .get(&(file.to_string(), name.to_string()))
             .copied()
+        {
+            Some(extent) => Lookup::Present(extent),
+            // The lazy cache only surfaces CHANGED symbols, not a file's full outline, so
+            // a miss here is "not surfaced by the loaded analysis", never "proven absent".
+            None => Lookup::Unknown,
+        }
     }
-    fn edge_exists(&self, from: &EntityRef, to: &EntityRef, kind: PlanEdgeKind) -> bool {
-        self.edges
+    fn edge(&self, from: &EntityRef, to: &EntityRef, kind: PlanEdgeKind) -> Lookup<()> {
+        if self
+            .edges
             .contains(&(entity_key(from), entity_key(to), kind))
+        {
+            Lookup::Present(())
+        } else {
+            // The lazy path never builds a complete edge universe; an absent edge is
+            // "not queried", not "proven absent".
+            Lookup::Unknown
+        }
     }
-    fn hunk(&self, file: &codescope_core::FileId, index: u32) -> Option<()> {
-        self.hunks
-            .get(&file.to_string())
-            .and_then(|&n| (index < n as u32).then_some(()))
+    fn hunk(&self, file: &codescope_core::FileId, index: u32) -> Lookup<()> {
+        match self.hunks.get(&file.to_string()) {
+            Some(&n) if (index as usize) < n => Lookup::Present(()),
+            Some(_) => Lookup::Absent, // file enumerated, hunk index out of range
+            None => Lookup::Unknown,
+        }
     }
 }
 

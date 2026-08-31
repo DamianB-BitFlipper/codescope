@@ -7,7 +7,7 @@
 //! Uses [`AiConfig::from_env`]: set `CODESCOPE_AI_API_KEY` / `PRIME_API_KEY` /
 //! `OPENAI_API_KEY` (and optionally `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_MODEL`).
 
-use codescope_ai::{AiConfig, AiOutcome, AiService, FactView, NoToolExecutor};
+use codescope_ai::{AiConfig, AiOutcome, AiService, FactView, Lookup, NoToolExecutor};
 use codescope_core::{EntityRef, Epoch, FileId, LineRange, PlanEdgeKind};
 
 /// Accept-everything facts: the live smoke exercises the wire + plan contract, not the
@@ -15,17 +15,17 @@ use codescope_core::{EntityRef, Epoch, FileId, LineRange, PlanEdgeKind};
 struct AcceptAll;
 
 impl FactView for AcceptAll {
-    fn file_exists(&self, _file: &FileId) -> bool {
-        true
+    fn file(&self, _file: &FileId) -> Lookup<()> {
+        Lookup::Present(())
     }
-    fn resolve_symbol(&self, _file: &FileId, _name: &str) -> Option<LineRange> {
-        Some(LineRange::new(0, 0, 100_000, 0))
+    fn symbol(&self, _file: &FileId, _name: &str) -> Lookup<LineRange> {
+        Lookup::Present(LineRange::new(0, 0, 100_000, 0))
     }
-    fn edge_exists(&self, _from: &EntityRef, _to: &EntityRef, _kind: PlanEdgeKind) -> bool {
-        true
+    fn edge(&self, _from: &EntityRef, _to: &EntityRef, _kind: PlanEdgeKind) -> Lookup<()> {
+        Lookup::Present(())
     }
-    fn hunk(&self, _file: &FileId, _index: u32) -> Option<()> {
-        Some(())
+    fn hunk(&self, _file: &FileId, _index: u32) -> Lookup<()> {
+        Lookup::Present(())
     }
 }
 

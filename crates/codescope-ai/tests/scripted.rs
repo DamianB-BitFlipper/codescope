@@ -5,7 +5,7 @@
 
 use codescope_ai::{
     AiClient, AiClientOptions, AiConfig, AiError, AiOutcome, AiService, ChatMessage, FactView,
-    RetryPolicy, ToolExecError, ToolExecutor, PLAN_TOOL_NAME,
+    Lookup, RetryPolicy, ToolExecError, ToolExecutor, PLAN_TOOL_NAME,
 };
 use codescope_core::{EntityRef, Epoch, FileId, LineRange, PlanEdgeKind, ValidationVerdict};
 use codescope_testutil::fake_ai::{
@@ -54,21 +54,25 @@ fn service_for(provider: &ScriptedProvider) -> AiService {
 struct FixtureFacts;
 
 impl FactView for FixtureFacts {
-    fn file_exists(&self, file: &FileId) -> bool {
-        matches!(file.as_path().as_str(), MIDDLEWARE_FILE | POSTGRES_FILE)
-    }
-    fn resolve_symbol(&self, file: &FileId, name: &str) -> Option<LineRange> {
-        match (file.as_path().as_str(), name) {
-            (MIDDLEWARE_FILE, "LoggingMiddleware") => Some(LineRange::new(10, 0, 30, 1)),
-            (POSTGRES_FILE, "(PostgresRepo).Get") => Some(LineRange::new(40, 0, 60, 1)),
-            _ => None,
+    fn file(&self, file: &FileId) -> Lookup<()> {
+        if matches!(file.as_path().as_str(), MIDDLEWARE_FILE | POSTGRES_FILE) {
+            Lookup::Present(())
+        } else {
+            Lookup::Absent
         }
     }
-    fn edge_exists(&self, _from: &EntityRef, _to: &EntityRef, _kind: PlanEdgeKind) -> bool {
-        false
+    fn symbol(&self, file: &FileId, name: &str) -> Lookup<LineRange> {
+        match (file.as_path().as_str(), name) {
+            (MIDDLEWARE_FILE, "LoggingMiddleware") => Lookup::Present(LineRange::new(10, 0, 30, 1)),
+            (POSTGRES_FILE, "(PostgresRepo).Get") => Lookup::Present(LineRange::new(40, 0, 60, 1)),
+            _ => Lookup::Absent,
+        }
     }
-    fn hunk(&self, _file: &FileId, _index: u32) -> Option<()> {
-        None
+    fn edge(&self, _from: &EntityRef, _to: &EntityRef, _kind: PlanEdgeKind) -> Lookup<()> {
+        Lookup::Absent
+    }
+    fn hunk(&self, _file: &FileId, _index: u32) -> Lookup<()> {
+        Lookup::Absent
     }
 }
 

@@ -38,18 +38,41 @@ pub const IMPACT_SUMMARY_MAX_BULLETS: usize = 8;
 /// `codescope-analysis` wires the real implementation (symbol trees, impact graph, change
 /// sets); tests stub it. The `Sync` supertrait keeps futures that hold a `&dyn FactView`
 /// across `.await` points spawnable.
+/// Tri-state result of a fact lookup. Distinguishes "a complete query proved this
+/// absent" from "this was never queried / the query was partial", so an unqueried
+/// relationship is never mistaken for a disproven one (review 19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lookup<T> {
+    /// The fact was found.
+    Present(T),
+    /// A complete query covering this fact ran and did not return it — authoritative absence.
+    Absent,
+    /// The fact was not queried, the query was partial/failed, or evidence is unavailable.
+    Unknown,
+}
+
+impl<T> Lookup<T> {
+    /// `true` only for an authoritative absence (a complete query returned nothing).
+    pub fn is_absent(self) -> bool {
+        matches!(self, Lookup::Absent)
+    }
+}
+
+/// The fact store a plan is validated against (the deterministic boundary). Implementors
+/// answer whether cited files/symbols/edges/hunks exist; the tri-state [`Lookup`] keeps
+/// "never queried" distinct from "proven absent".
 pub trait FactView: Sync {
-    /// `true` when `file` exists in the current change context (worktree or base overlay).
-    fn file_exists(&self, file: &FileId) -> bool;
+    /// Whether `file` exists in the current change context (worktree or base overlay).
+    fn file(&self, file: &FileId) -> Lookup<()>;
 
-    /// Resolve a fully-qualified symbol name within `file` to its extent, if it exists.
-    fn resolve_symbol(&self, file: &FileId, name: &str) -> Option<LineRange>;
+    /// Resolve a fully-qualified symbol name within `file` to its extent.
+    fn symbol(&self, file: &FileId, name: &str) -> Lookup<LineRange>;
 
-    /// `true` when the impact graph contains a `kind` edge from `from` to `to`.
-    fn edge_exists(&self, from: &EntityRef, to: &EntityRef, kind: PlanEdgeKind) -> bool;
+    /// Whether the impact evidence contains a `kind` edge from `from` to `to`.
+    fn edge(&self, from: &EntityRef, to: &EntityRef, kind: PlanEdgeKind) -> Lookup<()>;
 
-    /// `Some(())` when hunk `index` (zero-based, diff order) exists for `file`.
-    fn hunk(&self, file: &FileId, index: u32) -> Option<()>;
+    /// Whether hunk `index` (zero-based, diff order) exists for `file`.
+    fn hunk(&self, file: &FileId, index: u32) -> Lookup<()>;
 }
 
 /// Validate and sanitize `plan` in place against `facts`, gated on `current_epoch`.
@@ -155,8 +178,17 @@ fn node_invalid_reason(
             else {
                 return Some("focused_diff entity.symbol must be \"hunk:<index>\"".to_string());
             };
-            if facts.hunk(&entity.file, index).is_none() {
-                return Some(format!("hunk {}#h{index} does not exist", entity.file));
+            match facts.hunk(&entity.file, index) {
+                Lookup::Present(()) => {}
+                Lookup::Absent => {
+                    return Some(format!("hunk {}#h{index} does not exist", entity.file))
+                }
+                Lookup::Unknown => {
+                    return Some(format!(
+                        "hunk {}#h{index} not queried (cannot validate)",
+                        entity.file
+                    ))
+                }
             }
             None
         }
@@ -164,15 +196,31 @@ fn node_invalid_reason(
             let Some(entity) = &node.entity else {
                 return None; // presentational node
             };
-            if !facts.file_exists(&entity.file) {
-                return Some(format!("file {} does not exist", entity.file));
+            match facts.file(&entity.file) {
+                Lookup::Present(()) => {}
+                Lookup::Absent => return Some(format!("file {} does not exist", entity.file)),
+                Lookup::Unknown => {
+                    return Some(format!(
+                        "file {} not queried (cannot validate)",
+                        entity.file
+                    ))
+                }
             }
             if let Some(symbol) = &entity.symbol {
-                let Some(extent) = facts.resolve_symbol(&entity.file, symbol) else {
-                    return Some(format!(
-                        "symbol {symbol} does not resolve in {}",
-                        entity.file
-                    ));
+                let extent = match facts.symbol(&entity.file, symbol) {
+                    Lookup::Present(extent) => extent,
+                    Lookup::Absent => {
+                        return Some(format!(
+                            "symbol {symbol} not found in {} (analyzed)",
+                            entity.file
+                        ))
+                    }
+                    Lookup::Unknown => {
+                        return Some(format!(
+                            "symbol {symbol} not queried in {} (cannot validate)",
+                            entity.file
+                        ))
+                    }
                 };
                 if let Some(range) = &entity.range {
                     if !extent.contains_lines(range) {
@@ -501,14 +549,21 @@ fn sanitize_flow(
         let to = &form.nodes[id_to_idx[&edge.to]];
         if edge_kind_verifiable(edge.kind) {
             match (&from.entity, &to.entity) {
-                (Some(fe), Some(te)) => {
-                    if !facts.edge_exists(fe, te, edge.kind) {
+                (Some(fe), Some(te)) => match facts.edge(fe, te, edge.kind) {
+                    Lookup::Present(()) => {}
+                    Lookup::Absent => {
                         return Err(format!(
                             "edge {} -> {} ({:?}) not in the impact graph",
                             edge.from, edge.to, edge.kind
-                        ));
+                        ))
                     }
-                }
+                    Lookup::Unknown => {
+                        return Err(format!(
+                            "edge {} -> {} ({:?}) not queried (cannot validate)",
+                            edge.from, edge.to, edge.kind
+                        ))
+                    }
+                },
                 _ => notes.push(format!(
                     "form {form_idx}: edge {} -> {} unverifiable (presentational endpoint)",
                     edge.from, edge.to
@@ -625,8 +680,9 @@ fn retain_clean_edges(
         }
         if edge_kind_verifiable(edge.kind) {
             match (by_id.get(&edge.from), by_id.get(&edge.to)) {
-                (Some(fe), Some(te)) => {
-                    if !facts.edge_exists(fe, te, edge.kind) {
+                (Some(fe), Some(te)) => match facts.edge(fe, te, edge.kind) {
+                    Lookup::Present(()) => {}
+                    Lookup::Absent => {
                         dropped.push(DroppedItem {
                             subject: format!(
                                 "edge {} -> {} in form {form_idx}",
@@ -636,7 +692,17 @@ fn retain_clean_edges(
                         });
                         continue;
                     }
-                }
+                    Lookup::Unknown => {
+                        dropped.push(DroppedItem {
+                            subject: format!(
+                                "edge {} -> {} in form {form_idx}",
+                                edge.from, edge.to
+                            ),
+                            reason: format!("{:?} edge not queried (cannot validate)", edge.kind),
+                        });
+                        continue;
+                    }
+                },
                 _ => notes.push(format!(
                     "form {form_idx}: edge {} -> {} unverifiable (presentational endpoint)",
                     edge.from, edge.to
@@ -657,15 +723,36 @@ mod tests {
     use super::*;
     use codescope_core::{FormKind, PlanEdge, PlanNodeChange};
 
-    #[derive(Default)]
     struct StubFacts {
         files: HashSet<String>,
         symbols: HashMap<(String, String), LineRange>,
         edges: HashSet<(String, String, PlanEdgeKind)>,
         hunks: HashSet<(String, u32)>,
+        /// When true, symbol/edge misses are authoritative `Absent` (a complete query ran);
+        /// when false they are `Unknown` (never queried). Default true to preserve the
+        /// existing fixtures' closed-universe semantics.
+        complete: bool,
+    }
+
+    impl Default for StubFacts {
+        fn default() -> Self {
+            StubFacts {
+                files: HashSet::new(),
+                symbols: HashMap::new(),
+                edges: HashSet::new(),
+                hunks: HashSet::new(),
+                complete: true,
+            }
+        }
     }
 
     impl StubFacts {
+        /// Mark the universe unqueried: misses report `Unknown`, not `Absent`.
+        fn incomplete(mut self) -> Self {
+            self.complete = false;
+            self
+        }
+
         fn with_symbol(mut self, file: &str, name: &str, extent: LineRange) -> Self {
             self.files.insert(file.to_string());
             self.symbols
@@ -687,22 +774,45 @@ mod tests {
     }
 
     impl FactView for StubFacts {
-        fn file_exists(&self, file: &FileId) -> bool {
-            self.files.contains(file.as_path().as_str())
+        fn file(&self, file: &FileId) -> Lookup<()> {
+            if self.files.contains(file.as_path().as_str()) {
+                Lookup::Present(())
+            } else {
+                Lookup::Absent
+            }
         }
-        fn resolve_symbol(&self, file: &FileId, name: &str) -> Option<LineRange> {
-            self.symbols
+        fn symbol(&self, file: &FileId, name: &str) -> Lookup<LineRange> {
+            match self
+                .symbols
                 .get(&(file.as_path().as_str().to_string(), name.to_string()))
                 .copied()
+            {
+                Some(extent) => Lookup::Present(extent),
+                None if self.complete => Lookup::Absent,
+                None => Lookup::Unknown,
+            }
         }
-        fn edge_exists(&self, from: &EntityRef, to: &EntityRef, kind: PlanEdgeKind) -> bool {
-            self.edges
+        fn edge(&self, from: &EntityRef, to: &EntityRef, kind: PlanEdgeKind) -> Lookup<()> {
+            if self
+                .edges
                 .contains(&(from.to_string(), to.to_string(), kind))
+            {
+                Lookup::Present(())
+            } else if self.complete {
+                Lookup::Absent
+            } else {
+                Lookup::Unknown
+            }
         }
-        fn hunk(&self, file: &FileId, index: u32) -> Option<()> {
-            self.hunks
+        fn hunk(&self, file: &FileId, index: u32) -> Lookup<()> {
+            if self
+                .hunks
                 .contains(&(file.as_path().as_str().to_string(), index))
-                .then_some(())
+            {
+                Lookup::Present(())
+            } else {
+                Lookup::Absent
+            }
         }
     }
 
@@ -886,6 +996,82 @@ mod tests {
             .dropped
             .iter()
             .any(|d| d.reason.contains("endpoint n2 invalid")));
+    }
+
+    /// Review 19: an unqueried edge is `Unknown` and rejected as "not queried", NOT as
+    /// "does not exist" — absence of evidence is not evidence of absence.
+    #[test]
+    fn unqueried_edge_is_unknown_not_absent() {
+        let a = sym_entity("main.go", "A");
+        let b = sym_entity("main.go", "B");
+        let facts = abc_facts().incomplete(); // never queried the graph
+        let mut plan = plan_with(vec![form(
+            FormKind::Sequence,
+            vec![node("n1", Some(a), &[]), node("n2", Some(b), &[])],
+            vec![edge("n1", "n2", PlanEdgeKind::Calls)],
+        )]);
+        let report = validate(&mut plan, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("not queried (cannot validate)")),
+            "unqueried edge is honest about coverage: {:?}",
+            report.dropped
+        );
+        assert!(
+            !report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("not in the impact graph")),
+            "unqueried must not be misreported as proven-absent"
+        );
+    }
+
+    /// Review 19: a complete edge query that found nothing is authoritatively Absent and
+    /// keeps the original "not in the impact graph" wording (proven, not unqueried).
+    #[test]
+    fn queried_absent_edge_says_not_in_graph() {
+        let a = sym_entity("main.go", "A");
+        let b = sym_entity("main.go", "B");
+        let facts = abc_facts(); // complete universe
+        let mut plan = plan_with(vec![form(
+            FormKind::Sequence,
+            vec![node("n1", Some(a), &[]), node("n2", Some(b), &[])],
+            vec![edge("n1", "n2", PlanEdgeKind::Calls)],
+        )]);
+        let report = validate(&mut plan, &facts, Epoch(1));
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("not in the impact graph")));
+    }
+
+    /// Review 19: an unqueried symbol is "not queried", distinct from a proven-absent one.
+    #[test]
+    fn unqueried_symbol_is_unknown_not_absent() {
+        let facts = abc_facts().incomplete();
+        let mut plan = plan_with(vec![form(
+            FormKind::ImpactSummary,
+            vec![node("n1", Some(sym_entity("main.go", "ZZZ")), &[])],
+            vec![],
+        )]);
+        let report = validate(&mut plan, &facts, Epoch(1));
+        assert!(
+            report.dropped.iter().any(|d| d
+                .reason
+                .contains("not queried in main.go (cannot validate)")),
+            "unqueried symbol is honest about coverage: {:?}",
+            report.dropped
+        );
+        assert!(
+            !report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("not found")),
+            "unqueried must not be misreported as proven-absent"
+        );
     }
 
     #[test]

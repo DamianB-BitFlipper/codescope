@@ -171,7 +171,7 @@ impl AiService {
                 return match report.verdict {
                     ValidationVerdict::Stale => AiOutcome::Stale,
                     ValidationVerdict::Rejected => {
-                        AiOutcome::Failed(format!("plan rejected: {}", report.notes.join("; ")))
+                        AiOutcome::Failed(format!("plan rejected: {}", rejection_summary(&report)))
                     }
                     ValidationVerdict::Valid | ValidationVerdict::ValidWithDrops => {
                         AiOutcome::Plan(plan, report)
@@ -265,6 +265,68 @@ fn error_result(message: String) -> String {
 }
 
 /// Map a terminal error onto the UI-facing outcome.
+/// Build a bounded, sanitized, user-facing rejection summary from the concrete dropped
+/// items rather than the generic `notes` tail. Surfaces the actionable cause (which
+/// symbol/edge/entity failed and why) instead of only "no renderable forms remain".
+///
+/// Bounded and sanitized for the status bar: at most two concrete reasons plus an
+/// omitted-count suffix, whitespace collapsed, control characters stripped, secrets
+/// scrubbed, and each reason / the whole summary truncated by Unicode scalar count.
+fn rejection_summary(report: &ValidationReport) -> String {
+    const MAX_REASONS: usize = 2;
+    const MAX_REASON_CHARS: usize = 120;
+    const MAX_TOTAL_CHARS: usize = 240;
+
+    // Sanitize one free-form string: collapse whitespace, drop control chars, scrub
+    // secrets, then truncate to `max` Unicode scalar values (never split a char).
+    let clean = |raw: &str, max: usize| -> String {
+        let collapsed: String = raw
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let scrubbed = crate::scrub::scrub_secrets(&collapsed);
+        let mut out: String = scrubbed.chars().take(max).collect();
+        if scrubbed.chars().count() > max {
+            out.push('\u{2026}'); // ellipsis marks truncation
+        }
+        out
+    };
+
+    // Prefer the concrete, actionable causes (dropped forms/nodes/edges) over the
+    // generic terminal note.
+    let mut reasons: Vec<String> = report
+        .dropped
+        .iter()
+        .map(|d| clean(&format!("{}: {}", d.subject, d.reason), MAX_REASON_CHARS))
+        .filter(|r| !r.is_empty())
+        .collect();
+    if reasons.is_empty() {
+        reasons = report
+            .notes
+            .iter()
+            .map(|n| clean(n, MAX_REASON_CHARS))
+            .filter(|r| !r.is_empty())
+            .collect();
+    }
+    if reasons.is_empty() {
+        return "no renderable forms remain; use the deterministic fallback".to_string();
+    }
+    let omitted = reasons.len().saturating_sub(MAX_REASONS);
+    let mut summary = reasons
+        .iter()
+        .take(MAX_REASONS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if omitted > 0 {
+        summary.push_str(&format!(" (+{omitted} more)"));
+    }
+    clean(&summary, MAX_TOTAL_CHARS)
+}
+
 fn outcome_from_error(error: &AiError) -> AiOutcome {
     match error {
         AiError::Disabled | AiError::CircuitOpen { .. } | AiError::Throttled { .. } => {
@@ -316,6 +378,71 @@ fn build_system_prompt(epoch: Epoch, max_tool_calls: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codescope_core::DroppedItem;
+
+    fn report_with(dropped: Vec<(&str, &str)>, notes: &[&str]) -> ValidationReport {
+        ValidationReport {
+            verdict: ValidationVerdict::Rejected,
+            dropped: dropped
+                .into_iter()
+                .map(|(subject, reason)| DroppedItem {
+                    subject: subject.to_string(),
+                    reason: reason.to_string(),
+                })
+                .collect(),
+            notes: notes.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    /// A rejected plan surfaces the concrete dropped-form reason, not the generic tail.
+    #[test]
+    fn rejection_summary_surfaces_dropped_reasons() {
+        let report = report_with(
+            vec![
+                (
+                    "form 0 (RelationshipFlow)",
+                    "endpoint n1 invalid: symbol Parser::parse was not queried in src/lib.rs",
+                ),
+                ("form 1 (CallTree)", "root symbol does not resolve"),
+                ("form 2 (Sequence)", "edge not queried"),
+            ],
+            &["no renderable forms remain; use the deterministic fallback"],
+        );
+        let summary = rejection_summary(&report);
+        assert!(
+            summary.contains("form 0 (RelationshipFlow)"),
+            "first form reason surfaced: {summary}"
+        );
+        assert!(
+            summary.contains("root symbol does not resolve"),
+            "second reason: {summary}"
+        );
+        assert!(summary.contains("(+1 more)"), "omitted count: {summary}");
+        assert!(
+            !summary.contains("no renderable forms remain"),
+            "generic note not used when concrete reasons exist: {summary}"
+        );
+    }
+
+    /// Falls back to notes when nothing was dropped, and stays bounded + sanitized.
+    #[test]
+    fn rejection_summary_is_bounded_and_sanitized() {
+        let long = "x".repeat(500);
+        let report = report_with(vec![("form 0", &format!("line1\n\tline2 {long}"))], &[]);
+        let summary = rejection_summary(&report);
+        assert!(
+            summary.chars().count() <= 240,
+            "bounded: {}",
+            summary.chars().count()
+        );
+        assert!(
+            !summary.contains('\n') && !summary.contains('\t'),
+            "whitespace collapsed"
+        );
+        // No concrete reasons -> generic note.
+        let generic = rejection_summary(&report_with(vec![], &["no renderable forms remain"]));
+        assert_eq!(generic, "no renderable forms remain");
+    }
 
     #[test]
     fn redaction_strips_root_prefix() {

@@ -46,4 +46,4 @@ pub use tools::{
     is_read_only_tool, read_only_tools, NoToolExecutor, ToolDef, ToolExecError, ToolExecutor,
     MAX_TOOL_CALLS, PLAN_TOOL_NAME,
 };
-pub use validator::{validate, FactView, IMPACT_SUMMARY_MAX_BULLETS};
+pub use validator::{validate, FactView, Lookup, IMPACT_SUMMARY_MAX_BULLETS};
