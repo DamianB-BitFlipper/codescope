@@ -1718,9 +1718,10 @@ impl FactView for SnapshotFacts {
         if self.files.contains(&file.to_string()) {
             Lookup::Present(())
         } else {
-            // The changeset enumerates every changed file, so a file outside it is
-            // authoritatively absent from this change context.
-            Lookup::Absent
+            // The changeset is a complete inventory of CHANGED files, not of every repo
+            // file. A miss means "not in the current fact catalog", not "does not exist"
+            // (review 21 m1): the file may simply be unchanged.
+            Lookup::Unknown
         }
     }
     fn symbol(&self, file: &codescope_core::FileId, name: &str) -> Lookup<LineRange> {

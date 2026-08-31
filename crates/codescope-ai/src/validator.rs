@@ -19,7 +19,7 @@
 //!   [`MAX_FORM_DEPTH`], summary ≤ [`MAX_SUMMARY_LINES`] lines (and ≤
 //!   [`IMPACT_SUMMARY_MAX_BULLETS`] bullets for `impact_summary`, research 05 §2).
 //!
-//! Edges may only *select* relationships that exist ([`FactView::edge_exists`]); `reads`/
+//! Edges may only *select* relationships that exist ([`FactView::edge`]); `reads`/
 //! `writes` edges have no impact-graph counterpart in v0 and are kept with an
 //! "unverified" note when their endpoints resolve.
 
@@ -1072,6 +1072,55 @@ mod tests {
                 .any(|d| d.reason.contains("not found")),
             "unqueried must not be misreported as proven-absent"
         );
+    }
+
+    /// Review 21 m5: a verifiable edge on a NON-flow form is dropped when Unknown
+    /// (unqueried), never retained as a rendered relationship.
+    #[test]
+    fn non_flow_unknown_edge_is_dropped_not_retained() {
+        let a = sym_entity("main.go", "A");
+        let b = sym_entity("main.go", "B");
+        let facts = abc_facts().incomplete();
+        let mut plan = plan_with(vec![form(
+            FormKind::ChangedSymbolTree,
+            vec![node("n1", Some(a), &[]), node("n2", Some(b), &[])],
+            vec![edge("n1", "n2", PlanEdgeKind::Calls)],
+        )]);
+        let report = validate(&mut plan, &facts, Epoch(1));
+        // The edge is dropped with the honest coverage reason; the form survives without it.
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("not queried (cannot validate)")),
+            "unknown non-flow edge dropped honestly: {:?}",
+            report.dropped
+        );
+        assert!(
+            plan.forms[0].edges.is_empty(),
+            "unknown edge never rendered"
+        );
+    }
+
+    /// Review 21 m5: a complete (analyzed) miss for a symbol is Absent and says "not
+    /// found", distinct from the unqueried "not queried" wording.
+    #[test]
+    fn analyzed_missing_symbol_says_not_found() {
+        let facts = abc_facts(); // complete universe
+        let mut plan = plan_with(vec![form(
+            FormKind::ImpactSummary,
+            vec![node("n1", Some(sym_entity("main.go", "ZZZ")), &[])],
+            vec![],
+        )]);
+        let report = validate(&mut plan, &facts, Epoch(1));
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("not found in main.go (analyzed)")));
+        assert!(!report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("not queried")));
     }
 
     #[test]

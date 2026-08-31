@@ -171,7 +171,18 @@ impl AiService {
                 return match report.verdict {
                     ValidationVerdict::Stale => AiOutcome::Stale,
                     ValidationVerdict::Rejected => {
-                        AiOutcome::Failed(format!("plan rejected: {}", rejection_summary(&report)))
+                        // Retain the typed report for diagnostics before flattening it to
+                        // a bounded status line (review 21 m4); never put the unbounded
+                        // model-controlled reasons on the status bar.
+                        tracing::info!(
+                            dropped = report.dropped.len(),
+                            notes = report.notes.len(),
+                            "plan rejected by validation"
+                        );
+                        AiOutcome::Failed(format!(
+                            "plan rejected: {}",
+                            rejection_summary(&report, &self.repo_root)
+                        ))
                     }
                     ValidationVerdict::Valid | ValidationVerdict::ValidWithDrops => {
                         AiOutcome::Plan(plan, report)
@@ -272,13 +283,14 @@ fn error_result(message: String) -> String {
 /// Bounded and sanitized for the status bar: at most two concrete reasons plus an
 /// omitted-count suffix, whitespace collapsed, control characters stripped, secrets
 /// scrubbed, and each reason / the whole summary truncated by Unicode scalar count.
-fn rejection_summary(report: &ValidationReport) -> String {
+fn rejection_summary(report: &ValidationReport, repo_root: &Utf8Path) -> String {
     const MAX_REASONS: usize = 2;
     const MAX_REASON_CHARS: usize = 120;
     const MAX_TOTAL_CHARS: usize = 240;
 
-    // Sanitize one free-form string: collapse whitespace, drop control chars, scrub
-    // secrets, then truncate to `max` Unicode scalar values (never split a char).
+    // Sanitize one free-form string: collapse whitespace, drop control chars, redact the
+    // repo root, scrub secrets, then truncate to `max` Unicode scalar values (never split
+    // a char). The ellipsis counts toward `max`, so the result never exceeds it.
     let clean = |raw: &str, max: usize| -> String {
         let collapsed: String = raw
             .chars()
@@ -287,11 +299,15 @@ fn rejection_summary(report: &ValidationReport) -> String {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let scrubbed = crate::scrub::scrub_secrets(&collapsed);
-        let mut out: String = scrubbed.chars().take(max).collect();
-        if scrubbed.chars().count() > max {
-            out.push('\u{2026}'); // ellipsis marks truncation
+        let redacted = redact_repo_root(&collapsed, repo_root);
+        let scrubbed = crate::scrub::scrub_secrets(&redacted);
+        let count = scrubbed.chars().count();
+        if count <= max {
+            return scrubbed;
         }
+        // Reserve one scalar for the ellipsis so the total stays within `max`.
+        let mut out: String = scrubbed.chars().take(max.saturating_sub(1)).collect();
+        out.push('\u{2026}');
         out
     };
 
@@ -315,16 +331,23 @@ fn rejection_summary(report: &ValidationReport) -> String {
         return "no renderable forms remain; use the deterministic fallback".to_string();
     }
     let omitted = reasons.len().saturating_sub(MAX_REASONS);
+    let suffix = if omitted > 0 {
+        format!(" (+{omitted} more)")
+    } else {
+        String::new()
+    };
+    // Reserve the suffix budget before truncating the reasons, so the omitted count can
+    // never be truncated away (review 21 m3).
+    let reasons_budget = MAX_TOTAL_CHARS.saturating_sub(suffix.chars().count());
     let mut summary = reasons
         .iter()
         .take(MAX_REASONS)
         .cloned()
         .collect::<Vec<_>>()
         .join("; ");
-    if omitted > 0 {
-        summary.push_str(&format!(" (+{omitted} more)"));
-    }
-    clean(&summary, MAX_TOTAL_CHARS)
+    summary = clean(&summary, reasons_budget);
+    summary.push_str(&suffix);
+    summary
 }
 
 fn outcome_from_error(error: &AiError) -> AiOutcome {
@@ -408,7 +431,7 @@ mod tests {
             ],
             &["no renderable forms remain; use the deterministic fallback"],
         );
-        let summary = rejection_summary(&report);
+        let summary = rejection_summary(&report, Utf8Path::new("/Users/dev/repo"));
         assert!(
             summary.contains("form 0 (RelationshipFlow)"),
             "first form reason surfaced: {summary}"
@@ -424,12 +447,63 @@ mod tests {
         );
     }
 
+    /// Review 21 m5: secrets are scrubbed and the absolute repo root is redacted out of
+    /// model-controlled rejection reasons before they reach the status line.
+    #[test]
+    fn rejection_summary_scrubs_secrets_and_root() {
+        let report = report_with(
+            vec![(
+                "form 0 (CallTree)",
+                "api_key=sk-abcdef1234567890abcd for /Users/dev/repo/src/lib.rs",
+            )],
+            &[],
+        );
+        let summary = rejection_summary(&report, Utf8Path::new("/Users/dev/repo"));
+        assert!(
+            !summary.contains("/Users/dev/repo"),
+            "root redacted: {summary}"
+        );
+        assert!(
+            summary.contains("src/lib.rs"),
+            "relative path survives: {summary}"
+        );
+        assert!(
+            !summary.contains("sk-abcdef1234567890abcd"),
+            "secret scrubbed: {summary}"
+        );
+    }
+
+    /// Review 21 m3: two long multibyte reasons plus a third omitted reason stay within
+    /// the cap and keep the omitted-count suffix.
+    #[test]
+    fn rejection_summary_preserves_suffix_within_cap() {
+        let long = "\u{4e2d}\u{6587}".repeat(80); // multibyte
+        let report = report_with(
+            vec![
+                ("form 0 (RelationshipFlow)", &long),
+                ("form 1 (CallTree)", &long),
+                ("form 2 (Sequence)", &long),
+            ],
+            &[],
+        );
+        let summary = rejection_summary(&report, Utf8Path::new("/r"));
+        assert!(
+            summary.chars().count() <= 240,
+            "within cap: {} chars",
+            summary.chars().count()
+        );
+        assert!(
+            summary.contains("(+1 more)"),
+            "omitted count survives: {summary}"
+        );
+    }
+
     /// Falls back to notes when nothing was dropped, and stays bounded + sanitized.
     #[test]
     fn rejection_summary_is_bounded_and_sanitized() {
         let long = "x".repeat(500);
         let report = report_with(vec![("form 0", &format!("line1\n\tline2 {long}"))], &[]);
-        let summary = rejection_summary(&report);
+        let summary = rejection_summary(&report, Utf8Path::new("/Users/dev/repo"));
         assert!(
             summary.chars().count() <= 240,
             "bounded: {}",
@@ -440,7 +514,10 @@ mod tests {
             "whitespace collapsed"
         );
         // No concrete reasons -> generic note.
-        let generic = rejection_summary(&report_with(vec![], &["no renderable forms remain"]));
+        let generic = rejection_summary(
+            &report_with(vec![], &["no renderable forms remain"]),
+            Utf8Path::new("/Users/dev/repo"),
+        );
         assert_eq!(generic, "no renderable forms remain");
     }
 
