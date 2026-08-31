@@ -36,14 +36,27 @@ pub async fn run(
     let mut pending_scope = PendingScope::default();
     let mut selection = SelectionTracker::default();
 
+    // The frame plan the user last saw; mouse hit-testing reads only this (never
+    // recomputed). Rebuilt on every draw.
+    let mut last_geometry = crate::geometry::UiGeometry::default();
+    let mut drag = crate::mouse::DragState::Idle;
+    // Draw only when state changed. Mouse `Moved`/no-op events do not force a redraw, and a
+    // steady mouse stream cannot starve the snapshot/tick arms (review 24 B2).
+    let mut dirty = true; // first frame draws
     loop {
-        terminal.draw(|frame| render(frame, &app, &app.snapshot.clone()))?;
+        if dirty {
+            terminal.draw(|frame| {
+                let geo = crate::geometry::UiGeometry::build(frame.area(), &app, &app.snapshot);
+                render(frame, &app, &app.snapshot.clone());
+                last_geometry = geo;
+            })?;
+            dirty = false;
+        }
         if app.should_quit {
             return Ok(());
         }
 
         tokio::select! {
-            biased;
             // Keyboard/mouse input first — never starve interactivity.
             maybe = events.next() => {
                 match maybe {
@@ -51,16 +64,42 @@ pub async fn run(
                         let action = map_key(key, &app);
                         dispatch(&mut app, action, &tx, &mut pending_scope, &mut selection)
                             .await;
+                        dirty = true;
                     }
-                    Some(Ok(Event::Resize(_, _))) => { /* redrawn next pass */ }
-                    Some(Ok(_)) | Some(Err(_)) | None => {}
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        // Route against the retained frame plan. Row clicks reuse the
+                        // existing SelectionTracker: the returned action is dispatched
+                        // through the same path as a keypress.
+                        let outcome = crate::mouse::map_mouse(
+                            mouse,
+                            &app,
+                            &app.snapshot,
+                            &last_geometry,
+                            drag,
+                        );
+                        drag = outcome.drag;
+                        dirty |= outcome.dirty;
+                        if let Some(action) = outcome.action {
+                            dispatch(&mut app, action, &tx, &mut pending_scope, &mut selection)
+                                .await;
+                        }
+                    }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        // A resize invalidates the retained geometry and any drag anchored
+                        // to it: cancel the drag; the next draw rebuilds the plan.
+                        drag = crate::mouse::DragState::Idle;
+                        dirty = true;
+                    }
+                    // Event stream ended or errored: the loop cannot stay interactive; exit
+                    // cleanly rather than hot-loop on a permanently-ready source.
+                    Some(Ok(_)) | Some(Err(_)) | None => return Ok(()),
                 }
             }
             // A new repository/analysis state arrived.
             changed = rx.changed() => {
                 if changed.is_err() {
-                    // Dispatcher dropped the sender: keep rendering the last state.
-                    continue;
+                    // Dispatcher dropped the sender: nothing more will arrive; stop.
+                    return Ok(());
                 }
                 let mut snapshot = rx.borrow_and_update().clone();
                 pending_scope.reconcile(&mut snapshot);
@@ -68,6 +107,7 @@ pub async fn run(
                 // The new state may have moved the selection (clamp / re-expanded rows):
                 // keep the dispatcher's diff + relations aimed at it.
                 selection.sync(&app, &tx).await;
+                dirty = true;
             }
             // Spinner/redraw heartbeat.
             _ = tick.tick() => {}

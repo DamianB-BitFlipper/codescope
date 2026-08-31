@@ -121,6 +121,18 @@ pub enum Action {
     ToggleWrap,
     /// Reset the diff pane's horizontal scroll to zero (`0`).
     ResetHScroll,
+    /// Mouse: select the file/symbol row at this logical index (and focus Files).
+    /// The selection tracker emits the same SelectionChanged a keyboard move would.
+    SelectFileRow {
+        /// The logical (selectable) row index.
+        logical_index: usize,
+    },
+    /// Mouse: directly select the bottom pane's view (idempotent; `v` toggles).
+    SetBottomView(crate::app::BottomView),
+    /// Mouse drag: set the files-pane width to an absolute value (clamped).
+    SetFilesWidth(u16),
+    /// Mouse drag: set the Impact-pane height to an absolute value (clamped).
+    SetImpactHeight(u16),
     /// The key did not map to an action.
     None,
 }

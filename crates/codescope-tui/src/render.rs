@@ -18,7 +18,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{filter_candidates, App, BottomView, Pane};
 use crate::elide;
 use crate::intraline;
-use crate::layout::{choose_tier, files_width, Tier, IMPACT_HEIGHT, MIN_DIFF_WIDTH};
+use crate::layout::{choose_tier, files_width, Tier, MIN_DIFF_WIDTH};
 use crate::snapshot::{DiffRow, ImpactList, ImpactLoadState, StatusLevel, UiSnapshot};
 
 // -- palette (docs/review/15 §2) ----------------------------------------------
@@ -84,7 +84,7 @@ pub fn render(frame: &mut Frame, app: &App, snap: &UiSnapshot) {
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(7),
-                Constraint::Length(IMPACT_HEIGHT),
+                Constraint::Length(crate::layout::impact_height(app.impact_height, area.height)),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
@@ -477,12 +477,8 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     // Build the flattened rows, tracking which flat row is the active one.
     let mut items: Vec<ListItem> = Vec::new();
     let mut flat = 0usize;
-    let mut active_flat: Option<usize> = None;
     for (fi, f) in snap.files.iter().enumerate() {
         let active = flat == app.file_sel;
-        if active {
-            active_flat = Some(items.len());
-        }
         flat += 1;
         let bg = if active {
             SELECTED_BG
@@ -546,9 +542,6 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                 _ => {
                     for s in &f.symbols {
                         let active = flat == app.file_sel;
-                        if active {
-                            active_flat = Some(items.len());
-                        }
                         flat += 1;
                         items.push(ListItem::new(symbol_row_line(s, active, inner_w)));
                     }
@@ -563,10 +556,18 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
         ))));
     }
 
-    let mut state = ListState::default();
-    state.select(active_flat);
-    let list = List::new(items).block(block);
-    frame.render_stateful_widget(list, area, &mut state);
+    // Viewport: the shared projection computes the first visible PHYSICAL row from the
+    // selection, so mouse hit-testing maps screen rows to the same slice the user sees
+    // (review 23: no hidden ListState offset).
+    let capacity = area.height.saturating_sub(2) as usize; // inside the border
+    let first_visible = crate::file_rows::first_visible(&snap.files, app.file_sel, capacity);
+    let visible: Vec<ListItem> = items
+        .into_iter()
+        .skip(first_visible)
+        .take(capacity.max(1))
+        .collect();
+    let list = List::new(visible).block(block);
+    frame.render_widget(list, area);
 }
 
 /// The decimal digit count of `n` (for right-aligning counts).

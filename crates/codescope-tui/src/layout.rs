@@ -8,9 +8,10 @@
 use ratatui::layout::Rect;
 
 /// Which pane arrangement to render for the current viewport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tier {
     /// Terminal too small to be usable: show only the size message.
+    #[default]
     TooSmall,
     /// The focused pane gets the whole body between the chrome rows (explicit zoom, or
     /// the viewport is below the normal minimum).
@@ -30,6 +31,14 @@ pub const MAX_FILES_WIDTH: u16 = 56;
 pub const MIN_DIFF_WIDTH: u16 = 48;
 /// Height of the full-width Impact pane, including its border.
 pub const IMPACT_HEIGHT: u16 = 9;
+/// Default requested Impact-pane height.
+pub const DEFAULT_IMPACT_HEIGHT: u16 = 9;
+/// Minimum Impact-pane height.
+pub const MIN_IMPACT_HEIGHT: u16 = 5;
+/// Maximum Impact-pane height.
+pub const MAX_IMPACT_HEIGHT: u16 = 18;
+/// Minimum height of the work (files+diff) row the Impact pane may not consume.
+pub const MIN_WORK_HEIGHT: u16 = 7;
 
 /// Choose the layout tier for a viewport of `area` cells.
 ///
@@ -57,11 +66,30 @@ pub fn choose_tier(area: Rect, zoomed: bool) -> Tier {
 /// `request` (docs/review/15 §1.1): the request is clamped to
 /// [`MIN_FILES_WIDTH`..=`MAX_FILES_WIDTH`] and then yields to [`MIN_DIFF_WIDTH`] without
 /// changing the stored preference.
+/// The Impact-pane height for a frame of `frame_height` rows, given the App-owned
+/// `request`: clamped to `MIN_IMPACT_HEIGHT..=MAX_IMPACT_HEIGHT`, then yields to the
+/// `MIN_WORK_HEIGHT` work area (top bar + summary + status + help each take a row).
+#[must_use]
+pub fn impact_height(request: u16, frame_height: u16) -> u16 {
+    let available = frame_height.saturating_sub(1 + 1 + MIN_WORK_HEIGHT + 1 + 1);
+    // No arbitrary maximum: the Impact pane may grow until the work area hits its
+    // minimum. A small floor keeps the pane grabbable.
+    request
+        .max(MIN_IMPACT_HEIGHT)
+        .min(available.max(MIN_IMPACT_HEIGHT))
+}
+
+/// The files-pane width for a work row of `work_width` cells, given the App-owned
+/// `request`: clamped to the fixed range, then yields to the diff's minimum.
 #[must_use]
 pub fn files_width(request: u16, work_width: u16) -> u16 {
-    request
-        .clamp(MIN_FILES_WIDTH, MAX_FILES_WIDTH)
-        .min(work_width.saturating_sub(MIN_DIFF_WIDTH))
+    // No arbitrary maximum: the files pane may grow until the diff hits its own minimum.
+    // A small floor keeps the pane grabbable (a zero-width pane's drag handle vanishes).
+    request.max(MIN_FILES_WIDTH).min(
+        work_width
+            .saturating_sub(MIN_DIFF_WIDTH)
+            .max(MIN_FILES_WIDTH),
+    )
 }
 
 #[cfg(test)]
@@ -108,11 +136,12 @@ mod tests {
     fn files_width_clamps_request_and_yields_to_diff() {
         assert_eq!(files_width(42, 140), 42);
         assert_eq!(files_width(10, 140), MIN_FILES_WIDTH);
-        assert_eq!(files_width(200, 140), MAX_FILES_WIDTH);
+        // No arbitrary maximum: a wide request is limited only by the diff's minimum.
+        assert_eq!(files_width(200, 140), 140 - MIN_DIFF_WIDTH);
         // At 80 columns the diff's 48-cell minimum wins over the requested 42.
         assert_eq!(files_width(42, 80), 32);
         assert_eq!(files_width(56, 80), 32);
-        // Never panics on a pathological width.
-        assert_eq!(files_width(42, 10), 0);
+        // Pathological widths fall back to the floor, never panic or zero the pane.
+        assert_eq!(files_width(42, 10), MIN_FILES_WIDTH);
     }
 }

@@ -10,8 +10,11 @@
 pub mod action;
 pub mod app;
 pub mod elide;
+pub mod file_rows;
+pub mod geometry;
 pub mod intraline;
 pub mod layout;
+pub mod mouse;
 pub mod render;
 pub mod run;
 pub mod snapshot;

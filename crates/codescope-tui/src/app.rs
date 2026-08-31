@@ -51,6 +51,9 @@ pub struct App {
     /// Requested files-pane width in the normal layout (`[`/`]` resize in two-cell steps,
     /// clamped to 28..=56; the renderer may narrow it further to protect the diff).
     pub files_width: u16,
+    /// Requested Impact-pane height in the normal layout (drag the work|impact border;
+    /// clamped to 5..=18, preserving the 7-row work area).
+    pub impact_height: u16,
     /// Whether the focused pane is zoomed to fill the whole body (`z`).
     pub zoomed: bool,
     /// Which view the bottom pane renders (`v`): the deterministic Impact columns or the
@@ -96,6 +99,7 @@ impl Default for App {
             diff_hscroll: 0,
             current_hunk: 0,
             files_width: DEFAULT_FILES_WIDTH,
+            impact_height: crate::layout::DEFAULT_IMPACT_HEIGHT,
             show_help: false,
             show_model_picker: false,
             model_sel: 0,
@@ -263,17 +267,38 @@ impl App {
             Action::ResetHScroll => self.diff_hscroll = 0,
             // View-state resize: two-cell steps clamped to the spec range; the renderer
             // may still narrow further to protect MIN_DIFF_WIDTH without touching this.
+            // Mouse: select a file/symbol row by logical index and focus Files. The
+            // selection tracker emits the same SelectionChanged a keyboard move would.
+            Action::SelectFileRow { logical_index } => {
+                self.focused = Pane::Files;
+                self.file_sel = logical_index.min(self.flat_file_rows().saturating_sub(1));
+            }
+            // Mouse: directly select the bottom tab (idempotent; focuses Impact, resets
+            // scroll only on a real switch). `v` toggles; this names the view.
+            Action::SetBottomView(view) => {
+                self.focused = Pane::Impact;
+                if self.bottom_view != view {
+                    self.bottom_view = view;
+                    self.ai_plan_scroll = 0;
+                }
+            }
+            // Mouse drag: absolute resize, clamped to the fixed preference range.
+            Action::SetFilesWidth(w) => {
+                // Store the request; the layout clamps it against the live terminal size
+                // (no arbitrary cap — the diff's minimum is the only ceiling).
+                self.files_width = w.max(crate::layout::MIN_FILES_WIDTH);
+            }
+            Action::SetImpactHeight(h) => {
+                self.impact_height = h.max(crate::layout::MIN_IMPACT_HEIGHT);
+            }
             Action::ResizeFilesNarrower => {
-                self.files_width = self.files_width.saturating_sub(2).clamp(
-                    crate::layout::MIN_FILES_WIDTH,
-                    crate::layout::MAX_FILES_WIDTH,
-                );
+                self.files_width = self
+                    .files_width
+                    .saturating_sub(2)
+                    .max(crate::layout::MIN_FILES_WIDTH);
             }
             Action::ResizeFilesWider => {
-                self.files_width = self.files_width.saturating_add(2).clamp(
-                    crate::layout::MIN_FILES_WIDTH,
-                    crate::layout::MAX_FILES_WIDTH,
-                );
+                self.files_width = self.files_width.saturating_add(2);
             }
             Action::Collapse => match self.focused {
                 // Wrapped mode has no hidden horizontal state: h must not move it.
@@ -524,20 +549,9 @@ impl App {
 
     /// The selected file's repo-relative path (symbol rows map to their owning file).
     pub fn selected_file_path(&self) -> Option<&str> {
-        let mut idx = self.file_sel;
-        for f in &self.snapshot.files {
-            if idx == 0 {
-                return Some(f.path.as_str());
-            }
-            idx -= 1;
-            if f.expanded {
-                if idx < f.symbols.len() {
-                    return Some(f.path.as_str());
-                }
-                idx -= f.symbols.len();
-            }
-        }
-        None
+        // The shared projection decides what is selectable (review 24 M4).
+        crate::file_rows::resolve_logical(&self.snapshot.files, self.file_sel)
+            .map(|(f, _)| f.path.as_str())
     }
 
     /// The symbol name when the files-pane selection sits on a symbol row (the diff
@@ -590,20 +604,8 @@ impl App {
         &crate::snapshot::FileRow,
         Option<&crate::snapshot::SymbolRow>,
     )> {
-        let mut idx = self.file_sel;
-        for f in &self.snapshot.files {
-            if idx == 0 {
-                return Some((f, None));
-            }
-            idx -= 1;
-            if f.expanded {
-                if idx < f.symbols.len() {
-                    return Some((f, Some(&f.symbols[idx])));
-                }
-                idx -= f.symbols.len();
-            }
-        }
-        None
+        // The shared projection decides what is selectable (review 24 M4).
+        crate::file_rows::resolve_logical(&self.snapshot.files, self.file_sel)
     }
 
     /// Flattened file+symbol row count (expanded symbols included).
@@ -794,7 +796,10 @@ mod tests {
         for _ in 0..40 {
             app.apply(Action::ResizeFilesWider);
         }
-        assert_eq!(app.files_width, 56, "clamped at MAX_FILES_WIDTH");
+        // No arbitrary maximum: the stored preference grows unbounded; the layout clamps
+        // it against the live terminal width (the diff's minimum is the only ceiling).
+        // 20 narrowings hit the 28 floor; the 40 widenings grow from there (28 + 80 = 108).
+        assert_eq!(app.files_width, 108, "no arbitrary cap on the preference");
     }
 
     #[test]
