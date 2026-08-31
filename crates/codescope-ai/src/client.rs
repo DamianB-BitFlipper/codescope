@@ -175,6 +175,7 @@ pub struct AiClient {
     endpoint: String,
     model: Mutex<String>,
     api_key: Option<SecretString>,
+    prime_team_id: Option<String>,
     timeout: Duration,
     provider: ProviderKind,
     limiter: DirectLimiter,
@@ -233,6 +234,7 @@ impl AiClient {
             endpoint,
             model: Mutex::new(config.model.clone()),
             api_key: config.api_key.clone(),
+            prime_team_id: config.prime_team_id.clone(),
             timeout: config.timeout,
             provider,
             limiter,
@@ -342,6 +344,16 @@ impl AiClient {
                     )) {
                         value.set_sensitive(true);
                         request = request.header(reqwest::header::AUTHORIZATION, value);
+                    }
+                    // Prime Inference bills the team balance only when X-Prime-Team-ID is sent;
+                    // otherwise it bills the key's personal balance. Send it on the Prime endpoint.
+                    if self.endpoint.contains("pinference.ai") {
+                        if let Some(team) = &self.prime_team_id {
+                            if let Ok(mut v) = reqwest::header::HeaderValue::from_str(team) {
+                                v.set_sensitive(true);
+                                request = request.header("X-Prime-Team-ID", v);
+                            }
+                        }
                     }
                 }
                 ProviderKind::Anthropic => {
@@ -762,6 +774,7 @@ mod tests {
             api_key: Some(SecretString::from("sk-test".to_string())),
             timeout: Duration::from_millis(50),
             max_tool_calls: 8,
+            prime_team_id: None,
         }
     }
 
@@ -1001,4 +1014,28 @@ mod tests {
         let client = AiClient::new(&cfg).unwrap();
         assert_eq!(client.models_url(), "https://api.anthropic.com/v1/models");
     }
+    #[test]
+    fn prime_team_id_header_sent_on_prime_endpoint() {
+        let mut cfg = enabled_config();
+        cfg.base_url = "https://api.pinference.ai/api/v1".into();
+        cfg.prime_team_id = Some("team-abc".into());
+        let client = AiClient::new(&cfg).unwrap();
+        // Build any request through apply_auth and inspect the headers.
+        let req = client.apply_auth(client.http.get("https://api.pinference.ai/api/v1/models")).build().unwrap();
+        assert_eq!(
+            req.headers().get("X-Prime-Team-ID").and_then(|v| v.to_str().ok()),
+            Some("team-abc")
+        );
+        assert!(req.headers().get("authorization").is_some());
+    }
+
+    #[test]
+    fn prime_team_id_not_sent_off_prime_endpoint() {
+        let mut cfg = enabled_config();
+        cfg.prime_team_id = Some("team-abc".into());
+        let client = AiClient::new(&cfg).unwrap();
+        let req = client.apply_auth(client.http.get("http://127.0.0.1:1/v1/models")).build().unwrap();
+        assert!(req.headers().get("X-Prime-Team-ID").is_none());
+    }
 }
+

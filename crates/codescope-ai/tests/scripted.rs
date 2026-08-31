@@ -29,6 +29,7 @@ fn config_for(provider: &ScriptedProvider, timeout: Duration) -> AiConfig {
         api_key: Some(SecretString::from("sk-test".to_string())),
         timeout,
         max_tool_calls: 8,
+        prime_team_id: None,
     }
 }
 

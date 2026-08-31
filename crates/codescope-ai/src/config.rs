@@ -65,6 +65,10 @@ pub struct AiConfig {
     pub timeout: Duration,
     /// Read-only tool-call budget per plan (≤ [`MAX_TOOL_CALLS`]).
     pub max_tool_calls: u32,
+    /// Prime Inference team id, sent as `X-Prime-Team-ID` so requests bill the team balance
+    /// instead of the key's personal balance (read from `PRIME_TEAM_ID`; only sent on the
+    /// Prime Inference endpoint).
+    pub prime_team_id: Option<String>,
 }
 
 impl AiConfig {
@@ -78,6 +82,7 @@ impl AiConfig {
             api_key: None,
             timeout: DEFAULT_TIMEOUT,
             max_tool_calls: MAX_TOOL_CALLS,
+            prime_team_id: None,
         }
     }
 
@@ -191,6 +196,8 @@ impl AiConfig {
         let max_tool_calls = file
             .and_then(|f| f.max_tool_calls)
             .unwrap_or(MAX_TOOL_CALLS);
+        let prime_team_id = env("PRIME_TEAM_ID");
+
         let max_tool_calls = if max_tool_calls > MAX_TOOL_CALLS {
             tracing::warn!(
                 requested = max_tool_calls,
@@ -217,6 +224,7 @@ impl AiConfig {
             api_key: key.map(SecretString::from),
             timeout: Duration::from_millis(timeout_ms),
             max_tool_calls,
+            prime_team_id,
         })
     }
 }
@@ -385,6 +393,19 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn prime_team_id_reads_from_env() {
+        let cfg = AiConfig::resolve(
+            None,
+            env_of(&[("PRIME_API_KEY", "sk-p"), ("PRIME_TEAM_ID", "team-123")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.prime_team_id.as_deref(), Some("team-123"));
+        // absent when unset
+        let cfg2 = AiConfig::resolve(None, env_of(&[("PRIME_API_KEY", "sk-p")])).unwrap();
+        assert!(cfg2.prime_team_id.is_none());
     }
 
     #[test]
