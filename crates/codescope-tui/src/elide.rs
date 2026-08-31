@@ -30,7 +30,10 @@ pub fn elide_paths(paths: &[&str], budget: usize) -> Vec<String> {
     let marker = if root.is_some() { ROOT_MARKER } else { "" };
     let rest: Vec<&str> = paths
         .iter()
-        .map(|p| root.as_deref().map_or(*p, |r| p.strip_prefix(r).unwrap_or(p)))
+        .map(|p| {
+            root.as_deref()
+                .map_or(*p, |r| p.strip_prefix(r).unwrap_or(p))
+        })
         .collect();
     let comps: Vec<Vec<&str>> = rest.iter().map(|p| p.split('/').collect()).collect();
 
@@ -89,10 +92,9 @@ fn distinguishing_depth(comps: &[Vec<&str>], i: usize) -> usize {
     let mine = &comps[i];
     for depth in 1..=mine.len() {
         let suffix = &mine[mine.len() - depth..];
-        let unique = comps
-            .iter()
-            .enumerate()
-            .all(|(j, other)| j == i || other.len() < depth || other[other.len() - depth..] != *suffix);
+        let unique = comps.iter().enumerate().all(|(j, other)| {
+            j == i || other.len() < depth || other[other.len() - depth..] != *suffix
+        });
         if unique {
             return depth;
         }
@@ -194,7 +196,10 @@ fn middle_elide(s: &str, budget: usize) -> String {
         return "…".to_string();
     }
     // Split head/tail around a central "…". Keep the extension on the tail.
-    let ext = s.rsplit_once('.').map(|(_, e)| format!(".{e}")).unwrap_or_default();
+    let ext = s
+        .rsplit_once('.')
+        .map(|(_, e)| format!(".{e}"))
+        .unwrap_or_default();
     let tail_keep = ext.width().min(budget / 2);
     let head_keep = budget.saturating_sub(1 + tail_keep);
     let head = take_cells(s, head_keep);
@@ -251,7 +256,10 @@ mod tests {
             "sandbox/vm-sandboxes/packages/api/server.go",
             "sandbox/vm-sandboxes/packages/conduitd/config.go",
         ];
-        assert_eq!(shared_root(paths).as_deref(), Some("sandbox/vm-sandboxes/packages/"));
+        assert_eq!(
+            shared_root(paths).as_deref(),
+            Some("sandbox/vm-sandboxes/packages/")
+        );
     }
 
     #[test]
@@ -268,17 +276,21 @@ mod tests {
 
     #[test]
     fn elide_middle_preserves_basename() {
-        let out = elide_paths(&["sandbox/vm-sandboxes/packages/primelet/internal/actionworker/executor.go"], 30);
+        let out = elide_paths(
+            &["sandbox/vm-sandboxes/packages/primelet/internal/actionworker/executor.go"],
+            30,
+        );
         assert!(out[0].width() <= 30, "must fit budget");
-        assert!(out[0].ends_with("executor.go"), "basename preserved: {}", out[0]);
+        assert!(
+            out[0].ends_with("executor.go"),
+            "basename preserved: {}",
+            out[0]
+        );
     }
 
     #[test]
     fn two_same_basenames_stay_distinguishable() {
-        let out = elide_paths(
-            &["worker/executor.go", "control-plane/executor.go"],
-            40,
-        );
+        let out = elide_paths(&["worker/executor.go", "control-plane/executor.go"], 40);
         assert_ne!(out[0], out[1]);
         assert!(out[0].contains("executor.go"));
         assert!(out[1].contains("executor.go"));
@@ -295,10 +307,17 @@ mod tests {
         ];
         for budget in [60usize, 40, 30, 24, 18] {
             let out = elide_paths(paths, budget);
-            assert_ne!(out[0], out[1], "budget {budget}: {:?} vs {:?}", out[0], out[1]);
+            assert_ne!(
+                out[0], out[1],
+                "budget {budget}: {:?} vs {:?}",
+                out[0], out[1]
+            );
             for o in &out {
                 assert!(o.width() <= budget, "budget {budget}: {o}");
-                assert!(o.contains("executor.go") || o.contains("…"), "budget {budget}: {o}");
+                assert!(
+                    o.contains("executor.go") || o.contains("…"),
+                    "budget {budget}: {o}"
+                );
             }
         }
     }

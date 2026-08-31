@@ -1021,9 +1021,14 @@ mod tests {
         cfg.prime_team_id = Some("team-abc".into());
         let client = AiClient::new(&cfg).unwrap();
         // Build any request through apply_auth and inspect the headers.
-        let req = client.apply_auth(client.http.get("https://api.pinference.ai/api/v1/models")).build().unwrap();
+        let req = client
+            .apply_auth(client.http.get("https://api.pinference.ai/api/v1/models"))
+            .build()
+            .unwrap();
         assert_eq!(
-            req.headers().get("X-Prime-Team-ID").and_then(|v| v.to_str().ok()),
+            req.headers()
+                .get("X-Prime-Team-ID")
+                .and_then(|v| v.to_str().ok()),
             Some("team-abc")
         );
         assert!(req.headers().get("authorization").is_some());
@@ -1034,8 +1039,10 @@ mod tests {
         let mut cfg = enabled_config();
         cfg.prime_team_id = Some("team-abc".into());
         let client = AiClient::new(&cfg).unwrap();
-        let req = client.apply_auth(client.http.get("http://127.0.0.1:1/v1/models")).build().unwrap();
+        let req = client
+            .apply_auth(client.http.get("http://127.0.0.1:1/v1/models"))
+            .build()
+            .unwrap();
         assert!(req.headers().get("X-Prime-Team-ID").is_none());
     }
 }
-

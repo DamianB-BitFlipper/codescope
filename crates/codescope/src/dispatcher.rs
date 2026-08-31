@@ -59,6 +59,10 @@ pub enum DispatchEvent {
     AiDone {
         /// Epoch the plan was requested against.
         epoch: Epoch,
+        /// The AI request generation (monotonic per dispatcher): distinguishes two
+        /// requests in the same epoch, so a slow older request can never overwrite a
+        /// newer plan (review 18 M7).
+        generation: u64,
         /// The validated outcome.
         outcome: AiOutcome,
     },
@@ -153,14 +157,23 @@ pub struct Dispatcher {
     /// The selected symbol's lazily-expanded callers/callees, kept as separate lists so
     /// the impact pane can show both columns.
     selected_relations: Option<SelectedRelations>,
+    /// The epoch that produced the current `repo_ctx`/`changeset`. Jobs that clone
+    /// those as inputs (per-file analysis, AI digest) must only launch when this equals
+    /// `self.epoch` — otherwise they would tag old git facts with the new epoch
+    /// (review 18 M1).
+    data_epoch: Epoch,
+    /// Monotonic AI request counter: `AiDone.generation` must match to apply.
+    ai_request_seq: u64,
     /// Per-file lazy semantic analysis, keyed by repo-relative path. Absent = Unloaded.
     /// Cleared on every epoch bump (scope/base/repo change invalidates file content).
     file_semantics: std::collections::HashMap<String, FileSemanticState>,
     /// Files the user expanded with Tab (dispatcher owns expansion so the snapshot is the
     /// single source of truth; the app forwards ToggleFileAnalysis).
     expanded_files: std::collections::HashSet<String>,
-    /// In-flight per-file analysis jobs (coalescing + concurrency bound).
-    analysis_in_flight: std::collections::HashSet<String>,
+    /// In-flight per-file analysis jobs: path → the epoch its job was launched under.
+    /// A completing job removes only its own entry (matching epoch); a stale-epoch
+    /// completion never disturbs a newer job's ledger entry (review 18 M2).
+    analysis_in_flight: std::collections::HashMap<String, Epoch>,
     /// FIFO queue for per-file analysis beyond the concurrency bound.
     analysis_queue: std::collections::VecDeque<String>,
     snapshot_tx: watch::Sender<UiSnapshot>,
@@ -219,7 +232,9 @@ impl Dispatcher {
             selected_relations: None,
             file_semantics: std::collections::HashMap::new(),
             expanded_files: std::collections::HashSet::new(),
-            analysis_in_flight: std::collections::HashSet::new(),
+            ai_request_seq: 0,
+            data_epoch: Epoch::ZERO,
+            analysis_in_flight: std::collections::HashMap::new(),
             analysis_queue: std::collections::VecDeque::new(),
             base_override: None,
             available_bases: Vec::new(),
@@ -260,7 +275,11 @@ impl Dispatcher {
                 file,
                 result,
             } => self.on_file_analysis_done(epoch, file, result),
-            DispatchEvent::AiDone { epoch, outcome } => self.on_ai_done(epoch, outcome),
+            DispatchEvent::AiDone {
+                epoch,
+                generation,
+                outcome,
+            } => self.on_ai_done(epoch, generation, outcome),
             DispatchEvent::EngineReady(engine) => {
                 self.ls_status = LsStatus::Ready;
                 self.engine = Some(std::sync::Arc::new(*engine));
@@ -336,7 +355,7 @@ impl Dispatcher {
     fn on_action(&mut self, action: Action) {
         match action {
             Action::RefreshGit => self.spawn_refresh(),
-            Action::ToggleFileAnalysis => self.toggle_file_analysis(),
+            Action::SetFileExpanded { path, expanded } => self.set_file_expanded(&path, expanded),
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
             Action::ScopeUnstaged => self.set_scope(ChangeScope::Unstaged),
             Action::ScopeBranch => self.set_scope(ChangeScope::Branch),
@@ -578,41 +597,65 @@ impl Dispatcher {
             return;
         }
         let epoch = self.epoch;
+        self.ai_request_seq += 1;
+        let generation = self.ai_request_seq;
         self.ai_status = AiStatus::Loading { since_epoch: epoch };
         self.publish();
         // Digest from the git changeset + the symbols of files the user explicitly
-        // analyzed (Ready). Unloaded files contribute hunks only; the digest's evidence
-        // notes record the partial semantic coverage honestly. Never triggers analysis.
-        let changed: Vec<codescope_analysis::ChangedSymbolInfo> = self
-            .file_semantics
-            .values()
-            .filter_map(|s| match s {
-                FileSemanticState::Ready(res) => Some(res.changed.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
+        // analyzed (Ready), in CHANGSET order (deterministic). Unloaded files contribute
+        // hunks only; Loading/Failed/Unsupported are reported separately. Never triggers
+        // analysis. The relation graph was never queried — `Unknown`, not a partial answer.
+        let mut changed: Vec<codescope_analysis::ChangedSymbolInfo> = Vec::new();
+        let mut diags: Vec<codescope_core::Diagnostic> = Vec::new();
+        let (mut loading, mut failed, mut unsupported) = (0usize, 0usize, 0usize);
+        for f in &changeset.files {
+            match self.file_semantics.get(f.path.as_str()) {
+                Some(FileSemanticState::Ready(res)) => {
+                    changed.extend(res.changed.clone());
+                    diags.extend(res.diagnostics.clone());
+                }
+                Some(FileSemanticState::Loading) => loading += 1,
+                Some(FileSemanticState::Failed) => failed += 1,
+                Some(FileSemanticState::Unsupported) => unsupported += 1,
+                None => {}
+            }
+        }
         let mut digest = codescope_analysis::change_digest(
             &changed,
             changeset,
             &codescope_core::Evidence {
                 value: codescope_core::ImpactGraph::default(),
-                completeness: codescope_core::Completeness::Partial,
-                notes: vec!["lazy semantics: only user-expanded files analyzed".to_string()],
+                completeness: codescope_core::Completeness::Unknown,
+                notes: vec!["relations not queried (lazy per-file semantics)".to_string()],
             },
-            &[],
+            &diags,
             ctx,
         )
         .render();
         let unloaded = changeset
             .files
             .iter()
-            .filter(|f| !matches!(self.file_semantics.get(f.path.as_str()), Some(FileSemanticState::Ready(_))))
+            .filter(|f| {
+                !matches!(
+                    self.file_semantics.get(f.path.as_str()),
+                    Some(FileSemanticState::Ready(_))
+                )
+            })
             .count();
         if unloaded > 0 {
+            let mut parts = vec![format!("{unloaded} not yet analyzed")];
+            if loading > 0 {
+                parts.push(format!("{loading} analyzing"));
+            }
+            if failed > 0 {
+                parts.push(format!("{failed} failed"));
+            }
+            if unsupported > 0 {
+                parts.push(format!("{unsupported} unsupported"));
+            }
             digest.push_str(&format!(
-                "\nnote: {unloaded} changed file{} not yet analyzed (expand with Tab for symbol detail)",
-                if unloaded == 1 { "" } else { "s" }
+                "\nnote: {}; expand a file with Tab for symbol detail",
+                parts.join(", ")
             ));
         }
         let facts = SnapshotFacts::from_lazy(changeset, &self.file_semantics);
@@ -626,7 +669,13 @@ impl Dispatcher {
                 }
                 None => AiOutcome::Unavailable,
             };
-            let _ = tx.send(DispatchEvent::AiDone { epoch, outcome }).await;
+            let _ = tx
+                .send(DispatchEvent::AiDone {
+                    epoch,
+                    generation,
+                    outcome,
+                })
+                .await;
         });
     }
 
@@ -635,48 +684,85 @@ impl Dispatcher {
     const MAX_FILE_JOBS: usize = 4;
 
     /// Start (or queue) the lazy per-file analysis for `path`. Coalesces duplicates: a
-    /// file already Loading/Ready/in-flight launches nothing.
+    /// file already Loading/Ready this epoch launches nothing; a path with a job in
+    /// flight (any epoch) is queued so the language server's per-file overlay never sees
+    /// two writers (review 18 M2).
     fn spawn_file_analysis(&mut self, path: &str) {
-        use std::collections::hash_map::Entry;
-        // Coalesce: already loaded or in flight for this epoch.
+        // Coalesce terminal/ready states: a cached Ready or a definitive Unsupported is
+        // reused within the epoch. Failed retries on re-expand (the user asked again).
         if matches!(
             self.file_semantics.get(path),
-            Some(FileSemanticState::Loading) | Some(FileSemanticState::Ready(_))
-        ) || self.analysis_in_flight.contains(path)
-        {
+            Some(FileSemanticState::Loading)
+                | Some(FileSemanticState::Ready(_))
+                | Some(FileSemanticState::Unsupported)
+        ) {
             return;
         }
+        // The engine may still be starting (LsStatus::Starting) — queue, don't mislabel
+        // the file as unsupported (review 18 m2).
+        if self.engine.is_none() {
+            if self.ls_status == codescope_core::LsStatus::Failed {
+                self.file_semantics
+                    .insert(path.to_string(), FileSemanticState::Unsupported);
+                self.publish();
+            } else {
+                self.enqueue_file_analysis(path);
+            }
+            return;
+        }
+        // M1: only launch against the CURRENT git-fact bundle. While a refresh is in
+        // flight (data_epoch behind epoch), queue — the ChangesetReady handler drains.
+        // M2: a path with an in-flight job (any epoch) queues instead of double-spawning.
+        if self.data_epoch != self.epoch || self.analysis_in_flight.contains_key(path) {
+            self.enqueue_file_analysis(path);
+            return;
+        }
+        if self.analysis_in_flight.len() >= Self::MAX_FILE_JOBS {
+            self.enqueue_file_analysis(path);
+            return;
+        }
+        self.spawn_file_analysis_now(path);
+    }
+
+    /// Queue `path` for a later spawn (bounded concurrency / stale data epoch / engine
+    /// starting), marking the row Loading so the UI shows the pending state.
+    fn enqueue_file_analysis(&mut self, path: &str) {
+        if !self.analysis_queue.iter().any(|p| p == path) {
+            self.analysis_queue.push_back(path.to_string());
+        }
+        if !matches!(
+            self.file_semantics.get(path),
+            Some(FileSemanticState::Loading)
+        ) {
+            self.file_semantics
+                .insert(path.to_string(), FileSemanticState::Loading);
+        }
+        self.publish();
+    }
+
+    /// The actual spawn: assumes the caller verified coalescing, the data epoch, the
+    /// per-path in-flight exclusion, and the global bound.
+    fn spawn_file_analysis_now(&mut self, path: &str) {
         let Some(engine) = self.engine.clone() else {
-            // Git-only: mark unsupported rather than queue a job that can never run.
-            self.file_semantics.insert(
-                path.to_string(),
-                FileSemanticState::Unsupported,
-            );
-            self.publish();
             return;
         };
         let Some(changeset) = &self.changeset else {
             return;
         };
-        let Some(fc) = changeset.files.iter().find(|f| f.path.as_str() == path).cloned() else {
+        let Some(fc) = changeset
+            .files
+            .iter()
+            .find(|f| f.path.as_str() == path)
+            .cloned()
+        else {
             return;
         };
-        let Some(ctx) = self.repo_ctx.clone() else { return };
-        if self.analysis_in_flight.len() >= Self::MAX_FILE_JOBS {
-            if !self.analysis_queue.iter().any(|p| p == path) {
-                self.analysis_queue.push_back(path.to_string());
-            }
-            // Mark Loading now so the UI shows the pending row while queued.
-            if let Entry::Vacant(e) = self.file_semantics.entry(path.to_string()) {
-                e.insert(FileSemanticState::Loading);
-                self.publish();
-            }
+        let Some(ctx) = self.repo_ctx.clone() else {
             return;
-        }
-        self.analysis_in_flight.insert(path.to_string());
-        if let Entry::Vacant(e) = self.file_semantics.entry(path.to_string()) {
-            e.insert(FileSemanticState::Loading);
-        }
+        };
+        self.analysis_in_flight.insert(path.to_string(), self.epoch);
+        self.file_semantics
+            .insert(path.to_string(), FileSemanticState::Loading);
         self.publish();
         let epoch = self.epoch;
         let scope = self.scope;
@@ -704,9 +790,13 @@ impl Dispatcher {
         file: String,
         result: Result<Box<codescope_analysis::FileSemanticResult>, String>,
     ) {
-        self.analysis_in_flight.remove(&file);
-        // Epoch gate: a refresh superseded this job.
-        if epoch != self.epoch {
+        // Ledger removal is epoch-exact: a stale completion never disturbs a newer job's
+        // entry for the same path (review 18 M2).
+        if self.analysis_in_flight.get(&file) == Some(&epoch) {
+            self.analysis_in_flight.remove(&file);
+        }
+        // Epoch + data-epoch gates: a refresh superseded this job or its inputs.
+        if epoch != self.epoch || self.data_epoch != self.epoch {
             self.drain_analysis_queue();
             return;
         }
@@ -723,10 +813,38 @@ impl Dispatcher {
             Ok(res) => {
                 let state = if res.unsupported {
                     FileSemanticState::Unsupported
+                } else if res.worktree_failed {
+                    // The symbol query failed: surface a retryable failure, never
+                    // authoritative empty/deleted data (review 18 M3).
+                    self.set_status(
+                        format!(
+                            "semantic analysis failed for {file}: {}",
+                            res.analysis
+                                .notes
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "symbol query failed".to_string())
+                        ),
+                        StatusLevel::Warning,
+                    );
+                    FileSemanticState::Failed
                 } else {
                     FileSemanticState::Ready(res)
                 };
-                self.file_semantics.insert(file, state);
+                self.file_semantics.insert(file.clone(), state);
+                // A Ready transition resolves relations for a symbol selection that was
+                // waiting on this file (review 18 m3).
+                if matches!(
+                    self.file_semantics.get(&file),
+                    Some(FileSemanticState::Ready(_))
+                ) && self
+                    .selected_symbol
+                    .as_ref()
+                    .is_some_and(|(f, _, _, _)| *f == file)
+                {
+                    let (f, name, line, col) = self.selected_symbol.clone().expect("checked");
+                    self.spawn_expand(f, name, line, col);
+                }
             }
             Err(e) => {
                 self.set_status(
@@ -740,17 +858,18 @@ impl Dispatcher {
         self.drain_analysis_queue();
     }
 
-    /// Start the next queued per-file job when a slot frees.
+    /// Start the next queued per-file job when a slot frees and the data epoch is current.
     fn drain_analysis_queue(&mut self) {
-        while self.analysis_in_flight.len() < Self::MAX_FILE_JOBS {
+        while self.analysis_in_flight.len() < Self::MAX_FILE_JOBS && self.data_epoch == self.epoch {
             let Some(next) = self.analysis_queue.pop_front() else {
                 break;
             };
-            // Skip entries that already landed while queued.
+            // Already satisfied or still running: skip silently.
             if matches!(
                 self.file_semantics.get(&next),
                 Some(FileSemanticState::Ready(_))
-            ) {
+            ) || self.analysis_in_flight.contains_key(&next)
+            {
                 continue;
             }
             // Clear the queued Loading marker so the spawn path runs the real job.
@@ -759,32 +878,42 @@ impl Dispatcher {
         }
     }
 
-    /// Tab on the files pane: collapse an expanded file (keeping its cached semantics),
-    /// or expand a collapsed one — dispatching the lazy analysis on first expand.
-    fn toggle_file_analysis(&mut self) {
-        let Some(file) = self.selected_file.clone() else {
-            return;
-        };
-        if self.expanded_files.contains(&file) {
-            self.expanded_files.remove(&file);
-            // Collapsing the file that owns the selected symbol: the relation view no
-            // longer has a visible anchor.
-            if self
-                .selected_symbol
-                .as_ref()
-                .is_some_and(|(f, _, _, _)| *f == file)
-            {
-                self.selected_symbol = None;
-                self.selected_relations = None;
-            }
-            self.publish();
+    /// The targeted expansion command (review 18 M4): the path was resolved by the app
+    /// at keypress time, so a coalesced SelectionChanged cannot retarget the toggle.
+    /// Idempotent — the SetFileExpanded command names the desired end state.
+    fn set_file_expanded(&mut self, path: &str, expanded: bool) {
+        // Only files in the current changeset can be expanded.
+        let known = self
+            .changeset
+            .as_ref()
+            .is_some_and(|cs| cs.files.iter().any(|f| f.path.as_str() == path));
+        if !known {
             return;
         }
-        self.expanded_files.insert(file.clone());
+        if expanded {
+            if !self.expanded_files.insert(path.to_string()) {
+                return; // already expanded
+            }
+            self.publish();
+            // First expand dispatches the lazy analysis; cached/queued/in-flight
+            // coalesces inside spawn_file_analysis.
+            self.spawn_file_analysis(path);
+            return;
+        }
+        if !self.expanded_files.remove(path) {
+            return; // already collapsed
+        }
+        // Collapsing the file that owns the selected symbol: the relation view no longer
+        // has a visible anchor.
+        if self
+            .selected_symbol
+            .as_ref()
+            .is_some_and(|(f, _, _, _)| f == path)
+        {
+            self.selected_symbol = None;
+            self.selected_relations = None;
+        }
         self.publish();
-        // First expand dispatches the lazy analysis; a cached/queued/in-flight file
-        // coalesces inside spawn_file_analysis.
-        self.spawn_file_analysis(&file);
     }
 
     fn on_changeset_ready(
@@ -800,12 +929,33 @@ impl Dispatcher {
         }
         self.repo_ctx = Some(ctx);
         self.changeset = Some(changeset);
-        if self.analysis.is_none() {
-            self.set_status(
-                "files listed; symbol analysis still running…",
-                StatusLevel::Info,
-            );
+        // The git-fact bundle is now current: per-file analysis and AI digests may launch
+        // against it. Replay expansion intent for files that survived the refresh.
+        self.data_epoch = epoch;
+        // The message must not claim analysis is "running": in the lazy world the
+        // pipeline ends here and symbols load only on demand (review 18 m6).
+        if self.analysis.is_none()
+            && self.status.text == "files listed; symbol analysis still running…"
+        {
+            self.status = StatusMessage::default();
         }
+        // Replay expansion intent: files still in the (new) changeset that the user had
+        // expanded get their analysis relaunched against current data; vanished files
+        // drop out of the expansion set.
+        if let Some(cs) = &self.changeset {
+            let present: Vec<String> = self
+                .expanded_files
+                .iter()
+                .filter(|p| cs.files.iter().any(|f| f.path.as_str() == p.as_str()))
+                .cloned()
+                .collect();
+            self.expanded_files = present.iter().cloned().collect();
+            for path in present {
+                self.spawn_file_analysis(&path);
+            }
+        }
+        // Jobs queued while the data epoch was stale may launch now.
+        self.drain_analysis_queue();
         // Analysis is still in flight: keep the refreshing marker on.
         self.publish_refreshing();
     }
@@ -853,9 +1003,13 @@ impl Dispatcher {
         self.publish();
     }
 
-    fn on_ai_done(&mut self, epoch: Epoch, outcome: AiOutcome) {
+    fn on_ai_done(&mut self, epoch: Epoch, generation: u64, outcome: AiOutcome) {
         if epoch != self.epoch {
             // A newer state superseded this plan; do not apply.
+            return;
+        }
+        if generation != self.ai_request_seq {
+            // A newer AI request in the same epoch superseded this one (review 18 M7).
             return;
         }
         match outcome {
@@ -1061,7 +1215,10 @@ impl Dispatcher {
                         })
                 });
             let (change, interpretation) = match info {
-                Some(info) => (change_label(info.record.change_kind), interpret_change(info)),
+                Some(info) => (
+                    change_label(info.record.change_kind),
+                    interpret_change(info),
+                ),
                 None => ("modified", String::new()),
             };
             return Some(SelectedChange {
@@ -1073,9 +1230,22 @@ impl Dispatcher {
             });
         }
         let file = self.selected_file.as_deref()?;
-        let changed_in_file = match self.file_semantics.get(file) {
-            Some(FileSemanticState::Ready(res)) => res.changed.len(),
-            _ => 0,
+        // The numeric count is real only for Ready; other states describe themselves
+        // (review 18 m6).
+        let interpretation = match self.file_semantics.get(file) {
+            Some(FileSemanticState::Ready(res)) => {
+                let n = res.changed.len();
+                format!(
+                    "{n} changed symbol{} in this file; select one to inspect impact.",
+                    if n == 1 { "" } else { "s" }
+                )
+            }
+            Some(FileSemanticState::Loading) => "analyzing symbols…".to_string(),
+            Some(FileSemanticState::Unsupported) => {
+                "semantic analysis unavailable for this file".to_string()
+            }
+            Some(FileSemanticState::Failed) => "symbol analysis failed; Tab to retry".to_string(),
+            None => "not analyzed; Tab to load symbols".to_string(),
         };
         let change = self
             .changeset
@@ -1087,14 +1257,10 @@ impl Dispatcher {
             file: file.to_string(),
             label: file.to_string(),
             change,
-            interpretation: format!(
-                "{changed_in_file} changed symbol{} in this file; select one to inspect impact.",
-                if changed_in_file == 1 { "" } else { "s" }
-            ),
+            interpretation,
             interpretation_source: InterpretationSource::Deterministic,
         })
     }
-
 }
 
 /// The git+analysis pipeline, run as one spawned job. A base override (from the base
@@ -1203,13 +1369,26 @@ fn lazy_file_rows(
             let path = f.path.to_string();
             let state = semantics.get(&path);
             let (symbols, semantic) = match state {
-                Some(FileSemanticState::Ready(res)) => {
-                    (changed_info_to_symbol_rows(&res.changed, &res.diagnostics), codescope_tui::snapshot::FileSemanticLoad::Ready)
-                }
-                Some(FileSemanticState::Loading) => (Vec::new(), codescope_tui::snapshot::FileSemanticLoad::Loading),
-                Some(FileSemanticState::Unsupported) => (Vec::new(), codescope_tui::snapshot::FileSemanticLoad::Unsupported),
-                Some(FileSemanticState::Failed) => (Vec::new(), codescope_tui::snapshot::FileSemanticLoad::Failed),
-                None => (Vec::new(), codescope_tui::snapshot::FileSemanticLoad::Unloaded),
+                Some(FileSemanticState::Ready(res)) => (
+                    changed_info_to_symbol_rows(&res.changed, &res.diagnostics),
+                    codescope_tui::snapshot::FileSemanticLoad::Ready,
+                ),
+                Some(FileSemanticState::Loading) => (
+                    Vec::new(),
+                    codescope_tui::snapshot::FileSemanticLoad::Loading,
+                ),
+                Some(FileSemanticState::Unsupported) => (
+                    Vec::new(),
+                    codescope_tui::snapshot::FileSemanticLoad::Unsupported,
+                ),
+                Some(FileSemanticState::Failed) => (
+                    Vec::new(),
+                    codescope_tui::snapshot::FileSemanticLoad::Failed,
+                ),
+                None => (
+                    Vec::new(),
+                    codescope_tui::snapshot::FileSemanticLoad::Unloaded,
+                ),
             };
             FileRow {
                 changed_symbol_count: symbols.len(),
@@ -1314,9 +1493,6 @@ fn selected_diff(a: &codescope_core::ChangeSet, selected: Option<&str>) -> DiffP
     }
 }
 
-
-
-
 /// The deterministic one-line interpretation of a changed symbol (spec §3.5). AI may
 /// replace this sentence only with a validated, epoch-matched result tied to the same
 /// selected entity; today's AI output is repository-wide, so this always stands.
@@ -1355,7 +1531,6 @@ fn file_change_label(status: &codescope_core::FileStatus) -> &'static str {
         _ => "modified",
     }
 }
-
 
 fn plan_rows(plan: &codescope_core::VisualizationPlan) -> Vec<SemRow> {
     let mut rows = Vec::new();
@@ -1436,8 +1611,6 @@ impl SnapshotFacts {
         }
         facts
     }
-
-
 }
 
 fn entity_key(e: &EntityRef) -> String {
@@ -1446,7 +1619,6 @@ fn entity_key(e: &EntityRef) -> String {
         None => e.file.to_string(),
     }
 }
-
 
 impl FactView for SnapshotFacts {
     fn file_exists(&self, file: &codescope_core::FileId) -> bool {
@@ -1741,7 +1913,10 @@ mod tests {
         let snap = snapshot_rx.borrow().clone();
         assert!(snap.refreshing);
         assert_eq!(snap.repo.branch, "feature", "branch survives refresh start");
-        assert!(!snap.repo.repo_name.is_empty(), "repo name survives refresh start");
+        assert!(
+            !snap.repo.repo_name.is_empty(),
+            "repo name survives refresh start"
+        );
         assert!(
             !snap.files.is_empty(),
             "files survive refresh start (stale data + spinner beats an empty pane)"
@@ -2109,6 +2284,7 @@ mod tests {
             analysis: codescope_analysis::FileAnalysis {
                 file: codescope_core::FileId::new_unchecked(file),
                 status: codescope_core::FileStatus::Modified,
+                worktree_query_failed: false,
                 worktree: None,
                 base: None,
                 mappings: Vec::new(),
@@ -2117,6 +2293,7 @@ mod tests {
             changed,
             diagnostics: Vec::new(),
             unsupported: false,
+            worktree_failed: false,
         }))
     }
 
@@ -2124,25 +2301,50 @@ mod tests {
     #[test]
     fn deterministic_interpretation_sentences_cover_each_change_kind() {
         use codescope_core::{ChangeKind, SymbolKind};
-        let added = changed_symbol("a.go", "NewHandler", SymbolKind::Function, ChangeKind::Added, 3, false);
+        let added = changed_symbol(
+            "a.go",
+            "NewHandler",
+            SymbolKind::Function,
+            ChangeKind::Added,
+            3,
+            false,
+        );
         assert_eq!(interpret_change(&added), "Added function across 3 hunks.");
 
-        let modified =
-            changed_symbol("a.go", "Handle", SymbolKind::Method, ChangeKind::Modified, 2, false);
+        let modified = changed_symbol(
+            "a.go",
+            "Handle",
+            SymbolKind::Method,
+            ChangeKind::Modified,
+            2,
+            false,
+        );
         assert_eq!(
             interpret_change(&modified),
             "Modified implementation across 2 hunks."
         );
 
-        let signature =
-            changed_symbol("a.go", "Handle", SymbolKind::Method, ChangeKind::Modified, 1, true);
+        let signature = changed_symbol(
+            "a.go",
+            "Handle",
+            SymbolKind::Method,
+            ChangeKind::Modified,
+            1,
+            true,
+        );
         assert_eq!(
             interpret_change(&signature),
             "Modified signature and implementation across 1 hunks."
         );
 
-        let removed =
-            changed_symbol("a.go", "Legacy", SymbolKind::Function, ChangeKind::Deleted, 1, false);
+        let removed = changed_symbol(
+            "a.go",
+            "Legacy",
+            SymbolKind::Function,
+            ChangeKind::Deleted,
+            1,
+            false,
+        );
         assert_eq!(
             interpret_change(&removed),
             "Removed function; callers may require updates."
@@ -2156,8 +2358,10 @@ mod tests {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
 
+        let generation = disp.ai_request_seq;
         disp.handle(DispatchEvent::AiDone {
             epoch: disp.epoch,
+            generation,
             outcome: AiOutcome::Failed("ai request timed out after 20s".to_string()),
         })
         .await;
@@ -2188,7 +2392,10 @@ mod tests {
         .await;
         let snap = snapshot_rx.borrow().clone();
         assert_eq!(snap.status.level, StatusLevel::Warning);
-        assert_eq!(snap.status.text, "git-only (no supported language detected)");
+        assert_eq!(
+            snap.status.text,
+            "git-only (no supported language detected)"
+        );
 
         disp.handle(DispatchEvent::AnalysisDone {
             epoch: disp.epoch,
@@ -2272,8 +2479,8 @@ mod tests {
         assert_eq!(selected.label, "b.txt");
         assert_eq!(selected.change, "modified");
         assert_eq!(
-            selected.interpretation,
-            "0 changed symbols in this file; select one to inspect impact."
+            selected.interpretation, "not analyzed; Tab to load symbols",
+            "an unanalyzed file says so, not a fake zero"
         );
         assert_eq!(snap.impact.callers.state, ImpactLoadState::Idle);
         assert_eq!(snap.impact.downstream.state, ImpactLoadState::Idle);
@@ -2463,7 +2670,10 @@ mod tests {
             snap.files[0].semantic,
             codescope_tui::snapshot::FileSemanticLoad::Unloaded
         );
-        assert_eq!(snap.files[0].changed_symbol_count, 0, "no fake zero-symbol count");
+        assert_eq!(
+            snap.files[0].changed_symbol_count, 0,
+            "no fake zero-symbol count"
+        );
         // No per-file analysis job was launched (no FileAnalysisDone queued).
         assert!(
             job_rx.try_recv().is_err(),
@@ -2479,8 +2689,10 @@ mod tests {
         let (mut disp, _snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
         // No engine in the fixture: EngineUnavailable is the git-only path, and the point
         // is that neither readiness path triggers a repo-wide refresh.
-        disp.handle(DispatchEvent::EngineUnavailable("no supported language detected".into()))
-            .await;
+        disp.handle(DispatchEvent::EngineUnavailable(
+            "no supported language detected".into(),
+        ))
+        .await;
         assert_eq!(disp.ls_status, codescope_core::LsStatus::Failed);
         // No analysis job followed.
         assert!(
@@ -2509,25 +2721,46 @@ mod tests {
         }))
         .await;
 
-        // No engine: the expand marks Unsupported (git-only) rather than queue a job
-        // that could never run — and a second Tab collapses.
-        disp.handle(DispatchEvent::Work(Action::ToggleFileAnalysis)).await;
+        // No engine yet (LsStatus::Starting in this fixture): the expand queues the
+        // file as Loading rather than mislabeling it unsupported (review 18 m2); the
+        // queued job waits for the engine.
+        disp.handle(DispatchEvent::Work(Action::SetFileExpanded {
+            path: "a.txt".to_string(),
+            expanded: true,
+        }))
+        .await;
         {
             let snap = snapshot_rx.borrow().clone();
             assert!(snap.files[0].expanded, "expanded");
             assert_eq!(
                 snap.files[0].semantic,
-                codescope_tui::snapshot::FileSemanticLoad::Unsupported
+                codescope_tui::snapshot::FileSemanticLoad::Loading
             );
         }
-        // Repeated toggles coalesce: collapse (no job), re-expand (cache/unsupported hit,
-        // still no job).
-        disp.handle(DispatchEvent::Work(Action::ToggleFileAnalysis)).await;
+        // Collapse, then re-expand: the second expand coalesces onto the queued job
+        // (no duplicate spawn).
+        disp.handle(DispatchEvent::Work(Action::SetFileExpanded {
+            path: "a.txt".to_string(),
+            expanded: false,
+        }))
+        .await;
         assert!(!snapshot_rx.borrow().files[0].expanded);
-        disp.handle(DispatchEvent::Work(Action::ToggleFileAnalysis)).await;
+        disp.handle(DispatchEvent::Work(Action::SetFileExpanded {
+            path: "a.txt".to_string(),
+            expanded: true,
+        }))
+        .await;
         let snap = snapshot_rx.borrow().clone();
         assert!(snap.files[0].expanded);
-        assert!(disp.analysis_in_flight.is_empty(), "no duplicate jobs");
+        // One queued job, coalesced: the queue holds a single entry, no duplicates.
+        assert_eq!(
+            disp.analysis_queue
+                .iter()
+                .filter(|p| p.as_str() == "a.txt")
+                .count(),
+            1,
+            "exactly one queued analysis for the file"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2535,10 +2768,23 @@ mod tests {
     #[tokio::test]
     async fn file_analysis_result_fills_symbols_and_stale_epochs_drop() {
         let root = scratch_repo();
-        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
         disp.handle(DispatchEvent::RepoChanged).await;
+        let done = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::AnalysisDone { .. })
+        })
+        .await;
+        disp.handle(done).await;
         let snap_epoch = snapshot_rx.borrow().epoch;
-        disp.changeset = Some(two_file_changeset());
+        // Land the two-file changeset via the event so data_epoch tracks it (the result
+        // gate requires data_epoch == epoch — review 18 M1).
+        let ctx = disp.repo_ctx.clone().expect("repo ctx after refresh");
+        disp.handle(DispatchEvent::ChangesetReady {
+            epoch: disp.epoch,
+            ctx,
+            changeset: two_file_changeset(),
+        })
+        .await;
         disp.expanded_files.insert("a.txt".to_string());
 
         // Current-epoch result: fills the row.
@@ -2550,6 +2796,7 @@ mod tests {
                 analysis: codescope_analysis::FileAnalysis {
                     file: codescope_core::FileId::new_unchecked("a.txt"),
                     status: codescope_core::FileStatus::Modified,
+                    worktree_query_failed: false,
                     worktree: None,
                     base: None,
                     mappings: Vec::new(),
@@ -2565,6 +2812,7 @@ mod tests {
                 )],
                 diagnostics: Vec::new(),
                 unsupported: false,
+                worktree_failed: false,
             })),
         })
         .await;
@@ -2587,6 +2835,7 @@ mod tests {
                 analysis: codescope_analysis::FileAnalysis {
                     file: codescope_core::FileId::new_unchecked("b.txt"),
                     status: codescope_core::FileStatus::Modified,
+                    worktree_query_failed: false,
                     worktree: None,
                     base: None,
                     mappings: Vec::new(),
@@ -2602,6 +2851,7 @@ mod tests {
                 )],
                 diagnostics: Vec::new(),
                 unsupported: false,
+                worktree_failed: false,
             })),
         })
         .await;
@@ -2623,8 +2873,20 @@ mod tests {
     #[tokio::test]
     async fn collapsing_the_selected_symbols_file_clears_relations() {
         let root = scratch_repo();
-        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
-        disp.changeset = Some(two_file_changeset());
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+        disp.handle(DispatchEvent::RepoChanged).await;
+        let done = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::AnalysisDone { .. })
+        })
+        .await;
+        disp.handle(done).await;
+        let ctx = disp.repo_ctx.clone().expect("repo ctx after refresh");
+        disp.handle(DispatchEvent::ChangesetReady {
+            epoch: disp.epoch,
+            ctx,
+            changeset: two_file_changeset(),
+        })
+        .await;
         disp.file_semantics.insert(
             "a.txt".to_string(),
             ready_semantics(
@@ -2647,7 +2909,11 @@ mod tests {
         .await;
         assert!(disp.selected_symbol.is_some());
         // Collapse: the selection leaves the hidden symbol; the relation view clears.
-        disp.handle(DispatchEvent::Work(Action::ToggleFileAnalysis)).await;
+        disp.handle(DispatchEvent::Work(Action::SetFileExpanded {
+            path: "a.txt".to_string(),
+            expanded: false,
+        }))
+        .await;
         assert!(disp.selected_symbol.is_none());
         assert!(disp.selected_relations.is_none());
         assert!(!snapshot_rx.borrow().files[0].expanded);

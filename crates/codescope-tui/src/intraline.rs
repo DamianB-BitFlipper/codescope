@@ -136,8 +136,16 @@ fn pair_rows_aligned(rows: &[DiffRow]) -> Vec<Option<usize>> {
     let mut adds: Vec<usize> = Vec::new();
     let flush = |pairs: &mut Vec<Option<usize>>, dels: &mut Vec<usize>, adds: &mut Vec<usize>| {
         if !dels.is_empty() && !adds.is_empty() && dels.len() + adds.len() <= MAX_BLOCK_LINES {
-            let old_joined = dels.iter().map(|&i| row_text(&rows[i])).collect::<Vec<_>>().join("\n");
-            let new_joined = adds.iter().map(|&i| row_text(&rows[i])).collect::<Vec<_>>().join("\n");
+            let old_joined = dels
+                .iter()
+                .map(|&i| row_text(&rows[i]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let new_joined = adds
+                .iter()
+                .map(|&i| row_text(&rows[i]))
+                .collect::<Vec<_>>()
+                .join("\n");
             let diff = TextDiff::from_lines(&old_joined, &new_joined);
             // Group consecutive changes by op class; zip only the two sides of a Replace
             // group (a run of deletes followed by a run of inserts with no equal between).
@@ -145,14 +153,15 @@ fn pair_rows_aligned(rows: &[DiffRow]) -> Vec<Option<usize>> {
             let mut a = 0usize;
             let mut pending_del: Vec<usize> = Vec::new();
             let mut pending_add: Vec<usize> = Vec::new();
-            let flush_group = |pairs: &mut Vec<Option<usize>>, pd: &mut Vec<usize>, pa: &mut Vec<usize>| {
-                for k in 0..pd.len().min(pa.len()) {
-                    pairs[dels[pd[k]]] = Some(adds[pa[k]]);
-                    pairs[adds[pa[k]]] = Some(dels[pd[k]]);
-                }
-                pd.clear();
-                pa.clear();
-            };
+            let flush_group =
+                |pairs: &mut Vec<Option<usize>>, pd: &mut Vec<usize>, pa: &mut Vec<usize>| {
+                    for k in 0..pd.len().min(pa.len()) {
+                        pairs[dels[pd[k]]] = Some(adds[pa[k]]);
+                        pairs[adds[pa[k]]] = Some(dels[pd[k]]);
+                    }
+                    pd.clear();
+                    pa.clear();
+                };
             for change in diff.iter_all_changes() {
                 match change.tag() {
                     ChangeTag::Delete => {
@@ -385,8 +394,14 @@ mod tests {
         let old = "    let timeout = 30;";
         let new = "    let timeout = 60;";
         let (old_spans, new_spans) = changed_spans(old, new);
-        assert_eq!(old_spans, vec![(old.find("30").unwrap(), old.find("30").unwrap() + 2)]);
-        assert_eq!(new_spans, vec![(new.find("60").unwrap(), new.find("60").unwrap() + 2)]);
+        assert_eq!(
+            old_spans,
+            vec![(old.find("30").unwrap(), old.find("30").unwrap() + 2)]
+        );
+        assert_eq!(
+            new_spans,
+            vec![(new.find("60").unwrap(), new.find("60").unwrap() + 2)]
+        );
     }
 
     #[test]
@@ -421,7 +436,10 @@ mod tests {
             changed_spans("if a == b {", "for x in xs() {"),
             (vec![], vec![])
         );
-        assert_eq!(changed_spans("return foo(1)", "break bar(2)"), (vec![], vec![]));
+        assert_eq!(
+            changed_spans("return foo(1)", "break bar(2)"),
+            (vec![], vec![])
+        );
     }
 
     #[test]
@@ -446,7 +464,11 @@ mod tests {
     fn changed_adjacent_tokens_merge() {
         // "30;" replaced by a longer token run: touching changed tokens read as one span.
         let (old_spans, new_spans) = changed_spans("x = 30;", "x = 60 + 2;");
-        assert_eq!(old_spans, vec![(4, 6)], "just `30`; the trailing `;` survives");
+        assert_eq!(
+            old_spans,
+            vec![(4, 6)],
+            "just `30`; the trailing `;` survives"
+        );
         assert_eq!(new_spans, vec![(4, 10)], "`60 + 2` merges into one span");
     }
 
@@ -518,26 +540,46 @@ mod tests {
         assert!(spans[4].is_empty(), "unpaired extra add: no spans");
     }
 
-
     /// Review 16 M4: an insertion inside a del/add run must not shift later partners.
     /// The two `return` lines pair; the pure insertion does not.
     #[test]
     fn inserted_line_does_not_shift_later_pairs() {
         let rows = vec![
-            DiffRow::Del { old_ln: 1, text: "let keep = 1;".to_string() },
-            DiffRow::Del { old_ln: 2, text: "return old".to_string() },
-            DiffRow::Add { new_ln: 1, text: "let inserted = 0;".to_string() },
-            DiffRow::Add { new_ln: 2, text: "let keep = 1;".to_string() },
-            DiffRow::Add { new_ln: 3, text: "return new".to_string() },
+            DiffRow::Del {
+                old_ln: 1,
+                text: "let keep = 1;".to_string(),
+            },
+            DiffRow::Del {
+                old_ln: 2,
+                text: "return old".to_string(),
+            },
+            DiffRow::Add {
+                new_ln: 1,
+                text: "let inserted = 0;".to_string(),
+            },
+            DiffRow::Add {
+                new_ln: 2,
+                text: "let keep = 1;".to_string(),
+            },
+            DiffRow::Add {
+                new_ln: 3,
+                text: "return new".to_string(),
+            },
         ];
         let pairs = pair_rows_aligned(&rows);
-        assert_eq!(pairs[0], None, "pure delete of `let keep` (moved, not changed)");
+        assert_eq!(
+            pairs[0], None,
+            "pure delete of `let keep` (moved, not changed)"
+        );
         assert_eq!(pairs[1], Some(4), "`return old` pairs with `return new`");
         assert_eq!(pairs[4], Some(1));
         assert_eq!(pairs[2], None, "pure insertion unpaired");
         assert_eq!(pairs[3], None);
         let spans = row_spans(&rows);
-        assert!(!spans[1].is_empty() && !spans[4].is_empty(), "old/new brighten");
+        assert!(
+            !spans[1].is_empty() && !spans[4].is_empty(),
+            "old/new brighten"
+        );
         assert!(spans[2].is_empty(), "inserted line has no intraline spans");
     }
 }

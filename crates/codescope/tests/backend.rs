@@ -219,7 +219,9 @@ fn scan_tolerates_branch_scope_without_base() {
         .as_array()
         .expect("unavailable scope is explained in notes");
     assert!(
-        notes.iter().any(|n| n.as_str().unwrap_or_default().contains("branch")),
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap_or_default().contains("branch")),
         "note should name the branch scope: {json}"
     );
 }
@@ -322,7 +324,10 @@ fn analyze_fixture_full_snapshot() {
         "diagnostics",
         "digest",
     ] {
-        assert!(json.get(key).is_some(), "missing top-level key {key}: {json}");
+        assert!(
+            json.get(key).is_some(),
+            "missing top-level key {key}: {json}"
+        );
     }
     assert_eq!(json["changeset"]["scope"], "unstaged");
 
@@ -360,7 +365,10 @@ fn analyze_fixture_full_snapshot() {
 
     // Per-file degradation notes never fail the run.
     let files = json["files"].as_array().unwrap();
-    assert_eq!(files.len(), json["changeset"]["files"].as_array().unwrap().len());
+    assert_eq!(
+        files.len(),
+        json["changeset"]["files"].as_array().unwrap().len()
+    );
 
     assert_repo_relative(&stdout(&out), &root);
 }
@@ -375,15 +383,22 @@ fn analyze_git_only_when_server_binary_missing() {
         .expect("spawn codescope");
     let json = json_stdout(&out);
 
-    assert!(json["lsp"].is_null(), "git-only mode reports lsp: null: {json}");
+    assert!(
+        json["lsp"].is_null(),
+        "git-only mode reports lsp: null: {json}"
+    );
     let notes = json["notes"].as_array().expect("git-only notes");
     assert!(
-        notes.iter().any(|n| n.as_str().unwrap_or_default().contains("git-only")),
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap_or_default().contains("git-only")),
         "notes explain the degradation: {notes:?}"
     );
     // Files carry per-file notes and no semantic trees, but hunks survive in the digest.
     let files = json["files"].as_array().unwrap();
-    assert!(files.iter().all(|f| !f["notes"].as_array().unwrap().is_empty()));
+    assert!(files
+        .iter()
+        .all(|f| !f["notes"].as_array().unwrap().is_empty()));
     assert!(files.iter().all(|f| f["worktree"].is_null()));
     assert!(json["changed"].as_array().unwrap().is_empty());
     assert!(
@@ -434,8 +449,14 @@ fn digest_fixture_json_and_text() {
     let out = codescope(&["digest", &root, "--scope", "unstaged", "--text"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
-    assert!(text.starts_with("# change digest\n"), "rendered digest: {text:?}");
-    assert!(serde_json::from_str::<Value>(&text).is_err(), "--text is not JSON");
+    assert!(
+        text.starts_with("# change digest\n"),
+        "rendered digest: {text:?}"
+    );
+    assert!(
+        serde_json::from_str::<Value>(&text).is_err(),
+        "--text is not JSON"
+    );
     assert_repo_relative(&text, Path::new(&root));
 }
 
@@ -499,7 +520,10 @@ fn non_repo_path_errors_with_json_and_exit_1() {
         let out = codescope(&[sub, &path]);
         let err = json_stderr_error(&out);
         assert!(
-            err["error"].as_str().unwrap().contains("not a git repository"),
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("not a git repository"),
             "{sub}: clear non-repo error: {err}"
         );
     }
@@ -626,14 +650,27 @@ fn assert_analyze_keys(json: &Value, label: &str) {
         "diagnostics",
         "digest",
     ] {
-        assert!(json.get(key).is_some(), "{label}: analyze missing key {key}: {json}");
+        assert!(
+            json.get(key).is_some(),
+            "{label}: analyze missing key {key}: {json}"
+        );
     }
 }
 
 /// The `digest` tier keys (the five tiers of the AI prompt payload).
 fn assert_digest_tiers(json: &Value, label: &str) {
-    for key in ["scope", "changed_symbols", "diagnostics", "hunks", "relations", "repo"] {
-        assert!(json.get(key).is_some(), "{label}: digest missing tier {key}: {json}");
+    for key in [
+        "scope",
+        "changed_symbols",
+        "diagnostics",
+        "hunks",
+        "relations",
+        "repo",
+    ] {
+        assert!(
+            json.get(key).is_some(),
+            "{label}: digest missing tier {key}: {json}"
+        );
     }
 }
 
@@ -663,7 +700,10 @@ fn check_shape(root: &Path, label: &str, expect: ShapeExpect) {
     let out = codescope(&["scan", &root_s]);
     let json = json_stdout(&out);
     for key in ["repo", "scopes", "languages", "language_server"] {
-        assert!(json.get(key).is_some(), "{label}: scan missing key {key}: {json}");
+        assert!(
+            json.get(key).is_some(),
+            "{label}: scan missing key {key}: {json}"
+        );
     }
     assert!(
         json["repo"].get("toplevel").is_none(),
@@ -680,7 +720,11 @@ fn check_shape(root: &Path, label: &str, expect: ShapeExpect) {
             "{label}: branch scope without a base reports null: {json}"
         ),
     }
-    assert_eq!(json["scopes"]["staged"].as_u64(), Some(expect.staged as u64), "{label}: staged");
+    assert_eq!(
+        json["scopes"]["staged"].as_u64(),
+        Some(expect.staged as u64),
+        "{label}: staged"
+    );
     assert_eq!(
         json["scopes"]["unstaged"].as_u64(),
         Some(expect.unstaged as u64),
@@ -713,10 +757,16 @@ fn check_shape(root: &Path, label: &str, expect: ShapeExpect) {
     let out = codescope_env(&["analyze", &root_s, "--scope", "working"], GIT_ONLY_ENV);
     let json = json_stdout(&out);
     assert_analyze_keys(&json, label);
-    assert!(json["lsp"].is_null(), "{label}: forced git-only reports lsp null: {json}");
+    assert!(
+        json["lsp"].is_null(),
+        "{label}: forced git-only reports lsp null: {json}"
+    );
     assert_eq!(json["changeset"]["scope"], "working");
     assert_eq!(
-        json["changeset"]["files"].as_array().expect("files array").len(),
+        json["changeset"]["files"]
+            .as_array()
+            .expect("files array")
+            .len(),
         expect.working,
         "{label}: analyze working file count"
     );
@@ -731,8 +781,14 @@ fn check_shape(root: &Path, label: &str, expect: ShapeExpect) {
     let json = json_stdout(&out);
     assert_digest_tiers(&json, label);
     assert_eq!(json["scope"], "working");
-    assert!(json["repo"]["head"].is_string(), "{label}: digest sketch head: {json}");
-    assert!(json["repo"]["dirs"].is_array(), "{label}: digest sketch dirs: {json}");
+    assert!(
+        json["repo"]["head"].is_string(),
+        "{label}: digest sketch head: {json}"
+    );
+    assert!(
+        json["repo"]["dirs"].is_array(),
+        "{label}: digest sketch dirs: {json}"
+    );
     assert_repo_relative(&stdout(&out), root);
 
     // bases: always succeeds on a repo, even when empty.
@@ -746,22 +802,75 @@ fn check_shape(root: &Path, label: &str, expect: ShapeExpect) {
 fn subcommand_matrix_all_repo_shapes() {
     let shapes: [(&str, ShapeExpect); 7] = [
         // Clean tree, single `main` branch (no inferable base), one dirty file.
-        ("dirty_worktree", ShapeExpect { branch: None, staged: 0, unstaged: 1, working: 1 }),
+        (
+            "dirty_worktree",
+            ShapeExpect {
+                branch: None,
+                staged: 0,
+                unstaged: 1,
+                working: 1,
+            },
+        ),
         // Staged + unstaged + untracked on a single branch.
         (
             "mixed_staged_unstaged_untracked",
-            ShapeExpect { branch: None, staged: 1, unstaged: 2, working: 3 },
+            ShapeExpect {
+                branch: None,
+                staged: 1,
+                unstaged: 2,
+                working: 3,
+            },
         ),
         // Fully pushed branch: the branch scope falls back to the dirty worktree.
-        ("branch_fully_pushed", ShapeExpect { branch: Some(1), staged: 0, unstaged: 1, working: 1 }),
+        (
+            "branch_fully_pushed",
+            ShapeExpect {
+                branch: Some(1),
+                staged: 0,
+                unstaged: 1,
+                working: 1,
+            },
+        ),
         // main <- a <- b: branch scope of b holds only b.go.
-        ("stacked_branches", ShapeExpect { branch: Some(1), staged: 0, unstaged: 0, working: 0 }),
+        (
+            "stacked_branches",
+            ShapeExpect {
+                branch: Some(1),
+                staged: 0,
+                unstaged: 0,
+                working: 0,
+            },
+        ),
         // No commits yet: branch scope has no base, the untracked file is visible.
-        ("unborn_branch", ShapeExpect { branch: None, staged: 0, unstaged: 1, working: 1 }),
+        (
+            "unborn_branch",
+            ShapeExpect {
+                branch: None,
+                staged: 0,
+                unstaged: 1,
+                working: 1,
+            },
+        ),
         // Mid-merge with a conflict: the unmerged file counts in every scope.
-        ("merge_conflict", ShapeExpect { branch: Some(1), staged: 1, unstaged: 1, working: 1 }),
+        (
+            "merge_conflict",
+            ShapeExpect {
+                branch: Some(1),
+                staged: 1,
+                unstaged: 1,
+                working: 1,
+            },
+        ),
         // A staged pure rename on a single branch.
-        ("renamed_file", ShapeExpect { branch: None, staged: 1, unstaged: 0, working: 1 }),
+        (
+            "renamed_file",
+            ShapeExpect {
+                branch: None,
+                staged: 1,
+                unstaged: 0,
+                working: 1,
+            },
+        ),
     ];
     for (name, expect) in shapes {
         let built = scenario_repo(name);
@@ -772,11 +881,25 @@ fn subcommand_matrix_all_repo_shapes() {
     check_shape(
         &root,
         "clean_repo",
-        ShapeExpect { branch: Some(1), staged: 0, unstaged: 0, working: 0 },
+        ShapeExpect {
+            branch: Some(1),
+            staged: 0,
+            unstaged: 0,
+            working: 0,
+        },
     );
 
     let (_tmp, root) = go_fixture();
-    check_shape(&root, "go_fixture", ShapeExpect { branch: Some(2), staged: 2, unstaged: 2, working: 3 });
+    check_shape(
+        &root,
+        "go_fixture",
+        ShapeExpect {
+            branch: Some(2),
+            staged: 2,
+            unstaged: 2,
+            working: 3,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -792,9 +915,17 @@ fn changeset_fallback_flag_true_only_on_fully_pushed_branch() {
     // worktree file is surfaced under the fallback flag.
     let out = codescope(&["changeset", &root, "--scope", "branch"]);
     let json = json_stdout(&out);
-    assert_eq!(json["fallback"].as_bool(), Some(true), "fallback fires: {json}");
+    assert_eq!(
+        json["fallback"].as_bool(),
+        Some(true),
+        "fallback fires: {json}"
+    );
     let files = json["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1, "fallback fills the set from the worktree: {json}");
+    assert_eq!(
+        files.len(),
+        1,
+        "fallback fills the set from the worktree: {json}"
+    );
     assert_eq!(files[0]["path"], "util.go");
     assert_eq!(files[0]["status"], "modified");
 
@@ -802,15 +933,26 @@ fn changeset_fallback_flag_true_only_on_fully_pushed_branch() {
     for scope in ["staged", "unstaged", "working"] {
         let out = codescope(&["changeset", &root, "--scope", scope]);
         let json = json_stdout(&out);
-        assert!(json.get("fallback").is_some(), "{scope}: fallback key present: {json}");
-        assert_eq!(json["fallback"].as_bool(), Some(false), "{scope}: no fallback: {json}");
+        assert!(
+            json.get("fallback").is_some(),
+            "{scope}: fallback key present: {json}"
+        );
+        assert_eq!(
+            json["fallback"].as_bool(),
+            Some(false),
+            "{scope}: no fallback: {json}"
+        );
     }
 
     // A normal diverged branch reports fallback=false on the branch scope too.
     let (_tmp, fx) = go_fixture();
     let out = codescope(&["changeset", &fx.to_string_lossy(), "--scope", "branch"]);
     let json = json_stdout(&out);
-    assert_eq!(json["fallback"].as_bool(), Some(false), "fixture branch has real commits: {json}");
+    assert_eq!(
+        json["fallback"].as_bool(),
+        Some(false),
+        "fixture branch has real commits: {json}"
+    );
 }
 
 #[test]
@@ -822,7 +964,11 @@ fn analyze_fully_pushed_branch_marks_changeset_as_fallback() {
     let json = json_stdout(&out);
     assert_analyze_keys(&json, "fully_pushed analyze");
     assert_eq!(json["changeset"]["scope"], "branch");
-    assert_eq!(json["changeset"]["fallback"].as_bool(), Some(true), "fallback rides the snapshot: {json}");
+    assert_eq!(
+        json["changeset"]["fallback"].as_bool(),
+        Some(true),
+        "fallback rides the snapshot: {json}"
+    );
     assert_eq!(json["changeset"]["files"][0]["path"], "util.go");
     // The fallback hunk reaches tier 3 of the embedded digest.
     assert!(
@@ -853,8 +999,14 @@ fn digest_fully_pushed_branch_scope_carries_fallback_content() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     assert!(text.starts_with("# change digest\n"), "{text}");
-    assert!(text.contains("## hunks (1)"), "fallback hunk rendered: {text}");
-    assert!(text.contains("util.go#h0"), "hunk line names the file: {text}");
+    assert!(
+        text.contains("## hunks (1)"),
+        "fallback hunk rendered: {text}"
+    );
+    assert!(
+        text.contains("util.go#h0"),
+        "hunk line names the file: {text}"
+    );
     assert_repo_relative(&text, &built.root);
 }
 
@@ -866,12 +1018,18 @@ fn bases_fully_pushed_branch_lists_the_upstream_first() {
     let out = codescope(&["bases", &root]);
     let json = json_stdout(&out);
     let bases = json["bases"].as_array().unwrap();
-    assert!(!bases.is_empty(), "upstream configured → at least one candidate: {json}");
+    assert!(
+        !bases.is_empty(),
+        "upstream configured → at least one candidate: {json}"
+    );
     assert_eq!(bases[0]["ref_name"], "main");
     assert_eq!(bases[0]["source"], "upstream");
     let merge_base = bases[0]["merge_base"].as_str().expect("merge_base string");
     assert_eq!(merge_base.len(), 40, "full hex oid: {merge_base}");
-    assert!(merge_base.chars().all(|c| c.is_ascii_hexdigit()), "hex oid: {merge_base}");
+    assert!(
+        merge_base.chars().all(|c| c.is_ascii_hexdigit()),
+        "hex oid: {merge_base}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -886,14 +1044,21 @@ fn stacked_branches_branch_scope_uses_nearest_ancestor() {
     let out = codescope(&["scan", &root]);
     let json = json_stdout(&out);
     assert_eq!(json["repo"]["head"]["branch"], "b");
-    assert_eq!(json["repo"]["base"]["ref_name"], "a", "base is the nearest ancestor, not main");
+    assert_eq!(
+        json["repo"]["base"]["ref_name"], "a",
+        "base is the nearest ancestor, not main"
+    );
     assert_eq!(json["repo"]["base"]["source"], "ancestor");
 
     // The branch change-set diffs against a: only b.go (a.go belongs to branch a).
     let out = codescope(&["changeset", &root, "--scope", "branch"]);
     let json = json_stdout(&out);
     let files = json["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1, "a.go must not leak into b's branch scope: {json}");
+    assert_eq!(
+        files.len(),
+        1,
+        "a.go must not leak into b's branch scope: {json}"
+    );
     assert_eq!(files[0]["path"], "b.go");
     assert_eq!(files[0]["status"], "added");
     assert_eq!(json["fallback"].as_bool(), Some(false));
@@ -919,7 +1084,10 @@ fn bases_stacked_branches_order_nearest_ancestor_first() {
     let out = codescope(&["bases", &root]);
     let json = json_stdout(&out);
     let bases = json["bases"].as_array().unwrap();
-    let names: Vec<&str> = bases.iter().map(|b| b["ref_name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = bases
+        .iter()
+        .map(|b| b["ref_name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, ["a", "main"], "nearest ancestor first: {bases:?}");
     assert!(
         bases.iter().all(|b| b["source"] == "ancestor"),
@@ -940,14 +1108,25 @@ fn unborn_branch_scan_reports_unborn_head_and_null_branch_scope() {
 
     let out = codescope(&["scan", &root]);
     let json = json_stdout(&out);
-    assert_eq!(json["repo"]["head"], "unborn", "unborn head serialization: {json}");
-    assert!(json["scopes"]["branch"].is_null(), "no base without commits: {json}");
+    assert_eq!(
+        json["repo"]["head"], "unborn",
+        "unborn head serialization: {json}"
+    );
+    assert!(
+        json["scopes"]["branch"].is_null(),
+        "no base without commits: {json}"
+    );
     assert_eq!(json["scopes"]["staged"], 0);
-    assert_eq!(json["scopes"]["unstaged"], 1, "the untracked file is unstaged-visible");
+    assert_eq!(
+        json["scopes"]["unstaged"], 1,
+        "the untracked file is unstaged-visible"
+    );
     assert_eq!(json["scopes"]["working"], 1);
     let notes = json["notes"].as_array().expect("unavailable scope noted");
     assert!(
-        notes.iter().any(|n| n.as_str().unwrap_or_default().contains("branch")),
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap_or_default().contains("branch")),
         "note names the branch scope: {notes:?}"
     );
     assert_repo_relative(&stdout(&out), &built.root);
@@ -999,7 +1178,10 @@ fn unborn_branch_branch_scope_errors_but_other_subcommands_work() {
     let out = codescope(&["digest", &root, "--scope", "working"]);
     let json = json_stdout(&out);
     assert_eq!(json["scope"], "working");
-    assert_eq!(json["repo"]["head"], "(unborn)", "sketch renders the unborn head: {json}");
+    assert_eq!(
+        json["repo"]["head"], "(unborn)",
+        "sketch renders the unborn head: {json}"
+    );
     assert!(
         json["notes"]
             .as_array()
@@ -1035,7 +1217,11 @@ fn merge_conflict_reports_unmerged_files_without_failing() {
         assert_eq!(files.len(), 1, "{scope}: {json}");
         assert_eq!(files[0]["path"], "util.go", "{scope}");
         assert_eq!(files[0]["status"], "unmerged", "{scope}");
-        assert_eq!(files[0]["hunks"], serde_json::json!([]), "{scope}: unmerged files are not hunk-parsed");
+        assert_eq!(
+            files[0]["hunks"],
+            serde_json::json!([]),
+            "{scope}: unmerged files are not hunk-parsed"
+        );
         assert_eq!(json["fallback"].as_bool(), Some(false), "{scope}");
     }
 
@@ -1052,7 +1238,11 @@ fn merge_conflict_reports_unmerged_files_without_failing() {
     let out = codescope(&["bases", &root]);
     let json = json_stdout(&out);
     assert!(
-        json["bases"].as_array().unwrap().iter().any(|b| b["ref_name"] == "main"),
+        json["bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["ref_name"] == "main"),
         "conflict does not block base candidates: {json}"
     );
 }
@@ -1070,7 +1260,10 @@ fn merge_conflict_analyze_and_digest_survive_git_only() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["file"], "util.go");
     assert_eq!(files[0]["status"], "unmerged");
-    assert!(files[0]["worktree"].is_null(), "no symbol tree for a conflicted file");
+    assert!(
+        files[0]["worktree"].is_null(),
+        "no symbol tree for a conflicted file"
+    );
     assert!(
         files[0]["notes"]
             .as_array()
@@ -1085,7 +1278,11 @@ fn merge_conflict_analyze_and_digest_survive_git_only() {
     let json = json_stdout(&out);
     assert_digest_tiers(&json, "merge_conflict digest");
     assert_eq!(json["scope"], "working");
-    assert_eq!(json["hunks"], serde_json::json!([]), "unmerged files contribute no hunks");
+    assert_eq!(
+        json["hunks"],
+        serde_json::json!([]),
+        "unmerged files contribute no hunks"
+    );
     assert!(
         json["notes"]
             .as_array()
@@ -1114,8 +1311,15 @@ fn renamed_file_change_sets_carry_rename_status_and_old_path() {
         assert_eq!(files.len(), 1, "{scope}: {json}");
         assert_eq!(files[0]["path"], "helper.go", "{scope}: post-rename path");
         assert_eq!(files[0]["old_path"], "util.go", "{scope}: pre-rename path");
-        assert_eq!(files[0]["status"]["renamed"]["score"], 100, "{scope}: identical content");
-        assert_eq!(files[0]["hunks"], serde_json::json!([]), "{scope}: pure rename has no hunks");
+        assert_eq!(
+            files[0]["status"]["renamed"]["score"], 100,
+            "{scope}: identical content"
+        );
+        assert_eq!(
+            files[0]["hunks"],
+            serde_json::json!([]),
+            "{scope}: pure rename has no hunks"
+        );
     }
 
     // Nothing is left unstaged (the rename is fully staged).
@@ -1174,7 +1378,11 @@ fn clean_repo_empty_uncommitted_scopes_and_committed_branch_scope() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["path"], "extra.go");
     assert_eq!(files[0]["status"], "added");
-    assert_eq!(json["fallback"].as_bool(), Some(false), "committed diff is non-empty");
+    assert_eq!(
+        json["fallback"].as_bool(),
+        Some(false),
+        "committed diff is non-empty"
+    );
 
     // digest of an empty scope: valid, empty tiers, exit 0.
     let out = codescope(&["digest", &root, "--scope", "working"]);
@@ -1218,8 +1426,14 @@ fn fixture_scope_semantics_exact_file_sets() {
     assert_eq!(
         paths_and_statuses(&json),
         [
-            ("internal/api/middleware.go".to_string(), "added".to_string()),
-            ("internal/store/postgres.go".to_string(), "modified".to_string()),
+            (
+                "internal/api/middleware.go".to_string(),
+                "added".to_string()
+            ),
+            (
+                "internal/store/postgres.go".to_string(),
+                "modified".to_string()
+            ),
         ],
         "branch = the 2-commit divergence from main: {json}"
     );
@@ -1241,7 +1455,10 @@ fn fixture_scope_semantics_exact_file_sets() {
     assert_eq!(
         paths_and_statuses(&json),
         [
-            ("internal/service/service.go".to_string(), "modified".to_string()),
+            (
+                "internal/service/service.go".to_string(),
+                "modified".to_string()
+            ),
             (
                 "internal/store/memstore.go".to_string(),
                 r#"{"renamed":{"score":100}}"#.to_string()
@@ -1257,8 +1474,14 @@ fn fixture_scope_semantics_exact_file_sets() {
     assert_eq!(
         paths_and_statuses(&json),
         [
-            ("internal/api/health.go".to_string(), "untracked".to_string()),
-            ("internal/store/memstore.go".to_string(), "modified".to_string()),
+            (
+                "internal/api/health.go".to_string(),
+                "untracked".to_string()
+            ),
+            (
+                "internal/store/memstore.go".to_string(),
+                "modified".to_string()
+            ),
         ],
         "unstaged = memstore edit + untracked: {json}"
     );
@@ -1273,8 +1496,15 @@ fn fixture_scope_semantics_exact_file_sets() {
     let json = json_stdout(&out);
     let files = json["files"].as_array().unwrap();
     assert_eq!(
-        files.iter().map(|f| f["path"].as_str().unwrap()).collect::<Vec<_>>(),
-        ["internal/api/health.go", "internal/service/service.go", "internal/store/memstore.go"],
+        files
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "internal/api/health.go",
+            "internal/service/service.go",
+            "internal/store/memstore.go"
+        ],
         "working = staged + unstaged + untracked: {json}"
     );
     assert_eq!(files[0]["status"], "untracked");
@@ -1282,7 +1512,10 @@ fn fixture_scope_semantics_exact_file_sets() {
     let score = files[2]["status"]["renamed"]["score"]
         .as_u64()
         .expect("memstore is a rename in the working scope");
-    assert!((50..=100).contains(&score), "rename similarity survives the edit: {score}");
+    assert!(
+        (50..=100).contains(&score),
+        "rename similarity survives the edit: {score}"
+    );
     assert_eq!(files[2]["old_path"], "internal/store/memory.go");
 }
 
@@ -1325,10 +1558,19 @@ fn digest_json_has_the_five_tier_structure() {
         // Tier 1 (changed symbols): the nil-guard edit maps to MemoryRepo.Get and the
         // untracked health.go contributes an added function.
         let symbols = json["changed_symbols"].as_array().unwrap();
-        let names: Vec<&str> = symbols.iter().map(|s| s["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"(*MemoryRepo).Get"), "tier 1 names: {names:?}");
+        let names: Vec<&str> = symbols
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"(*MemoryRepo).Get"),
+            "tier 1 names: {names:?}"
+        );
         assert!(names.contains(&"Health"), "tier 1 names: {names:?}");
-        let get = symbols.iter().find(|s| s["name"] == "(*MemoryRepo).Get").unwrap();
+        let get = symbols
+            .iter()
+            .find(|s| s["name"] == "(*MemoryRepo).Get")
+            .unwrap();
         assert_eq!(get["file"], "internal/store/memstore.go");
         assert_eq!(get["change_kind"], "modified");
         assert_eq!(get["kind"], "method");
@@ -1361,7 +1603,10 @@ fn digest_text_renders_the_prompt_and_mentions_a_changed_symbol() {
     let out = codescope(&["digest", &root, "--scope", "unstaged", "--text"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let text = stdout(&out);
-    assert!(text.starts_with("# change digest\n"), "rendered digest: {text}");
+    assert!(
+        text.starts_with("# change digest\n"),
+        "rendered digest: {text}"
+    );
     for needle in [
         "## changed symbols",
         "(*MemoryRepo).Get",
@@ -1370,7 +1615,10 @@ fn digest_text_renders_the_prompt_and_mentions_a_changed_symbol() {
         "## hunks",
         "## relations",
     ] {
-        assert!(text.contains(needle), "rendered digest missing {needle:?}:\n{text}");
+        assert!(
+            text.contains(needle),
+            "rendered digest missing {needle:?}:\n{text}"
+        );
     }
     assert!(
         serde_json::from_str::<Value>(&text).is_err(),
@@ -1391,11 +1639,17 @@ fn digest_git_only_forced_keeps_git_derived_tiers() {
     // LSP-derived tiers empty out; git-derived tiers survive the degradation.
     assert_eq!(json["changed_symbols"], serde_json::json!([]));
     assert_eq!(json["relations"], serde_json::json!([]));
-    assert_eq!(json["hunks"].as_array().unwrap().len(), 1, "hunks are git-derived");
+    assert_eq!(
+        json["hunks"].as_array().unwrap().len(),
+        1,
+        "hunks are git-derived"
+    );
     assert_eq!(json["repo"]["base_ref"], "main");
     let notes = json["notes"].as_array().expect("git-only notes");
     assert!(
-        notes.iter().any(|n| n.as_str().unwrap_or_default().contains("git-only")),
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap_or_default().contains("git-only")),
         "notes explain the degradation: {notes:?}"
     );
     assert_repo_relative(&stdout(&out), std::path::Path::new(&root));
@@ -1410,13 +1664,22 @@ fn analyze_fixture_all_scopes_git_only() {
     let (_tmp, root) = go_fixture();
     let root = root.to_string_lossy().to_string();
 
-    for (scope, file_count) in [("branch", 2), ("staged", 2), ("unstaged", 2), ("working", 3)] {
+    for (scope, file_count) in [
+        ("branch", 2),
+        ("staged", 2),
+        ("unstaged", 2),
+        ("working", 3),
+    ] {
         let out = codescope_env(&["analyze", &root, "--scope", scope], GIT_ONLY_ENV);
         let json = json_stdout(&out);
         assert_analyze_keys(&json, scope);
         assert!(json["lsp"].is_null(), "{scope}: forced git-only: {json}");
         assert_eq!(json["changeset"]["scope"], scope, "{scope}: scope echo");
-        assert_eq!(json["changeset"]["fallback"].as_bool(), Some(false), "{scope}");
+        assert_eq!(
+            json["changeset"]["fallback"].as_bool(),
+            Some(false),
+            "{scope}"
+        );
         assert_eq!(
             json["changeset"]["files"].as_array().unwrap().len(),
             file_count,
@@ -1430,11 +1693,11 @@ fn analyze_fixture_all_scopes_git_only() {
         assert_eq!(json["epoch"], 0, "{scope}: epoch zero on a fresh snapshot");
         // Every file degrades to a note instead of failing the run.
         assert!(
-            json["files"]
+            json["files"].as_array().unwrap().iter().all(|f| !f["notes"]
                 .as_array()
                 .unwrap()
-                .iter()
-                .all(|f| !f["notes"].as_array().unwrap().is_empty() && f["worktree"].is_null()),
+                .is_empty()
+                && f["worktree"].is_null()),
             "{scope}: per-file git-only notes: {json}"
         );
         assert_repo_relative(&stdout(&out), std::path::Path::new(&root));
@@ -1450,7 +1713,11 @@ fn analyze_fixture_all_scopes_git_only() {
         .find(|f| f["file"] == "internal/store/memstore.go")
         .expect("memstore analyzed");
     assert_eq!(renamed["status"]["renamed"]["score"], 100);
-    assert_eq!(json["changed"], serde_json::json!([]), "no semantic changes git-only");
+    assert_eq!(
+        json["changed"],
+        serde_json::json!([]),
+        "no semantic changes git-only"
+    );
     assert!(
         !json["digest"]["hunks"].as_array().unwrap().is_empty(),
         "the staged service edit reaches the digest hunks"
@@ -1464,12 +1731,19 @@ fn analyze_fixture_all_scopes_git_only() {
 #[test]
 fn nonexistent_path_errors_with_json_and_exit_1() {
     let tmp = TempDir::new().expect("tempdir");
-    let missing = tmp.path().join("does-not-exist").to_string_lossy().to_string();
+    let missing = tmp
+        .path()
+        .join("does-not-exist")
+        .to_string_lossy()
+        .to_string();
     for sub in ["scan", "changeset", "analyze", "digest", "bases"] {
         let out = codescope(&[sub, &missing]);
         let err = json_stderr_error(&out);
         assert!(
-            err["error"].as_str().unwrap().contains("not a git repository"),
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("not a git repository"),
             "{sub}: clear non-repo error: {err}"
         );
     }
@@ -1485,7 +1759,10 @@ fn file_path_is_not_a_repo() {
         let out = codescope(&[sub, &file]);
         let err = json_stderr_error(&out);
         assert!(
-            err["error"].as_str().unwrap().contains("not a git repository"),
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("not a git repository"),
             "{sub}: a file is not a repo: {err}"
         );
     }
@@ -1500,7 +1777,10 @@ fn non_git_dir_scenario_errors_on_all_subcommands() {
         let out = codescope(&[sub, &root]);
         let err = json_stderr_error(&out);
         assert!(
-            err["error"].as_str().unwrap().contains("not a git repository"),
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("not a git repository"),
             "{sub}: {err}"
         );
     }
@@ -1569,12 +1849,20 @@ fn bases_empty_when_no_base_candidates_exist() {
     let (_tmp, root) = single_branch_repo();
     let out = codescope(&["bases", &root.to_string_lossy()]);
     let json = json_stdout(&out);
-    assert_eq!(json["bases"], serde_json::json!([]), "lone main: no candidates");
+    assert_eq!(
+        json["bases"],
+        serde_json::json!([]),
+        "lone main: no candidates"
+    );
 
     let built = scenario_repo("unborn_branch");
     let out = codescope(&["bases", &built.root.to_string_lossy()]);
     let json = json_stdout(&out);
-    assert_eq!(json["bases"], serde_json::json!([]), "unborn: no candidates");
+    assert_eq!(
+        json["bases"],
+        serde_json::json!([]),
+        "unborn: no candidates"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,7 +1884,10 @@ fn subdirectory_path_discovers_the_repo_and_keeps_paths_repo_relative() {
 
     let out = codescope(&["scan", &sub]);
     let json = json_stdout(&out);
-    assert_eq!(json["repo"]["head"]["branch"], "feature", "discovery walks up to the repo");
+    assert_eq!(
+        json["repo"]["head"]["branch"], "feature",
+        "discovery walks up to the repo"
+    );
     assert_repo_relative(&stdout(&out), &root);
 }
 
@@ -1614,7 +1905,11 @@ fn omitted_path_uses_the_current_directory() {
 
     let out = codescope_in(&root, &["bases"]);
     let json = json_stdout(&out);
-    assert!(json["bases"].as_array().unwrap().iter().any(|b| b["ref_name"] == "main"));
+    assert!(json["bases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["ref_name"] == "main"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,7 +1964,11 @@ fn detached_head_scan_reports_the_detached_oid() {
     let out = codescope(&["bases", &root]);
     let json = json_stdout(&out);
     assert!(
-        json["bases"].as_array().unwrap().iter().any(|b| b["ref_name"] == "main"),
+        json["bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["ref_name"] == "main"),
         "main is still a base candidate: {json}"
     );
     let out = codescope(&["changeset", &root, "--scope", "working"]);

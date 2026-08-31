@@ -141,7 +141,11 @@ pub fn build(s: &Scenario) -> Result<Built> {
 
     if s.name == "non_git_dir" {
         std::fs::write(root.join("lonely.txt"), "not a repo\n")?;
-        return Ok(Built { _tmp: tmp, root, git: false });
+        return Ok(Built {
+            _tmp: tmp,
+            root,
+            git: false,
+        });
     }
 
     git(&root, &["init", "-q", "-b", "main"])?;
@@ -153,7 +157,11 @@ pub fn build(s: &Scenario) -> Result<Built> {
     for step in &s.steps {
         apply(&root, step)?;
     }
-    Ok(Built { _tmp: tmp, root, git: true })
+    Ok(Built {
+        _tmp: tmp,
+        root,
+        git: true,
+    })
 }
 
 /// The library of named scenarios.
@@ -180,9 +188,18 @@ pub fn all() -> Vec<Scenario> {
 
 fn base_commit() -> Vec<Step> {
     vec![
-        Step::Write { path: "main.go", content: "package main\n\nfunc main() {}\n" },
-        Step::Write { path: "util.go", content: "package main\n\nfunc Helper() int { return 1 }\n" },
-        Step::Write { path: "README.md", content: "# scratch\n" },
+        Step::Write {
+            path: "main.go",
+            content: "package main\n\nfunc main() {}\n",
+        },
+        Step::Write {
+            path: "util.go",
+            content: "package main\n\nfunc Helper() int { return 1 }\n",
+        },
+        Step::Write {
+            path: "README.md",
+            content: "# scratch\n",
+        },
         Step::AddAll,
         Step::Commit { msg: "initial" },
     ]
@@ -203,7 +220,10 @@ fn single_commit_repo() -> Scenario {
 
 fn dirty_worktree() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Append { path: "util.go", content: "\n// unstaged edit\n" });
+    steps.push(Step::Append {
+        path: "util.go",
+        content: "\n// unstaged edit\n",
+    });
     Scenario {
         name: "dirty_worktree",
         steps,
@@ -218,7 +238,10 @@ fn dirty_worktree() -> Scenario {
 
 fn staged_only() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Append { path: "util.go", content: "\n// staged edit\n" });
+    steps.push(Step::Append {
+        path: "util.go",
+        content: "\n// staged edit\n",
+    });
     steps.push(Step::Add { path: "util.go" });
     Scenario {
         name: "staged_only",
@@ -233,10 +256,19 @@ fn staged_only() -> Scenario {
 
 fn mixed_staged_unstaged_untracked() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Append { path: "util.go", content: "\n// staged\n" });
+    steps.push(Step::Append {
+        path: "util.go",
+        content: "\n// staged\n",
+    });
     steps.push(Step::Add { path: "util.go" });
-    steps.push(Step::Append { path: "main.go", content: "\n// unstaged\n" });
-    steps.push(Step::Write { path: "untracked.go", content: "package main\n" });
+    steps.push(Step::Append {
+        path: "main.go",
+        content: "\n// unstaged\n",
+    });
+    steps.push(Step::Write {
+        path: "untracked.go",
+        content: "package main\n",
+    });
     Scenario {
         name: "mixed_staged_unstaged_untracked",
         steps,
@@ -250,7 +282,10 @@ fn mixed_staged_unstaged_untracked() -> Scenario {
 
 fn detached_head() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Write { path: "x.go", content: "package main\n" });
+    steps.push(Step::Write {
+        path: "x.go",
+        content: "package main\n",
+    });
     steps.push(Step::AddAll);
     steps.push(Step::Commit { msg: "second" });
     steps.push(Step::Detach);
@@ -268,7 +303,10 @@ fn detached_head() -> Scenario {
 fn unborn_branch() -> Scenario {
     Scenario {
         name: "unborn_branch",
-        steps: vec![Step::Write { path: "new.go", content: "package main\n" }],
+        steps: vec![Step::Write {
+            path: "new.go",
+            content: "package main\n",
+        }],
         expect: Expect {
             branch: Some("(no commits)"),
             has_base: Some(false),
@@ -280,7 +318,10 @@ fn unborn_branch() -> Scenario {
 
 fn renamed_file() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Rename { from: "util.go", to: "helper.go" });
+    steps.push(Step::Rename {
+        from: "util.go",
+        to: "helper.go",
+    });
     Scenario {
         name: "renamed_file",
         steps,
@@ -313,16 +354,22 @@ fn deleted_file() -> Scenario {
 fn merge_conflict() -> Scenario {
     // main and other diverge from the initial commit; merging main into other conflicts.
     let mut steps = base_commit();
-    steps.push(Step::Branch { name: "other" });      // create + switch to `other` (at initial)
-    steps.push(Step::Append { path: "util.go", content: "\n// other side\n" });
+    steps.push(Step::Branch { name: "other" }); // create + switch to `other` (at initial)
+    steps.push(Step::Append {
+        path: "util.go",
+        content: "\n// other side\n",
+    });
     steps.push(Step::AddAll);
     steps.push(Step::Commit { msg: "other edit" }); // on `other`
-    steps.push(Step::Checkout { name: "main" });     // back to main (at initial)
-    steps.push(Step::Append { path: "util.go", content: "\n// main side\n" });
+    steps.push(Step::Checkout { name: "main" }); // back to main (at initial)
+    steps.push(Step::Append {
+        path: "util.go",
+        content: "\n// main side\n",
+    });
     steps.push(Step::AddAll);
-    steps.push(Step::Commit { msg: "main edit" });   // on `main`
-    steps.push(Step::Checkout { name: "other" });    // back to `other`
-    steps.push(Step::Commit { msg: "__merge__" });   // sentinel: merge main into other
+    steps.push(Step::Commit { msg: "main edit" }); // on `main`
+    steps.push(Step::Checkout { name: "other" }); // back to `other`
+    steps.push(Step::Commit { msg: "__merge__" }); // sentinel: merge main into other
     Scenario {
         name: "merge_conflict",
         steps,
@@ -340,7 +387,10 @@ fn branch_fully_pushed() -> Scenario {
     let mut steps = base_commit();
     steps.push(Step::Branch { name: "feature" }); // feature == HEAD == main tip
     steps.push(Step::SetUpstream { to: "main" });
-    steps.push(Step::Append { path: "util.go", content: "\n// dirty\n" });
+    steps.push(Step::Append {
+        path: "util.go",
+        content: "\n// dirty\n",
+    });
     Scenario {
         name: "branch_fully_pushed",
         steps,
@@ -356,11 +406,17 @@ fn branch_fully_pushed() -> Scenario {
 fn stacked_branches() -> Scenario {
     let mut steps = base_commit();
     steps.push(Step::Branch { name: "a" });
-    steps.push(Step::Write { path: "a.go", content: "package main\n" });
+    steps.push(Step::Write {
+        path: "a.go",
+        content: "package main\n",
+    });
     steps.push(Step::AddAll);
     steps.push(Step::Commit { msg: "a1" });
     steps.push(Step::Branch { name: "b" });
-    steps.push(Step::Write { path: "b.go", content: "package main\n" });
+    steps.push(Step::Write {
+        path: "b.go",
+        content: "package main\n",
+    });
     steps.push(Step::AddAll);
     steps.push(Step::Commit { msg: "b1" });
     Scenario {
@@ -378,7 +434,10 @@ fn stacked_branches() -> Scenario {
 
 fn deep_nesting() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Write { path: "a/b/c/d/e/deep.go", content: "package e\n" });
+    steps.push(Step::Write {
+        path: "a/b/c/d/e/deep.go",
+        content: "package e\n",
+    });
     Scenario {
         name: "deep_nesting",
         steps,
@@ -392,10 +451,16 @@ fn deep_nesting() -> Scenario {
 
 fn binary_change() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Write { path: "bin.dat", content: "\u{0}\u{1}\u{2}\u{ff}" });
+    steps.push(Step::Write {
+        path: "bin.dat",
+        content: "\u{0}\u{1}\u{2}\u{ff}",
+    });
     steps.push(Step::AddAll);
     steps.push(Step::Commit { msg: "add binary" });
-    steps.push(Step::Write { path: "bin.dat", content: "\u{0}\u{1}\u{3}\u{fe}\u{fd}" });
+    steps.push(Step::Write {
+        path: "bin.dat",
+        content: "\u{0}\u{1}\u{3}\u{fe}\u{fd}",
+    });
     Scenario {
         name: "binary_change",
         steps,
@@ -409,7 +474,10 @@ fn binary_change() -> Scenario {
 
 fn special_char_filename() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Write { path: "sp ace.go", content: "package main\n" });
+    steps.push(Step::Write {
+        path: "sp ace.go",
+        content: "package main\n",
+    });
     Scenario {
         name: "special_char_filename",
         steps,
@@ -423,10 +491,16 @@ fn special_char_filename() -> Scenario {
 
 fn crlf_file() -> Scenario {
     let mut steps = base_commit();
-    steps.push(Step::Write { path: "crlf.go", content: "package main\r\n\r\nfunc C() {}\r\n" });
+    steps.push(Step::Write {
+        path: "crlf.go",
+        content: "package main\r\n\r\nfunc C() {}\r\n",
+    });
     steps.push(Step::AddAll);
     steps.push(Step::Commit { msg: "crlf" });
-    steps.push(Step::Append { path: "crlf.go", content: "\r\n// edit\r\n" });
+    steps.push(Step::Append {
+        path: "crlf.go",
+        content: "\r\n// edit\r\n",
+    });
     Scenario {
         name: "crlf_file",
         steps,

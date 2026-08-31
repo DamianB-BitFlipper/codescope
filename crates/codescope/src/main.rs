@@ -189,8 +189,8 @@ mod tests {
             let cli = Cli::try_parse_from(["codescope", name]).unwrap();
             assert!(cli.command.is_some(), "{name} must be a subcommand");
         }
-        let cli = Cli::try_parse_from(["codescope", "analyze", "/repo", "--scope", "staged"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["codescope", "analyze", "/repo", "--scope", "staged"]).unwrap();
         match cli.command {
             Some(backend::BackendCommand::Analyze(args)) => {
                 assert_eq!(args.path, camino::Utf8PathBuf::from("/repo"));

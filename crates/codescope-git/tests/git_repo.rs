@@ -436,11 +436,19 @@ async fn stacked_branch_infers_nearest_ancestor_not_default() {
     let repo = open_repo(&top).await;
     // main = X. Create A off main with a commit, then B off A with a commit.
     git(top.as_std_path(), &["checkout", "-q", "-b", "a"]);
-    write(top.as_std_path(), "a.go", "package main\n\nfunc A() int { return 1 }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nfunc A() int { return 1 }\n",
+    );
     git(top.as_std_path(), &["add", "a.go"]);
     git(top.as_std_path(), &["commit", "-q", "-m", "a1"]);
     git(top.as_std_path(), &["checkout", "-q", "-b", "b"]);
-    write(top.as_std_path(), "b.go", "package main\n\nfunc B() int { return 2 }\n");
+    write(
+        top.as_std_path(),
+        "b.go",
+        "package main\n\nfunc B() int { return 2 }\n",
+    );
     git(top.as_std_path(), &["add", "b.go"]);
     git(top.as_std_path(), &["commit", "-q", "-m", "b1"]);
 
@@ -723,9 +731,16 @@ async fn fully_pushed_upstream_yields_to_local_ancestor() {
     git(top.as_std_path(), &["commit", "-q", "-m", "b1"]);
     // A same-tip local ref set as upstream => merge-base == HEAD (fully pushed).
     git(top.as_std_path(), &["branch", "b-remote"]);
-    git(top.as_std_path(), &["branch", "--set-upstream-to", "b-remote", "b"]);
+    git(
+        top.as_std_path(),
+        &["branch", "--set-upstream-to", "b-remote", "b"],
+    );
     let ctx = repo.repo_context().await.expect("ctx");
     let base = ctx.base.expect("base inferred");
-    assert_eq!(base.source, codescope_core::BaseSource::Ancestor,
-        "fully-pushed upstream must yield to a local ancestor; got {:?}", base);
+    assert_eq!(
+        base.source,
+        codescope_core::BaseSource::Ancestor,
+        "fully-pushed upstream must yield to a local ancestor; got {:?}",
+        base
+    );
 }

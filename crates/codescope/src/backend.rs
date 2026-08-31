@@ -523,7 +523,10 @@ impl SemanticSource for GitOnlySource {
         false
     }
 
-    async fn document_symbols(&self, _file: &FileId) -> Result<Evidence<SymbolTree>, SemanticError> {
+    async fn document_symbols(
+        &self,
+        _file: &FileId,
+    ) -> Result<Evidence<SymbolTree>, SemanticError> {
         Err(self.unavailable())
     }
 

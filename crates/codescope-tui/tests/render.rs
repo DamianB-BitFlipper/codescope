@@ -120,7 +120,6 @@ fn narrow_layout_shows_one_pane() {
     );
 }
 
-
 #[test]
 fn too_small_renders_message() {
     let backend = TestBackend::new(24, 6);
@@ -268,7 +267,10 @@ fn picker_modal_swallows_keys() {
         Action::PickerBackspace
     );
     assert_eq!(map_key(key(KeyCode::Esc), &app), Action::ModelPicker);
-    assert_eq!(map_key(key(KeyCode::Char('j')), &app), Action::PickerInput('j'));
+    assert_eq!(
+        map_key(key(KeyCode::Char('j')), &app),
+        Action::PickerInput('j')
+    );
     assert_eq!(
         map_key(key(KeyCode::Enter), &app),
         Action::ModelSelected(String::new())
@@ -316,8 +318,10 @@ fn top_bar_shows_provider_not_long_model() {
     // the model is exposed via the `m` picker). Assert the provider badge and that the model
     // appears in the open picker.
     let text = buffer_text(&t);
-    assert!(text.contains("prime") || text.contains("openai") || text.contains("anthropic"),
-        "provider badge in top bar: {text:?}");
+    assert!(
+        text.contains("prime") || text.contains("openai") || text.contains("anthropic"),
+        "provider badge in top bar: {text:?}"
+    );
 }
 
 #[test]

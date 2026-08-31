@@ -166,7 +166,11 @@ impl ChangeSet {
     /// Create a change-set for `scope`.
     #[must_use]
     pub fn new(scope: ChangeScope, files: Vec<FileChange>) -> Self {
-        ChangeSet { scope, files, fallback: false }
+        ChangeSet {
+            scope,
+            files,
+            fallback: false,
+        }
     }
 
     /// Mark this set as a working-tree fallback for an empty committed diff.

@@ -33,6 +33,10 @@ pub struct FileAnalysis {
     pub file: FileId,
     /// Git status of the file in this change-set.
     pub status: FileStatus,
+    /// The worktree document-symbol query failed (vs the file simply being deleted).
+    /// Consumers must not diff an absent tree against a base tree on failure: that would
+    /// report every base symbol as deleted (review 18 M3).
+    pub worktree_query_failed: bool,
     /// Worktree symbol tree (`None` for deleted files or when the query failed).
     pub worktree: Option<SymbolTree>,
     /// Base-revision overlay tree (`None` when unavailable).
@@ -58,6 +62,9 @@ pub struct FileSemanticResult {
     /// The language service does not own this file (binary, gitlink, unowned language):
     /// semantic analysis will never produce symbols for it.
     pub unsupported: bool,
+    /// The worktree symbol query failed: `changed` is empty and must not be read as
+    /// "no changed symbols" (the dispatcher surfaces this as a retryable Failed).
+    pub worktree_failed: bool,
 }
 
 /// One epoch-tagged analysis result for a change-set.
@@ -233,20 +240,25 @@ impl<S: SemanticSource> AnalysisEngine<S> {
         } else {
             Vec::new()
         };
-        let changed = changed_symbols_detailed(
-            analysis.worktree.as_ref(),
-            analysis.base.as_ref(),
-            fc,
-        );
+        // A failed worktree query produces no changed-symbol claims: diffing an absent
+        // tree against a base tree would report every base symbol as deleted
+        // (review 18 M3).
+        let changed = if analysis.worktree_query_failed {
+            Vec::new()
+        } else {
+            changed_symbols_detailed(analysis.worktree.as_ref(), analysis.base.as_ref(), fc)
+        };
         // A file the language service does not own (binary, gitlink, unowned language)
         // reports no worktree tree and a note; surface that as `unsupported` so the UI
         // can say so instead of pretending analysis is still pending.
         let unsupported = analysis.worktree.is_none()
-            && analysis
-                .notes
-                .iter()
-                .any(|n| n.contains("skipped semantic analysis") || n.contains("not owned by the language service"));
+            && !analysis.worktree_query_failed
+            && analysis.notes.iter().any(|n| {
+                n.contains("skipped semantic analysis")
+                    || n.contains("not owned by the language service")
+            });
         Ok(FileSemanticResult {
+            worktree_failed: analysis.worktree_query_failed,
             file: analysis.file.clone(),
             analysis,
             changed,
@@ -272,6 +284,7 @@ impl<S: SemanticSource> AnalysisEngine<S> {
             return Ok(FileAnalysis {
                 file,
                 status: fc.status,
+                worktree_query_failed: false,
                 worktree: None,
                 base: None,
                 mappings: Vec::new(),
@@ -286,6 +299,7 @@ impl<S: SemanticSource> AnalysisEngine<S> {
             return Ok(FileAnalysis {
                 file,
                 status: fc.status,
+                worktree_query_failed: false,
                 worktree: None,
                 base: None,
                 mappings: Vec::new(),
@@ -293,7 +307,10 @@ impl<S: SemanticSource> AnalysisEngine<S> {
             });
         }
 
-        // Worktree tree (the language server reads from disk).
+        // Worktree tree (the language server reads from disk). A query failure is typed
+        // (`worktree_query_failed`): consumers must not diff the absent tree against a
+        // base tree — that would report every base symbol as deleted (review 18 M3).
+        let mut worktree_query_failed = false;
         let worktree = if fc.status == FileStatus::Deleted {
             None
         } else {
@@ -307,6 +324,7 @@ impl<S: SemanticSource> AnalysisEngine<S> {
                 Err(err) => {
                     tracing::warn!(%file, error = %err, "worktree document symbols failed");
                     notes.push(format!("worktree symbols unavailable: {err}"));
+                    worktree_query_failed = true;
                     None
                 }
             }
@@ -324,10 +342,17 @@ impl<S: SemanticSource> AnalysisEngine<S> {
             }
         };
 
-        let mappings = file_mappings(worktree.as_ref(), base.as_ref(), fc);
+        // A failed worktree query must not produce mappings: diffing an absent tree
+        // against a base tree would claim every base symbol was deleted (review 18 M3).
+        let mappings = if worktree_query_failed {
+            Vec::new()
+        } else {
+            file_mappings(worktree.as_ref(), base.as_ref(), fc)
+        };
         Ok(FileAnalysis {
             file,
             status: fc.status,
+            worktree_query_failed,
             worktree,
             base,
             mappings,

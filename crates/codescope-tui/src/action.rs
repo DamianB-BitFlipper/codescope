@@ -19,10 +19,18 @@ pub enum Action {
     ToggleHelp,
     /// Focus a pane directly (`1`/`2`/`3`; Tab no longer cycles panes).
     Focus(Pane),
-    /// Tab on the files pane: expand a collapsed file (dispatching its lazy semantic
-    /// analysis on first expand), or collapse an expanded one. Forwarded to the
-    /// dispatcher, which owns expansion + the analysis job.
-    ToggleFileAnalysis,
+    /// Tab on the files pane: set the expansion of the file the selection is on RIGHT
+    /// NOW. The path is resolved by the app at keypress time and carried with the
+    /// command, so a coalesced/out-of-order SelectionChanged can never make the
+    /// dispatcher toggle a different file than the one the user pressed Tab on
+    /// (review 18 M4). Idempotent; expanding an Unloaded file dispatches its lazy
+    /// analysis.
+    SetFileExpanded {
+        /// Repo-relative path of the file row.
+        path: String,
+        /// The desired expansion state.
+        expanded: bool,
+    },
     /// Move the selection/scroll down / up by one.
     Down,
     /// Move the selection/scroll up by one.
@@ -133,7 +141,11 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         };
     }
     if app.show_model_picker {
-        return picker_key(key, Action::ModelPicker, Action::ModelSelected(String::new()));
+        return picker_key(
+            key,
+            Action::ModelPicker,
+            Action::ModelSelected(String::new()),
+        );
     }
     if app.show_base_picker {
         return picker_key(key, Action::BasePicker, Action::BaseSelected(String::new()));
@@ -155,7 +167,10 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Esc => Action::None,
         // Tab is lazy file expansion, not focus cycling: on the files pane it expands
         // (analyzing on first expand) or collapses the selected file. Elsewhere inert.
-        KeyCode::Tab if app.focused == Pane::Files => Action::ToggleFileAnalysis,
+        KeyCode::Tab if app.focused == Pane::Files => match app.file_toggle_target() {
+            Some((path, expanded)) => Action::SetFileExpanded { path, expanded },
+            None => Action::None,
+        },
         KeyCode::Tab | KeyCode::BackTab => Action::None,
         KeyCode::Char('1') => Action::Focus(Pane::Files),
         KeyCode::Char('2') => Action::Focus(Pane::Diff),
@@ -208,9 +223,9 @@ fn picker_key(key: KeyEvent, close: Action, select: Action) -> Action {
         KeyCode::Enter => select,
         KeyCode::Backspace => Action::PickerBackspace,
         KeyCode::Char(c)
-            if !key.modifiers.intersects(
-                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-            ) =>
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
         {
             Action::PickerInput(c)
         }
@@ -292,9 +307,23 @@ mod tests {
         // inert everywhere. 1/2/3 focus panes directly.
         let mut files_focused = app();
         files_focused.focused = Pane::Files;
+        files_focused.update(crate::snapshot::UiSnapshot {
+            files: vec![crate::snapshot::FileRow {
+                path: "a.go".to_string(),
+                status: "M",
+                changed_symbol_count: 0,
+                symbols: Vec::new(),
+                expanded: false,
+                semantic: crate::snapshot::FileSemanticLoad::Unloaded,
+            }],
+            ..Default::default()
+        });
         assert_eq!(
             map_key(key(KeyCode::Tab), &files_focused),
-            Action::ToggleFileAnalysis
+            Action::SetFileExpanded {
+                path: "a.go".to_string(),
+                expanded: true,
+            }
         );
         let mut diff_focused = app();
         diff_focused.focused = Pane::Diff;
@@ -390,8 +419,14 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Tab), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Esc), &a), Action::BasePicker);
         // Plain chars (incl. j/k) are filter input; arrows navigate.
-        assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::PickerInput('j'));
-        assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::PickerInput('k'));
+        assert_eq!(
+            map_key(key(KeyCode::Char('j')), &a),
+            Action::PickerInput('j')
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('k')), &a),
+            Action::PickerInput('k')
+        );
         assert_eq!(map_key(key(KeyCode::Down), &a), Action::Down);
         assert_eq!(map_key(key(KeyCode::Up), &a), Action::Up);
         assert_eq!(
@@ -416,9 +451,18 @@ mod tests {
         ] {
             let mut a = app();
             a.apply(open);
-            assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::PickerInput('q'));
-            assert_eq!(map_key(key(KeyCode::Char('m')), &a), Action::PickerInput('m'));
-            assert_eq!(map_key(key(KeyCode::Char('1')), &a), Action::PickerInput('1'));
+            assert_eq!(
+                map_key(key(KeyCode::Char('q')), &a),
+                Action::PickerInput('q')
+            );
+            assert_eq!(
+                map_key(key(KeyCode::Char('m')), &a),
+                Action::PickerInput('m')
+            );
+            assert_eq!(
+                map_key(key(KeyCode::Char('1')), &a),
+                Action::PickerInput('1')
+            );
             assert_eq!(
                 map_key(key(KeyCode::Backspace), &a),
                 Action::PickerBackspace
@@ -426,8 +470,14 @@ mod tests {
             assert_eq!(map_key(key(KeyCode::Esc), &a), close);
             assert_eq!(map_key(key(KeyCode::Enter), &a), select);
             // Plain chars (incl. j/k) are filter input; modified chars are swallowed.
-            assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::PickerInput('j'));
-            assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::PickerInput('k'));
+            assert_eq!(
+                map_key(key(KeyCode::Char('j')), &a),
+                Action::PickerInput('j')
+            );
+            assert_eq!(
+                map_key(key(KeyCode::Char('k')), &a),
+                Action::PickerInput('k')
+            );
             let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
             assert_eq!(map_key(ctrl_x, &a), Action::None);
         }

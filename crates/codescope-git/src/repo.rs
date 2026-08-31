@@ -348,10 +348,15 @@ impl GitRepo {
     async fn nearest_ancestor(&self, status: &StatusSnapshot) -> Result<Option<BaseInfo>> {
         // --sort=-committerdate returns nearest-first; take the first (review 10 F1: the old
         // ascending order + pop() selected the farthest ancestor).
-        Ok(self.ancestor_branches(status).await?.into_iter().next().map(|mut b| {
-            b.source = BaseSource::Ancestor;
-            b
-        }))
+        Ok(self
+            .ancestor_branches(status)
+            .await?
+            .into_iter()
+            .next()
+            .map(|mut b| {
+                b.source = BaseSource::Ancestor;
+                b
+            }))
     }
 
     /// Local branches whose tip is an ancestor of HEAD, NEAREST (newest tip commit) first.
@@ -802,11 +807,20 @@ mod tests {
             "dirty worktree files must surface in the (otherwise empty) branch scope"
         );
         assert_eq!(cs.files[0].status, FileStatus::Untracked);
-        assert!(cs.files[0].hunks.is_empty(), "untracked files carry no hunks");
+        assert!(
+            cs.files[0].hunks.is_empty(),
+            "untracked files carry no hunks"
+        );
         assert_eq!(cs.files[1].status, FileStatus::Modified);
-        assert!(!cs.files[1].hunks.is_empty(), "staged edit diffs against HEAD");
+        assert!(
+            !cs.files[1].hunks.is_empty(),
+            "staged edit diffs against HEAD"
+        );
         assert_eq!(cs.files[2].status, FileStatus::Modified);
-        assert!(!cs.files[2].hunks.is_empty(), "unstaged edit diffs against HEAD");
+        assert!(
+            !cs.files[2].hunks.is_empty(),
+            "unstaged edit diffs against HEAD"
+        );
 
         // Once the dirty files are committed, the branch is ahead again and the normal
         // committed diff takes over (the fallback only fires on an empty branch diff).

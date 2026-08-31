@@ -199,20 +199,22 @@ async fn dispatch(
         Action::RefreshGit | Action::AiToggle | Action::AiRefresh => {
             let _ = tx.send(action).await;
         }
-        Action::ToggleFileAnalysis => {
-            // Optimistic local flip (responsive collapse/expand), then the dispatcher
-            // reconciles: it owns expansion + the lazy analysis job.
-            app.apply(Action::ToggleFileAnalysis);
-            let _ = tx.send(Action::ToggleFileAnalysis).await;
+        Action::SetFileExpanded { .. } => {
+            // Optimistic local apply (responsive expand/collapse), then the dispatcher
+            // reconciles: it owns expansion + the lazy analysis job. The path is part of
+            // the command, so a coalesced SelectionChanged cannot retarget it.
+            app.apply(action.clone());
+            let _ = tx.send(action).await;
         }
         // Space/h/l are expansion aliases that must not bypass the lazy analysis path:
         // an Unloaded row cannot be expanded without the dispatcher dispatching the job,
-        // so they route through the same toggle (which forwards to the dispatcher).
-        Action::ToggleExpand | Action::Collapse | Action::Expand
-            if app.focused == Pane::Files =>
-        {
-            app.apply(Action::ToggleFileAnalysis);
-            let _ = tx.send(Action::ToggleFileAnalysis).await;
+        // so they resolve the same targeted command (which forwards to the dispatcher).
+        Action::ToggleExpand | Action::Collapse | Action::Expand if app.focused == Pane::Files => {
+            if let Some((path, expanded)) = app.file_toggle_target() {
+                let cmd = Action::SetFileExpanded { path, expanded };
+                app.apply(cmd.clone());
+                let _ = tx.send(cmd).await;
+            }
         }
         Action::ModelPicker => {
             // Toggle locally, and ask the dispatcher to fetch the model list on open.

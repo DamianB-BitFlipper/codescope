@@ -35,7 +35,11 @@ async fn check(s: &Scenario) {
     // discover
     let discovered = GitRepo::discover(built.root_utf8()).await;
     if s.expect.discover_fails {
-        assert!(discovered.is_err(), "{}: discover must fail for a non-git dir", s.name);
+        assert!(
+            discovered.is_err(),
+            "{}: discover must fail for a non-git dir",
+            s.name
+        );
         return;
     }
     let repo = discovered.unwrap_or_else(|e| panic!("{}: discover failed: {e}", s.name));
@@ -50,7 +54,10 @@ async fn check(s: &Scenario) {
         assert_eq!(ctx.base.is_some(), want, "{}: has_base", s.name);
     }
     if let Some(want) = s.expect.base_source {
-        let src = ctx.base.as_ref().map(|b| format!("{:?}", b.source).to_lowercase());
+        let src = ctx
+            .base
+            .as_ref()
+            .map(|b| format!("{:?}", b.source).to_lowercase());
         assert!(
             src.as_deref().map(|s| s.contains(want)).unwrap_or(false),
             "{}: base_source {:?} must contain {:?}",
@@ -73,15 +80,34 @@ async fn check(s: &Scenario) {
             Err(e) => panic!("{}: branch scope failed: {e}", s.name),
         };
         assert_eq!(branch_n, b, "{}: branch scope count", s.name);
-        assert_eq!(staged.expect("staged"), st, "{}: staged scope count", s.name);
-        assert_eq!(unstaged.expect("unstaged"), u, "{}: unstaged scope count", s.name);
-        assert_eq!(working.expect("working"), w, "{}: working scope count", s.name);
+        assert_eq!(
+            staged.expect("staged"),
+            st,
+            "{}: staged scope count",
+            s.name
+        );
+        assert_eq!(
+            unstaged.expect("unstaged"),
+            u,
+            "{}: unstaged scope count",
+            s.name
+        );
+        assert_eq!(
+            working.expect("working"),
+            w,
+            "{}: working scope count",
+            s.name
+        );
     }
 
     // must_have_status: somewhere across staged+unstaged+working.
     if !s.expect.must_have_status.is_empty() {
         let mut all = Vec::new();
-        for scope in [ChangeScope::Staged, ChangeScope::Unstaged, ChangeScope::Working] {
+        for scope in [
+            ChangeScope::Staged,
+            ChangeScope::Unstaged,
+            ChangeScope::Working,
+        ] {
             if let Ok(cs) = repo.changeset(scope).await {
                 all.extend(cs.files.iter().map(status_name_from));
             }
@@ -98,7 +124,10 @@ async fn check(s: &Scenario) {
     // fingerprint: stable, then changes on a follow-up edit.
     if s.expect.fingerprint_changes_on_edit {
         let f1 = repo.fingerprint().await.expect("fp1");
-        built.edit("util.go", "package main\n\nfunc Helper() int { return 2 }\n");
+        built.edit(
+            "util.go",
+            "package main\n\nfunc Helper() int { return 2 }\n",
+        );
         let f2 = repo.fingerprint().await.expect("fp2");
         assert_ne!(f1, f2, "{}: fingerprint must change after an edit", s.name);
     }
@@ -155,12 +184,17 @@ async fn branch_fully_pushed_sets_fallback_marker() {
         .find(|s| s.name == "branch_fully_pushed")
         .expect("scenario exists");
     let built = scenarios::build(&s).expect("build");
-    let repo = GitRepo::discover(built.root_utf8()).await.expect("discover");
+    let repo = GitRepo::discover(built.root_utf8())
+        .await
+        .expect("discover");
     let cs = repo
         .changeset(ChangeScope::Branch)
         .await
         .expect("branch changeset");
-    assert!(cs.fallback, "a fully-pushed branch with a dirty tree must set the fallback marker");
+    assert!(
+        cs.fallback,
+        "a fully-pushed branch with a dirty tree must set the fallback marker"
+    );
     assert!(
         cs.files.iter().any(|f| f.path.as_str() == "util.go"),
         "the dirty worktree file surfaces in branch scope: {:?}",

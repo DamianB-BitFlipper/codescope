@@ -135,9 +135,49 @@ impl App {
             // First diff for this path (hunks just arrived): start at hunk 1.
             self.current_hunk = 1;
         }
+        // Selection identity survives the swap (review 18 M5): an expanded file filling
+        // in its symbol rows shifts flat indices; without re-resolving by (file, symbol)
+        // the cursor would slide onto whatever row now holds the old ordinal.
+        let keep = self
+            .selected_file_symbol()
+            .map(|(f, sym)| (f.path.clone(), sym.map(|s| (s.name.clone(), s.position))));
         self.sync_bottom_view(&snapshot);
         self.snapshot = snapshot;
         self.clamp();
+        if let Some((file, sym)) = keep {
+            self.restore_selection(&file, sym.as_ref());
+        }
+    }
+
+    /// Re-resolve a previously selected (file, symbol) against the current snapshot:
+    /// the symbol row when it still exists, else the owning file row, else the nearest
+    /// row that survived (clamp).
+    fn restore_selection(&mut self, file: &str, sym: Option<&(String, Option<(u32, u32)>)>) {
+        let mut flat = 0usize;
+        let mut file_row_idx: Option<usize> = None;
+        let mut sym_row_idx: Option<usize> = None;
+        for f in &self.snapshot.files {
+            if f.path == file {
+                file_row_idx = Some(flat);
+                if let Some((name, pos)) = sym {
+                    if f.expanded {
+                        for (si, s) in f.symbols.iter().enumerate() {
+                            let same = s.name == *name
+                                && (pos.is_none() || s.position == *pos || s.position.is_none());
+                            if same {
+                                sym_row_idx = Some(flat + 1 + si);
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            flat += 1 + if f.expanded { f.symbols.len() } else { 0 };
+        }
+        self.file_sel = sym_row_idx
+            .or(file_row_idx)
+            .unwrap_or_else(|| self.file_sel.min(self.flat_file_rows().saturating_sub(1)));
     }
 
     /// Bottom-pane view transitions driven by the AI status edge (docs/review/16):
@@ -194,7 +234,13 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::ToggleHelp => self.show_help = !self.show_help,
-            Action::ToggleFileAnalysis => self.toggle_file_analysis(),
+            Action::SetFileExpanded { path, expanded } => {
+                self.set_file_expanded(&path, expanded);
+            }
+            // Space maps to the expansion intent, but the targeted command (with the
+            // resolved path) is built in run.rs; here it is a no-op placeholder so the
+            // key alone never mutates dispatcher-owned expansion state (review 18 m4).
+            Action::ToggleExpand => {}
             Action::Focus(p) => self.focused = p,
             Action::Down => self.move_sel(1),
             Action::Up => self.move_sel(-1),
@@ -204,7 +250,6 @@ impl App {
             Action::PageUp => self.page(-20),
             Action::Top => self.top(),
             Action::Bottom => self.bottom(),
-            Action::ToggleExpand => self.toggle_expand(),
             Action::Activate => self.activate(),
             Action::ToggleZoom => self.zoomed = !self.zoomed,
             Action::ToggleBottomView => {
@@ -219,27 +264,30 @@ impl App {
             // View-state resize: two-cell steps clamped to the spec range; the renderer
             // may still narrow further to protect MIN_DIFF_WIDTH without touching this.
             Action::ResizeFilesNarrower => {
-                self.files_width = self
-                    .files_width
-                    .saturating_sub(2)
-                    .clamp(crate::layout::MIN_FILES_WIDTH, crate::layout::MAX_FILES_WIDTH);
+                self.files_width = self.files_width.saturating_sub(2).clamp(
+                    crate::layout::MIN_FILES_WIDTH,
+                    crate::layout::MAX_FILES_WIDTH,
+                );
             }
             Action::ResizeFilesWider => {
-                self.files_width = self
-                    .files_width
-                    .saturating_add(2)
-                    .clamp(crate::layout::MIN_FILES_WIDTH, crate::layout::MAX_FILES_WIDTH);
+                self.files_width = self.files_width.saturating_add(2).clamp(
+                    crate::layout::MIN_FILES_WIDTH,
+                    crate::layout::MAX_FILES_WIDTH,
+                );
             }
             Action::Collapse => match self.focused {
                 // Wrapped mode has no hidden horizontal state: h must not move it.
                 Pane::Diff if self.diff_wrap => {}
                 Pane::Diff => self.diff_hscroll = self.diff_hscroll.saturating_sub(8),
-                _ => self.collapse_sel(),
+                // Files-pane expansion is dispatcher-owned: run.rs routes Space/h/l to
+                // the targeted SetFileExpanded command; App applies no local tree
+                // mutation for them (review 18 m4).
+                _ => {}
             },
             Action::Expand => match self.focused {
                 Pane::Diff if self.diff_wrap => {}
                 Pane::Diff => self.diff_hscroll = self.diff_hscroll.saturating_add(8),
-                _ => self.expand_sel(),
+                _ => {}
             },
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
             Action::ScopeUnstaged => self.set_scope(ChangeScope::Unstaged),
@@ -410,72 +458,22 @@ impl App {
         self.current_hunk = seen.clamp(1, total);
     }
 
-    fn toggle_expand(&mut self) {
-        self.set_expanded_toggle();
-    }
-
-    /// Tab on the files pane: optimistically flip the selected file's expansion. The
-    /// dispatcher is the source of truth — the action is also forwarded to it, and the
-    /// next snapshot reconciles `expanded` (and fills `semantic`/symbols). Optimistic
-    /// flip keeps the UI responsive for the common collapse case.
-    fn toggle_file_analysis(&mut self) {
-        if self.focused != Pane::Files {
-            return;
+    /// Optimistically apply the targeted expansion command so the frame the user sees
+    /// matches their keypress; the dispatcher remains the source of truth and its next
+    /// snapshot reconciles `expanded` (and fills `semantic`/symbols). Idempotent.
+    fn set_file_expanded(&mut self, path: &str, expanded: bool) {
+        if let Some(row) = self.snapshot.files.iter_mut().find(|f| f.path == path) {
+            row.expanded = expanded;
         }
-        if let Some(row) = self.current_file_row() {
-            row.expanded = !row.expanded;
-        }
-        // Collapsing may hide the selected symbol row: clamp the selection onto the
-        // visible rows (the clamp pass in `update` handles this on the next snapshot;
-        // do it now for the optimistic frame too).
         self.clamp();
-    }
-
-    fn collapse_sel(&mut self) {
-        self.set_expanded(false);
-    }
-
-    fn expand_sel(&mut self) {
-        self.set_expanded(true);
-    }
-
-    fn set_expanded_toggle(&mut self) {
-        if let Some(row) = self.current_file_row() {
-            row.expanded = !row.expanded;
-        }
-    }
-
-    fn set_expanded(&mut self, value: bool) {
-        if let Some(row) = self.current_file_row() {
-            row.expanded = value;
-        }
-    }
-
-    /// The file row the flattened selection sits on (symbol rows map to their file).
-    fn current_file_row(&mut self) -> Option<&mut crate::snapshot::FileRow> {
-        let mut idx = self.file_sel;
-        for row in &mut self.snapshot.files {
-            if idx == 0 {
-                return Some(row);
-            }
-            idx -= 1;
-            if row.expanded {
-                if idx < row.symbols.len() {
-                    return Some(row); // a symbol row: expand acts on its file
-                }
-                idx -= row.symbols.len();
-            }
-        }
-        None
     }
 
     /// `Enter`: in the files pane, jump diff+semantic to the selection (handled by the
     /// dispatcher via a forwarded action would be ideal; locally we at least scroll the
     /// diff to the selected file's first hunk). In other panes, no-op for now.
     fn activate(&mut self) {
-        if self.focused == Pane::Files {
-            self.set_expanded(true);
-        }
+        // Expansion is dispatcher-owned (review 18 m4): Enter forwards through the
+        // targeted SetFileExpanded path in run.rs; App performs no local expansion.
     }
 
     fn jump_hunk(&mut self, delta: i32) {
@@ -503,6 +501,28 @@ impl App {
     /// The full repo-relative path of the file under the files-pane selection (symbol rows
     /// map to their file). The footer shows this unelided path when no message is pending.
     #[must_use]
+    /// The `(path, desired expanded)` pair a Tab press right now would command: the file
+    /// under the selection (symbol rows map to their file) and the inverse of its current
+    /// expansion. Resolved against the app's snapshot — the same flattened rows the user
+    /// sees (review 18 M4).
+    pub fn file_toggle_target(&self) -> Option<(String, bool)> {
+        let mut idx = self.file_sel;
+        for f in &self.snapshot.files {
+            if idx == 0 {
+                return Some((f.path.clone(), !f.expanded));
+            }
+            idx -= 1;
+            if f.expanded {
+                if idx < f.symbols.len() {
+                    return Some((f.path.clone(), false)); // on a symbol row: collapse
+                }
+                idx -= f.symbols.len();
+            }
+        }
+        None
+    }
+
+    /// The selected file's repo-relative path (symbol rows map to their owning file).
     pub fn selected_file_path(&self) -> Option<&str> {
         let mut idx = self.file_sel;
         for f in &self.snapshot.files {
@@ -564,7 +584,12 @@ impl App {
     /// The file row and the symbol row (when the selection is on a symbol) under the
     /// flattened files-pane selection.
     #[must_use]
-    pub fn selected_file_symbol(&self) -> Option<(&crate::snapshot::FileRow, Option<&crate::snapshot::SymbolRow>)> {
+    pub fn selected_file_symbol(
+        &self,
+    ) -> Option<(
+        &crate::snapshot::FileRow,
+        Option<&crate::snapshot::SymbolRow>,
+    )> {
         let mut idx = self.file_sel;
         for f in &self.snapshot.files {
             if idx == 0 {
@@ -689,7 +714,13 @@ mod tests {
     fn collapse_hides_symbols() {
         let mut app = app_with_files();
         app.file_sel = 0;
-        app.apply(Action::ToggleExpand);
+        // Expansion is dispatcher-owned: the app applies the targeted command (what
+        // run.rs sends after resolving the selected file at keypress time).
+        let path = app.snapshot.files[0].path.clone();
+        app.apply(Action::SetFileExpanded {
+            path,
+            expanded: false,
+        });
         assert!(!app.snapshot.files[0].expanded);
         assert_eq!(app.flat_file_rows(), 2); // a.go + b.go
     }
@@ -877,15 +908,25 @@ mod tests {
         let mut app = App::new();
         app.snapshot.diff.rows = vec![
             DiffRow::HunkHeader("@@ -1,2 +1,2 @@".to_string()),
-            DiffRow::Context { old_ln: 1, new_ln: 1, text: "a".to_string() },
+            DiffRow::Context {
+                old_ln: 1,
+                new_ln: 1,
+                text: "a".to_string(),
+            },
             DiffRow::HunkHeader("@@ -40,2 +40,2 @@".to_string()),
-            DiffRow::Add { new_ln: 41, text: "b".to_string() },
+            DiffRow::Add {
+                new_ln: 41,
+                text: "b".to_string(),
+            },
         ];
         app.snapshot.diff.total_hunks = 2;
         app.current_hunk = 1;
         app.apply(Action::NextHunk);
         assert_eq!(app.current_hunk, 2);
-        assert_eq!(app.diff_scroll, 2, "scroll anchors on the second hunk header");
+        assert_eq!(
+            app.diff_scroll, 2,
+            "scroll anchors on the second hunk header"
+        );
         app.apply(Action::PrevHunk);
         assert_eq!(app.diff_scroll, 0);
         assert_eq!(app.current_hunk, 1);
@@ -898,9 +939,16 @@ mod tests {
         app.focused = Pane::Diff;
         app.snapshot.diff.rows = vec![
             DiffRow::HunkHeader("@@ -1,2 +1,2 @@".to_string()),
-            DiffRow::Context { old_ln: 1, new_ln: 1, text: "a".to_string() },
+            DiffRow::Context {
+                old_ln: 1,
+                new_ln: 1,
+                text: "a".to_string(),
+            },
             DiffRow::HunkHeader("@@ -40,2 +40,2 @@".to_string()),
-            DiffRow::Add { new_ln: 41, text: "b".to_string() },
+            DiffRow::Add {
+                new_ln: 41,
+                text: "b".to_string(),
+            },
         ];
         app.snapshot.diff.total_hunks = 2;
         app.current_hunk = 1;
@@ -1346,5 +1394,43 @@ mod tests {
         app.apply(Action::PageDown);
         assert_eq!(app.diff_scroll, 20);
         assert_eq!(app.ai_plan_scroll, 0);
+    }
+
+    /// Review 18 M5: a snapshot that inserts symbol rows (a file's lazy analysis landing)
+    /// must not slide the selection onto a different entity — the selected (file, symbol)
+    /// re-resolves by identity.
+    #[test]
+    fn selection_follows_the_entity_when_symbols_arrive() {
+        // Two collapsed files; select the second (b.go).
+        let mut app = App::new();
+        app.update(UiSnapshot {
+            files: vec![row("a.go", false, 0), row("b.go", false, 0)],
+            ..UiSnapshot::default()
+        });
+        app.file_sel = 1;
+        assert_eq!(app.selected_file_path(), Some("b.go"));
+        // a.go's analysis lands: its symbols insert rows, shifting b.go's ordinal.
+        let mut snap = app.snapshot.clone();
+        snap.files[0].expanded = true;
+        snap.files[0].semantic = crate::snapshot::FileSemanticLoad::Ready;
+        snap.files[0].symbols = vec![
+            SymbolRow {
+                name: "NewSym".to_string(),
+                change: "added",
+                confidence: "",
+                has_diagnostic: false,
+                position: Some((1, 0)),
+            },
+            SymbolRow {
+                name: "Other".to_string(),
+                change: "modified",
+                confidence: "",
+                has_diagnostic: false,
+                position: Some((3, 0)),
+            },
+        ];
+        app.update(snap);
+        // b.go is still selected (its flat index moved from 1 to 3).
+        assert_eq!(app.selected_file_path(), Some("b.go"));
     }
 }
