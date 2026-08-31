@@ -203,6 +203,21 @@ impl GitRepo {
 
         if let Some(upstream) = &status.upstream {
             if let Some(mb) = self.merge_base(upstream).await? {
+                // A fully-pushed branch has merge-base == HEAD: the upstream is an empty base
+                // (nothing to compare). Prefer the nearest LOCAL ancestor when it exists — it
+                // carries the actual branch shape (review: stacked X <- A <- B, base of B is A).
+                let upstream_is_empty = status.oid.as_ref().is_some_and(|h| *h == mb);
+                if !upstream_is_empty {
+                    return Ok(Some(BaseInfo {
+                        source: BaseSource::Upstream,
+                        ref_name: upstream.clone(),
+                        merge_base: mb,
+                    }));
+                }
+                if let Some(ancestor) = self.nearest_ancestor(status).await? {
+                    return Ok(Some(ancestor));
+                }
+                // No local ancestor either; the empty upstream is all we have.
                 return Ok(Some(BaseInfo {
                     source: BaseSource::Upstream,
                     ref_name: upstream.clone(),

@@ -709,3 +709,23 @@ async fn read_only_guarantee_smoke() {
         "the index must never be rewritten"
     );
 }
+
+/// Regression: a branch fully pushed to its upstream (merge-base == HEAD) has an empty branch
+/// diff, so the upstream is a useless base. The nearest LOCAL ancestor must win instead.
+#[tokio::test]
+async fn fully_pushed_upstream_yields_to_local_ancestor() {
+    let (_tmp, top) = scratch_repo();
+    let repo = open_repo(&top).await;
+    git(top.as_std_path(), &["checkout", "-q", "-b", "base"]);
+    git(top.as_std_path(), &["checkout", "-q", "-b", "b"]);
+    write(top.as_std_path(), "b.go", "package main\n\nfunc B() {}\n");
+    git(top.as_std_path(), &["add", "b.go"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "b1"]);
+    // A same-tip local ref set as upstream => merge-base == HEAD (fully pushed).
+    git(top.as_std_path(), &["branch", "b-remote"]);
+    git(top.as_std_path(), &["branch", "--set-upstream-to", "b-remote", "b"]);
+    let ctx = repo.repo_context().await.expect("ctx");
+    let base = ctx.base.expect("base inferred");
+    assert_eq!(base.source, codescope_core::BaseSource::Ancestor,
+        "fully-pushed upstream must yield to a local ancestor; got {:?}", base);
+}
