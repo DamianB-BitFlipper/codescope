@@ -9,6 +9,8 @@
 
 pub mod action;
 pub mod app;
+pub mod elide;
+pub mod layout;
 pub mod render;
 pub mod run;
 pub mod snapshot;

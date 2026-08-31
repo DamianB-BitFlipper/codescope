@@ -215,7 +215,16 @@ fn m_opens_model_picker() {
 fn picker_modal_swallows_keys() {
     let mut app = App::new();
     app.show_model_picker = true;
-    assert_eq!(map_key(key(KeyCode::Char('q')), &app), Action::None);
+    // Characters feed the filter query; non-character keys stay swallowed.
+    assert_eq!(map_key(key(KeyCode::Tab), &app), Action::None);
+    assert_eq!(
+        map_key(key(KeyCode::Char('q')), &app),
+        Action::PickerInput('q')
+    );
+    assert_eq!(
+        map_key(key(KeyCode::Backspace), &app),
+        Action::PickerBackspace
+    );
     assert_eq!(map_key(key(KeyCode::Esc), &app), Action::ModelPicker);
     assert_eq!(map_key(key(KeyCode::Char('j')), &app), Action::Down);
     assert_eq!(
@@ -236,6 +245,23 @@ fn picker_renders_models_and_current() {
     assert!(text.contains("openai/gpt-5"), "a listed model");
     assert!(text.contains("claude-fable-5"), "another listed model");
     assert!(text.contains("●"), "current-model marker");
+}
+
+#[test]
+fn picker_filter_shows_query_and_only_matching_models() {
+    let backend = TestBackend::new(120, 30);
+    let mut t = Terminal::new(backend).unwrap();
+    let mut app = App::new();
+    app.show_model_picker = true;
+    app.model_query = "gpt-5".to_string();
+    t.draw(|f| render(f, &app, &picker_snapshot())).unwrap();
+    let text = buffer_text(&t);
+    assert!(text.contains("filter: gpt-5"), "query footer: {text}");
+    assert!(text.contains("openai/gpt-5"), "matching model listed");
+    assert!(
+        !text.contains("claude-fable-5"),
+        "non-matching model filtered out: {text}"
+    );
 }
 
 #[test]

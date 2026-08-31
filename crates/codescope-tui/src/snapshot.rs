@@ -27,6 +27,9 @@ pub struct UiSnapshot {
     pub ai: AiStatus,
     /// The AI model currently selected (empty when AI is off).
     pub ai_model: String,
+    /// Which AI provider/credential is active ("prime"/"openai"/"anthropic"/"custom"; empty
+    /// when AI is off).
+    pub ai_provider: String,
     /// Models the provider advertises (for the picker modal; empty until fetched).
     pub available_models: Vec<String>,
     /// The base ref the `Branch` scope compares against (empty until known). Shown in the
@@ -54,6 +57,7 @@ impl Default for UiSnapshot {
             ls: LsStatus::Starting,
             ai: AiStatus::Disabled,
             ai_model: String::new(),
+            ai_provider: String::new(),
             available_models: Vec::new(),
             base_ref: String::new(),
             available_bases: Vec::new(),

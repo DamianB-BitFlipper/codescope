@@ -41,6 +41,17 @@ pub enum Action {
     Bottom,
     /// Activate the selection (jump diff+semantic to it / re-center impact view).
     Activate,
+    /// The files-pane selection moved (j/k/arrows, or a snapshot clamped it): the diff
+    /// pane retargets to the selected file and, for a symbol row, the dispatcher lazily
+    /// expands its callers/callees. Sent by the run loop only when the resolved selection
+    /// target actually changed; never produced by [`map_key`].
+    SelectionChanged {
+        /// Selected changed file (repo-relative); `None` when the file list is empty.
+        file: Option<String>,
+        /// Selected symbol (name, identifier line, identifier col) when the selection sits
+        /// on a symbol row with a position; `None` on file rows and unmapped symbols.
+        symbol: Option<(String, u32, u32)>,
+    },
     /// The user selected a changed symbol; the dispatcher lazily expands its callers/callees.
     SelectSymbol {
         /// Repo-relative file of the symbol.
@@ -86,10 +97,20 @@ pub enum Action {
     BasePicker,
     /// The user picked a base ref in the picker (the dispatcher applies it).
     BaseSelected(String),
+    /// A typed character appended to the open picker's filter query.
+    PickerInput(char),
+    /// Backspace in the open picker's filter query.
+    PickerBackspace,
     /// Jump to the next / previous diff hunk.
     NextHunk,
     /// Jump to the previous diff hunk.
     PrevHunk,
+    /// Toggle zoom of the focused pane into the whole main area (`z`).
+    ToggleZoom,
+    /// Toggle smart wrap in the diff pane (`W`); raw mode clips + h-scrolls.
+    ToggleWrap,
+    /// Reset the diff pane's horizontal scroll to zero (`0`).
+    ResetHScroll,
     /// The key did not map to an action.
     None,
 }
@@ -110,22 +131,10 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         };
     }
     if app.show_model_picker {
-        return match key.code {
-            KeyCode::Esc => Action::ModelPicker,
-            KeyCode::Char('j') | KeyCode::Down => Action::Down,
-            KeyCode::Char('k') | KeyCode::Up => Action::Up,
-            KeyCode::Enter => Action::ModelSelected(String::new()), // app fills the name
-            _ => Action::None,
-        };
+        return picker_key(key, Action::ModelPicker, Action::ModelSelected(String::new()));
     }
     if app.show_base_picker {
-        return match key.code {
-            KeyCode::Esc => Action::BasePicker,
-            KeyCode::Char('j') | KeyCode::Down => Action::Down,
-            KeyCode::Char('k') | KeyCode::Up => Action::Up,
-            KeyCode::Enter => Action::BaseSelected(String::new()), // app fills the name
-            _ => Action::None,
-        };
+        return picker_key(key, Action::BasePicker, Action::BaseSelected(String::new()));
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -138,6 +147,9 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
     match key.code {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('?') => Action::ToggleHelp,
+        // Esc exits a pinned zoom; otherwise it is deliberately inert (modals handle
+        // their own Esc above).
+        KeyCode::Esc if app.zoomed => Action::ToggleZoom,
         KeyCode::Esc => Action::None,
         KeyCode::Tab => Action::FocusNext,
         KeyCode::BackTab => Action::FocusPrev,
@@ -166,8 +178,34 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::PageUp => Action::PageUp,
         KeyCode::Char('n') => Action::NextHunk,
         KeyCode::Char('N') => Action::PrevHunk,
+        KeyCode::Char('z') => Action::ToggleZoom,
+        KeyCode::Char('W') => Action::ToggleWrap,
+        KeyCode::Char('0') => Action::ResetHScroll,
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
+        _ => Action::None,
+    }
+}
+
+/// Keys while a picker modal is open: the modal swallows everything, but most keys now
+/// feed the type-to-filter query. `j`/`k`/arrows still navigate (navigation wins over
+/// input — the existing tradeoff), Esc closes, Enter selects, Backspace edits the query,
+/// and any other plain character is appended to the query (`close`/`select` are the
+/// picker's toggle and selection actions; the selection name is filled in later).
+fn picker_key(key: KeyEvent, close: Action, select: Action) -> Action {
+    match key.code {
+        KeyCode::Esc => close,
+        KeyCode::Char('j') | KeyCode::Down => Action::Down,
+        KeyCode::Char('k') | KeyCode::Up => Action::Up,
+        KeyCode::Enter => select,
+        KeyCode::Backspace => Action::PickerBackspace,
+        KeyCode::Char(c)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+            ) =>
+        {
+            Action::PickerInput(c)
+        }
         _ => Action::None,
     }
 }
@@ -280,7 +318,25 @@ mod tests {
 
     #[test]
     fn unmapped_is_none() {
-        assert_eq!(map_key(key(KeyCode::Char('z')), &app()), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('x')), &app()), Action::None);
+    }
+
+    #[test]
+    fn zoom_wrap_reset_keys() {
+        assert_eq!(map_key(key(KeyCode::Char('z')), &app()), Action::ToggleZoom);
+        assert_eq!(map_key(key(KeyCode::Char('W')), &app()), Action::ToggleWrap);
+        assert_eq!(
+            map_key(key(KeyCode::Char('0')), &app()),
+            Action::ResetHScroll
+        );
+    }
+
+    #[test]
+    fn esc_exits_zoom_but_is_otherwise_inert() {
+        assert_eq!(map_key(key(KeyCode::Esc), &app()), Action::None);
+        let mut a = app();
+        a.zoomed = true;
+        assert_eq!(map_key(key(KeyCode::Esc), &a), Action::ToggleZoom);
     }
 
     #[test]
@@ -292,14 +348,50 @@ mod tests {
     fn base_picker_modal_swallows_keys() {
         let mut a = app();
         a.show_base_picker = true;
-        assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
+        // Non-character keys stay swallowed; characters now feed the filter query.
+        assert_eq!(map_key(key(KeyCode::Tab), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Esc), &a), Action::BasePicker);
         assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::Down);
         assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::Up);
+        assert_eq!(map_key(key(KeyCode::Down), &a), Action::Down);
+        assert_eq!(map_key(key(KeyCode::Up), &a), Action::Up);
         assert_eq!(
             map_key(key(KeyCode::Enter), &a),
             Action::BaseSelected(String::new())
         );
+    }
+
+    #[test]
+    fn open_picker_maps_chars_and_backspace_to_query_input() {
+        for (open, close, select) in [
+            (
+                Action::BasePicker,
+                Action::BasePicker,
+                Action::BaseSelected(String::new()),
+            ),
+            (
+                Action::ModelPicker,
+                Action::ModelPicker,
+                Action::ModelSelected(String::new()),
+            ),
+        ] {
+            let mut a = app();
+            a.apply(open);
+            assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::PickerInput('q'));
+            assert_eq!(map_key(key(KeyCode::Char('m')), &a), Action::PickerInput('m'));
+            assert_eq!(map_key(key(KeyCode::Char('1')), &a), Action::PickerInput('1'));
+            assert_eq!(
+                map_key(key(KeyCode::Backspace), &a),
+                Action::PickerBackspace
+            );
+            assert_eq!(map_key(key(KeyCode::Esc), &a), close);
+            assert_eq!(map_key(key(KeyCode::Enter), &a), select);
+            // j/k navigate instead of entering text; modified chars are swallowed.
+            assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::Down);
+            assert_eq!(map_key(key(KeyCode::Char('k')), &a), Action::Up);
+            let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+            assert_eq!(map_key(ctrl_x, &a), Action::None);
+        }
     }
 
     #[test]

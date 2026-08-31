@@ -49,8 +49,16 @@ pub enum DispatchEvent {
     BaseLoaded(Vec<String>),
     /// The selected symbol's lazy callers/callees resolved.
     RelationsLoaded {
-        /// Symbol label (for the pane title).
-        label: String,
+        /// Epoch the job ran against; stale results are dropped on apply.
+        epoch: Epoch,
+        /// File of the symbol (part of the staleness key).
+        file: String,
+        /// Symbol name (part of the staleness key; doubles as the pane-title label).
+        name: String,
+        /// Identifier line the job resolved (part of the staleness key).
+        line: u32,
+        /// Identifier column the job resolved (part of the staleness key).
+        col: u32,
         /// Callers of the symbol.
         callers: Vec<SemRow>,
         /// Callees of the symbol.
@@ -74,6 +82,12 @@ pub struct Dispatcher {
     analysis: Option<AnalysisSnapshot>,
     /// Validated AI plan rows with the epoch they were validated against.
     ai_rows: Option<(Epoch, Vec<SemRow>, String)>,
+    /// The file the diff pane is aimed at (the files-pane selection; falls back to the
+    /// changeset's first file when unset or absent from the set).
+    selected_file: Option<String>,
+    /// Identity of the selected symbol (file, name, line, col), when the selection sits on
+    /// a symbol row; gates stale relations jobs.
+    selected_symbol: Option<(String, String, u32, u32)>,
     /// The selected symbol's lazily-expanded callers/callees (semantic pane).
     selected_relations: Option<(String, Vec<SemRow>, Vec<SemRow>)>,
     snapshot_tx: watch::Sender<UiSnapshot>,
@@ -126,6 +140,8 @@ impl Dispatcher {
             analysis: None,
             ai_rows: None,
             available_models: Vec::new(),
+            selected_file: None,
+            selected_symbol: None,
             selected_relations: None,
             base_override: None,
             available_bases: Vec::new(),
@@ -167,8 +183,28 @@ impl Dispatcher {
                 self.available_models = models;
                 self.publish();
             }
-            DispatchEvent::RelationsLoaded { label, callers, callees } => {
-                self.selected_relations = Some((label, callers, callees));
+            DispatchEvent::RelationsLoaded {
+                epoch,
+                file,
+                name,
+                line,
+                col,
+                callers,
+                callees,
+            } => {
+                // Staleness gate: the result applies only while it answers the CURRENT
+                // selection in the CURRENT repo state. Navigation no longer needs Enter, so
+                // a slow fetch for a row the user has since left must never overwrite the
+                // pane (the epoch gate covers refreshes; the identity gate covers j/k moves
+                // within one epoch).
+                let current = self
+                    .selected_symbol
+                    .as_ref()
+                    .is_some_and(|s| *s == (file, name.clone(), line, col));
+                if epoch != self.epoch || !current {
+                    return;
+                }
+                self.selected_relations = Some((name, callers, callees));
                 self.publish();
             }
             DispatchEvent::BaseLoaded(bases) => {
@@ -223,9 +259,19 @@ impl Dispatcher {
             Action::AiRefresh => self.spawn_ai(),
             Action::ModelPicker => self.spawn_list_models(),
             Action::ModelSelected(name) => self.set_model(&name),
-            Action::SelectSymbol { file, name, line, col } => {
+            Action::SelectSymbol {
+                file,
+                name,
+                line,
+                col,
+            } => {
+                // Enter re-centers on the selection: record it as the current target (so
+                // the result is not dropped as stale) and expand its relations.
+                self.selected_file = Some(file.clone());
+                self.selected_symbol = Some((file.clone(), name.clone(), line, col));
                 self.spawn_expand(file, name, line, col);
             }
+            Action::SelectionChanged { file, symbol } => self.on_selection_changed(file, symbol),
             Action::BasePicker => self.spawn_list_bases(),
             Action::BaseSelected(name) => self.set_base(name),
             _ => {}
@@ -279,16 +325,35 @@ impl Dispatcher {
         });
     }
 
-    /// Apply a base selection from the picker: everything downstream (repo context,
-    /// branch changeset, analysis) is recomputed against the chosen ref.
-    /// Lazily expand a selected symbol's callers/callees (spawned; non-blocking).
+    /// The files-pane selection moved (navigation-driven panes; no Enter required): aim
+    /// the diff pane at the selected file, and lazily expand a selected symbol's
+    /// callers/callees. Moving OFF a symbol (file row / empty list) clears the relations
+    /// view back to the impact/AI pane.
+    fn on_selection_changed(&mut self, file: Option<String>, symbol: Option<(String, u32, u32)>) {
+        self.selected_file = file.clone();
+        self.selected_symbol = match (file, symbol) {
+            (Some(file), Some((name, line, col))) => Some((file, name, line, col)),
+            _ => None,
+        };
+        // Drop the previous selection's rows immediately: nothing stale may linger while
+        // the new fetch is in flight.
+        self.selected_relations = None;
+        if let Some((file, name, line, col)) = self.selected_symbol.clone() {
+            self.spawn_expand(file, name, line, col);
+        }
+        self.publish();
+    }
+
+    /// Lazily expand a selected symbol's callers/callees (spawned; non-blocking). The job
+    /// carries the current epoch and the symbol's identity; the result is dropped on apply
+    /// when either has moved on (see RelationsLoaded).
     fn spawn_expand(&mut self, file: String, name: String, line: u32, col: u32) {
         let Some(engine) = &self.engine else {
             return;
         };
+        let epoch = self.epoch;
         let engine = engine.clone();
         let tx = self.job_tx.clone();
-        let label = name.clone();
         let file_id = match codescope_core::FileId::new(file.clone()) {
             Ok(f) => f,
             Err(_) => return,
@@ -298,7 +363,11 @@ impl Dispatcher {
             let (callers, callees) = relations_for(&engine, &file_id, pos).await;
             let _ = tx
                 .send(DispatchEvent::RelationsLoaded {
-                    label,
+                    epoch,
+                    file,
+                    name,
+                    line,
+                    col,
                     callers,
                     callees,
                 })
@@ -306,6 +375,8 @@ impl Dispatcher {
         });
     }
 
+    /// Apply a base selection from the picker: everything downstream (repo context,
+    /// branch changeset, analysis) is recomputed against the chosen ref.
     fn set_base(&mut self, name: String) {
         if name.is_empty() {
             return;
@@ -324,6 +395,12 @@ impl Dispatcher {
     fn set_scope(&mut self, scope: ChangeScope) {
         if self.scope != scope {
             self.scope = scope;
+            // The scope swap replaces the whole file list (the TUI resets its selection to
+            // the top row and re-reports it): the old symbol's relations must not linger.
+            // selected_file survives — the same file may exist in the new scope, and the
+            // TUI's SelectionChanged corrects it otherwise.
+            self.selected_symbol = None;
+            self.selected_relations = None;
             self.spawn_refresh();
         }
     }
@@ -354,6 +431,12 @@ impl Dispatcher {
                 })
                 .await;
         });
+        // Re-fetch the selected symbol's relations against the new state: an in-flight
+        // pre-refresh fetch is epoch-gated and dropped, and navigation does not re-send a
+        // selection that did not move.
+        if let Some((file, name, line, col)) = self.selected_symbol.clone() {
+            self.spawn_expand(file, name, line, col);
+        }
     }
 
     fn spawn_ai(&mut self) {
@@ -467,6 +550,11 @@ impl Dispatcher {
             ls: self.ls_status,
             ai: self.ai_status.clone(),
             ai_model: self.ai.as_ref().map(|a| a.model()).unwrap_or_default(),
+            ai_provider: self
+                .ai
+                .as_ref()
+                .map(|a| a.provider_label().to_string())
+                .unwrap_or_default(),
             available_models: self.available_models.clone(),
             base_ref,
             available_bases: self.available_bases.clone(),
@@ -477,7 +565,11 @@ impl Dispatcher {
     }
 
     fn panes(&self) -> (DiffPane, SemanticPane) {
-        let diff = self.changeset.as_ref().map(first_diff).unwrap_or_default();
+        let diff = self
+            .changeset
+            .as_ref()
+            .map(|cs| selected_diff(cs, self.selected_file.as_deref()))
+            .unwrap_or_default();
         // A selected symbol's lazily-expanded callers/callees take precedence over the
         // shallow impact graph (the "who calls this" view; restored after the perf split).
         if let Some((label, callers, callees)) = &self.selected_relations {
@@ -666,8 +758,14 @@ fn status_badge(status: &codescope_core::FileStatus) -> &'static str {
     }
 }
 
-fn first_diff(a: &codescope_core::ChangeSet) -> DiffPane {
-    let Some(file) = a.files.first() else {
+/// The diff pane for `selected` (a repo-relative path), falling back to the changeset's
+/// first file when nothing is selected or the selected file is absent from the set (e.g. a
+/// scope switch dropped it).
+fn selected_diff(a: &codescope_core::ChangeSet, selected: Option<&str>) -> DiffPane {
+    let file = selected
+        .and_then(|path| a.files.iter().find(|f| f.path.as_str() == path))
+        .or_else(|| a.files.first());
+    let Some(file) = file else {
         return DiffPane::default();
     };
     let mut rows = Vec::new();
@@ -882,7 +980,6 @@ impl FactView for SnapshotFacts {
     }
 }
 
-
 /// Fetch a symbol's callers + callees lazily and shape them as semantic-pane rows.
 pub(crate) async fn relations_for(
     engine: &std::sync::Arc<codescope_analysis::AnalysisEngine<codescope_lsp::LanguageService>>,
@@ -917,23 +1014,48 @@ pub async fn run(
         tokio::select! {
             e = events.recv() => match e {
                 Some(e) => {
-                    // Coalesce a burst of RepoChanged events into one refresh: drain everything
-                    // pending, then handle a single change-set. Without this, an editing/build
-                    // storm bumps the epoch faster than a refresh can complete, and the
-                    // epoch-gate drops every result (the TUI never gets data).
-                    let mut ev = e;
+                    // Coalesce a burst of RepoChanged events into one refresh. Without this, an
+                    // editing/build storm bumps the epoch faster than a refresh can complete,
+                    // and the epoch-gate drops every result (the TUI never gets data). Every
+                    // other event is a one-shot job result (analysis, AI plan, relations) and
+                    // must never be dropped behind a repo change.
+                    let mut batch = vec![e];
                     while let Ok(next) = events.try_recv() {
-                        ev = next; // keep the latest
+                        batch.push(next);
                     }
-                    disp.handle(ev).await;
+                    let last_change = batch
+                        .iter()
+                        .rposition(|ev| matches!(ev, DispatchEvent::RepoChanged));
+                    for (i, ev) in batch.into_iter().enumerate() {
+                        if matches!(ev, DispatchEvent::RepoChanged) && Some(i) != last_change {
+                            continue;
+                        }
+                        disp.handle(ev).await;
+                    }
                 }
                 None => break,
             },
             a = actions.recv() => match a {
                 Some(a) => {
-                    let mut act = a;
-                    while let Ok(next) = actions.try_recv() { act = next; }
-                    disp.handle(DispatchEvent::Work(act)).await;
+                    // SelectionChanged is latest-wins state (where the files-pane selection
+                    // sits): keep only the newest in a burst. Every other action is a one-shot
+                    // command (scope change, refresh, picker choice) and must never be dropped
+                    // behind a selection update.
+                    let mut batch = vec![a];
+                    while let Ok(next) = actions.try_recv() {
+                        batch.push(next);
+                    }
+                    let last_selection = batch
+                        .iter()
+                        .rposition(|act| matches!(act, Action::SelectionChanged { .. }));
+                    for (i, act) in batch.into_iter().enumerate() {
+                        if matches!(act, Action::SelectionChanged { .. })
+                            && Some(i) != last_selection
+                        {
+                            continue;
+                        }
+                        disp.handle(DispatchEvent::Work(act)).await;
+                    }
                 }
                 None => break,
             },
@@ -1113,6 +1235,252 @@ mod tests {
             "candidates include the ancestor branch: {:?}",
             snap.available_bases
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A two-file changeset with one tiny hunk each, so the diff-pane tests can watch the
+    /// pane follow the selection without running a refresh.
+    fn two_file_changeset() -> codescope_core::ChangeSet {
+        use codescope_core::{ChangeSet, DiffLine, FileChange, FileStatus, Hunk};
+        let file = |path: &str, added: &str| FileChange {
+            path: path.into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_len: 1,
+                new_start: 1,
+                new_len: 1,
+                section: None,
+                lines: vec![DiffLine::del(1, "old"), DiffLine::add(1, added)],
+            }],
+            binary: false,
+        };
+        ChangeSet::new(
+            ChangeScope::Branch,
+            vec![file("a.txt", "a-new"), file("b.txt", "b-new")],
+        )
+    }
+
+    fn sem_row(label: &str) -> SemRow {
+        SemRow {
+            depth: 1,
+            label: label.to_string(),
+            relation: "",
+            changed: false,
+            has_diagnostic: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_changed_retargets_the_diff() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.publish();
+        assert_eq!(
+            snapshot_rx.borrow().diff.title,
+            "a.txt",
+            "with no selection the diff shows the first file"
+        );
+
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        assert_eq!(disp.selected_file.as_deref(), Some("b.txt"));
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.diff.title, "b.txt", "the diff follows the selection");
+        assert!(
+            snap.diff
+                .rows
+                .iter()
+                .any(|r| matches!(r, DiffRow::Add { text, .. } if text == "b-new")),
+            "the retargeted diff renders b.txt's hunk"
+        );
+
+        // A selection the changeset no longer contains falls back to the first file.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("gone.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        assert_eq!(snapshot_rx.borrow().diff.title, "a.txt");
+
+        // No selection at all (empty file list) falls back the same way.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: None,
+            symbol: None,
+        }))
+        .await;
+        assert_eq!(snapshot_rx.borrow().diff.title, "a.txt");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Navigation onto a symbol row records the target and (with an engine) spawns the
+    /// lazy expand; the result then populates the relations pane. This fixture has no
+    /// engine, so the spawn is skipped — the recorded target is what gates the fetch
+    /// result below.
+    #[tokio::test]
+    async fn selection_changed_on_a_symbol_fetches_and_shows_relations() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: Some(("sym0".to_string(), 1, 4)),
+        }))
+        .await;
+        assert_eq!(
+            disp.selected_symbol,
+            Some(("a.txt".to_string(), "sym0".to_string(), 1, 4)),
+            "the symbol target is recorded for the staleness gate"
+        );
+        assert!(disp.selected_relations.is_none());
+
+        // The fetch result for the CURRENT symbol applies: relations view + title.
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch: disp.epoch,
+            file: "a.txt".to_string(),
+            name: "sym0".to_string(),
+            line: 1,
+            col: 4,
+            callers: vec![sem_row("caller_fn")],
+            callees: vec![sem_row("callee_fn")],
+        })
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.semantic.title, "relations of sym0");
+        let labels: Vec<&str> = snap
+            .semantic
+            .rows
+            .iter()
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(labels, ["sym0", "caller_fn", "callee_fn"]);
+        assert_eq!(snap.semantic.rows[1].relation, "called by");
+        assert_eq!(snap.semantic.rows[2].relation, "calls");
+
+        // Navigating back to a file row clears the relations view immediately.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        assert!(disp.selected_symbol.is_none());
+        let snap = snapshot_rx.borrow().clone();
+        assert_ne!(snap.semantic.title, "relations of sym0");
+        assert!(snap.semantic.rows.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A RelationsLoaded that no longer answers the current selection (or the current
+    /// epoch) must never overwrite the pane: navigation without Enter makes slow fetches
+    /// for rows the user already left common.
+    #[tokio::test]
+    async fn stale_relations_loaded_is_dropped() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: Some(("sym0".to_string(), 1, 4)),
+        }))
+        .await;
+        let epoch = disp.epoch;
+
+        // Identity mismatch: a result for a symbol the user navigated away from.
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch,
+            file: "a.txt".to_string(),
+            name: "other_sym".to_string(),
+            line: 9,
+            col: 9,
+            callers: vec![sem_row("stale")],
+            callees: Vec::new(),
+        })
+        .await;
+        assert!(
+            disp.selected_relations.is_none(),
+            "a result for another symbol is dropped"
+        );
+
+        // Epoch mismatch: the same symbol, but computed against a superseded repo state.
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch: epoch.next(),
+            file: "a.txt".to_string(),
+            name: "sym0".to_string(),
+            line: 1,
+            col: 4,
+            callers: vec![sem_row("stale")],
+            callees: Vec::new(),
+        })
+        .await;
+        assert!(
+            disp.selected_relations.is_none(),
+            "a result from another epoch is dropped"
+        );
+
+        // Nothing selected at all (user moved onto a file row before the result landed).
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch: disp.epoch,
+            file: "a.txt".to_string(),
+            name: "sym0".to_string(),
+            line: 1,
+            col: 4,
+            callers: vec![sem_row("stale")],
+            callees: Vec::new(),
+        })
+        .await;
+        assert!(
+            disp.selected_relations.is_none(),
+            "a late result after leaving the symbol is dropped"
+        );
+        assert!(snapshot_rx.borrow().semantic.rows.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Enter (SelectSymbol) still works: it records the target and the fetch result for it
+    /// applies — navigation only makes Enter unnecessary, not broken.
+    #[tokio::test]
+    async fn select_symbol_enter_still_expands_relations() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.handle(DispatchEvent::Work(Action::SelectSymbol {
+            file: "a.txt".to_string(),
+            name: "sym0".to_string(),
+            line: 1,
+            col: 4,
+        }))
+        .await;
+        assert_eq!(disp.selected_file.as_deref(), Some("a.txt"));
+        assert_eq!(
+            disp.selected_symbol,
+            Some(("a.txt".to_string(), "sym0".to_string(), 1, 4))
+        );
+
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch: disp.epoch,
+            file: "a.txt".to_string(),
+            name: "sym0".to_string(),
+            line: 1,
+            col: 4,
+            callers: vec![sem_row("caller_fn")],
+            callees: Vec::new(),
+        })
+        .await;
+        assert_eq!(snapshot_rx.borrow().semantic.title, "relations of sym0");
 
         std::fs::remove_dir_all(&root).ok();
     }

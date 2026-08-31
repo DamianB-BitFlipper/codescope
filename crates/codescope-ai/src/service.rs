@@ -116,6 +116,12 @@ impl AiService {
         self.client.model()
     }
 
+    /// Which provider/credential is active ("prime"/"openai"/"anthropic"/"custom").
+    #[must_use]
+    pub fn provider_label(&self) -> &'static str {
+        self.config.provider_label()
+    }
+
     /// Switch the model for subsequent plan requests (the TUI model picker).
     pub fn set_model(&self, model: impl Into<String>) {
         self.client.set_model(model);

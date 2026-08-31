@@ -453,6 +453,86 @@ async fn stacked_branch_infers_nearest_ancestor_not_default() {
     );
 }
 
+/// Remote-tracking branches never factor into the nearest-ancestor pick: with local `a`
+/// and its `origin/a` twin at the SAME commit, the inferred base is the LOCAL `a`, and
+/// `origin/a` is not an ancestor candidate (it may still appear as the upstream entry).
+#[tokio::test]
+async fn remote_tracking_twin_is_not_an_ancestor_candidate() {
+    let (_tmp, top) = scratch_repo();
+    let remote_tmp = TempDir::new().unwrap();
+    git(remote_tmp.path(), &["init", "-q", "--bare", "-b", "main"]);
+    let remote_path = remote_tmp.path().to_str().unwrap().to_string();
+    git(
+        top.as_std_path(),
+        &["remote", "add", "origin", &remote_path],
+    );
+
+    // Stacked chain main <- a <- b (b checked out); `a` is pushed, so `origin/a` is a
+    // remote-tracking twin of local `a` at the same commit.
+    git(top.as_std_path(), &["checkout", "-q", "-b", "a"]);
+    write(top.as_std_path(), "a2.go", "package main\n\nfunc A2() {}\n");
+    git(top.as_std_path(), &["add", "a2.go"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "a1"]);
+    git(top.as_std_path(), &["push", "-q", "origin", "a"]);
+    git(top.as_std_path(), &["checkout", "-q", "-b", "b"]);
+    write(top.as_std_path(), "b.go", "package main\n\nfunc B() {}\n");
+    git(top.as_std_path(), &["add", "b.go"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "b1"]);
+
+    let a_sha = git(top.as_std_path(), &["rev-parse", "a"]);
+    let origin_a_sha = git(top.as_std_path(), &["rev-parse", "origin/a"]);
+    assert_eq!(a_sha, origin_a_sha, "setup: twin refs at the same commit");
+
+    // The inferred base is the LOCAL `a`, never `origin/a`.
+    let repo = open_repo(&top).await;
+    let ctx = repo.repo_context().await.expect("context");
+    let base = ctx.base.expect("base inferred");
+    assert_eq!(base.source, BaseSource::Ancestor);
+    assert_eq!(
+        base.ref_name, "a",
+        "the local branch wins over its origin twin; got {}",
+        base.ref_name
+    );
+    assert_eq!(base.merge_base.as_str(), a_sha.trim());
+
+    // Picker: no remote-tracking ref in the ancestor tier; local `a` is first (no upstream).
+    let candidates = repo.base_candidates().await.expect("candidates");
+    assert_eq!(candidates[0].source, BaseSource::Ancestor);
+    assert_eq!(candidates[0].ref_name, "a");
+    assert!(
+        !candidates
+            .iter()
+            .any(|c| c.source == BaseSource::Ancestor && c.ref_name.starts_with("origin/")),
+        "remote-tracking refs must not be ancestor candidates: {candidates:?}"
+    );
+    assert!(
+        !candidates.iter().any(|c| c.ref_name == "origin/a"),
+        "origin/a appears only as a configured upstream, never otherwise: {candidates:?}"
+    );
+
+    // A configured upstream MAY be a remote-tracking ref: it stays first, deduped.
+    git(
+        top.as_std_path(),
+        &["branch", "--set-upstream-to=origin/a", "b"],
+    );
+    let candidates = repo
+        .base_candidates()
+        .await
+        .expect("candidates with upstream");
+    assert_eq!(candidates[0].source, BaseSource::Upstream);
+    assert_eq!(candidates[0].ref_name, "origin/a");
+    assert!(
+        candidates.iter().skip(1).all(|c| c.ref_name != "origin/a"),
+        "the upstream entry is deduped out of the later tiers: {candidates:?}"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.source == BaseSource::Ancestor && c.ref_name == "a"),
+        "local `a` is still listed as an ancestor: {candidates:?}"
+    );
+}
+
 #[tokio::test]
 async fn base_inference_ancestor_default_upstream_wins() {
     let (_tmp, top) = scratch_repo();
@@ -467,8 +547,9 @@ async fn base_inference_ancestor_default_upstream_wins() {
 
     let repo = open_repo(&top).await;
 
-    // 2) No upstream: the nearest ancestor branch wins (`main` / its remote-tracking
-    //    twin point at the same commit), ahead of origin/HEAD and the guess fallbacks.
+    // 2) No upstream: the nearest ancestor branch wins, ahead of origin/HEAD and the guess
+    //    fallbacks. `origin/main` is a remote-tracking twin of `main` at the same commit, but
+    //    remote-tracking refs are excluded from the ancestor tier — the LOCAL `main` wins.
     git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
     write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 9 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
     git(top.as_std_path(), &["commit", "-q", "-am", "edit"]);
@@ -476,10 +557,9 @@ async fn base_inference_ancestor_default_upstream_wins() {
     let ctx = repo.repo_context().await.expect("context");
     let base = ctx.base.expect("base");
     assert_eq!(base.source, BaseSource::Ancestor);
-    assert!(
-        base.ref_name == "main" || base.ref_name == "origin/main",
-        "ancestor is main (or its remote-tracking ref), got {}",
-        base.ref_name
+    assert_eq!(
+        base.ref_name, "main",
+        "ancestor is the LOCAL main, never its remote-tracking twin"
     );
     assert_eq!(base.merge_base.as_str(), main_sha.trim());
 

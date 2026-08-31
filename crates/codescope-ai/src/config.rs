@@ -238,6 +238,24 @@ impl AiConfig {
             ProviderKind::OpenAiCompatible
         }
     }
+
+    /// A short display label for which credential/provider is active (for the UI).
+    ///
+    /// Derived from the base URL: the provider whose default base matches, or "custom" for an
+    /// overridden/unknown base. Only meaningful for an enabled config.
+    #[must_use]
+    pub fn provider_label(&self) -> &'static str {
+        let base = self.base_url.trim_end_matches('/');
+        if base == PRIME_BASE_URL.trim_end_matches('/') {
+            "prime"
+        } else if base == OPENAI_BASE_URL.trim_end_matches('/') {
+            "openai"
+        } else if base == ANTHROPIC_BASE_URL.trim_end_matches('/') {
+            "anthropic"
+        } else {
+            "custom"
+        }
+    }
 }
 
 /// The wire protocol a provider speaks.
@@ -367,6 +385,19 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn provider_label_follows_the_base_url() {
+        let mut c = AiConfig::disabled();
+        c.base_url = PRIME_BASE_URL.to_string();
+        assert_eq!(c.provider_label(), "prime");
+        c.base_url = OPENAI_BASE_URL.to_string();
+        assert_eq!(c.provider_label(), "openai");
+        c.base_url = ANTHROPIC_BASE_URL.to_string();
+        assert_eq!(c.provider_label(), "anthropic");
+        c.base_url = "http://127.0.0.1:11434/v1".to_string();
+        assert_eq!(c.provider_label(), "custom");
     }
 
     #[test]

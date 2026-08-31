@@ -273,9 +273,9 @@ impl GitRepo {
         Ok(None)
     }
 
-    /// All plausible base branches for the picker: upstream first, then ancestor branches
-    /// (most recent common commit first), then the conventional default branches. The current
-    /// branch is excluded.
+    /// All plausible base branches for the picker: upstream first (a configured upstream may
+    /// be a remote-tracking ref), then LOCAL ancestor branches (most recent common commit
+    /// first), then the conventional default branches. The current branch is excluded.
     pub async fn base_candidates(&self) -> Result<Vec<BaseInfo>> {
         let status = self.status_snapshot().await?;
         let mut out: Vec<BaseInfo> = Vec::new();
@@ -328,7 +328,7 @@ impl GitRepo {
         Ok(out)
     }
 
-    /// The nearest ancestor branch, if any: the branch (not the current one) whose
+    /// The nearest ancestor branch, if any: the LOCAL branch (not the current one) whose
     /// merge-base with HEAD is the most recent common commit.
     async fn nearest_ancestor(&self, status: &StatusSnapshot) -> Result<Option<BaseInfo>> {
         // --sort=-committerdate returns nearest-first; take the first (review 10 F1: the old
@@ -339,14 +339,20 @@ impl GitRepo {
         }))
     }
 
-    /// Branches whose tip is an ancestor of HEAD, NEAREST (newest tip commit) first.
-    /// Excludes the current branch and symbolic remote HEADs.
-    /// Branches whose tip is an ancestor of HEAD, nearest first. One `for-each-ref --merged
-    /// HEAD --sort=-committerdate` call — no per-ref subprocesses (review: a 5k-ref repo made
-    /// the old per-ref merge-base+show scan pin the CPU for minutes).
+    /// Local branches whose tip is an ancestor of HEAD, NEAREST (newest tip commit) first.
+    /// One `for-each-ref --merged HEAD --sort=-committerdate` call over `refs/heads` — no
+    /// per-ref subprocesses (review: a 5k-ref repo made the old per-ref merge-base+show scan
+    /// pin the CPU for minutes).
+    ///
+    /// Remote-tracking refs (`refs/remotes`) are deliberately NOT scanned: the nearest
+    /// ancestor is always a LOCAL branch, so a branch and its `origin/<name>` twin at the
+    /// same commit can never produce a remote winner or a duplicate entry. A configured
+    /// upstream may still be a remote-tracking ref; it is reported separately as
+    /// [`BaseSource::Upstream`].
     ///
     /// A merged ref's merge-base with HEAD is the ref's own tip, never HEAD itself, so the
-    /// empty-diff guard (merge_base == HEAD) is inherent. Symbolic remote HEADs are dropped.
+    /// empty-diff guard (merge_base == HEAD) is inherent. Excludes the current branch; the
+    /// `/HEAD` suffix guard still drops any symbolic-ref alias.
     async fn ancestor_branches(&self, status: &StatusSnapshot) -> Result<Vec<BaseInfo>> {
         if status.oid.is_none() {
             return Ok(Vec::new());
@@ -360,7 +366,6 @@ impl GitRepo {
                 "--sort=-committerdate",
                 "--format=%(refname) %(refname:short) %(objectname)",
                 "refs/heads",
-                "refs/remotes",
             ])
             .run()
             .await?;
