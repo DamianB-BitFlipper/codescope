@@ -123,9 +123,80 @@ pub fn changed_spans(old: &str, new: &str) -> (ByteSpans, ByteSpans) {
 
 /// Per-row changed byte spans for the renderer (empty when the row is unpaired or under
 /// a cap). Each pair is diffed once, from the `Del` side.
-pub fn row_spans(rows: &[DiffRow]) -> Vec<ByteSpans> {
+/// Pair del/add rows within each modification block by *content alignment*: a
+/// `TextDiff::from_lines` over the block's del texts vs add texts, zipping only the two
+/// sides of each `Replace` op. Positional pairing mis-pairs everything below an insertion
+/// inside the run (review 16 M4): with `["let keep = 1", "return old"]` vs
+/// `["let inserted = 0", "let keep = 1", "return new"]`, the two `return` lines pair and
+/// the pure insertion stays unpaired.
+fn pair_rows_aligned(rows: &[DiffRow]) -> Vec<Option<usize>> {
     let kinds: Vec<RowKind> = rows.iter().map(row_kind).collect();
-    let pairs = pair_rows(&kinds);
+    let mut pairs = vec![None; rows.len()];
+    let mut dels: Vec<usize> = Vec::new();
+    let mut adds: Vec<usize> = Vec::new();
+    let flush = |pairs: &mut Vec<Option<usize>>, dels: &mut Vec<usize>, adds: &mut Vec<usize>| {
+        if !dels.is_empty() && !adds.is_empty() && dels.len() + adds.len() <= MAX_BLOCK_LINES {
+            let old_joined = dels.iter().map(|&i| row_text(&rows[i])).collect::<Vec<_>>().join("\n");
+            let new_joined = adds.iter().map(|&i| row_text(&rows[i])).collect::<Vec<_>>().join("\n");
+            let diff = TextDiff::from_lines(&old_joined, &new_joined);
+            // Group consecutive changes by op class; zip only the two sides of a Replace
+            // group (a run of deletes followed by a run of inserts with no equal between).
+            let mut d = 0usize;
+            let mut a = 0usize;
+            let mut pending_del: Vec<usize> = Vec::new();
+            let mut pending_add: Vec<usize> = Vec::new();
+            let flush_group = |pairs: &mut Vec<Option<usize>>, pd: &mut Vec<usize>, pa: &mut Vec<usize>| {
+                for k in 0..pd.len().min(pa.len()) {
+                    pairs[dels[pd[k]]] = Some(adds[pa[k]]);
+                    pairs[adds[pa[k]]] = Some(dels[pd[k]]);
+                }
+                pd.clear();
+                pa.clear();
+            };
+            for change in diff.iter_all_changes() {
+                match change.tag() {
+                    ChangeTag::Delete => {
+                        pending_del.push(d);
+                        d += 1;
+                    }
+                    ChangeTag::Insert => {
+                        pending_add.push(a);
+                        a += 1;
+                    }
+                    ChangeTag::Equal => {
+                        // Sequences re-converged: close the pending replace group; the
+                        // equal lines themselves are unchanged content (no highlight).
+                        flush_group(pairs, &mut pending_del, &mut pending_add);
+                        d += 1;
+                        a += 1;
+                    }
+                }
+            }
+            flush_group(pairs, &mut pending_del, &mut pending_add);
+        }
+        dels.clear();
+        adds.clear();
+    };
+    for (i, kind) in kinds.iter().enumerate() {
+        match kind {
+            RowKind::Del => {
+                if !adds.is_empty() {
+                    flush(&mut pairs, &mut dels, &mut adds);
+                }
+                dels.push(i);
+            }
+            RowKind::Add => adds.push(i),
+            RowKind::Header | RowKind::Context => flush(&mut pairs, &mut dels, &mut adds),
+        }
+    }
+    flush(&mut pairs, &mut dels, &mut adds);
+    pairs
+}
+
+/// Per-row intraline change spans: one entry per row; non-empty on the rows of a
+/// content-paired del/add line.
+pub fn row_spans(rows: &[DiffRow]) -> Vec<ByteSpans> {
+    let pairs = pair_rows_aligned(rows);
     let mut spans: Vec<ByteSpans> = vec![Vec::new(); rows.len()];
     for (i, partner) in pairs.iter().enumerate() {
         let Some(j) = partner else { continue };
@@ -445,5 +516,28 @@ mod tests {
         assert_eq!(spans[2], vec![(18, 20)], "del side highlights `30`");
         assert_eq!(spans[3], vec![(18, 20)], "add side highlights `60`");
         assert!(spans[4].is_empty(), "unpaired extra add: no spans");
+    }
+
+
+    /// Review 16 M4: an insertion inside a del/add run must not shift later partners.
+    /// The two `return` lines pair; the pure insertion does not.
+    #[test]
+    fn inserted_line_does_not_shift_later_pairs() {
+        let rows = vec![
+            DiffRow::Del { old_ln: 1, text: "let keep = 1;".to_string() },
+            DiffRow::Del { old_ln: 2, text: "return old".to_string() },
+            DiffRow::Add { new_ln: 1, text: "let inserted = 0;".to_string() },
+            DiffRow::Add { new_ln: 2, text: "let keep = 1;".to_string() },
+            DiffRow::Add { new_ln: 3, text: "return new".to_string() },
+        ];
+        let pairs = pair_rows_aligned(&rows);
+        assert_eq!(pairs[0], None, "pure delete of `let keep` (moved, not changed)");
+        assert_eq!(pairs[1], Some(4), "`return old` pairs with `return new`");
+        assert_eq!(pairs[4], Some(1));
+        assert_eq!(pairs[2], None, "pure insertion unpaired");
+        assert_eq!(pairs[3], None);
+        let spans = row_spans(&rows);
+        assert!(!spans[1].is_empty() && !spans[4].is_empty(), "old/new brighten");
+        assert!(spans[2].is_empty(), "inserted line has no intraline spans");
     }
 }

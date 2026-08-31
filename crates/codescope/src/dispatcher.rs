@@ -34,6 +34,18 @@ pub enum DispatchEvent {
         /// The result.
         result: anyhow::Result<Box<AnalysisSnapshot>>,
     },
+    /// The git phase of a refresh completed (changeset + repo context) while the
+    /// language-server analysis is still running. Lets the UI show changed files and the
+    /// top bar within a second or two on repos where analysis takes tens of seconds,
+    /// instead of a misleading "0 changed files" placeholder.
+    ChangesetReady {
+        /// Epoch the job ran against; stale results are dropped on apply.
+        epoch: Epoch,
+        /// Repo context (top bar: repo/branch/base).
+        ctx: codescope_core::RepoContext,
+        /// The current scope's changeset (files pane + diff before symbols land).
+        changeset: codescope_core::ChangeSet,
+    },
     /// An AI plan job completed (spawned; epoch-tagged).
     AiDone {
         /// Epoch the plan was requested against.
@@ -203,6 +215,11 @@ impl Dispatcher {
             DispatchEvent::RepoChanged => self.bump_and_refresh(),
             DispatchEvent::Work(action) => self.on_action(action),
             DispatchEvent::AnalysisDone { epoch, result } => self.on_analysis_done(epoch, result),
+            DispatchEvent::ChangesetReady {
+                epoch,
+                ctx,
+                changeset,
+            } => self.on_changeset_ready(epoch, ctx, changeset),
             DispatchEvent::AiDone { epoch, outcome } => self.on_ai_done(epoch, outcome),
             DispatchEvent::EngineReady(engine) => {
                 self.ls_status = LsStatus::Ready;
@@ -473,16 +490,19 @@ impl Dispatcher {
         let repo = self.repo.clone();
         let scope = self.scope;
         let base_override = self.base_override.clone();
-        // Publish immediately: show the git-level view with a refreshing marker.
-        self.repo_ctx = None;
-        self.changeset = None;
+        // Publish immediately with a refreshing marker. Keep the previous repo context and
+        // changeset visible while the job runs: on large repos the language-server phase
+        // takes tens of seconds, and blanking the top bar ("?") and files pane reads as
+        // "0 changed files" breakage. The spinner marks the data as in flight.
         self.publish_refreshing();
         let engine = self.engine.clone();
         let tx = self.job_tx.clone();
         // The engine is Arc-shared; the job runs the full git+analysis pipeline without
-        // blocking the dispatcher. Result is epoch-gated at apply time (on_analysis_done).
+        // blocking the dispatcher. It reports twice: `ChangesetReady` as soon as the fast
+        // git phase lands (files pane + top bar), then `AnalysisDone` when the language
+        // server finishes. Both are epoch-gated at apply time.
         tokio::spawn(async move {
-            let result = run_pipeline(repo, scope, engine, epoch, base_override).await;
+            let result = run_pipeline(repo, scope, engine, epoch, base_override, &tx).await;
             let _ = tx
                 .send(DispatchEvent::AnalysisDone {
                     epoch,
@@ -490,12 +510,12 @@ impl Dispatcher {
                 })
                 .await;
         });
-        // Re-fetch the selected symbol's relations against the new state: an in-flight
-        // pre-refresh fetch is epoch-gated and dropped, and navigation does not re-send a
-        // selection that did not move.
-        if let Some((file, name, line, col)) = self.selected_symbol.clone() {
-            self.spawn_expand(file, name, line, col);
-        }
+        // Relations for the selected symbol are re-fetched in `on_analysis_done`, once the
+        // new analysis exists. Firing the query here would race the language server's own
+        // refresh and tag a pre-refresh answer with the new epoch. The previously loaded
+        // rows describe the old state, so drop them: `build_impact` renders the lists as
+        // Loading while a selection is set.
+        self.selected_relations = None;
     }
 
     fn spawn_ai(&mut self) {
@@ -524,6 +544,29 @@ impl Dispatcher {
         });
     }
 
+    fn on_changeset_ready(
+        &mut self,
+        epoch: Epoch,
+        ctx: codescope_core::RepoContext,
+        changeset: codescope_core::ChangeSet,
+    ) {
+        // Same epoch gate as AnalysisDone: a superseded refresh must not resurrect stale
+        // git state either.
+        if epoch != self.epoch {
+            return;
+        }
+        self.repo_ctx = Some(ctx);
+        self.changeset = Some(changeset);
+        if self.analysis.is_none() {
+            self.set_status(
+                "files listed; symbol analysis still running…",
+                StatusLevel::Info,
+            );
+        }
+        // Analysis is still in flight: keep the refreshing marker on.
+        self.publish_refreshing();
+    }
+
     fn on_analysis_done(&mut self, epoch: Epoch, result: anyhow::Result<Box<AnalysisSnapshot>>) {
         // Apply-time epoch gate: drop results computed against an older repo state.
         if epoch != self.epoch {
@@ -546,9 +589,19 @@ impl Dispatcher {
             Ok(snap) => {
                 self.repo_ctx = Some(snap.repo_ctx.clone());
                 self.changeset = Some(snap.changeset.clone());
-                self.ls_status = LsStatus::Ready;
-                self.status = StatusMessage::default();
+                // A git-only pipeline (no engine) also lands here as Ok: it must not light
+                // the top bar's LSP glyph nor erase the git-only warning. Semantic status
+                // belongs to the engine lifecycle (EngineReady/EngineUnavailable).
+                if self.engine.is_some() {
+                    self.ls_status = LsStatus::Ready;
+                    self.status = StatusMessage::default();
+                }
                 self.analysis = Some(*snap);
+                // Relations were cleared at refresh start; resolve them against the new
+                // analysis now that it has landed.
+                if let Some((file, name, line, col)) = self.selected_symbol.clone() {
+                    self.spawn_expand(file, name, line, col);
+                }
             }
             Err(e) => {
                 self.set_status(format!("analysis failed: {e}"), StatusLevel::Error);
@@ -596,7 +649,14 @@ impl Dispatcher {
 
     fn build_snapshot(&self) -> UiSnapshot {
         let (repo_bar, counts) = repo_bar(self.repo_ctx.as_ref());
-        let files = self.analysis.as_ref().map(file_rows).unwrap_or_default();
+        // Files come from analysis once it lands; before that (or without a language
+        // server at all), the changeset alone still lists every changed file.
+        let files = self
+            .analysis
+            .as_ref()
+            .map(file_rows)
+            .or_else(|| self.changeset.as_ref().map(changeset_file_rows))
+            .unwrap_or_default();
         let (diff, semantic) = self.panes();
         let impact = self.build_impact();
         // The base shown in the top bar: the latest repo context's base (which already
@@ -710,6 +770,12 @@ impl Dispatcher {
     fn build_impact(&self) -> ImpactPane {
         let mut impact = ImpactPane::default();
         let Some(analysis) = &self.analysis else {
+            // No analysis yet (startup or mid-refresh): a symbol selection with a live
+            // engine has relations on the way — Loading, not the misleading Idle.
+            if self.selected_symbol.is_some() && self.engine.is_some() {
+                impact.callers.state = ImpactLoadState::Loading;
+                impact.downstream.state = ImpactLoadState::Loading;
+            }
             return impact;
         };
         impact.selected_change = selected_change(
@@ -763,6 +829,7 @@ async fn run_pipeline(
     engine: Option<std::sync::Arc<AnalysisEngine<LanguageService>>>,
     epoch: Epoch,
     base_override: Option<String>,
+    tx: &mpsc::Sender<DispatchEvent>,
 ) -> anyhow::Result<AnalysisSnapshot> {
     let ctx = repo
         .repo_context_with_base(base_override.as_deref())
@@ -771,6 +838,16 @@ async fn run_pipeline(
         (ChangeScope::Branch, Some(base)) => repo.branch_changeset_with_base(base).await?,
         _ => repo.changeset(scope).await?,
     };
+    // Report the git-level result immediately: the files pane and top bar can render long
+    // before the language server finishes. Failure to send just means the UI waits for the
+    // full result — never a correctness issue.
+    let _ = tx
+        .send(DispatchEvent::ChangesetReady {
+            epoch,
+            ctx: ctx.clone(),
+            changeset: changeset.clone(),
+        })
+        .await;
     let Some(engine) = engine else {
         // No language service: fabricate an analysis carrying just git state.
         return Ok(git_only_snapshot(epoch, ctx, changeset));
@@ -876,6 +953,22 @@ fn file_rows(a: &AnalysisSnapshot) -> Vec<FileRow> {
                 symbols,
                 expanded: true,
             }
+        })
+        .collect()
+}
+
+/// File rows from the changeset alone — no symbol information yet. Shown as soon as the
+/// git phase of a refresh completes so large repos never sit on an empty "0 changed files"
+/// pane while the language server analyzes.
+fn changeset_file_rows(cs: &codescope_core::ChangeSet) -> Vec<FileRow> {
+    cs.files
+        .iter()
+        .map(|f| FileRow {
+            path: f.path.to_string(),
+            status: status_badge(&f.status),
+            changed_symbol_count: 0,
+            symbols: Vec::new(),
+            expanded: true,
         })
         .collect()
 }
@@ -1515,6 +1608,79 @@ mod tests {
         assert_eq!(snap.repo.base.as_deref(), Some("main"));
         assert_eq!(snap.repo.branch, "feature");
         assert_eq!(snap.files.len(), 1, "one file changed vs main");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Regression test for "branch mode looks broken on large repos": the files pane and
+    /// top bar must populate from the git phase (`ChangesetReady`) without waiting for the
+    /// language-server analysis (`AnalysisDone`), which can take tens of seconds.
+    #[tokio::test]
+    async fn changeset_ready_populates_files_before_analysis_lands() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+
+        disp.handle(DispatchEvent::RepoChanged).await;
+        // The git phase reports first…
+        let ready = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::ChangesetReady { .. })
+        })
+        .await;
+        disp.handle(ready).await;
+        {
+            let snap = snapshot_rx.borrow().clone();
+            assert_eq!(snap.repo.branch, "feature", "top bar populated early");
+            assert_eq!(snap.files.len(), 1, "changed files visible before analysis");
+            assert_eq!(snap.files[0].path, "a.txt");
+            assert!(snap.refreshing, "spinner stays on until analysis lands");
+        }
+        // …then the analysis result arrives and keeps the same files.
+        let done = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::AnalysisDone { .. })
+        })
+        .await;
+        disp.handle(done).await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.files.len(), 1);
+        assert!(!snap.refreshing);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Regression test: starting a refresh must not blank the top bar. While a refresh is
+    /// in flight the previously known repo/branch/base stay visible (the spinner signals
+    /// staleness); an empty bar reading "codescope ?" made branch mode look broken.
+    #[tokio::test]
+    async fn refresh_keeps_previous_repo_bar_visible() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+
+        // Land the initial state.
+        disp.handle(DispatchEvent::RepoChanged).await;
+        let done = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::AnalysisDone { .. })
+        })
+        .await;
+        disp.handle(done).await;
+        assert_eq!(snapshot_rx.borrow().repo.branch, "feature");
+
+        // Start a second refresh: the bar must not reset to placeholder values.
+        disp.handle(DispatchEvent::RepoChanged).await;
+        let snap = snapshot_rx.borrow().clone();
+        assert!(snap.refreshing);
+        assert_eq!(snap.repo.branch, "feature", "branch survives refresh start");
+        assert!(!snap.repo.repo_name.is_empty(), "repo name survives refresh start");
+        assert!(
+            !snap.files.is_empty(),
+            "files survive refresh start (stale data + spinner beats an empty pane)"
+        );
+
+        // Drain the follow-up job so the dispatcher is not dropped with it in flight.
+        let done = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::AnalysisDone { .. })
+        })
+        .await;
+        disp.handle(done).await;
 
         std::fs::remove_dir_all(&root).ok();
     }
