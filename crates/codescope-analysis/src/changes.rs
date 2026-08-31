@@ -152,30 +152,19 @@ pub fn changed_symbols_detailed(
     // Tree-diff sweep: symbols present in exactly one tree, even when no hunk mapped to
     // them directly (e.g. a new field whose hunk mapped to the enclosing struct).
     if let Some(base_keys) = &base_keys {
-        // Collect added worktree symbols, then drop a parent whose presence is implied by
-        // an added descendant (its own declaration didn't change — it just gained a
-        // child). A parent whose declaration itself was edited still maps via its hunk
-        // (record() above), so this only dedupes tree-diff noise (review 20 parent
-        // suppression).
-        let added: Vec<(SymbolKey, SymbolId)> = ordered_keys(wt)
-            .into_iter()
-            .filter(|(key, _)| !base_keys.contains_key(key))
-            .collect();
-        let added_names: Vec<&str> = added.iter().map(|((n, _), _)| n.as_str()).collect();
-        for ((name, _), id) in &added {
-            // Skip this parent when a strictly-deeper added entry nests under it.
-            let has_added_descendant = added_names
-                .iter()
-                .any(|other| *other != name.as_str() && other.starts_with(&format!("{name}.")));
-            if has_added_descendant {
-                continue;
+        // Record every worktree-only symbol as Added (review 22 M5: an ancestor that only
+        // exists on the worktree side IS a real addition — its key is absent from base
+        // precisely because it was added, so it must not be suppressed). A parent whose
+        // own declaration changed maps via its hunk earlier; the sweep catches the rest.
+        for (key, id) in ordered_keys(wt) {
+            if !base_keys.contains_key(&key) {
+                agg.record_if_absent(
+                    TreeSide::Worktree,
+                    id,
+                    ChangeKind::Added,
+                    MappingConfidence::Exact,
+                );
             }
-            agg.record_if_absent(
-                TreeSide::Worktree,
-                id.clone(),
-                ChangeKind::Added,
-                MappingConfidence::Exact,
-            );
         }
         if let Some(base_tree) = base {
             for (key, id) in ordered_keys(base_tree) {
@@ -711,9 +700,10 @@ mod tests {
         let change = file_change(FileStatus::Added, vec![hunk(0, 0, 1, 60)]);
         let out = changed_symbols(Some(&worktree()), None, &change);
         let with_hunks: Vec<_> = out.iter().filter(|c| !c.hunks.is_empty()).collect();
-        assert_eq!(with_hunks.len(), 3); // three top-level symbols from the multi-target hunk
+        // The deepest frontier maps every covered symbol directly (the two fields too).
+        assert_eq!(with_hunks.len(), 5);
         assert!(out.iter().all(|c| c.change_kind == ChangeKind::Added));
-        assert_eq!(out.len(), 5); // tree-diff sweep adds the two fields
+        assert_eq!(out.len(), 5); // three top-level symbols + the two fields
     }
 
     #[test]
@@ -793,6 +783,61 @@ mod tests {
         assert!(
             !names.contains(&"Helper"),
             "a context-only symbol is NOT reported: {names:?}"
+        );
+    }
+
+    /// Review 22 M1: a baseless deletion's worktree-fallback target is labeled Worktree,
+    /// not Base — so it aggregates instead of being dropped as a phantom base id.
+    #[test]
+    fn baseless_deletion_aggregates_onto_worktree_survivor() {
+        // Delete two lines inside main (old 10,11); NO base tree. The run's anchor (next
+        // new-side slot) lands inside worktree main, folding the deletion onto it.
+        let change = file_change(FileStatus::Modified, vec![del_hunk(10, 2, 12)]);
+        let out = changed_symbols_detailed(Some(&worktree()), None, &change);
+        let main = out.iter().find(|c| c.name == "main").unwrap();
+        assert_eq!(
+            main.revision,
+            Revision::Worktree,
+            "fallback target is worktree"
+        );
+        assert!(matches!(
+            main.record.confidence,
+            MappingConfidence::Approximate(_)
+        ));
+        assert!(
+            !main.record.hunks.is_empty(),
+            "the deletion's hunk is recorded"
+        );
+    }
+
+    /// Review 22 M2: a run covering two adjacent sibling FIELDS maps to the fields (the
+    /// semantic frontier), not their parent struct.
+    #[test]
+    fn sibling_field_edit_maps_to_fields_not_parent() {
+        // Worktree: Greeter struct (20-30) with fields Name (22) and Email (23). An Add
+        // run covering exactly the two field lines maps to the fields.
+        let change = file_change(
+            FileStatus::Modified,
+            vec![hunk_with(
+                23,
+                2,
+                23,
+                2,
+                vec![
+                    codescope_core::DiffLine::add(23, ""),
+                    codescope_core::DiffLine::add(24, ""),
+                ],
+            )],
+        );
+        let out = changed_symbols_detailed(Some(&worktree()), Some(&base()), &change);
+        let names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"Greeter.Name"),
+            "field Name mapped: {names:?}"
+        );
+        assert!(
+            names.contains(&"Greeter.Email"),
+            "field Email mapped: {names:?}"
         );
     }
 }

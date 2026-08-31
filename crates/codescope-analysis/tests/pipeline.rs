@@ -109,7 +109,12 @@ fn pure_pipeline_produces_digest() {
     assert_eq!(main_changed.len(), 1);
     assert_eq!(main_changed[0].name, "main");
     assert_eq!(main_changed[0].record.change_kind, ChangeKind::Modified);
-    assert_eq!(main_changed[0].record.confidence, MappingConfidence::Exact);
+    // A baseless replacement (no base tree for cmd/main.go): the Del run's approximate
+    // fallback keeps the record honest — worst-wins is Approximate, not Exact.
+    assert!(matches!(
+        main_changed[0].record.confidence,
+        MappingConfidence::Approximate(_)
+    ));
 
     let greet_changed =
         changed_symbols_detailed(Some(&greet_worktree()), Some(&greet_base()), &cs.files[1]);

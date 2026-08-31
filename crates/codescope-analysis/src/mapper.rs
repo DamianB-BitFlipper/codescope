@@ -67,7 +67,6 @@ pub fn map_changes_detailed(
     base: Option<&SymbolTree>,
     hunks: &[Hunk],
 ) -> Vec<MappedHunk> {
-    use codescope_core::{ChangedSide, Revision};
     let file = tree.file.as_path().to_path_buf();
     let mut out: Vec<MappedHunk> = Vec::new();
     for (index, hunk) in hunks.iter().enumerate() {
@@ -80,10 +79,7 @@ pub fn map_changes_detailed(
             let mut signature_touches: Vec<SymbolId> = mapped.signature_touches.clone();
             signature_touches.sort();
             signature_touches.dedup();
-            let mapped_revision = match run.side {
-                ChangedSide::Old => Revision::Base,
-                ChangedSide::New => Revision::Worktree,
-            };
+            let mapped_revision = mapped.revision;
             tracing::trace!(
                 hunk = %hunk_id,
                 run = run_index,
@@ -117,11 +113,15 @@ struct ChangeRun {
     anchor_new: u32,
 }
 
-/// The (targets, confidence, signature-touching targets) for one changed run.
+/// The (targets, confidence, signature-touching targets, target namespace) for one
+/// changed run. `revision` is the tree the targets actually resolve against: `Base` for a
+/// base-mapped deletion, `Worktree` for additions AND for a baseless-deletion fallback to
+/// a surviving worktree symbol (review 22 M1: never label a worktree target as Base).
 struct RunMapping {
     targets: Vec<SymbolId>,
     confidence: MappingConfidence,
     signature_touches: Vec<SymbolId>,
+    revision: codescope_core::Revision,
 }
 
 /// Extract maximal same-kind, consecutive-coordinate `Add`/`Del` runs from a hunk body.
@@ -131,10 +131,13 @@ fn changed_runs(hunk: &Hunk) -> Vec<ChangeRun> {
     use codescope_core::{ChangedSide, DiffLineKind};
     let mut runs: Vec<ChangeRun> = Vec::new();
     let mut cur: Option<ChangeRun> = None;
-    let mut last_new = hunk.insertion_point_zero_based(); // 0-based new-side cursor
+    // The next new-side index where a deletion would be inserted. Before any line it is
+    // the hunk's new-side start (0-based); after a Context/Add at 1-based N it is N (the
+    // NEXT slot), so a deletion island anchors at the line that follows it (review 22 M3).
+    let mut last_new = hunk.new_start.saturating_sub(1);
     for line in &hunk.lines {
         if let Some(nl) = line.new_ln {
-            last_new = nl - 1; // track the surviving cursor through context/adds
+            last_new = nl; // consumed new-side line N (1-based) -> next insertion slot N (0-based)
         }
         let (side, coord) = match line.kind {
             DiffLineKind::Add => (ChangedSide::New, line.new_ln),
@@ -147,9 +150,11 @@ fn changed_runs(hunk: &Hunk) -> Vec<ChangeRun> {
             }
         };
         let Some(coord) = coord else {
-            // Malformed body: a changed line without its coordinate. Fail closed — end the
-            // run rather than guess a span.
-            cur = None;
+            // Malformed body: a changed line without its coordinate. Fail closed — but
+            // FLUSH the valid run accumulated so far instead of discarding it (review 22).
+            if let Some(r) = cur.take() {
+                runs.push(r);
+            }
             continue;
         };
         let zl = coord - 1; // 1-based -> 0-based
@@ -184,59 +189,91 @@ fn map_run(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -> Run
     }
 }
 
+/// The minimal set of deepest symbols covering `target` (the semantic frontier): recurse
+/// into each child that intersects the run; add the node itself only for the lines it owns
+/// that NO child covers (its own declaration, or body between/around children). A change
+/// touching two sibling fields maps to both fields, not their parent; a change to a
+/// struct's own declaration maps to the struct (review 22 M2).
+fn deepest_frontier<'t>(node: &'t SymbolNode, target: &LineRange, out: &mut Vec<&'t SymbolNode>) {
+    if !node.range.intersects_lines(target) {
+        return;
+    }
+    let mut child_covers = false;
+    for child in &node.children {
+        if child.range.intersects_lines(target) {
+            deepest_frontier(child, target, out);
+            child_covers = true;
+        }
+    }
+    // The node owns a line the children don't when the run reaches its own region: either
+    // it has no intersecting child at all, or its own declaration/selection is touched, or
+    // the run spans lines outside every child (a gap the parent owns). We approximate the
+    // last with: the run is not fully covered by the union of intersecting children.
+    if !child_covers {
+        out.push(node);
+        return;
+    }
+    // The parent owns the run (not its children) when its own declaration is touched, or
+    // when the run is not fully explained by the intersecting children. A run spanning a
+    // child boundary (start before one child or end after another) reaches parent-owned
+    // body, so the parent is the target — not the children (which would over-split one
+    // edit and mislabel a genuinely-new sibling, review 22 M2).
+    let own_decl_touched = node.selection.intersects_lines(target);
+    let spans_child_boundary = {
+        let mut hits: Vec<&LineRange> = node
+            .children
+            .iter()
+            .filter(|c| c.range.intersects_lines(target))
+            .map(|c| &c.range)
+            .collect();
+        hits.sort_by_key(|r| r.start_line);
+        let before = hits
+            .first()
+            .is_some_and(|r| target.start_line < r.start_line);
+        let after = hits.last().is_some_and(|r| target.end_line > r.end_line);
+        before || after
+    };
+    if own_decl_touched || spans_child_boundary {
+        out.push(node);
+    }
+}
+
 /// New-side (addition) run against the worktree tree.
 fn map_run_worktree(tree: &SymbolTree, target: &LineRange) -> RunMapping {
-    if let Some(sym) = tree.find_smallest_containing(target) {
-        let sig = sym.selection.intersects_lines(target);
+    // Deepest semantic frontier across all roots: siblings map to themselves, parents
+    // only for their own declaration/body evidence.
+    let mut frontier: Vec<&SymbolNode> = Vec::new();
+    for root in &tree.roots {
+        deepest_frontier(root, target, &mut frontier);
+    }
+    if !frontier.is_empty() {
+        let targets: Vec<SymbolId> = frontier.iter().map(|n| n.id.clone()).collect();
+        let touches: Vec<SymbolId> = frontier
+            .iter()
+            .filter(|n| n.selection.intersects_lines(target))
+            .map(|n| n.id.clone())
+            .collect();
+        // Exact when every target's range is covered by the run (a real edit of those
+        // symbols); HunkSpansSymbols when one run genuinely crosses several symbols without
+        // covering them; DocCommentOrGap when the run hangs into a gap around one symbol.
+        let exact = frontier.iter().all(|n| target.contains_lines(&n.range))
+            || frontier.len() == 1 && tree.find_smallest_containing(target).is_some();
+        let confidence = if exact {
+            MappingConfidence::Exact
+        } else if frontier.len() > 1 {
+            MappingConfidence::Approximate(ApproxReason::HunkSpansSymbols)
+        } else {
+            MappingConfidence::Approximate(ApproxReason::DocCommentOrGap)
+        };
         return RunMapping {
-            targets: vec![sym.id.clone()],
-            confidence: MappingConfidence::Exact,
-            signature_touches: if sig { vec![sym.id.clone()] } else { vec![] },
+            revision: codescope_core::Revision::Worktree,
+            targets,
+            confidence,
+            signature_touches: touches,
         };
     }
-    let intersected: Vec<&SymbolNode> = tree
-        .roots
-        .iter()
-        .filter(|n| n.range.intersects_lines(target))
-        .collect();
-    match intersected.len() {
-        0 => map_gap(tree, target),
-        1 => {
-            let sym = intersected[0];
-            if target.contains_lines(&sym.range) {
-                let sig = sym.selection.intersects_lines(target);
-                RunMapping {
-                    targets: vec![sym.id.clone()],
-                    confidence: MappingConfidence::Exact,
-                    signature_touches: if sig { vec![sym.id.clone()] } else { vec![] },
-                }
-            } else {
-                // Partial overlap hanging into a gap (typically the symbol plus its doc
-                // comment, which the language server excludes from the range).
-                RunMapping {
-                    targets: vec![sym.id.clone()],
-                    confidence: MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
-                    signature_touches: vec![],
-                }
-            }
-        }
-        _ => {
-            let targets: Vec<SymbolId> = intersected.iter().map(|n| n.id.clone()).collect();
-            if intersected.iter().all(|n| target.contains_lines(&n.range)) {
-                RunMapping {
-                    targets,
-                    confidence: MappingConfidence::Exact,
-                    signature_touches: vec![],
-                }
-            } else {
-                RunMapping {
-                    targets,
-                    confidence: MappingConfidence::Approximate(ApproxReason::HunkSpansSymbols),
-                    signature_touches: vec![],
-                }
-            }
-        }
-    }
+    // No symbol intersects the run: a gap (doc comment, import block, between symbols).
+    map_gap(tree, target)
 }
 
 /// Old-side (deletion) run against the base tree; baseless falls back to the worktree.
@@ -246,6 +283,7 @@ fn map_run_base(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -
         if let Some(sym) = base.find_smallest_containing(target) {
             let sig = sym.selection.intersects_lines(target);
             return RunMapping {
+                revision: codescope_core::Revision::Base,
                 targets: vec![sym.id.clone()],
                 confidence: MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
                 signature_touches: if sig { vec![sym.id.clone()] } else { vec![] },
@@ -259,6 +297,7 @@ fn map_run_base(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -
             .collect();
         if !intersected.is_empty() {
             return RunMapping {
+                revision: codescope_core::Revision::Base,
                 targets: intersected,
                 confidence: MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
                 signature_touches: vec![],
@@ -266,6 +305,7 @@ fn map_run_base(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -
         }
         if let Some(sym) = nearest_within(base, target, GAP_ATTACH_LINES) {
             return RunMapping {
+                revision: codescope_core::Revision::Base,
                 targets: vec![sym.id.clone()],
                 confidence: MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
                 signature_touches: vec![],
@@ -278,6 +318,7 @@ fn map_run_base(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -
     let target = LineRange::from_line_span(point, point);
     if let Some(sym) = tree.find_smallest_containing(&target) {
         return RunMapping {
+            revision: codescope_core::Revision::Worktree,
             targets: vec![sym.id.clone()],
             confidence: MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
             signature_touches: vec![],
@@ -291,11 +332,13 @@ fn map_run_base(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -
 fn map_gap(tree: &SymbolTree, target: &LineRange) -> RunMapping {
     match nearest_within(tree, target, GAP_ATTACH_LINES) {
         Some(sym) => RunMapping {
+            revision: codescope_core::Revision::Worktree,
             targets: vec![sym.id.clone()],
             confidence: MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
             signature_touches: vec![],
         },
         None => RunMapping {
+            revision: codescope_core::Revision::Worktree,
             targets: Vec::new(),
             confidence: MappingConfidence::Unmapped,
             signature_touches: vec![],
@@ -601,7 +644,9 @@ mod tests {
 
     #[test]
     fn hunk_spanning_two_symbols_lists_all_intersected() {
-        // Zero-based 10..=25 intersects main (5-15) and Greeter (20-30), covers neither.
+        // Zero-based 10..=25 intersects main (5-15), Greeter (20-30) and its field
+        // (1/0, line 22), covering none fully. The deepest frontier surfaces the nested
+        // field alongside the two top-level symbols (review 20: children are real targets).
         let maps = map_changes(&tree(), &[hunk(11, 16, 11, 16)]);
         assert_eq!(
             maps[0].confidence,
@@ -609,18 +654,24 @@ mod tests {
         );
         assert_eq!(
             maps[0].targets,
-            vec![SymbolId::new("0"), SymbolId::new("1")]
+            vec![SymbolId::new("0"), SymbolId::new("1/0"), SymbolId::new("1")]
         );
     }
 
     #[test]
     fn hunk_covering_whole_symbols_is_exact_multi_target() {
-        // Whole-file-style addition: zero-based 0..=55 covers all three top-level symbols.
+        // Whole-file-style addition: zero-based 0..=55 covers all symbols. The frontier
+        // includes Greeter's nested field (1/0) as a real addition target.
         let maps = map_changes(&tree(), &[hunk(0, 0, 1, 56)]);
         assert_eq!(maps[0].confidence, MappingConfidence::Exact);
         assert_eq!(
             maps[0].targets,
-            vec![SymbolId::new("0"), SymbolId::new("1"), SymbolId::new("2")]
+            vec![
+                SymbolId::new("0"),
+                SymbolId::new("1/0"),
+                SymbolId::new("1"),
+                SymbolId::new("2")
+            ]
         );
     }
 
