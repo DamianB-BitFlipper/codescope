@@ -13,7 +13,9 @@ use codescope_core::{AiStatus, ChangeScope, EntityRef, Epoch, LineRange, LsStatu
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
 use codescope_tui::snapshot::{
-    DiffPane, DiffRow, FileRow, RepoBar, ScopeCounts, SemRow, SemanticPane, SymbolRow, UiSnapshot,
+    DiffPane, DiffRow, FileRow, ImpactList, ImpactLoadState, ImpactPane, ImpactRow,
+    InterpretationSource, RepoBar, ScopeCounts, SelectedChange, SemRow, SemanticPane, StatusLevel,
+    StatusMessage, SymbolRow, UiSnapshot,
 };
 use codescope_tui::Action;
 use tokio::sync::{mpsc, watch};
@@ -59,15 +61,42 @@ pub enum DispatchEvent {
         line: u32,
         /// Identifier column the job resolved (part of the staleness key).
         col: u32,
-        /// Callers of the symbol.
-        callers: Vec<SemRow>,
-        /// Callees of the symbol.
-        callees: Vec<SemRow>,
+        /// Callers of the symbol (with the evidence honesty flag).
+        callers: RelationRows,
+        /// Callees of the symbol (with the evidence honesty flag).
+        callees: RelationRows,
     },
+}
+
+/// Lazily-fetched relation rows for one direction (callers or callees), keeping the
+/// evidence's completeness so the UI can mark a partial answer instead of implying it
+/// is exhaustive (spec §5.4).
+#[derive(Debug, Clone, Default)]
+pub struct RelationRows {
+    /// The relation rows (empty when the symbol has none or the fetch failed).
+    pub rows: Vec<ImpactRow>,
+    /// `true` when the evidence was not complete (timeout, truncation, unsupported
+    /// server feature).
+    pub partial: bool,
 }
 
 /// Picker entry that returns base selection to inference.
 const AUTO_BASE: &str = "(auto / inferred)";
+
+/// Appended to every AI failure in the status bar (spec §3.6): `A` re-requests the plan
+/// and `m` opens the model picker, and the deterministic impact view is unaffected.
+const AI_FAILURE_SUFFIX: &str = "A retry · m change model · deterministic impact remains available";
+
+/// Lazily-expanded relations of the currently selected symbol.
+#[derive(Debug, Clone)]
+struct SelectedRelations {
+    /// Display label of the selected symbol (the legacy semantic pane's title).
+    label: String,
+    /// Incoming calls (lazy LSP call hierarchy).
+    callers: RelationRows,
+    /// Outgoing calls (lazy LSP call hierarchy).
+    callees: RelationRows,
+}
 
 /// The dispatcher actor. Single writer of all published state.
 pub struct Dispatcher {
@@ -88,13 +117,15 @@ pub struct Dispatcher {
     /// Identity of the selected symbol (file, name, line, col), when the selection sits on
     /// a symbol row; gates stale relations jobs.
     selected_symbol: Option<(String, String, u32, u32)>,
-    /// The selected symbol's lazily-expanded callers/callees (semantic pane).
-    selected_relations: Option<(String, Vec<SemRow>, Vec<SemRow>)>,
+    /// The selected symbol's lazily-expanded callers/callees, kept as separate lists so
+    /// the impact pane can show both columns (the legacy semantic pane flattens them).
+    selected_relations: Option<SelectedRelations>,
     snapshot_tx: watch::Sender<UiSnapshot>,
     /// Where completed jobs report back.
     job_tx: mpsc::Sender<DispatchEvent>,
-    /// Status message surfaced in the bottom bar.
-    message: String,
+    /// Typed status message surfaced in the bottom bar (`UiSnapshot::message` mirrors
+    /// its text while the renderer migrates).
+    status: StatusMessage,
     /// Available AI models for the picker (from the provider).
     available_models: Vec<String>,
     /// User-picked comparison base (overrides inference until cleared).
@@ -147,7 +178,7 @@ impl Dispatcher {
             available_bases: Vec::new(),
             snapshot_tx,
             job_tx,
-            message: String::new(),
+            status: StatusMessage::default(),
             repo_ctx: None,
             changeset: None,
         }
@@ -155,6 +186,15 @@ impl Dispatcher {
 
     fn publish(&self) {
         let _ = self.snapshot_tx.send(self.build_snapshot());
+    }
+
+    /// Set the bottom-bar status message; `UiSnapshot::message` mirrors the text while
+    /// the renderer migrates to the typed [`StatusMessage`].
+    fn set_status(&mut self, text: impl Into<String>, level: StatusLevel) {
+        self.status = StatusMessage {
+            text: text.into(),
+            level,
+        };
     }
 
     /// Handle one event. Never blocks on git/LSP/AI — those run as spawned jobs.
@@ -173,9 +213,15 @@ impl Dispatcher {
             DispatchEvent::EngineUnavailable(reason) => {
                 self.ls_status = LsStatus::Failed;
                 if reason.contains("no supported language detected") {
-                    self.message = "git-only (no supported language detected)".to_string();
+                    self.set_status(
+                        "git-only (no supported language detected)",
+                        StatusLevel::Warning,
+                    );
                 } else {
-                    self.message = format!("git-only (language server failed: {reason})");
+                    self.set_status(
+                        format!("git-only (language server failed: {reason})"),
+                        StatusLevel::Warning,
+                    );
                 }
                 self.publish();
             }
@@ -204,7 +250,13 @@ impl Dispatcher {
                 if epoch != self.epoch || !current {
                     return;
                 }
-                self.selected_relations = Some((name, callers, callees));
+                // Callers and callees stay separate lists: the impact pane shows them
+                // in their own columns, each with its evidence honesty flag.
+                self.selected_relations = Some(SelectedRelations {
+                    label: name,
+                    callers,
+                    callees,
+                });
                 self.publish();
             }
             DispatchEvent::BaseLoaded(bases) => {
@@ -244,7 +296,10 @@ impl Dispatcher {
             }
             Action::AiToggle => {
                 if self.ai.is_none() {
-                    self.message = "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)".to_string();
+                    self.set_status(
+                        "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)",
+                        StatusLevel::Warning,
+                    );
                     self.publish();
                     return;
                 }
@@ -281,9 +336,10 @@ impl Dispatcher {
     /// Fetch the provider's model list for the picker (spawned; non-blocking).
     fn spawn_list_models(&mut self) {
         let Some(ai) = &self.ai else {
-            self.message =
-                "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)"
-                    .to_string();
+            self.set_status(
+                "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)",
+                StatusLevel::Warning,
+            );
             self.publish();
             return;
         };
@@ -300,12 +356,13 @@ impl Dispatcher {
         match &self.ai {
             Some(ai) => {
                 ai.set_model(name);
-                self.message = format!("AI model: {name}");
+                self.set_status(format!("AI model: {name}"), StatusLevel::Info);
             }
             None => {
-                self.message =
-                    "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)"
-                        .to_string();
+                self.set_status(
+                    "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)",
+                    StatusLevel::Warning,
+                );
             }
         }
         self.publish();
@@ -326,9 +383,11 @@ impl Dispatcher {
     }
 
     /// The files-pane selection moved (navigation-driven panes; no Enter required): aim
-    /// the diff pane at the selected file, and lazily expand a selected symbol's
-    /// callers/callees. Moving OFF a symbol (file row / empty list) clears the relations
-    /// view back to the impact/AI pane.
+    /// the diff pane at the selected file, publish the selection's `SelectedChange`
+    /// immediately (deterministic interpretation; spec §5.3/§5.6), and lazily expand a
+    /// selected symbol's callers/callees — the impact lists read `Loading` until the
+    /// fetch lands. Moving OFF a symbol (file row / empty list) clears the relations
+    /// view back to the impact/AI pane and leaves the impact lists `Idle`.
     fn on_selection_changed(&mut self, file: Option<String>, symbol: Option<(String, u32, u32)>) {
         self.selected_file = file.clone();
         self.selected_symbol = match (file, symbol) {
@@ -383,11 +442,11 @@ impl Dispatcher {
         }
         if name == AUTO_BASE {
             self.base_override = None;
-            self.message = "base: auto (inferred)".to_string();
+            self.set_status("base: auto (inferred)", StatusLevel::Info);
             self.spawn_refresh();
             return;
         }
-        self.message = format!("base: {name}");
+        self.set_status(format!("base: {name}"), StatusLevel::Info);
         self.base_override = Some(name);
         self.spawn_refresh();
     }
@@ -475,7 +534,10 @@ impl Dispatcher {
         if let Err(e) = &result {
             if self.base_override.is_some() && e.to_string().contains("no base") {
                 self.base_override = None;
-                self.message = "base branch gone; reverted to inferred base".to_string();
+                self.set_status(
+                    "base branch gone; reverted to inferred base",
+                    StatusLevel::Warning,
+                );
                 self.spawn_refresh();
                 return;
             }
@@ -485,11 +547,11 @@ impl Dispatcher {
                 self.repo_ctx = Some(snap.repo_ctx.clone());
                 self.changeset = Some(snap.changeset.clone());
                 self.ls_status = LsStatus::Ready;
-                self.message.clear();
+                self.status = StatusMessage::default();
                 self.analysis = Some(*snap);
             }
             Err(e) => {
-                self.message = format!("analysis failed: {e}");
+                self.set_status(format!("analysis failed: {e}"), StatusLevel::Error);
             }
         }
         self.publish();
@@ -513,7 +575,12 @@ impl Dispatcher {
             }
             AiOutcome::Stale => self.ai_status = AiStatus::Stale { epoch },
             AiOutcome::Failed(reason) => {
-                self.message = format!("AI: {reason}");
+                // Every AI failure carries the recovery suffix (spec §3.6); the
+                // deterministic impact pane is unaffected by the failure.
+                self.set_status(
+                    format!("AI: {reason} · {AI_FAILURE_SUFFIX}"),
+                    StatusLevel::Warning,
+                );
                 self.ai_status = AiStatus::Failed { reason };
             }
             _ => self.ai_status = AiStatus::Idle,
@@ -531,6 +598,7 @@ impl Dispatcher {
         let (repo_bar, counts) = repo_bar(self.repo_ctx.as_ref());
         let files = self.analysis.as_ref().map(file_rows).unwrap_or_default();
         let (diff, semantic) = self.panes();
+        let impact = self.build_impact();
         // The base shown in the top bar: the latest repo context's base (which already
         // reflects any override), else the pending override while a refresh is in flight.
         let base_ref = self
@@ -547,6 +615,7 @@ impl Dispatcher {
             files,
             diff,
             semantic,
+            impact,
             ls: self.ls_status,
             ai: self.ai_status.clone(),
             ai_model: self.ai.as_ref().map(|a| a.model()).unwrap_or_default(),
@@ -558,41 +627,57 @@ impl Dispatcher {
             available_models: self.available_models.clone(),
             base_ref,
             available_bases: self.available_bases.clone(),
-            message: self.message.clone(),
+            message: self.status.text.clone(),
+            status: self.status.clone(),
             epoch: self.epoch,
             refreshing: false,
         }
     }
 
     fn panes(&self) -> (DiffPane, SemanticPane) {
-        let diff = self
+        let mut diff = self
             .changeset
             .as_ref()
             .map(|cs| selected_diff(cs, self.selected_file.as_deref()))
             .unwrap_or_default();
+        // Publish the selected symbol's label for the diff title (spec §5.2) — only when
+        // the diff actually shows that symbol's file; the first-file fallback and file
+        // rows have no focused symbol. The full path stays the identity in `title`.
+        diff.focused_symbol = match &self.selected_symbol {
+            Some((file, name, _, _)) if *file == diff.title => Some(name.clone()),
+            _ => None,
+        };
         // A selected symbol's lazily-expanded callers/callees take precedence over the
         // shallow impact graph (the "who calls this" view; restored after the perf split).
-        if let Some((label, callers, callees)) = &self.selected_relations {
+        if let Some(relations) = &self.selected_relations {
             let mut rows = Vec::new();
             rows.push(SemRow {
                 depth: 0,
-                label: label.clone(),
+                label: relations.label.clone(),
                 relation: "selected",
                 changed: true,
                 has_diagnostic: false,
             });
-            for c in callers {
-                let mut r = c.clone();
-                r.relation = "called by";
-                rows.push(r);
+            for c in &relations.callers.rows {
+                rows.push(SemRow {
+                    depth: 1,
+                    label: c.label.clone(),
+                    relation: "called by",
+                    changed: c.changed,
+                    has_diagnostic: c.has_diagnostic,
+                });
             }
-            for c in callees {
-                let mut r = c.clone();
-                r.relation = "calls";
-                rows.push(r);
+            for c in &relations.callees.rows {
+                rows.push(SemRow {
+                    depth: 1,
+                    label: c.label.clone(),
+                    relation: "calls",
+                    changed: c.changed,
+                    has_diagnostic: c.has_diagnostic,
+                });
             }
             let semantic = SemanticPane {
-                title: format!("relations of {label}"),
+                title: format!("relations of {}", relations.label),
                 rows,
                 note: String::new(),
                 ai_generated: false,
@@ -617,6 +702,56 @@ impl Dispatcher {
             (None, None) => SemanticPane::default(),
         };
         (diff, semantic)
+    }
+
+    /// Assemble the impact pane (spec §5.3–§5.7): the deterministic selected change plus
+    /// the callers/downstream columns. Lazy LSP relations and the one-hop impact graph
+    /// merge into both lists; AI plan rows never replace this pane.
+    fn build_impact(&self) -> ImpactPane {
+        let mut impact = ImpactPane::default();
+        let Some(analysis) = &self.analysis else {
+            return impact;
+        };
+        impact.selected_change = selected_change(
+            analysis,
+            self.selected_file.as_deref(),
+            self.selected_symbol.as_ref(),
+        );
+        // A file row (or no selection) leaves both lists Idle with the file-level
+        // selected-change fallback; only a symbol row fetches relations.
+        let Some((file, name, _, _)) = &self.selected_symbol else {
+            return impact;
+        };
+        match &self.selected_relations {
+            Some(relations) => {
+                impact.callers = ImpactList {
+                    rows: relations.callers.rows.clone(),
+                    state: ImpactLoadState::Ready,
+                    partial: relations.callers.partial,
+                };
+                impact.downstream = ImpactList {
+                    rows: relations.callees.rows.clone(),
+                    state: ImpactLoadState::Ready,
+                    partial: relations.callees.partial,
+                };
+            }
+            None => {
+                // A fetch is in flight only when an engine exists to serve it; in
+                // git-only mode the lists are Unavailable, not forever-Loading.
+                let state = if self.engine.is_some() {
+                    ImpactLoadState::Loading
+                } else {
+                    ImpactLoadState::Unavailable
+                };
+                impact.callers.state = state;
+                impact.downstream.state = state;
+            }
+        }
+        merge_graph_neighbors(analysis, file, name, &mut impact.callers, &mut impact.downstream);
+        if impact.callers.partial || impact.downstream.partial || !analysis.graph.is_complete() {
+            impact.note = "partial: some relationships unavailable".to_string();
+        }
+        impact
     }
 }
 
@@ -706,11 +841,7 @@ fn file_rows(a: &AnalysisSnapshot) -> Vec<FileRow> {
     use std::collections::BTreeMap;
     let mut by_file: BTreeMap<String, Vec<SymbolRow>> = BTreeMap::new();
     for c in &a.changed {
-        let change = match c.record.change_kind {
-            codescope_core::ChangeKind::Added => "added",
-            codescope_core::ChangeKind::Modified => "modified",
-            codescope_core::ChangeKind::Deleted => "removed",
-        };
+        let change = change_label(c.record.change_kind);
         let confidence = match &c.record.confidence {
             codescope_core::MappingConfidence::Exact => "",
             codescope_core::MappingConfidence::Approximate(_) => "~",
@@ -736,11 +867,15 @@ fn file_rows(a: &AnalysisSnapshot) -> Vec<FileRow> {
     a.changeset
         .files
         .iter()
-        .map(|f| FileRow {
-            path: f.path.to_string(),
-            status: status_badge(&f.status),
-            symbols: by_file.remove(&f.path.to_string()).unwrap_or_default(),
-            expanded: true,
+        .map(|f| {
+            let symbols = by_file.remove(&f.path.to_string()).unwrap_or_default();
+            FileRow {
+                path: f.path.to_string(),
+                status: status_badge(&f.status),
+                changed_symbol_count: symbols.len(),
+                symbols,
+                expanded: true,
+            }
         })
         .collect()
 }
@@ -797,6 +932,8 @@ fn selected_diff(a: &codescope_core::ChangeSet, selected: Option<&str>) -> DiffP
     }
     DiffPane {
         title: file.path.to_string(),
+        // Set by the dispatcher, which owns the selection identity.
+        focused_symbol: None,
         rows,
         current_hunk: if hunk_no > 0 { 1 } else { 0 },
         total_hunks: hunk_no,
@@ -860,6 +997,192 @@ fn relation_label(kind: codescope_core::RelationKind) -> &'static str {
         R::Contains => "contains",
         R::SubtypeOf => "subtype of",
         R::SupertypeOf => "supertype of",
+    }
+}
+
+/// The deterministic `SelectedChange` for the current selection (spec §5.3/§5.6).
+///
+/// A symbol row resolves the exact [`ChangedSymbolInfo`] and builds the interpretation
+/// sentence from it; a file row gets the file-level fallback ("N changed symbols …").
+/// `None` only when nothing is selected at all.
+fn selected_change(
+    analysis: &AnalysisSnapshot,
+    selected_file: Option<&str>,
+    selected_symbol: Option<&(String, String, u32, u32)>,
+) -> Option<SelectedChange> {
+    match selected_symbol {
+        Some((file, name, line, col)) => {
+            let info = find_changed_symbol(analysis, file, name, *line, *col);
+            let (change, interpretation) = match info {
+                Some(info) => (change_label(info.record.change_kind), interpret_change(info)),
+                // The selection predates the current analysis (a refresh is in flight):
+                // keep the identity, but do not invent a change kind or a sentence.
+                None => ("modified", String::new()),
+            };
+            Some(SelectedChange {
+                file: file.clone(),
+                label: name.clone(),
+                change,
+                interpretation,
+                interpretation_source: InterpretationSource::Deterministic,
+            })
+        }
+        None => {
+            let file = selected_file?;
+            let changed_in_file = analysis
+                .changed
+                .iter()
+                .filter(|c| c.file.as_path().as_str() == file)
+                .count();
+            let change = analysis
+                .changeset
+                .files
+                .iter()
+                .find(|f| f.path.as_str() == file)
+                .map(|f| file_change_label(&f.status))
+                .unwrap_or("modified");
+            Some(SelectedChange {
+                file: file.to_string(),
+                label: file.to_string(),
+                change,
+                interpretation: format!(
+                    "{changed_in_file} changed symbol{} in this file; select one to inspect impact.",
+                    if changed_in_file == 1 { "" } else { "s" }
+                ),
+                interpretation_source: InterpretationSource::Deterministic,
+            })
+        }
+    }
+}
+
+/// The exact [`ChangedSymbolInfo`] behind a symbol selection: file + qualified name +
+/// the identifier position the row carries (spec §5.6). Falls back to file + name when
+/// the position drifted (e.g. the row was rendered before the latest refresh landed).
+fn find_changed_symbol<'a>(
+    analysis: &'a AnalysisSnapshot,
+    file: &str,
+    name: &str,
+    line: u32,
+    col: u32,
+) -> Option<&'a codescope_analysis::ChangedSymbolInfo> {
+    analysis
+        .changed
+        .iter()
+        .find(|c| {
+            c.file.as_path().as_str() == file
+                && c.name == name
+                && c.selection.start_line == line
+                && c.selection.start_col == col
+        })
+        .or_else(|| {
+            analysis
+                .changed
+                .iter()
+                .find(|c| c.file.as_path().as_str() == file && c.name == name)
+        })
+}
+
+/// The deterministic one-line interpretation of a changed symbol (spec §3.5). AI may
+/// replace this sentence only with a validated, epoch-matched result tied to the same
+/// selected entity; today's AI output is repository-wide, so this always stands.
+fn interpret_change(info: &codescope_analysis::ChangedSymbolInfo) -> String {
+    let hunks = info.record.hunks.len();
+    let kind = format!("{:?}", info.kind).to_lowercase();
+    match info.record.change_kind {
+        codescope_core::ChangeKind::Added => format!("Added {kind} across {hunks} hunks."),
+        codescope_core::ChangeKind::Modified if info.signature_touch => {
+            format!("Modified signature and implementation across {hunks} hunks.")
+        }
+        codescope_core::ChangeKind::Modified => {
+            format!("Modified implementation across {hunks} hunks.")
+        }
+        codescope_core::ChangeKind::Deleted => {
+            format!("Removed {kind}; callers may require updates.")
+        }
+    }
+}
+
+/// `added` / `modified` / `removed` for a symbol change kind.
+fn change_label(kind: codescope_core::ChangeKind) -> &'static str {
+    match kind {
+        codescope_core::ChangeKind::Added => "added",
+        codescope_core::ChangeKind::Modified => "modified",
+        codescope_core::ChangeKind::Deleted => "removed",
+    }
+}
+
+/// `added` / `modified` / `removed` for a file-level selection (from the file status).
+fn file_change_label(status: &codescope_core::FileStatus) -> &'static str {
+    use codescope_core::FileStatus as S;
+    match status {
+        S::Added | S::Untracked => "added",
+        S::Deleted => "removed",
+        _ => "modified",
+    }
+}
+
+/// Merge the selected node's one-hop impact-graph neighbors into the impact lists
+/// (spec §5.5): incoming `Calls` neighbors are callers, every outgoing neighbor is
+/// downstream. Rows deduplicate by `(label, relation)` in stable order; the lazy LSP
+/// rows are already in the lists and win on duplicates (graph rows merge their badges).
+fn merge_graph_neighbors(
+    analysis: &AnalysisSnapshot,
+    file: &str,
+    name: &str,
+    callers: &mut ImpactList,
+    downstream: &mut ImpactList,
+) {
+    let graph = &analysis.graph.value;
+    let Some(node) = graph.nodes.iter().find(|n| {
+        n.entity.file.as_path().as_str() == file && n.entity.symbol.as_deref() == Some(name)
+    }) else {
+        return;
+    };
+    for e in graph.edges_to(&node.id) {
+        if e.kind != codescope_core::RelationKind::Calls {
+            continue;
+        }
+        if let Some(source) = graph.node(&e.from) {
+            push_graph_row(callers, graph_row(source, e.kind));
+        }
+    }
+    for e in graph.edges_from(&node.id) {
+        if let Some(target) = graph.node(&e.to) {
+            push_graph_row(downstream, graph_row(target, e.kind));
+        }
+    }
+}
+
+/// An impact row for one graph neighbor of the selection.
+fn graph_row(
+    node: &codescope_core::ImpactNode,
+    kind: codescope_core::RelationKind,
+) -> ImpactRow {
+    ImpactRow {
+        label: node
+            .entity
+            .symbol
+            .clone()
+            .unwrap_or_else(|| node.entity.file.to_string()),
+        relation: relation_label(kind),
+        changed: node.change.is_some(),
+        has_diagnostic: node.diagnostic_severity.is_some(),
+    }
+}
+
+/// Push a graph row, deduplicating by `(label, relation)`: an existing (lazy LSP) row
+/// keeps its identity and position, and absorbs the graph row's badges.
+fn push_graph_row(list: &mut ImpactList, row: ImpactRow) {
+    match list
+        .rows
+        .iter_mut()
+        .find(|r| r.label == row.label && r.relation == row.relation)
+    {
+        Some(existing) => {
+            existing.changed |= row.changed;
+            existing.has_diagnostic |= row.has_diagnostic;
+        }
+        None => list.rows.push(row),
     }
 }
 
@@ -980,25 +1303,29 @@ impl FactView for SnapshotFacts {
     }
 }
 
-/// Fetch a symbol's callers + callees lazily and shape them as semantic-pane rows.
+/// Fetch a symbol's callers + callees lazily and shape them as impact rows. The
+/// evidence's completeness is NOT discarded (spec §5.4): an incomplete answer (timeout,
+/// truncation, unsupported server feature) sets `partial` so the UI can say so instead
+/// of implying an exhaustive list.
 pub(crate) async fn relations_for(
     engine: &std::sync::Arc<codescope_analysis::AnalysisEngine<codescope_lsp::LanguageService>>,
     file: &codescope_core::FileId,
     pos: codescope_core::Position,
-) -> (Vec<SemRow>, Vec<SemRow>) {
+) -> (RelationRows, RelationRows) {
     let callers = engine.callers_of(file, pos).await;
     let callees = engine.callees_of(file, pos).await;
-    let to_rows = |ev: codescope_core::Evidence<Vec<codescope_core::SymbolRef>>| {
-        ev.value
+    let to_rows = |ev: codescope_core::Evidence<Vec<codescope_core::SymbolRef>>| RelationRows {
+        partial: !ev.is_complete(),
+        rows: ev
+            .value
             .iter()
-            .map(|r| SemRow {
-                depth: 1,
+            .map(|r| ImpactRow {
                 label: r.name.clone(),
-                relation: "",
+                relation: "calls",
                 changed: false,
                 has_diagnostic: false,
             })
-            .collect::<Vec<_>>()
+            .collect(),
     };
     (to_rows(callers), to_rows(callees))
 }
@@ -1263,13 +1590,19 @@ mod tests {
         )
     }
 
-    fn sem_row(label: &str) -> SemRow {
-        SemRow {
-            depth: 1,
+    fn impact_row(label: &str) -> ImpactRow {
+        ImpactRow {
             label: label.to_string(),
-            relation: "",
+            relation: "calls",
             changed: false,
             has_diagnostic: false,
+        }
+    }
+
+    fn relation_rows(labels: &[&str]) -> RelationRows {
+        RelationRows {
+            rows: labels.iter().map(|l| impact_row(l)).collect(),
+            partial: false,
         }
     }
 
@@ -1349,8 +1682,8 @@ mod tests {
             name: "sym0".to_string(),
             line: 1,
             col: 4,
-            callers: vec![sem_row("caller_fn")],
-            callees: vec![sem_row("callee_fn")],
+            callers: relation_rows(&["caller_fn"]),
+            callees: relation_rows(&["callee_fn"]),
         })
         .await;
         let snap = snapshot_rx.borrow().clone();
@@ -1401,8 +1734,8 @@ mod tests {
             name: "other_sym".to_string(),
             line: 9,
             col: 9,
-            callers: vec![sem_row("stale")],
-            callees: Vec::new(),
+            callers: relation_rows(&["stale"]),
+            callees: RelationRows::default(),
         })
         .await;
         assert!(
@@ -1417,8 +1750,8 @@ mod tests {
             name: "sym0".to_string(),
             line: 1,
             col: 4,
-            callers: vec![sem_row("stale")],
-            callees: Vec::new(),
+            callers: relation_rows(&["stale"]),
+            callees: RelationRows::default(),
         })
         .await;
         assert!(
@@ -1438,8 +1771,8 @@ mod tests {
             name: "sym0".to_string(),
             line: 1,
             col: 4,
-            callers: vec![sem_row("stale")],
-            callees: Vec::new(),
+            callers: relation_rows(&["stale"]),
+            callees: RelationRows::default(),
         })
         .await;
         assert!(
@@ -1476,11 +1809,410 @@ mod tests {
             name: "sym0".to_string(),
             line: 1,
             col: 4,
-            callers: vec![sem_row("caller_fn")],
-            callees: Vec::new(),
+            callers: relation_rows(&["caller_fn"]),
+            callees: RelationRows::default(),
         })
         .await;
         assert_eq!(snapshot_rx.borrow().semantic.title, "relations of sym0");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- impact pane (spec §4/§5) ---------------------------------------------
+
+    /// A changed symbol for the impact tests: identifier at `(2, 4)`, `hunks` hunks.
+    fn changed_symbol(
+        file: &str,
+        name: &str,
+        kind: codescope_core::SymbolKind,
+        change_kind: codescope_core::ChangeKind,
+        hunks: u32,
+        signature_touch: bool,
+    ) -> codescope_analysis::ChangedSymbolInfo {
+        codescope_analysis::ChangedSymbolInfo {
+            file: codescope_core::FileId::new_unchecked(file),
+            name: name.to_string(),
+            kind,
+            detail: None,
+            range: codescope_core::LineRange::new(2, 0, 10, 1),
+            selection: codescope_core::LineRange::new(2, 4, 2, 12),
+            revision: codescope_core::Revision::Worktree,
+            record: codescope_core::ChangedSymbol {
+                symbol: codescope_core::SymbolId::new(format!("{file}:{name}")),
+                change_kind,
+                hunks: (0..hunks)
+                    .map(|index| codescope_core::HunkId {
+                        file: file.into(),
+                        index,
+                    })
+                    .collect(),
+                confidence: codescope_core::MappingConfidence::Exact,
+            },
+            signature_touch,
+        }
+    }
+
+    /// An analysis snapshot carrying `changed` symbols and a complete impact `graph`.
+    fn analysis_with(
+        changed: Vec<codescope_analysis::ChangedSymbolInfo>,
+        graph: codescope_core::ImpactGraph,
+    ) -> AnalysisSnapshot {
+        AnalysisSnapshot {
+            epoch: Epoch::ZERO,
+            repo_ctx: codescope_core::RepoContext {
+                toplevel: "/tmp/codescope-test".into(),
+                head: codescope_core::HeadState::Branch("feature".to_string()),
+                upstream: None,
+                base: None,
+            },
+            changeset: two_file_changeset(),
+            files: Vec::new(),
+            changed,
+            graph: codescope_core::Evidence::complete(graph),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// The deterministic interpretation sentence for each change kind (spec §3.5).
+    #[test]
+    fn deterministic_interpretation_sentences_cover_each_change_kind() {
+        use codescope_core::{ChangeKind, SymbolKind};
+        let added = changed_symbol("a.go", "NewHandler", SymbolKind::Function, ChangeKind::Added, 3, false);
+        assert_eq!(interpret_change(&added), "Added function across 3 hunks.");
+
+        let modified =
+            changed_symbol("a.go", "Handle", SymbolKind::Method, ChangeKind::Modified, 2, false);
+        assert_eq!(
+            interpret_change(&modified),
+            "Modified implementation across 2 hunks."
+        );
+
+        let signature =
+            changed_symbol("a.go", "Handle", SymbolKind::Method, ChangeKind::Modified, 1, true);
+        assert_eq!(
+            interpret_change(&signature),
+            "Modified signature and implementation across 1 hunks."
+        );
+
+        let removed =
+            changed_symbol("a.go", "Legacy", SymbolKind::Function, ChangeKind::Deleted, 1, false);
+        assert_eq!(
+            interpret_change(&removed),
+            "Removed function; callers may require updates."
+        );
+    }
+
+    /// Every AI failure maps to a Warning status carrying the retry/model/deterministic
+    /// suffix (spec §3.6); the legacy `message` field mirrors the status text.
+    #[tokio::test]
+    async fn ai_failure_status_carries_retry_suffix() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+
+        disp.handle(DispatchEvent::AiDone {
+            epoch: disp.epoch,
+            outcome: AiOutcome::Failed("ai request timed out after 20s".to_string()),
+        })
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.status.level, StatusLevel::Warning);
+        assert_eq!(
+            snap.status.text,
+            "AI: ai request timed out after 20s · A retry · m change model · deterministic impact remains available"
+        );
+        assert_eq!(
+            snap.message, snap.status.text,
+            "the legacy message field mirrors the status text"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Analysis and engine failures map to typed status levels (spec §5.9): the LSP
+    /// falling away degrades to git-only (Warning); an analysis failure is an Error.
+    #[tokio::test]
+    async fn analysis_and_engine_failures_map_to_status_levels() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+
+        disp.handle(DispatchEvent::EngineUnavailable(
+            "no supported language detected".to_string(),
+        ))
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.status.level, StatusLevel::Warning);
+        assert_eq!(snap.status.text, "git-only (no supported language detected)");
+
+        disp.handle(DispatchEvent::AnalysisDone {
+            epoch: disp.epoch,
+            result: Err(anyhow::anyhow!("boom")),
+        })
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.status.level, StatusLevel::Error);
+        assert_eq!(snap.status.text, "analysis failed: boom");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Navigation alone publishes the selection's deterministic `SelectedChange`
+    /// immediately (spec §5.3/§5.6): no Enter, no wait for the relations fetch.
+    #[tokio::test]
+    async fn selection_changed_publishes_selected_change_immediately() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.analysis = Some(analysis_with(
+            vec![changed_symbol(
+                "a.txt",
+                "sym0",
+                codescope_core::SymbolKind::Function,
+                codescope_core::ChangeKind::Modified,
+                2,
+                false,
+            )],
+            codescope_core::ImpactGraph::new(),
+        ));
+
+        // A symbol row: the deterministic interpretation + focused symbol publish at
+        // once; the relation lists leave Idle (this fixture has no engine, so they can
+        // never load — Unavailable, distinct from a fetch in flight).
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: Some(("sym0".to_string(), 2, 4)),
+        }))
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        let selected = snap
+            .impact
+            .selected_change
+            .as_ref()
+            .expect("a symbol row publishes its selected change immediately");
+        assert_eq!(selected.file, "a.txt");
+        assert_eq!(selected.label, "sym0");
+        assert_eq!(selected.change, "modified");
+        assert_eq!(
+            selected.interpretation,
+            "Modified implementation across 2 hunks."
+        );
+        assert_eq!(
+            selected.interpretation_source,
+            InterpretationSource::Deterministic
+        );
+        assert_eq!(
+            snap.diff.focused_symbol.as_deref(),
+            Some("sym0"),
+            "the diff pane publishes the selected symbol's label"
+        );
+        assert_eq!(snap.impact.callers.state, ImpactLoadState::Unavailable);
+        assert_eq!(snap.impact.downstream.state, ImpactLoadState::Unavailable);
+
+        // A file row: the file-level fallback, both lists Idle, no focused symbol.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        let selected = snap
+            .impact
+            .selected_change
+            .as_ref()
+            .expect("a file row publishes the file-level fallback");
+        assert_eq!(selected.label, "b.txt");
+        assert_eq!(selected.change, "modified");
+        assert_eq!(
+            selected.interpretation,
+            "0 changed symbols in this file; select one to inspect impact."
+        );
+        assert_eq!(snap.impact.callers.state, ImpactLoadState::Idle);
+        assert_eq!(snap.impact.downstream.state, ImpactLoadState::Idle);
+        assert!(snap.impact.callers.rows.is_empty());
+        assert_eq!(snap.diff.focused_symbol, None);
+
+        // No selection at all: the pane empties.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: None,
+            symbol: None,
+        }))
+        .await;
+        assert!(snapshot_rx.borrow().impact.selected_change.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// RelationsLoaded stores callers and callees as separate impact columns, keeps the
+    /// evidence honesty flag (spec §5.4), and leaves the legacy semantic pane intact.
+    #[tokio::test]
+    async fn relations_loaded_populates_impact_columns() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.analysis = Some(analysis_with(
+            vec![changed_symbol(
+                "a.txt",
+                "sym0",
+                codescope_core::SymbolKind::Function,
+                codescope_core::ChangeKind::Modified,
+                1,
+                false,
+            )],
+            codescope_core::ImpactGraph::new(),
+        ));
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: Some(("sym0".to_string(), 2, 4)),
+        }))
+        .await;
+
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch: disp.epoch,
+            file: "a.txt".to_string(),
+            name: "sym0".to_string(),
+            line: 2,
+            col: 4,
+            callers: RelationRows {
+                rows: vec![impact_row("caller_fn")],
+                partial: true, // e.g. the language server truncated the answer
+            },
+            callees: relation_rows(&["callee_fn"]),
+        })
+        .await;
+
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.impact.callers.state, ImpactLoadState::Ready);
+        assert_eq!(snap.impact.downstream.state, ImpactLoadState::Ready);
+        let callers: Vec<&str> = snap
+            .impact
+            .callers
+            .rows
+            .iter()
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(callers, ["caller_fn"]);
+        let downstream: Vec<&str> = snap
+            .impact
+            .downstream
+            .rows
+            .iter()
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(downstream, ["callee_fn"]);
+        assert!(
+            snap.impact.callers.partial,
+            "incomplete evidence marks the list partial"
+        );
+        assert!(!snap.impact.downstream.partial);
+        assert_eq!(snap.impact.note, "partial: some relationships unavailable");
+        // The legacy semantic pane still flattens both directions.
+        assert_eq!(snap.semantic.title, "relations of sym0");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The one-hop impact graph merges into the columns (spec §5.5): incoming `Calls`
+    /// neighbors are callers, every outgoing neighbor is downstream, and lazy LSP rows
+    /// win duplicates while absorbing the graph row's badges.
+    #[tokio::test]
+    async fn impact_merges_graph_neighbors_with_lsp_relations() {
+        use codescope_core::{
+            ChangeKind, EntityRef, FileId, ImpactEdge, ImpactGraph, ImpactNode, RelationKind,
+            SymbolKind,
+        };
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let node = |file: &str, symbol: &str, changed: bool| ImpactNode {
+            id: format!("{file}:{symbol}"),
+            entity: EntityRef::for_symbol(FileId::new_unchecked(file), symbol, None),
+            change: changed.then_some(ChangeKind::Modified),
+            diagnostic_severity: None,
+        };
+        let mut graph = ImpactGraph::new();
+        graph.add_node(node("a.txt", "sym0", true));
+        graph.add_node(node("a.txt", "graph_caller", false));
+        graph.add_node(node("b.txt", "callee_fn", true)); // the LSP fetch returns it too
+        graph.add_node(node("b.txt", "graph_iface", false));
+        graph.add_edge(ImpactEdge {
+            from: "a.txt:graph_caller".into(),
+            to: "a.txt:sym0".into(),
+            kind: RelationKind::Calls,
+        });
+        graph.add_edge(ImpactEdge {
+            from: "a.txt:sym0".into(),
+            to: "b.txt:callee_fn".into(),
+            kind: RelationKind::Calls,
+        });
+        graph.add_edge(ImpactEdge {
+            from: "a.txt:sym0".into(),
+            to: "b.txt:graph_iface".into(),
+            kind: RelationKind::Implements,
+        });
+        disp.changeset = Some(two_file_changeset());
+        disp.analysis = Some(analysis_with(
+            vec![changed_symbol(
+                "a.txt",
+                "sym0",
+                SymbolKind::Function,
+                ChangeKind::Modified,
+                1,
+                false,
+            )],
+            graph,
+        ));
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: Some(("sym0".to_string(), 2, 4)),
+        }))
+        .await;
+
+        // The graph rows are visible before the lazy fetch lands (no engine here, so
+        // the lists are Unavailable rather than Loading — the rows are still real).
+        let snap = snapshot_rx.borrow().clone();
+        let callers: Vec<&str> = snap
+            .impact
+            .callers
+            .rows
+            .iter()
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(callers, ["graph_caller"]);
+
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch: disp.epoch,
+            file: "a.txt".to_string(),
+            name: "sym0".to_string(),
+            line: 2,
+            col: 4,
+            callers: relation_rows(&["lsp_caller"]),
+            callees: relation_rows(&["callee_fn"]),
+        })
+        .await;
+
+        let snap = snapshot_rx.borrow().clone();
+        let callers: Vec<&str> = snap
+            .impact
+            .callers
+            .rows
+            .iter()
+            .map(|r| r.label.as_str())
+            .collect();
+        assert_eq!(
+            callers,
+            ["lsp_caller", "graph_caller"],
+            "stable order: the lazy LSP rows lead, graph neighbors follow"
+        );
+        let downstream: Vec<(&str, &str, bool)> = snap
+            .impact
+            .downstream
+            .rows
+            .iter()
+            .map(|r| (r.label.as_str(), r.relation, r.changed))
+            .collect();
+        assert_eq!(
+            downstream,
+            [("callee_fn", "calls", true), ("graph_iface", "implements", false)],
+            "the duplicate keeps the LSP row and absorbs the graph row's changed badge"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

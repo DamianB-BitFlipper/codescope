@@ -69,10 +69,10 @@ pub enum Action {
     Collapse,
     /// Expand the selected node.
     Expand,
-    /// Increase / decrease the default semantic expansion depth.
-    ExpandMore,
-    /// Decrease the default semantic expansion depth.
-    ExpandLess,
+    /// Narrow the files pane by two cells (`[`), clamped to 28..=56 (docs/review/15 §1.1).
+    ResizeFilesNarrower,
+    /// Widen the files pane by two cells (`]`), clamped to 28..=56.
+    ResizeFilesWider,
     /// Show the staged scope.
     ScopeStaged,
     /// Show the unstaged scope.
@@ -155,7 +155,7 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::BackTab => Action::FocusPrev,
         KeyCode::Char('1') => Action::Focus(Pane::Files),
         KeyCode::Char('2') => Action::Focus(Pane::Diff),
-        KeyCode::Char('3') => Action::Focus(Pane::Semantic),
+        KeyCode::Char('3') => Action::Focus(Pane::Impact),
         KeyCode::Char('s') => Action::ScopeStaged,
         KeyCode::Char('u') => Action::ScopeUnstaged,
         KeyCode::Char('B') => Action::ScopeBranch,
@@ -172,8 +172,8 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char(' ') => Action::ToggleExpand,
         KeyCode::Char('h') | KeyCode::Left => Action::Collapse,
         KeyCode::Char('l') | KeyCode::Right => Action::Expand,
-        KeyCode::Char('+') => Action::ExpandMore,
-        KeyCode::Char('-') => Action::ExpandLess,
+        KeyCode::Char('[') => Action::ResizeFilesNarrower,
+        KeyCode::Char(']') => Action::ResizeFilesWider,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::Char('n') => Action::NextHunk,
@@ -299,8 +299,18 @@ mod tests {
         );
         assert_eq!(map_key(key(KeyCode::Char('h')), &app()), Action::Collapse);
         assert_eq!(map_key(key(KeyCode::Char('l')), &app()), Action::Expand);
-        assert_eq!(map_key(key(KeyCode::Char('+')), &app()), Action::ExpandMore);
-        assert_eq!(map_key(key(KeyCode::Char('-')), &app()), Action::ExpandLess);
+    }
+
+    #[test]
+    fn files_resize_keys() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('[')), &app()),
+            Action::ResizeFilesNarrower
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char(']')), &app()),
+            Action::ResizeFilesWider
+        );
     }
 
     #[test]

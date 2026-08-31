@@ -4,6 +4,7 @@
 use codescope_core::ChangeScope;
 
 use crate::action::{next_scope, Action};
+use crate::layout::DEFAULT_FILES_WIDTH;
 use crate::snapshot::{DiffRow, UiSnapshot};
 
 /// The three focusable panes.
@@ -14,24 +15,25 @@ pub enum Pane {
     Files,
     /// Center: focused diff.
     Diff,
-    /// Right: semantic (callers/callees/impact) view.
-    Semantic,
+    /// Bottom (full width): the deterministic Impact view (selected change, callers,
+    /// downstream). Renamed from `Semantic` in the reference redesign (docs/review/15).
+    Impact,
 }
 
 impl Pane {
     fn next(self) -> Self {
         match self {
             Pane::Files => Pane::Diff,
-            Pane::Diff => Pane::Semantic,
-            Pane::Semantic => Pane::Files,
+            Pane::Diff => Pane::Impact,
+            Pane::Impact => Pane::Files,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Pane::Files => Pane::Semantic,
+            Pane::Files => Pane::Impact,
             Pane::Diff => Pane::Files,
-            Pane::Semantic => Pane::Diff,
+            Pane::Impact => Pane::Diff,
         }
     }
 }
@@ -45,17 +47,22 @@ pub struct App {
     pub focused: Pane,
     /// Selected row in the files pane (flattened file+symbol index).
     pub file_sel: usize,
-    /// Selected row in the semantic pane.
-    pub sem_sel: usize,
-    /// Vertical scroll of the diff pane.
+    /// Vertical scroll of the diff pane (a logical-row anchor; the renderer maps it to a
+    /// visual line).
     pub diff_scroll: u16,
-    /// Horizontal scroll of the diff pane (long lines are clipped, not wrapped).
+    /// Horizontal scroll of the diff pane (raw mode: long lines are clipped + scrolled).
     pub diff_hscroll: u16,
-    /// Default semantic expansion depth (`+`/`-`).
-    pub sem_depth: u16,
-    /// Whether the focused pane is zoomed to fill the whole main area (`z`).
+    /// 1-based hunk under the diff scroll anchor; 0 when the diff has no hunks. App-owned
+    /// view state (docs/review/15 §4): the snapshot's `total_hunks` is immutable data, but
+    /// the current hunk follows navigation, so it must survive snapshot publishes.
+    pub current_hunk: usize,
+    /// Requested files-pane width in the normal layout (`[`/`]` resize in two-cell steps,
+    /// clamped to 28..=56; the renderer may narrow it further to protect the diff).
+    pub files_width: u16,
+    /// Whether the focused pane is zoomed to fill the whole body (`z`).
     pub zoomed: bool,
     /// Whether the diff pane smart-wraps long lines (`W`); off = raw clip + h-scroll.
+    /// The reference mode is raw (`wrap off`), docs/review/15 §3.4.
     pub diff_wrap: bool,
     /// Whether the help modal is open.
     pub show_help: bool,
@@ -81,10 +88,10 @@ impl Default for App {
             snapshot: UiSnapshot::default(),
             focused: Pane::default(),
             file_sel: 0,
-            sem_sel: 0,
             diff_scroll: 0,
             diff_hscroll: 0,
-            sem_depth: 0,
+            current_hunk: 0,
+            files_width: DEFAULT_FILES_WIDTH,
             show_help: false,
             show_model_picker: false,
             model_sel: 0,
@@ -94,29 +101,32 @@ impl Default for App {
             base_query: String::new(),
             should_quit: false,
             zoomed: false,
-            diff_wrap: true,
+            diff_wrap: false,
         }
     }
 }
 
 impl App {
-    /// A fresh app (branch scope, depth 2, diff wrap on).
+    /// A fresh app (branch scope, raw diff mode, files pane at the default width).
     #[must_use]
     pub fn new() -> Self {
-        App {
-            sem_depth: 2,
-            ..App::default()
-        }
+        App::default()
     }
 
     /// Replace the snapshot, clamping selection into the new bounds.
     pub fn update(&mut self, snapshot: UiSnapshot) {
         // The diff pane follows the files-pane selection: when the dispatcher retargets it
         // to a different file, start at the top of the new diff instead of keeping a scroll
-        // offset computed against the old one.
-        if self.snapshot.diff.title != snapshot.diff.title {
+        // offset computed against the old one. `DiffPane::title` is the file path today
+        // (MERGE: the dispatcher half renames it to `file_path`; the comparison stays).
+        let retargeted = self.snapshot.diff.title != snapshot.diff.title;
+        if retargeted {
             self.diff_scroll = 0;
             self.diff_hscroll = 0;
+            self.current_hunk = usize::from(snapshot.diff.total_hunks > 0);
+        } else if self.current_hunk == 0 && snapshot.diff.total_hunks > 0 {
+            // First diff for this path (hunks just arrived): start at hunk 1.
+            self.current_hunk = 1;
         }
         self.snapshot = snapshot;
         self.clamp();
@@ -144,6 +154,20 @@ impl App {
             Action::ToggleZoom => self.zoomed = !self.zoomed,
             Action::ToggleWrap => self.diff_wrap = !self.diff_wrap,
             Action::ResetHScroll => self.diff_hscroll = 0,
+            // View-state resize: two-cell steps clamped to the spec range; the renderer
+            // may still narrow further to protect MIN_DIFF_WIDTH without touching this.
+            Action::ResizeFilesNarrower => {
+                self.files_width = self
+                    .files_width
+                    .saturating_sub(2)
+                    .clamp(crate::layout::MIN_FILES_WIDTH, crate::layout::MAX_FILES_WIDTH);
+            }
+            Action::ResizeFilesWider => {
+                self.files_width = self
+                    .files_width
+                    .saturating_add(2)
+                    .clamp(crate::layout::MIN_FILES_WIDTH, crate::layout::MAX_FILES_WIDTH);
+            }
             Action::Collapse => match self.focused {
                 // Wrapped mode has no hidden horizontal state: h must not move it.
                 Pane::Diff if self.diff_wrap => {}
@@ -155,8 +179,6 @@ impl App {
                 Pane::Diff => self.diff_hscroll = self.diff_hscroll.saturating_add(8),
                 _ => self.expand_sel(),
             },
-            Action::ExpandMore => self.sem_depth = self.sem_depth.saturating_add(1).min(8),
-            Action::ExpandLess => self.sem_depth = self.sem_depth.saturating_sub(1),
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
             Action::ScopeUnstaged => self.set_scope(ChangeScope::Unstaged),
             Action::ScopeBranch => self.set_scope(ChangeScope::Branch),
@@ -208,9 +230,9 @@ impl App {
     fn set_scope(&mut self, scope: ChangeScope) {
         self.snapshot.scope = scope;
         self.file_sel = 0;
-        self.sem_sel = 0;
         self.diff_scroll = 0;
         self.diff_hscroll = 0;
+        self.current_hunk = usize::from(self.snapshot.diff.total_hunks > 0);
     }
 
     /// Model candidates matching the picker's filter query (the visible list).
@@ -241,10 +263,9 @@ impl App {
                 let len = self.flat_file_rows();
                 self.file_sel = step(self.file_sel, delta, len);
             }
-            Pane::Semantic => {
-                let len = self.snapshot.semantic.rows.len();
-                self.sem_sel = step(self.sem_sel, delta, len);
-            }
+            // The Impact pane has no cursor: it is a three-column summary of the current
+            // files-pane selection (docs/review/15 §3.5).
+            Pane::Impact => {}
             Pane::Diff => self.scroll_diff(delta),
         }
     }
@@ -253,24 +274,47 @@ impl App {
         let len = self.snapshot.diff.rows.len() as i32;
         let cur = self.diff_scroll as i32;
         self.diff_scroll = (cur + delta).clamp(0, len.saturating_sub(1).max(0)) as u16;
+        self.sync_current_hunk();
     }
 
     fn top(&mut self) {
         match self.focused {
             Pane::Files => self.file_sel = 0,
-            Pane::Semantic => self.sem_sel = 0,
-            Pane::Diff => self.diff_scroll = 0,
+            Pane::Impact => {}
+            Pane::Diff => {
+                self.diff_scroll = 0;
+                self.sync_current_hunk();
+            }
         }
     }
 
     fn bottom(&mut self) {
         match self.focused {
             Pane::Files => self.file_sel = self.flat_file_rows().saturating_sub(1),
-            Pane::Semantic => self.sem_sel = self.snapshot.semantic.rows.len().saturating_sub(1),
+            Pane::Impact => {}
             Pane::Diff => {
                 self.diff_scroll = self.snapshot.diff.rows.len().saturating_sub(1) as u16;
+                self.sync_current_hunk();
             }
         }
+    }
+
+    /// Recompute `current_hunk` from the scroll anchor: the number of hunk-header rows at
+    /// or before the anchor (the 1-based index of the hunk the user is looking at), or 0
+    /// when the diff has no hunks (docs/review/15 §4 "Hunk state ownership").
+    fn sync_current_hunk(&mut self) {
+        let total = self.snapshot.diff.total_hunks;
+        if total == 0 {
+            self.current_hunk = 0;
+            return;
+        }
+        // `..=scroll` inclusive: an anchor sitting exactly on a header row is that hunk.
+        let upto = (self.diff_scroll as usize + 1).min(self.snapshot.diff.rows.len());
+        let seen = self.snapshot.diff.rows[..upto]
+            .iter()
+            .filter(|r| matches!(r, DiffRow::HunkHeader(_)))
+            .count();
+        self.current_hunk = seen.clamp(1, total);
     }
 
     fn toggle_expand(&mut self) {
@@ -329,9 +373,9 @@ impl App {
         if total == 0 {
             return;
         }
-        let cur = self.snapshot.diff.current_hunk as i32;
+        let cur = self.current_hunk as i32;
         let next = (cur + delta).clamp(1, total) as usize;
-        self.snapshot.diff.current_hunk = next;
+        self.current_hunk = next;
         // Anchor the scroll to the hunk's header row so the jump is visible. The renderer
         // maps this logical row through first_visual_line when wrap mode is on.
         let mut seen = 0usize;
@@ -366,6 +410,67 @@ impl App {
         None
     }
 
+    /// The symbol name when the files-pane selection sits on a symbol row (the diff
+    /// title's `focused_symbol`). MERGE: drop this local derivation once the snapshot
+    /// publishes `DiffPane::focused_symbol` (docs/review/15 §4).
+    #[must_use]
+    pub fn selected_symbol_name(&self) -> Option<&str> {
+        let mut idx = self.file_sel;
+        for f in &self.snapshot.files {
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+            if f.expanded {
+                if idx < f.symbols.len() {
+                    return Some(f.symbols[idx].name.as_str());
+                }
+                idx -= f.symbols.len();
+            }
+        }
+        None
+    }
+
+    /// The index into `snapshot.files` of the file under the flattened files-pane
+    /// selection (symbol rows map to their file's index).
+    #[must_use]
+    pub fn selected_file_index(&self) -> Option<usize> {
+        let mut idx = self.file_sel;
+        for (i, f) in self.snapshot.files.iter().enumerate() {
+            if idx == 0 {
+                return Some(i);
+            }
+            idx -= 1;
+            if f.expanded {
+                if idx < f.symbols.len() {
+                    return Some(i);
+                }
+                idx -= f.symbols.len();
+            }
+        }
+        None
+    }
+
+    /// The file row and the symbol row (when the selection is on a symbol) under the
+    /// flattened files-pane selection.
+    #[must_use]
+    pub fn selected_file_symbol(&self) -> Option<(&crate::snapshot::FileRow, Option<&crate::snapshot::SymbolRow>)> {
+        let mut idx = self.file_sel;
+        for f in &self.snapshot.files {
+            if idx == 0 {
+                return Some((f, None));
+            }
+            idx -= 1;
+            if f.expanded {
+                if idx < f.symbols.len() {
+                    return Some((f, Some(&f.symbols[idx])));
+                }
+                idx -= f.symbols.len();
+            }
+        }
+        None
+    }
+
     /// Flattened file+symbol row count (expanded symbols included).
     #[must_use]
     pub fn flat_file_rows(&self) -> usize {
@@ -378,11 +483,15 @@ impl App {
 
     fn clamp(&mut self) {
         self.file_sel = self.file_sel.min(self.flat_file_rows().saturating_sub(1));
-        self.sem_sel = self
-            .sem_sel
-            .min(self.snapshot.semantic.rows.len().saturating_sub(1));
         let max_scroll = self.snapshot.diff.rows.len().saturating_sub(1) as u16;
         self.diff_scroll = self.diff_scroll.min(max_scroll);
+        // Keep the hunk cursor inside the snapshot's (immutable) total.
+        let total = self.snapshot.diff.total_hunks;
+        self.current_hunk = if total == 0 {
+            0
+        } else {
+            self.current_hunk.clamp(1, total)
+        };
         self.model_sel = self
             .model_sel
             .min(self.filtered_models().len().saturating_sub(1));
@@ -420,6 +529,7 @@ mod tests {
         FileRow {
             path: name.to_string(),
             status: "M",
+            changed_symbol_count: symbols,
             symbols: (0..symbols)
                 .map(|i| SymbolRow {
                     name: format!("sym{i}"),
@@ -473,11 +583,11 @@ mod tests {
         app.apply(Action::FocusNext);
         assert_eq!(app.focused, Pane::Diff);
         app.apply(Action::FocusNext);
-        assert_eq!(app.focused, Pane::Semantic);
+        assert_eq!(app.focused, Pane::Impact);
         app.apply(Action::FocusPrev);
         assert_eq!(app.focused, Pane::Diff);
-        app.apply(Action::Focus(Pane::Semantic));
-        assert_eq!(app.focused, Pane::Semantic);
+        app.apply(Action::Focus(Pane::Impact));
+        assert_eq!(app.focused, Pane::Impact);
     }
 
     #[test]
@@ -522,16 +632,21 @@ mod tests {
     }
 
     #[test]
-    fn depth_bounds() {
+    fn files_width_resizes_in_two_cell_steps_and_clamps() {
         let mut app = App::new();
+        assert_eq!(app.files_width, 42, "default from the spec");
+        app.apply(Action::ResizeFilesNarrower);
+        assert_eq!(app.files_width, 40);
+        app.apply(Action::ResizeFilesWider);
+        assert_eq!(app.files_width, 42, "two-cell steps cancel");
         for _ in 0..20 {
-            app.apply(Action::ExpandMore);
+            app.apply(Action::ResizeFilesNarrower);
         }
-        assert_eq!(app.sem_depth, 8);
-        for _ in 0..20 {
-            app.apply(Action::ExpandLess);
+        assert_eq!(app.files_width, 28, "clamped at MIN_FILES_WIDTH");
+        for _ in 0..40 {
+            app.apply(Action::ResizeFilesWider);
         }
-        assert_eq!(app.sem_depth, 0);
+        assert_eq!(app.files_width, 56, "clamped at MAX_FILES_WIDTH");
     }
 
     #[test]
@@ -628,15 +743,15 @@ mod tests {
     fn hunk_jump_clamps() {
         let mut app = App::new();
         app.snapshot.diff.total_hunks = 3;
-        app.snapshot.diff.current_hunk = 1;
+        app.current_hunk = 1;
         app.apply(Action::NextHunk);
-        assert_eq!(app.snapshot.diff.current_hunk, 2);
+        assert_eq!(app.current_hunk, 2);
         app.apply(Action::NextHunk);
-        assert_eq!(app.snapshot.diff.current_hunk, 3);
+        assert_eq!(app.current_hunk, 3);
         app.apply(Action::NextHunk);
-        assert_eq!(app.snapshot.diff.current_hunk, 3);
+        assert_eq!(app.current_hunk, 3);
         app.apply(Action::PrevHunk);
-        assert_eq!(app.snapshot.diff.current_hunk, 2);
+        assert_eq!(app.current_hunk, 2);
     }
 
     #[test]
@@ -650,12 +765,75 @@ mod tests {
             DiffRow::Add { new_ln: 41, text: "b".to_string() },
         ];
         app.snapshot.diff.total_hunks = 2;
-        app.snapshot.diff.current_hunk = 1;
+        app.current_hunk = 1;
         app.apply(Action::NextHunk);
-        assert_eq!(app.snapshot.diff.current_hunk, 2);
+        assert_eq!(app.current_hunk, 2);
         assert_eq!(app.diff_scroll, 2, "scroll anchors on the second hunk header");
         app.apply(Action::PrevHunk);
         assert_eq!(app.diff_scroll, 0);
+        assert_eq!(app.current_hunk, 1);
+    }
+
+    #[test]
+    fn scrolling_recomputes_the_current_hunk() {
+        use crate::snapshot::DiffRow;
+        let mut app = App::new();
+        app.focused = Pane::Diff;
+        app.snapshot.diff.rows = vec![
+            DiffRow::HunkHeader("@@ -1,2 +1,2 @@".to_string()),
+            DiffRow::Context { old_ln: 1, new_ln: 1, text: "a".to_string() },
+            DiffRow::HunkHeader("@@ -40,2 +40,2 @@".to_string()),
+            DiffRow::Add { new_ln: 41, text: "b".to_string() },
+        ];
+        app.snapshot.diff.total_hunks = 2;
+        app.current_hunk = 1;
+        // Ordinary vertical scrolling (not n/N) recomputes the hunk under the anchor.
+        app.apply(Action::Bottom);
+        assert_eq!(app.diff_scroll, 3);
+        assert_eq!(app.current_hunk, 2, "scrolled past the second header");
+        app.apply(Action::Up);
+        app.apply(Action::Up);
+        assert_eq!(app.diff_scroll, 1);
+        assert_eq!(app.current_hunk, 1);
+        app.apply(Action::Top);
+        assert_eq!(app.current_hunk, 1);
+    }
+
+    #[test]
+    fn current_hunk_resets_when_the_diff_retargets() {
+        let mut app = App::new();
+        app.snapshot.diff.title = "a.go".to_string();
+        app.snapshot.diff.total_hunks = 5;
+        app.current_hunk = 4;
+        // Same path: the hunk cursor survives a refresh publish.
+        app.update(UiSnapshot {
+            diff: crate::snapshot::DiffPane {
+                title: "a.go".to_string(),
+                total_hunks: 5,
+                ..crate::snapshot::DiffPane::default()
+            },
+            ..UiSnapshot::default()
+        });
+        assert_eq!(app.current_hunk, 4);
+        // New file: back to the top of the diff.
+        app.update(UiSnapshot {
+            diff: crate::snapshot::DiffPane {
+                title: "b.go".to_string(),
+                total_hunks: 2,
+                ..crate::snapshot::DiffPane::default()
+            },
+            ..UiSnapshot::default()
+        });
+        assert_eq!(app.current_hunk, 1);
+        // No hunks: 0.
+        app.update(UiSnapshot {
+            diff: crate::snapshot::DiffPane {
+                title: "c.go".to_string(),
+                ..crate::snapshot::DiffPane::default()
+            },
+            ..UiSnapshot::default()
+        });
+        assert_eq!(app.current_hunk, 0);
     }
 
     #[test]
@@ -669,24 +847,21 @@ mod tests {
     }
 
     #[test]
-    fn wrap_defaults_on_and_toggles() {
+    fn wrap_defaults_off_and_toggles() {
+        // The reference mode is raw (`wrap off`, docs/review/15 §3.4); W toggles.
         let mut app = App::new();
-        assert!(app.diff_wrap, "wrap is the default");
-        app.apply(Action::ToggleWrap);
-        assert!(!app.diff_wrap);
+        assert!(!app.diff_wrap, "raw is the default");
         app.apply(Action::ToggleWrap);
         assert!(app.diff_wrap);
+        app.apply(Action::ToggleWrap);
+        assert!(!app.diff_wrap);
     }
 
     #[test]
     fn hscroll_moves_only_in_raw_mode() {
         let mut app = App::new();
         app.focused = Pane::Diff;
-        // Wrap mode (default): h/l must not move hidden horizontal state.
-        app.apply(Action::Expand);
-        assert_eq!(app.diff_hscroll, 0);
-        // Raw mode: l steps by 8, h steps back, 0 resets.
-        app.apply(Action::ToggleWrap);
+        // Raw mode (default): l steps by 8, h steps back, 0 resets.
         app.apply(Action::Expand);
         app.apply(Action::Expand);
         assert_eq!(app.diff_hscroll, 16);
@@ -694,13 +869,18 @@ mod tests {
         assert_eq!(app.diff_hscroll, 8);
         app.apply(Action::ResetHScroll);
         assert_eq!(app.diff_hscroll, 0);
+        // Wrap mode: h/l must not move hidden horizontal state.
+        app.apply(Action::Expand);
+        app.apply(Action::ToggleWrap);
+        let before = app.diff_hscroll;
+        app.apply(Action::Expand);
+        assert_eq!(app.diff_hscroll, before);
     }
 
     #[test]
     fn scope_switch_resets_hscroll() {
         let mut app = App::new();
         app.focused = Pane::Diff;
-        app.apply(Action::ToggleWrap);
         app.apply(Action::Expand);
         assert_eq!(app.diff_hscroll, 8);
         app.apply(Action::ScopeStaged);
@@ -717,5 +897,15 @@ mod tests {
         let mut app3 = app_with_files();
         app3.file_sel = 3; // b.go
         assert_eq!(app3.selected_file_path(), Some("b.go"));
+    }
+
+    #[test]
+    fn selected_symbol_name_only_on_symbol_rows() {
+        let mut app = app_with_files();
+        assert_eq!(app.selected_symbol_name(), None, "file row: no symbol");
+        app.file_sel = 2; // sym1 of a.go
+        assert_eq!(app.selected_symbol_name(), Some("sym1"));
+        app.file_sel = 3; // b.go file row
+        assert_eq!(app.selected_symbol_name(), None);
     }
 }

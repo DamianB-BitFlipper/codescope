@@ -419,12 +419,14 @@ mod tests {
                 FileRow {
                     path: "a.go".to_string(),
                     status: "M",
+                    changed_symbol_count: 2,
                     symbols: vec![symbol("sym0", Some((10, 4))), symbol("sym1", Some((20, 4)))],
                     expanded: true,
                 },
                 FileRow {
                     path: "b.go".to_string(),
                     status: "M",
+                    changed_symbol_count: 0,
                     symbols: Vec::new(),
                     expanded: false,
                 },
@@ -533,6 +535,7 @@ mod tests {
             files: vec![FileRow {
                 path: "a.go".to_string(),
                 status: "M",
+                changed_symbol_count: 2,
                 symbols: vec![
                     SymbolRow {
                         name: "sym0".to_string(),

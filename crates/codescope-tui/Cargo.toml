@@ -16,3 +16,4 @@ thiserror.workspace = true
 tracing.workspace = true
 unicode-width.workspace = true
 unicode-segmentation = "1.13"
+similar.workspace = true

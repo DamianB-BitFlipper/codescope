@@ -20,7 +20,12 @@ pub struct UiSnapshot {
     /// Center pane: the focused diff for the current selection.
     pub diff: DiffPane,
     /// Right pane: the semantic view for the current selection.
+    ///
+    /// Legacy flattened view — superseded by [`UiSnapshot::impact`] (spec §4); both are
+    /// published while the renderer migrates.
     pub semantic: SemanticPane,
+    /// Right pane: the impact view (selected change, callers, downstream).
+    pub impact: ImpactPane,
     /// Language-server status for the top bar.
     pub ls: LsStatus,
     /// AI status for the top bar.
@@ -38,7 +43,12 @@ pub struct UiSnapshot {
     /// Base candidates for the picker modal (empty until fetched).
     pub available_bases: Vec<String>,
     /// Transient status/help message for the bottom bar.
+    ///
+    /// Legacy plain-text mirror of [`UiSnapshot::status`] (`status.text`); kept while the
+    /// renderer migrates to the typed status message.
     pub message: String,
+    /// Typed status message for the bottom bar: text plus severity.
+    pub status: StatusMessage,
     /// The repo-state epoch this snapshot describes.
     pub epoch: Epoch,
     /// `true` while a refresh is in flight (spinner).
@@ -54,6 +64,7 @@ impl Default for UiSnapshot {
             files: Vec::new(),
             diff: DiffPane::default(),
             semantic: SemanticPane::default(),
+            impact: ImpactPane::default(),
             ls: LsStatus::Starting,
             ai: AiStatus::Disabled,
             ai_model: String::new(),
@@ -62,6 +73,7 @@ impl Default for UiSnapshot {
             base_ref: String::new(),
             available_bases: Vec::new(),
             message: String::new(),
+            status: StatusMessage::default(),
             epoch: Epoch::ZERO,
             refreshing: false,
         }
@@ -74,6 +86,10 @@ impl UiSnapshot {
     pub fn placeholder() -> Self {
         UiSnapshot {
             message: "scanning repository…".to_string(),
+            status: StatusMessage {
+                text: "scanning repository…".to_string(),
+                level: StatusLevel::Info,
+            },
             refreshing: true,
             ..UiSnapshot::default()
         }
@@ -119,6 +135,8 @@ pub struct FileRow {
     pub path: String,
     /// Short status badge: `M`, `A`, `D`, `R`, `?`, `U`.
     pub status: &'static str,
+    /// Number of changed symbols inside the file (right-aligned in the files pane).
+    pub changed_symbol_count: usize,
     /// Changed symbols inside the file (indented under it).
     pub symbols: Vec<SymbolRow>,
     /// Whether the row's symbol list is expanded in the UI.
@@ -146,6 +164,10 @@ pub struct SymbolRow {
 pub struct DiffPane {
     /// Title (file path or symbol name).
     pub title: String,
+    /// The selected symbol's label when the diff shows its file (`None` on file rows and
+    /// on the first-file fallback). The full path stays in `title`; shortening a symbol
+    /// label is render-only.
+    pub focused_symbol: Option<String>,
     /// Render-ready diff rows.
     pub rows: Vec<DiffRow>,
     /// 1-based index of the hunk the cursor is on (`n`/`N` navigation).
@@ -210,4 +232,159 @@ pub struct SemRow {
     pub changed: bool,
     /// `true` when a diagnostic badge should be shown.
     pub has_diagnostic: bool,
+}
+
+/// The right impact pane: the selected change, its callers, and its downstream one-hop
+/// relations (redesign spec §4). Replaces the flattened [`SemanticPane`] — both are
+/// published while the renderer migrates.
+///
+/// The default is an empty but renderable frame: no selection, idle empty lists.
+#[derive(Debug, Clone, Default)]
+pub struct ImpactPane {
+    /// The deterministically-described selected change (`None` before any selection).
+    pub selected_change: Option<SelectedChange>,
+    /// Who calls the selected symbol (lazy LSP call hierarchy + incoming graph `Calls`).
+    pub callers: ImpactList,
+    /// What the selected symbol calls / relates to. One hop only — the analysis graph is
+    /// intentionally shallow, so rows must never be presented as transitive impact.
+    pub downstream: ImpactList,
+    /// One-line caveat when any data behind the pane is partial or approximate.
+    pub note: String,
+}
+
+/// One impact column (callers or downstream): rows plus a load state that distinguishes
+/// "zero rows" from "rows have not returned yet".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImpactList {
+    /// The relation rows (may be non-empty while `state` is still `Loading`: one-hop
+    /// impact-graph rows are available synchronously, lazy LSP rows land later).
+    pub rows: Vec<ImpactRow>,
+    /// Fetch state of the lazy evidence behind this list.
+    pub state: ImpactLoadState,
+    /// `true` when the evidence is incomplete (timeout, truncation, unsupported server
+    /// feature); the pane notes this instead of implying the list is exhaustive.
+    pub partial: bool,
+}
+
+/// Fetch state of an [`ImpactList`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImpactLoadState {
+    /// Nothing requested (no symbol selected). The list is empty by definition.
+    #[default]
+    Idle,
+    /// A fetch is in flight; rows so far (impact graph) may already be shown.
+    Loading,
+    /// The lazy fetch returned; `rows` is the full answer (possibly empty).
+    Ready,
+    /// No language service, so the lazy fetch can never return (git-only mode). Any
+    /// rows present come from the synchronous impact graph alone.
+    Unavailable,
+}
+
+/// The change the selection sits on, described deterministically from the analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedChange {
+    /// Repo-relative file (full path; the basename is render-only).
+    pub file: String,
+    /// Symbol label (e.g. `(*MemoryRepo).Get`), or the file path for a file-row
+    /// selection.
+    pub label: String,
+    /// `added` / `modified` / `removed`.
+    pub change: &'static str,
+    /// Exactly one interpretation sentence (see the dispatcher's deterministic builder).
+    pub interpretation: String,
+    /// Who produced `interpretation`.
+    pub interpretation_source: InterpretationSource,
+}
+
+/// Provenance of a [`SelectedChange`] interpretation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InterpretationSource {
+    /// Built from `ChangedSymbolInfo` (kind, change kind, hunk count, signature touch).
+    #[default]
+    Deterministic,
+    /// A validated, epoch-matched AI result explicitly tied to the selected entity.
+    Ai,
+}
+
+/// One row in an [`ImpactList`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImpactRow {
+    /// Display label (real symbol or file name).
+    pub label: String,
+    /// Relationship suffix, e.g. `calls`, `implements`, `references`.
+    pub relation: &'static str,
+    /// `true` when this entity is itself part of the change.
+    pub changed: bool,
+    /// `true` when a diagnostic badge should be shown.
+    pub has_diagnostic: bool,
+}
+
+/// A typed status-bar message: text plus severity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusMessage {
+    /// The message (empty: the bar falls back to the selected file's path).
+    pub text: String,
+    /// Severity driving the bar's styling.
+    pub level: StatusLevel,
+}
+
+/// Severity of a [`StatusMessage`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatusLevel {
+    /// Neutral feedback (confirmations, progress).
+    #[default]
+    Info,
+    /// Degraded functionality (git-only mode, AI failure, recovered picker override).
+    Warning,
+    /// A hard failure (analysis could not run).
+    Error,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default snapshot is an empty but renderable frame (spec §4): no selection,
+    /// idle impact lists, empty typed status.
+    #[test]
+    fn defaults_are_an_empty_renderable_frame() {
+        let snap = UiSnapshot::default();
+        assert!(snap.impact.selected_change.is_none());
+        assert_eq!(snap.impact.callers, ImpactList::default());
+        assert_eq!(snap.impact.downstream, ImpactList::default());
+        assert_eq!(snap.impact.callers.state, ImpactLoadState::Idle);
+        assert_eq!(snap.impact.downstream.state, ImpactLoadState::Idle);
+        assert!(snap.impact.note.is_empty());
+        assert_eq!(snap.status, StatusMessage::default());
+        assert_eq!(snap.status.level, StatusLevel::Info);
+        assert!(snap.diff.focused_symbol.is_none());
+        assert!(snap.files.is_empty());
+    }
+
+    /// The boot placeholder reports progress through the typed status too, keeping the
+    /// legacy `message` field as its text mirror.
+    #[test]
+    fn placeholder_reports_scanning_via_typed_status() {
+        let snap = UiSnapshot::placeholder();
+        assert_eq!(snap.status.text, "scanning repository…");
+        assert_eq!(snap.status.level, StatusLevel::Info);
+        assert_eq!(snap.message, snap.status.text);
+        assert!(snap.refreshing);
+    }
+
+    /// Defaults must draw: an empty frame is what a user sees before the first analysis
+    /// lands, so rendering it must never panic.
+    #[test]
+    fn default_snapshots_render_an_empty_frame() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let app = crate::app::App::new();
+        terminal
+            .draw(|f| crate::render::render(f, &app, &UiSnapshot::default()))
+            .expect("the default snapshot renders");
+        terminal
+            .draw(|f| crate::render::render(f, &app, &UiSnapshot::placeholder()))
+            .expect("the placeholder snapshot renders");
+    }
 }
