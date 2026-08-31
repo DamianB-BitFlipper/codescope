@@ -25,12 +25,12 @@ pub const GAP_ATTACH_LINES: u32 = 3;
 /// the mapping stays [`MappingConfidence::Exact`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedHunk {
-    /// The domain mapping record (hunk id, targets, confidence).
+    /// The domain mapping record (hunk id, run index, side, range, targets, confidence).
     pub mapping: codescope_core::HunkMapping,
-    /// `true` when the hunk's new-side lines intersect the mapped symbol's *selection*
-    /// range (identifier line) — a signature-ish change. Only meaningful for single-target
-    /// exact mappings.
-    pub signature_touch: bool,
+    /// The targets whose *selection* (identifier line) this run's changed lines intersect
+    /// — a signature-ish change. Per-target so one hunk can touch A's signature and B's
+    /// body without conflating them. Empty when no target's signature is touched.
+    pub signature_touches: Vec<SymbolId>,
 }
 
 /// Map hunks against the worktree tree only (no base-revision tree available).
@@ -67,176 +67,239 @@ pub fn map_changes_detailed(
     base: Option<&SymbolTree>,
     hunks: &[Hunk],
 ) -> Vec<MappedHunk> {
+    use codescope_core::{ChangedSide, Revision};
     let file = tree.file.as_path().to_path_buf();
-    hunks
-        .iter()
-        .enumerate()
-        .map(|(index, hunk)| {
-            let hunk_id = HunkId {
-                file: file.clone(),
-                index: index as u32,
+    let mut out: Vec<MappedHunk> = Vec::new();
+    for (index, hunk) in hunks.iter().enumerate() {
+        let hunk_id = HunkId {
+            file: file.clone(),
+            index: index as u32,
+        };
+        for (run_index, run) in changed_runs(hunk).into_iter().enumerate() {
+            let mapped = map_run(tree, base, &run);
+            let mut signature_touches: Vec<SymbolId> = mapped.signature_touches.clone();
+            signature_touches.sort();
+            signature_touches.dedup();
+            let mapped_revision = match run.side {
+                ChangedSide::Old => Revision::Base,
+                ChangedSide::New => Revision::Worktree,
             };
-            let (targets, confidence, signature_touch) = map_one(tree, base, hunk);
-            tracing::trace!(hunk = %hunk_id, ?confidence, targets = targets.len(), "mapped hunk");
-            MappedHunk {
+            tracing::trace!(
+                hunk = %hunk_id,
+                run = run_index,
+                side = ?run.side,
+                targets = mapped.targets.len(),
+                "mapped changed run"
+            );
+            out.push(MappedHunk {
                 mapping: codescope_core::HunkMapping {
-                    hunk: hunk_id,
-                    targets,
-                    confidence,
+                    hunk: hunk_id.clone(),
+                    run_index: run_index as u32,
+                    side: run.side,
+                    range: run.range,
+                    mapped_revision,
+                    targets: mapped.targets,
+                    confidence: mapped.confidence,
                 },
-                signature_touch,
-            }
-        })
-        .collect()
+                signature_touches,
+            });
+        }
+    }
+    out
 }
 
-/// Map a single hunk. Returns `(targets, confidence, signature_touch)`.
-fn map_one(
-    tree: &SymbolTree,
-    base: Option<&SymbolTree>,
-    hunk: &Hunk,
-) -> (Vec<SymbolId>, MappingConfidence, bool) {
-    if hunk.new_len == 0 && hunk.old_len == 0 {
-        // Degenerate hunk (git never emits this); nothing to map.
-        return (Vec::new(), MappingConfidence::Unmapped, false);
-    }
-    if hunk.is_pure_deletion() {
-        return map_pure_deletion(tree, base, hunk);
-    }
+/// A maximal run of consecutive changed (Add or Del) lines on one side of a hunk.
+struct ChangeRun {
+    side: codescope_core::ChangedSide,
+    range: LineRange,
+    /// New-side cursor at the run's start (the last new_ln seen before the run, or the
+    /// hunk's insertion point). Used only for baseless deletion anchoring.
+    anchor_new: u32,
+}
 
-    // New-side hunk: git 1-based [new_start, new_start+new_len) → zero-based inclusive span.
-    let target = zero_based_span(hunk.new_start, hunk.new_len);
+/// The (targets, confidence, signature-touching targets) for one changed run.
+struct RunMapping {
+    targets: Vec<SymbolId>,
+    confidence: MappingConfidence,
+    signature_touches: Vec<SymbolId>,
+}
 
-    if let Some(sym) = tree.find_smallest_containing(&target) {
-        let signature_touch = sym.selection.intersects_lines(&target);
-        return (
-            vec![sym.id.clone()],
-            MappingConfidence::Exact,
-            signature_touch,
-        );
+/// Extract maximal same-kind, consecutive-coordinate `Add`/`Del` runs from a hunk body.
+/// `Context` only separates runs — it is never evidence. Coordinates are 1-based; the
+/// ranges returned are zero-based inclusive on the run's own side.
+fn changed_runs(hunk: &Hunk) -> Vec<ChangeRun> {
+    use codescope_core::{ChangedSide, DiffLineKind};
+    let mut runs: Vec<ChangeRun> = Vec::new();
+    let mut cur: Option<ChangeRun> = None;
+    let mut last_new = hunk.insertion_point_zero_based(); // 0-based new-side cursor
+    for line in &hunk.lines {
+        if let Some(nl) = line.new_ln {
+            last_new = nl - 1; // track the surviving cursor through context/adds
+        }
+        let (side, coord) = match line.kind {
+            DiffLineKind::Add => (ChangedSide::New, line.new_ln),
+            DiffLineKind::Del => (ChangedSide::Old, line.old_ln),
+            DiffLineKind::Context => {
+                if let Some(r) = cur.take() {
+                    runs.push(r);
+                }
+                continue;
+            }
+        };
+        let Some(coord) = coord else {
+            // Malformed body: a changed line without its coordinate. Fail closed — end the
+            // run rather than guess a span.
+            cur = None;
+            continue;
+        };
+        let zl = coord - 1; // 1-based -> 0-based
+        match &mut cur {
+            Some(r) if r.side == side && r.range.end_line + 1 == zl => {
+                r.range.end_line = zl;
+            }
+            _ => {
+                if let Some(r) = cur.take() {
+                    runs.push(r);
+                }
+                cur = Some(ChangeRun {
+                    side,
+                    range: LineRange::from_line_span(zl, zl),
+                    anchor_new: last_new,
+                });
+            }
+        }
     }
+    if let Some(r) = cur {
+        runs.push(r);
+    }
+    runs
+}
 
-    // No single container: either the hunk covers whole symbols, spans several, or sits
-    // in a gap (doc comment / import block / between top-level symbols).
+/// Map one changed run against the tree for its side.
+fn map_run(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -> RunMapping {
+    use codescope_core::ChangedSide;
+    match run.side {
+        ChangedSide::New => map_run_worktree(tree, &run.range),
+        ChangedSide::Old => map_run_base(tree, base, run),
+    }
+}
+
+/// New-side (addition) run against the worktree tree.
+fn map_run_worktree(tree: &SymbolTree, target: &LineRange) -> RunMapping {
+    if let Some(sym) = tree.find_smallest_containing(target) {
+        let sig = sym.selection.intersects_lines(target);
+        return RunMapping {
+            targets: vec![sym.id.clone()],
+            confidence: MappingConfidence::Exact,
+            signature_touches: if sig { vec![sym.id.clone()] } else { vec![] },
+        };
+    }
     let intersected: Vec<&SymbolNode> = tree
         .roots
         .iter()
-        .filter(|n| n.range.intersects_lines(&target))
+        .filter(|n| n.range.intersects_lines(target))
         .collect();
     match intersected.len() {
-        0 => map_gap(tree, &target),
+        0 => map_gap(tree, target),
         1 => {
             let sym = intersected[0];
             if target.contains_lines(&sym.range) {
-                // The hunk fully covers the symbol: a whole-symbol addition/rewrite
-                // (research 03: "whole symbol added → Exact on that symbol").
-                let signature_touch = sym.selection.intersects_lines(&target);
-                (
-                    vec![sym.id.clone()],
-                    MappingConfidence::Exact,
-                    signature_touch,
-                )
+                let sig = sym.selection.intersects_lines(target);
+                RunMapping {
+                    targets: vec![sym.id.clone()],
+                    confidence: MappingConfidence::Exact,
+                    signature_touches: if sig { vec![sym.id.clone()] } else { vec![] },
+                }
             } else {
                 // Partial overlap hanging into a gap (typically the symbol plus its doc
-                // comment, which gopls excludes from the range).
-                (
-                    vec![sym.id.clone()],
-                    MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
-                    false,
-                )
+                // comment, which the language server excludes from the range).
+                RunMapping {
+                    targets: vec![sym.id.clone()],
+                    confidence: MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
+                    signature_touches: vec![],
+                }
             }
         }
         _ => {
             let targets: Vec<SymbolId> = intersected.iter().map(|n| n.id.clone()).collect();
             if intersected.iter().all(|n| target.contains_lines(&n.range)) {
-                // Every intersected symbol is fully covered — e.g. a whole-file addition:
-                // each top-level symbol is exactly added (research 03).
-                (targets, MappingConfidence::Exact, false)
-            } else {
-                (
+                RunMapping {
                     targets,
-                    MappingConfidence::Approximate(ApproxReason::HunkSpansSymbols),
-                    false,
-                )
+                    confidence: MappingConfidence::Exact,
+                    signature_touches: vec![],
+                }
+            } else {
+                RunMapping {
+                    targets,
+                    confidence: MappingConfidence::Approximate(ApproxReason::HunkSpansSymbols),
+                    signature_touches: vec![],
+                }
             }
         }
     }
 }
 
-/// Map a pure-deletion hunk (`new_len == 0`).
-///
-/// With a base tree: map the old-side span against it (always
-/// [`ApproxReason::DeletedHunkBaseMapped`] — the symbol ids refer to the base tree).
-/// Without one: attach to the nearest surviving symbol around the insertion point.
-fn map_pure_deletion(
-    tree: &SymbolTree,
-    base: Option<&SymbolTree>,
-    hunk: &Hunk,
-) -> (Vec<SymbolId>, MappingConfidence, bool) {
+/// Old-side (deletion) run against the base tree; baseless falls back to the worktree.
+fn map_run_base(tree: &SymbolTree, base: Option<&SymbolTree>, run: &ChangeRun) -> RunMapping {
     if let Some(base) = base {
-        let old = zero_based_span(hunk.old_start, hunk.old_len);
-        if let Some(sym) = base.find_smallest_containing(&old) {
-            return (
-                vec![sym.id.clone()],
-                MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
-                false,
-            );
+        let target = &run.range;
+        if let Some(sym) = base.find_smallest_containing(target) {
+            let sig = sym.selection.intersects_lines(target);
+            return RunMapping {
+                targets: vec![sym.id.clone()],
+                confidence: MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
+                signature_touches: if sig { vec![sym.id.clone()] } else { vec![] },
+            };
         }
         let intersected: Vec<SymbolId> = base
             .roots
             .iter()
-            .filter(|n| n.range.intersects_lines(&old))
+            .filter(|n| n.range.intersects_lines(target))
             .map(|n| n.id.clone())
             .collect();
         if !intersected.is_empty() {
-            return (
-                intersected,
-                MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
-                false,
-            );
+            return RunMapping {
+                targets: intersected,
+                confidence: MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
+                signature_touches: vec![],
+            };
         }
-        if let Some(sym) = nearest_within(base, &old, GAP_ATTACH_LINES) {
-            return (
-                vec![sym.id.clone()],
-                MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
-                false,
-            );
+        if let Some(sym) = nearest_within(base, target, GAP_ATTACH_LINES) {
+            return RunMapping {
+                targets: vec![sym.id.clone()],
+                confidence: MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped),
+                signature_touches: vec![],
+            };
         }
-        // Fall through to the surviving-neighbour fallback below.
     }
-
-    // No base tree (or the deletion mapped to nothing in it): nearest surviving symbol
-    // around the insertion point on the new side (research 03).
-    let point = hunk.insertion_point_zero_based();
+    // No base tree (or nothing mapped): attach to the nearest surviving symbol around the
+    // run's own insertion anchor (not the whole hunk's), staying approximate.
+    let point = run.anchor_new;
     let target = LineRange::from_line_span(point, point);
     if let Some(sym) = tree.find_smallest_containing(&target) {
-        // Deleted lines from inside a surviving symbol's extent.
-        return (
-            vec![sym.id.clone()],
-            MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
-            false,
-        );
+        return RunMapping {
+            targets: vec![sym.id.clone()],
+            confidence: MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
+            signature_touches: vec![],
+        };
     }
-    match nearest_within(tree, &target, GAP_ATTACH_LINES) {
-        Some(sym) => (
-            vec![sym.id.clone()],
-            MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
-            false,
-        ),
-        None => (Vec::new(), MappingConfidence::Unmapped, false),
-    }
+    map_gap(tree, &target)
 }
 
 /// Gap change (no symbol intersected): nearest symbol within [`GAP_ATTACH_LINES`] lines,
 /// preferring the symbol *below* (doc comments precede their symbol), else unmapped.
-fn map_gap(tree: &SymbolTree, target: &LineRange) -> (Vec<SymbolId>, MappingConfidence, bool) {
+fn map_gap(tree: &SymbolTree, target: &LineRange) -> RunMapping {
     match nearest_within(tree, target, GAP_ATTACH_LINES) {
-        Some(sym) => (
-            vec![sym.id.clone()],
-            MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
-            false,
-        ),
-        None => (Vec::new(), MappingConfidence::Unmapped, false),
+        Some(sym) => RunMapping {
+            targets: vec![sym.id.clone()],
+            confidence: MappingConfidence::Approximate(ApproxReason::DocCommentOrGap),
+            signature_touches: vec![],
+        },
+        None => RunMapping {
+            targets: Vec::new(),
+            confidence: MappingConfidence::Unmapped,
+            signature_touches: vec![],
+        },
     }
 }
 
@@ -255,14 +318,6 @@ fn nearest_within<'t>(
     }
     tree.nearest_above(target.start_line)
         .filter(|s| target.start_line.saturating_sub(s.range.end_line) <= max_lines)
-}
-
-/// Convert a git 1-based `(start, len)` span (`len >= 1`) into a zero-based inclusive
-/// [`LineRange`] line span.
-fn zero_based_span(start_1based: u32, len: u32) -> LineRange {
-    let start = start_1based.saturating_sub(1);
-    let end = start + len.saturating_sub(1);
-    LineRange::from_line_span(start, end)
 }
 
 #[cfg(test)]
@@ -310,6 +365,11 @@ mod tests {
         )
     }
 
+    /// A modification hunk. `hunk(o, l, n, l)` models an in-place edit: the new side
+    /// carries the changed lines (`new_len` adds from `new_start`), and the old side is
+    /// present only as the header envelope. This matches how the legacy fixtures were
+    /// written (they asserted the new-side mapping). Use [`add_hunk`]/[`del_hunk`] for
+    /// pure one-sided edits.
     fn hunk(old_start: u32, old_len: u32, new_start: u32, new_len: u32) -> Hunk {
         Hunk {
             old_start,
@@ -317,8 +377,94 @@ mod tests {
             new_start,
             new_len,
             section: None,
-            lines: Vec::new(),
+            lines: body(old_start, 0, new_start, new_len),
         }
+    }
+
+    /// A pure-deletion hunk body: `old_len` deleted lines starting at `old_start` (1-based).
+    fn del_hunk(old_start: u32, old_len: u32, new_start: u32) -> Hunk {
+        Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len: 0,
+            section: None,
+            lines: body(old_start, old_len, new_start, 0),
+        }
+    }
+
+    /// A hunk body with explicit lines (for context/disjoint-edit fixtures).
+    fn hunk_with_lines(
+        old_start: u32,
+        old_len: u32,
+        new_start: u32,
+        new_len: u32,
+        lines: Vec<codescope_core::DiffLine>,
+    ) -> Hunk {
+        Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len,
+            section: None,
+            lines,
+        }
+    }
+
+    fn ctx(old_ln: u32, new_ln: u32) -> codescope_core::DiffLine {
+        codescope_core::DiffLine {
+            kind: codescope_core::DiffLineKind::Context,
+            old_ln: Some(old_ln),
+            new_ln: Some(new_ln),
+            text: String::new(),
+        }
+    }
+
+    fn add(new_ln: u32) -> codescope_core::DiffLine {
+        codescope_core::DiffLine {
+            kind: codescope_core::DiffLineKind::Add,
+            old_ln: None,
+            new_ln: Some(new_ln),
+            text: String::new(),
+        }
+    }
+
+    fn del(old_ln: u32) -> codescope_core::DiffLine {
+        codescope_core::DiffLine {
+            kind: codescope_core::DiffLineKind::Del,
+            old_ln: Some(old_ln),
+            new_ln: None,
+            text: String::new(),
+        }
+    }
+
+    /// Build the body: `old_len` deleted lines (old side from `old_start`) then `new_len`
+    /// added lines (new side from `new_start`). Coordinates are 1-based.
+    fn body(
+        old_start: u32,
+        old_len: u32,
+        new_start: u32,
+        new_len: u32,
+    ) -> Vec<codescope_core::DiffLine> {
+        use codescope_core::{DiffLine, DiffLineKind};
+        let mut lines = Vec::new();
+        for i in 0..old_len {
+            lines.push(DiffLine {
+                kind: DiffLineKind::Del,
+                old_ln: Some(old_start + i),
+                new_ln: None,
+                text: String::new(),
+            });
+        }
+        for i in 0..new_len {
+            lines.push(DiffLine {
+                kind: DiffLineKind::Add,
+                old_ln: None,
+                new_ln: Some(new_start + i),
+                text: String::new(),
+            });
+        }
+        lines
     }
 
     #[test]
@@ -332,7 +478,7 @@ mod tests {
         assert_eq!(maps[0].hunk.file, "main.go");
         assert_eq!(maps[0].hunk.index, 0);
         let detailed = map_changes_detailed(&tree(), None, &[hunk(9, 3, 9, 3)]);
-        assert!(!detailed[0].signature_touch);
+        assert!(detailed[0].signature_touches.is_empty());
     }
 
     #[test]
@@ -341,7 +487,7 @@ mod tests {
         let detailed = map_changes_detailed(&tree(), None, &[hunk(6, 2, 6, 2)]);
         assert_eq!(detailed[0].mapping.confidence, MappingConfidence::Exact);
         assert_eq!(detailed[0].mapping.targets, vec![SymbolId::new("0")]);
-        assert!(detailed[0].signature_touch);
+        assert_eq!(detailed[0].signature_touches, vec![SymbolId::new("0")]);
     }
 
     #[test]
@@ -396,7 +542,7 @@ mod tests {
     #[test]
     fn pure_deletion_maps_against_base_tree() {
         // Old-side zero-based 21..=25 was inside base Legacy (20-28).
-        let del = hunk(22, 5, 18, 0);
+        let del = del_hunk(22, 5, 18);
         let maps = map_changes_with_base(&tree(), Some(&base_tree()), &[del]);
         assert_eq!(
             maps[0].confidence,
@@ -409,7 +555,7 @@ mod tests {
     #[test]
     fn pure_deletion_spanning_base_symbols_lists_all() {
         // Old-side zero-based 10..=25 intersects base main (5-15) and Legacy (20-28).
-        let del = hunk(11, 15, 9, 0);
+        let del = del_hunk(11, 15, 9);
         let maps = map_changes_with_base(&tree(), Some(&base_tree()), &[del]);
         assert_eq!(
             maps[0].confidence,
@@ -424,7 +570,7 @@ mod tests {
     #[test]
     fn pure_deletion_in_base_gap_attaches_to_nearest_base_symbol() {
         // Old-side zero-based 17..=18: gap in base; Legacy starts at 20 (2 below).
-        let del = hunk(18, 2, 16, 0);
+        let del = del_hunk(18, 2, 16);
         let maps = map_changes_with_base(&tree(), Some(&base_tree()), &[del]);
         assert_eq!(
             maps[0].confidence,
@@ -436,7 +582,7 @@ mod tests {
     #[test]
     fn pure_deletion_without_base_attaches_to_surviving_container() {
         // Insertion point zero-based 10 sits inside worktree main (5-15).
-        let del = hunk(11, 2, 10, 0);
+        let del = del_hunk(11, 2, 10);
         let maps = map_changes(&tree(), &[del]);
         assert_eq!(
             maps[0].confidence,
@@ -448,7 +594,7 @@ mod tests {
     #[test]
     fn pure_deletion_without_base_far_from_symbols_is_unmapped() {
         // Insertion point zero-based 35: >3 lines from Greeter (ends 30) and Hello (starts 40).
-        let del = hunk(36, 2, 35, 0);
+        let del = del_hunk(36, 2, 35);
         let maps = map_changes(&tree(), &[del]);
         assert_eq!(maps[0].confidence, MappingConfidence::Unmapped);
     }
@@ -500,9 +646,11 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_empty_hunk_is_unmapped() {
-        let maps = map_changes(&tree(), &[hunk(0, 0, 0, 0)]);
-        assert_eq!(maps[0].confidence, MappingConfidence::Unmapped);
+    fn degenerate_empty_hunk_produces_no_mapping() {
+        // A body with no Add/Del lines carries no changed-run evidence (review 20): it
+        // emits no mapping record at all rather than an Unmapped one.
+        let maps = map_changes(&tree(), &[del_hunk(0, 0, 0)]);
+        assert!(maps.is_empty());
     }
 
     #[test]
@@ -517,9 +665,93 @@ mod tests {
     #[test]
     fn empty_tree_maps_everything_unmapped() {
         let empty = SymbolTree::new(FileId::new("empty.go").unwrap(), Revision::Worktree, vec![]);
-        let maps = map_changes(&empty, &[hunk(1, 1, 1, 1), hunk(5, 3, 4, 0)]);
+        let maps = map_changes(&empty, &[hunk(1, 1, 1, 1), del_hunk(5, 3, 4)]);
         assert!(maps
             .iter()
             .all(|m| m.confidence == MappingConfidence::Unmapped));
+    }
+
+    /// Review 20: context lines are never evidence. An Add run surrounded by context maps
+    /// ONLY to the symbol the added lines touch — the neighboring symbol whose tail appears
+    /// as leading context is NOT reported.
+    #[test]
+    fn context_neighboring_symbols_are_not_mapped() {
+        // main 5-15, Greeter 20-30. The edit adds lines 18..=19 (in the gap). The hunk's
+        // leading context is main's tail (lines 16,17) and trailing context is Greeter's
+        // head (20,21). Old code mapped the whole envelope (16..=21) and would report both
+        // main and Greeter; only the gap attachment is honest.
+        let h = hunk_with_lines(
+            16,
+            6,
+            16,
+            8,
+            vec![
+                ctx(16, 16),
+                ctx(17, 17),
+                add(18),
+                add(19),
+                ctx(18, 20),
+                ctx(19, 21),
+            ],
+        );
+        let maps = map_changes(&tree(), &[h]);
+        assert_eq!(maps.len(), 1, "one add run, one mapping");
+        // The gap between main (ends 15) and Greeter (starts 20): nearest is Greeter below.
+        assert_eq!(maps[0].targets, vec![SymbolId::new("1")]);
+        assert_eq!(
+            maps[0].confidence,
+            MappingConfidence::Approximate(ApproxReason::DocCommentOrGap)
+        );
+        // Neither main (0) nor the trailing-context Greeter head is reported as touched.
+        assert!(!maps[0].targets.contains(&SymbolId::new("0")));
+    }
+
+    /// Review 20: two disjoint edits inside ONE git hunk map independently.
+    #[test]
+    fn disjoint_edits_in_one_hunk_map_independently() {
+        // main 5-15, (Greeter).Hello 40-50. Edit main (new 10) AND Hello (new 45) with a
+        // big context gap between them in one hunk.
+        let h = hunk_with_lines(
+            10,
+            40,
+            10,
+            42,
+            vec![
+                add(10), // edit in main (0-based 9)
+                ctx(11, 11),
+                ctx(12, 12),
+                add(45), // edit in Hello (0-based 44)
+            ],
+        );
+        let maps = map_changes(&tree(), &[h]);
+        assert_eq!(maps.len(), 2, "two add runs, two mappings");
+        assert_eq!(maps[0].targets, vec![SymbolId::new("0")]);
+        assert_eq!(maps[0].run_index, 0);
+        assert_eq!(maps[1].targets, vec![SymbolId::new("2")]);
+        assert_eq!(maps[1].run_index, 1);
+        assert!(maps
+            .iter()
+            .all(|m| m.confidence == MappingConfidence::Exact));
+    }
+
+    /// Review 20: a replacement (Del run + Add run) maps both sides; the deleted base
+    /// symbol folds onto the surviving worktree symbol at aggregation.
+    #[test]
+    fn replacement_maps_both_sides_of_the_run() {
+        let h = hunk_with_lines(10, 3, 10, 3, vec![del(10), del(11), add(10), add(11)]);
+        let maps = map_changes_detailed(&tree(), Some(&base_tree()), &[h]);
+        assert_eq!(maps.len(), 2, "one old-side run + one new-side run");
+        assert_eq!(maps[0].mapping.side, codescope_core::ChangedSide::Old);
+        assert_eq!(
+            maps[0].mapping.mapped_revision,
+            codescope_core::Revision::Base
+        );
+        assert_eq!(maps[1].mapping.side, codescope_core::ChangedSide::New);
+        assert_eq!(
+            maps[1].mapping.mapped_revision,
+            codescope_core::Revision::Worktree
+        );
+        assert_eq!(maps[1].mapping.targets, vec![SymbolId::new("0")]);
+        assert_eq!(maps[1].mapping.confidence, MappingConfidence::Exact);
     }
 }

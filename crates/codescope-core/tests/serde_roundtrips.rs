@@ -218,11 +218,18 @@ fn mapping_domain_roundtrips() {
     for kind in [ChangeKind::Added, ChangeKind::Modified, ChangeKind::Deleted] {
         roundtrip(&kind);
     }
+    for side in [ChangedSide::Old, ChangedSide::New] {
+        roundtrip(&side);
+    }
     roundtrip(&HunkMapping {
         hunk: HunkId {
             file: Utf8PathBuf::from("a.go"),
             index: 1,
         },
+        run_index: 0,
+        side: ChangedSide::New,
+        range: LineRange::new(4, 0, 6, 1),
+        mapped_revision: Revision::Worktree,
         targets: vec![SymbolId::new("0/1")],
         confidence: MappingConfidence::Approximate(ApproxReason::HunkSpansSymbols),
     });

@@ -64,17 +64,50 @@ pub enum ChangeKind {
 }
 
 /// Mapping of one hunk to its target symbol(s) (research 03 algorithm output).
+/// Which side of the diff a changed run's evidence lives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangedSide {
+    /// Deleted lines (`old_ln`, base revision).
+    Old,
+    /// Added lines (`new_ln`, worktree).
+    New,
+}
+
+/// One changed-run mapping from a hunk (research 03, evolved in review 20). A single Git
+/// hunk can contain several context-separated edit islands; each contiguous run of
+/// added or deleted lines maps independently, so one hunk can produce several records
+/// (distinguished by `run_index`). Context lines are never evidence.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HunkMapping {
     /// The hunk being mapped.
     pub hunk: HunkId,
-    /// Target symbols (tree-local ids within the revision the hunk was mapped against).
-    /// Empty when [`MappingConfidence::Unmapped`]. Multiple targets when a hunk spans
-    /// several symbols (the first is the smallest common ancestor).
+    /// Stable zero-based index of this run within the hunk's body.
+    #[serde(default)]
+    pub run_index: u32,
+    /// Which side of the diff this run's evidence lives on.
+    #[serde(default = "default_side")]
+    pub side: ChangedSide,
+    /// The run's line range on `side` (zero-based inclusive).
+    pub range: crate::position::LineRange,
+    /// Which tree namespace `targets` refer to (Base for deletions, Worktree otherwise).
+    #[serde(default = "default_revision")]
+    pub mapped_revision: crate::semantic::Revision,
+    /// Target symbols (tree-local ids within `mapped_revision`). Empty when
+    /// [`MappingConfidence::Unmapped`]. Multiple targets when one run genuinely spans
+    /// several symbols.
     #[serde(default)]
     pub targets: Vec<SymbolId>,
     /// Mapping confidence.
     pub confidence: MappingConfidence,
+}
+
+fn default_side() -> ChangedSide {
+    ChangedSide::New
+}
+
+fn default_revision() -> crate::semantic::Revision {
+    crate::semantic::Revision::Worktree
 }
 
 /// A symbol touched by the current change-set (digest unit for UI and AI).

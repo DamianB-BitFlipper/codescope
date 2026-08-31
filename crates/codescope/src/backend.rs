@@ -372,19 +372,19 @@ struct LspView {
     language: &'static str,
 }
 
-/// [`HunkMapping`] plus the analysis-level signature-touch flag.
+/// [`HunkMapping`] plus the analysis-level signature-touch targets.
 #[derive(Serialize)]
 struct MappedHunkView<'a> {
     #[serde(flatten)]
     mapping: &'a HunkMapping,
-    signature_touch: bool,
+    signature_touches: &'a [codescope_core::SymbolId],
 }
 
 impl<'a> From<&'a MappedHunk> for MappedHunkView<'a> {
     fn from(m: &'a MappedHunk) -> Self {
         MappedHunkView {
             mapping: &m.mapping,
-            signature_touch: m.signature_touch,
+            signature_touches: &m.signature_touches,
         }
     }
 }

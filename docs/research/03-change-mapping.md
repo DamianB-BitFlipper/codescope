@@ -28,38 +28,49 @@ verified live against gopls 0.21.0 / git 2.50.1 in /tmp/codescope_probe).
    Hello() {`) via the built-in Go userdiff driver. Crude (nearest preceding match, not true
    containment) but zero-cost and language-neutral-ish via .gitattributes userdiff.
 
-## Mapping algorithm (per changed file)
+## Mapping algorithm (per changed file) — changed-run mapping (review 20)
 
-Input: symbol tree (hierarchical, sorted by range), list of hunks with old_range/new_range.
-Output: for each hunk, a Mapping { symbol_id | None, confidence }.
+Input: hierarchical symbol tree(s) and hunks whose `DiffLine` bodies carry exact
+`Add`/`Del`/`Context` coordinates (`old_ln`/`new_ln`). Output: one `HunkMapping` **per
+changed run** (a hunk can yield several, or none).
+
+The envelope bug this replaces: mapping the whole `-U3` hunk header range
+(`new_start..new_start+new_len`) counted unchanged CONTEXT lines as evidence, so any symbol
+that merely *brushed* a hunk (a doc comment, the tail of a neighbouring function) was
+reported as changed. The fix maps only the changed lines.
 
 ```
 for hunk in hunks:
-    target_range = hunk.new_range (if count>0) else insertion point
-    if hunk is pure deletion:
-        if base symbol tree available: map old_range against base tree → confidence=DeletedIn(symbol)
-        else: nearest symbol above/below insertion point → Approximate
-        continue
-    containing = smallest symbol whose range fully contains target_range  # walk tree depth-first
-    if containing:
-        if symbol.selectionRange intersects target: Exact(signature-ish change)
-        else: Exact(body change)
-    else:
-        # gap: between top-level symbols, doc comment, import block
-        below = nearest symbol starting after target end (same file)
-        above = nearest symbol ending before target start
-        if above/below within N=3 lines: Approximate(that symbol)  # likely doc comment/signature edit
-        else: Unmapped(file-level)
+    # 1. extract runs: maximal same-kind consecutive-coordinate Add/Del runs.
+    #    Context only separates runs; it is NEVER evidence.
+    runs = extract(hunk.lines)   # Add runs carry new_ln, Del runs carry old_ln
+    for run in runs:
+        # 2. map each run against the tree for its own side
+        if run.side == New:  map run.range against WORKTREE tree
+        if run.side == Old:
+            if base tree:  map run.range against BASE tree (confidence DeletedHunkBaseMapped)
+            else:          nearest surviving symbol around the run's own new-side anchor
+        # 3. deepest semantic frontier: a line in a nested field maps to the field, never
+        #    to its parent unless the parent's own declaration/body changed
+        # 4. fold base-side targets onto surviving worktree symbols by (name, kind)
+        # 5. a run in a gap attaches approximately to the nearest symbol (doc comment);
+        #    a run with no credible symbol stays Unmapped (imports, far changes)
 ```
 
-Edge cases:
-- Hunk spanning multiple symbols → attach to the smallest common ancestor (often file-level);
-  record all intersected symbols.
-- Whole symbol added → Exact on that symbol (it is contained in a new-side-only hunk).
-- Whole file added → every top-level symbol is Exact-added (enum ChangeKind::Added on symbol).
-- Whole file deleted → map via base tree only, ChangeKind::Deleted.
-- Renamed file → path mapping from git rename detection; symbols matched by name/kind across
-  old/new trees when possible.
+Key properties:
+- Context lines never select a symbol and never set `signature_touch`.
+- Two disjoint edits in one Git hunk produce two independent mappings.
+- A replacement produces an old-side run (base tree) AND a new-side run (worktree tree).
+- `signature_touch` is per-target: it is set when the run's changed lines intersect the
+  target's *selection* range, not when context crosses it.
+- A hunk body with no Add/Del lines emits no mapping record.
+
+Edge cases (unchanged semantics, now driven by runs not envelopes):
+- Whole symbol added → the Add run covers it → Exact.
+- Whole file added → every top-level symbol is Exact-added (ChangeKind::Added).
+- Whole file deleted → mapped via the base tree only, ChangeKind::Deleted.
+- Hunk spanning multiple symbols (one run genuinely crosses them) → HunkSpansSymbols.
+- Renamed file → path from git rename detection; symbols matched by name/kind across trees.
 
 ## Confidence model
 

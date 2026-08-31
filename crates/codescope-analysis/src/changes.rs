@@ -120,10 +120,9 @@ pub fn changed_symbols_detailed(
 
     for m in &mapped {
         for target in &m.mapping.targets {
-            let base_mapped = matches!(
-                m.mapping.confidence,
-                MappingConfidence::Approximate(ApproxReason::DeletedHunkBaseMapped)
-            );
+            // The run's mapped revision, not its confidence, selects the tree namespace
+            // (review 20: DeletedHunkBaseMapped was an ambiguous proxy).
+            let base_mapped = m.mapping.mapped_revision == codescope_core::Revision::Base;
             if base_mapped {
                 let Some(base_tree) = base else { continue };
                 aggregate_base_target(
@@ -144,7 +143,7 @@ pub fn changed_symbols_detailed(
                     kind,
                     Some(&m.mapping.hunk),
                     m.mapping.confidence,
-                    m.signature_touch,
+                    m.signature_touches.contains(target),
                 );
             }
         }
@@ -153,15 +152,30 @@ pub fn changed_symbols_detailed(
     // Tree-diff sweep: symbols present in exactly one tree, even when no hunk mapped to
     // them directly (e.g. a new field whose hunk mapped to the enclosing struct).
     if let Some(base_keys) = &base_keys {
-        for (key, id) in ordered_keys(wt) {
-            if !base_keys.contains_key(&key) {
-                agg.record_if_absent(
-                    TreeSide::Worktree,
-                    id,
-                    ChangeKind::Added,
-                    MappingConfidence::Exact,
-                );
+        // Collect added worktree symbols, then drop a parent whose presence is implied by
+        // an added descendant (its own declaration didn't change — it just gained a
+        // child). A parent whose declaration itself was edited still maps via its hunk
+        // (record() above), so this only dedupes tree-diff noise (review 20 parent
+        // suppression).
+        let added: Vec<(SymbolKey, SymbolId)> = ordered_keys(wt)
+            .into_iter()
+            .filter(|(key, _)| !base_keys.contains_key(key))
+            .collect();
+        let added_names: Vec<&str> = added.iter().map(|((n, _), _)| n.as_str()).collect();
+        for ((name, _), id) in &added {
+            // Skip this parent when a strictly-deeper added entry nests under it.
+            let has_added_descendant = added_names
+                .iter()
+                .any(|other| *other != name.as_str() && other.starts_with(&format!("{name}.")));
+            if has_added_descendant {
+                continue;
             }
+            agg.record_if_absent(
+                TreeSide::Worktree,
+                id.clone(),
+                ChangeKind::Added,
+                MappingConfidence::Exact,
+            );
         }
         if let Some(base_tree) = base {
             for (key, id) in ordered_keys(base_tree) {
@@ -454,6 +468,11 @@ mod tests {
         }
     }
 
+    /// A modification hunk. `hunk(o, l, n, l)` models an in-place edit: the new side
+    /// carries the changed lines (`new_len` adds from `new_start`), and the old side is
+    /// present only as the header envelope. This matches how the legacy fixtures were
+    /// written (they asserted the new-side mapping). Use [`add_hunk`]/[`del_hunk`] for
+    /// pure one-sided edits.
     fn hunk(old_start: u32, old_len: u32, new_start: u32, new_len: u32) -> Hunk {
         Hunk {
             old_start,
@@ -461,8 +480,66 @@ mod tests {
             new_start,
             new_len,
             section: None,
-            lines: Vec::new(),
+            lines: body(old_start, 0, new_start, new_len),
         }
+    }
+
+    /// A pure-deletion hunk body: `old_len` deleted lines starting at `old_start` (1-based).
+    fn del_hunk(old_start: u32, old_len: u32, new_start: u32) -> Hunk {
+        Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len: 0,
+            section: None,
+            lines: body(old_start, old_len, new_start, 0),
+        }
+    }
+
+    /// Build the body: `old_len` deleted lines (old side from `old_start`) then `new_len`
+    /// added lines (new side from `new_start`). Coordinates are 1-based.
+    fn hunk_with(
+        old_start: u32,
+        old_len: u32,
+        new_start: u32,
+        new_len: u32,
+        lines: Vec<codescope_core::DiffLine>,
+    ) -> Hunk {
+        Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len,
+            section: None,
+            lines,
+        }
+    }
+
+    fn body(
+        old_start: u32,
+        old_len: u32,
+        new_start: u32,
+        new_len: u32,
+    ) -> Vec<codescope_core::DiffLine> {
+        use codescope_core::{DiffLine, DiffLineKind};
+        let mut lines = Vec::new();
+        for i in 0..old_len {
+            lines.push(DiffLine {
+                kind: DiffLineKind::Del,
+                old_ln: Some(old_start + i),
+                new_ln: None,
+                text: String::new(),
+            });
+        }
+        for i in 0..new_len {
+            lines.push(DiffLine {
+                kind: DiffLineKind::Add,
+                old_ln: None,
+                new_ln: Some(new_start + i),
+                text: String::new(),
+            });
+        }
+        lines
     }
 
     fn file_change(status: FileStatus, hunks: Vec<Hunk>) -> FileChange {
@@ -566,7 +643,7 @@ mod tests {
     #[test]
     fn pure_deletion_of_base_only_symbol_is_deleted() {
         // Old-side zero-based 33..=37 inside base Legacy (32-38); gone from worktree.
-        let change = file_change(FileStatus::Modified, vec![hunk(34, 5, 30, 0)]);
+        let change = file_change(FileStatus::Modified, vec![del_hunk(34, 5, 30)]);
         let out = changed_symbols_detailed(Some(&worktree()), Some(&base()), &change);
         let legacy = out.iter().find(|c| c.name == "Legacy").unwrap();
         assert_eq!(legacy.record.change_kind, ChangeKind::Deleted);
@@ -582,7 +659,7 @@ mod tests {
     #[test]
     fn deletion_inside_surviving_symbol_folds_into_modification() {
         // Old-side zero-based 11..=12 inside base main; main survives in the worktree.
-        let change = file_change(FileStatus::Modified, vec![hunk(12, 2, 11, 0)]);
+        let change = file_change(FileStatus::Modified, vec![del_hunk(12, 2, 11)]);
         let out = changed_symbols_detailed(Some(&worktree()), Some(&base()), &change);
         // main modified + tree-diff extras (Email/Hello added, Legacy deleted).
         assert_eq!(out.len(), 4);
@@ -646,7 +723,7 @@ mod tests {
             path: Utf8PathBuf::from("main.go"),
             old_path: None,
             status: FileStatus::Deleted,
-            hunks: vec![hunk(1, 40, 0, 0)],
+            hunks: vec![del_hunk(1, 40, 0)],
             binary: false,
         };
         let out = changed_symbols_detailed(None, Some(&base()), &change);
@@ -687,5 +764,35 @@ mod tests {
         );
         assert!(qualified_name(&wt, &SymbolId::new("9")).is_none());
         assert_eq!(find_by_id(&wt, &SymbolId::new("1/0")).unwrap().name, "Name");
+    }
+
+    /// Review 20: a symbol that appears only as hunk CONTEXT (unchanged lines around an
+    /// edit) is NOT reported as changed. This is the over-reporting fix: the mapper maps
+    /// changed-line runs, never the context-bearing hunk envelope.
+    #[test]
+    fn context_only_symbol_is_not_reported() {
+        // Worktree + base both have main (5-15) and Helper (20-25). The edit adds one line
+        // inside main (new 10); Helper appears only as the hunk's trailing context.
+        let change = file_change(
+            FileStatus::Modified,
+            vec![hunk_with(
+                10,
+                5,
+                10,
+                6,
+                vec![
+                    codescope_core::DiffLine::add(10, ""),
+                    codescope_core::DiffLine::context(11, 11, ""),
+                    codescope_core::DiffLine::context(12, 12, ""),
+                ],
+            )],
+        );
+        let out = changed_symbols_detailed(Some(&worktree()), Some(&base()), &change);
+        let names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"main"), "the edited symbol is reported");
+        assert!(
+            !names.contains(&"Helper"),
+            "a context-only symbol is NOT reported: {names:?}"
+        );
     }
 }
