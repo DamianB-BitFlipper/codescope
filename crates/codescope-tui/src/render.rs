@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Pa
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{filter_candidates, App, Pane};
+use crate::app::{filter_candidates, App, BottomView, Pane};
 use crate::elide;
 use crate::intraline;
 use crate::layout::{choose_tier, files_width, Tier, IMPACT_HEIGHT, MIN_DIFF_WIDTH};
@@ -365,8 +365,16 @@ fn summary_text(app: &App, snap: &UiSnapshot, width: usize) -> String {
     let diff_file = snap.files.iter().find(|f| f.path == diff_path);
 
     let file_phrase = diff_file.map(|f| {
-        let count = f.changed_symbol_count;
-        let sym = if count == 1 { "1 symbol".to_string() } else { format!("{count} symbols") };
+        // The symbol count is real only once the file's lazy analysis landed; an
+        // unanalyzed file must not claim `0 symbols`.
+        let sym = match f.semantic {
+            crate::snapshot::FileSemanticLoad::Ready => {
+                let count = f.changed_symbol_count;
+                if count == 1 { "1 symbol".to_string() } else { format!("{count} symbols") }
+            }
+            crate::snapshot::FileSemanticLoad::Loading => "analyzing…".to_string(),
+            _ => "symbols not analyzed".to_string(),
+        };
         format!("{sym} in {}", basename(&f.path))
     });
 
@@ -480,13 +488,43 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
             f, &display[fi], count, count_width, path_budget, inner_w, active, bg,
         )));
         if f.expanded {
-            for s in &f.symbols {
-                let active = flat == app.file_sel;
-                if active {
-                    active_flat = Some(items.len());
+            // Symbol rows, or the per-state placeholder: analysis in flight / not owned /
+            // failed / analyzed-but-no-symbols. Never a misleading empty block.
+            match f.semantic {
+                crate::snapshot::FileSemanticLoad::Loading => {
+                    flat += 1;
+                    items.push(ListItem::new(semantic_note_line(
+                        "… analyzing symbols", inner_w,
+                    )));
                 }
-                flat += 1;
-                items.push(ListItem::new(symbol_row_line(s, active, inner_w)));
+                crate::snapshot::FileSemanticLoad::Unsupported => {
+                    flat += 1;
+                    items.push(ListItem::new(semantic_note_line(
+                        "semantic analysis unavailable", inner_w,
+                    )));
+                }
+                crate::snapshot::FileSemanticLoad::Failed => {
+                    flat += 1;
+                    items.push(ListItem::new(semantic_note_line(
+                        "analysis failed — Tab to retry", inner_w,
+                    )));
+                }
+                crate::snapshot::FileSemanticLoad::Ready if f.symbols.is_empty() => {
+                    flat += 1;
+                    items.push(ListItem::new(semantic_note_line(
+                        "no changed symbols mapped", inner_w,
+                    )));
+                }
+                _ => {
+                    for s in &f.symbols {
+                        let active = flat == app.file_sel;
+                        if active {
+                            active_flat = Some(items.len());
+                        }
+                        flat += 1;
+                        items.push(ListItem::new(symbol_row_line(s, active, inner_w)));
+                    }
+                }
             }
         }
     }
@@ -545,12 +583,36 @@ fn file_row_line(
         Span::styled(dirs, Style::new().fg(MUTED).bg(bg)),
         Span::styled(base, basename_style),
         Span::styled(" ".repeat(pad), base_style),
+        // The count is only meaningful once analysis landed: Unloaded shows `…`
+        // (unknown, not zero), Loading shows the pending marker.
         Span::styled(
-            format!("{count:>count_width$}"),
+            match f.semantic {
+                crate::snapshot::FileSemanticLoad::Ready => {
+                    format!("{count:>count_width$}")
+                }
+                crate::snapshot::FileSemanticLoad::Loading => {
+                    format!("{:>count_width$}", "…")
+                }
+                _ => " ".repeat(count_width),
+            },
             Style::new().fg(MUTED).bg(bg),
         ),
         Span::styled(" ".repeat(trailing), base_style),
     ])
+}
+
+/// An indented muted note row under an expanded file (loading / unsupported / failed /
+/// analyzed-but-empty states; never selectable).
+fn semantic_note_line(text: &str, inner_w: usize) -> Line<'static> {
+    let mut line = Line::from(vec![
+        Span::raw("      "),
+        Span::styled(text.to_string(), Style::new().fg(MUTED)),
+    ]);
+    let w = 6 + text.len();
+    if w < inner_w {
+        line.push_span(Span::raw(" ".repeat(inner_w - w)));
+    }
+    line
 }
 
 /// Split a display path into its directory prefix (with trailing `/`) and basename.
@@ -1065,40 +1127,174 @@ fn is_soft_break(g: &str) -> bool {
         .any(|c| c.is_whitespace() || c.is_ascii_punctuation())
 }
 
-// -- impact pane (docs/review/15 §3.5) ---------------------------------------------
+// -- bottom pane: Impact | AI Plan (docs/review/15 §3.5, docs/review/16) -------------
 //
-// The renderer reads `snap.impact` (spec §4), published by the dispatcher. The pane
-// never reaches into `snap.semantic` directly.
+// The bottom pane is tabbed (`v`): the deterministic Impact view reads `snap.impact`
+// (spec §4), the AI plan view reads the validated plan the dispatcher publishes in
+// `snap.semantic` (only ever rendered when `ai_generated`).
 
-/// The full-width Impact pane: one bordered block, three inner columns (40/30/30) with
-/// right-border dividers on the first two. Headers are the first interior row of each
-/// column: `SELECTED CHANGE`, `CALLERS · {N|…}`, `DOWNSTREAM · {N|…}`.
+/// The full-width bottom pane: one bordered block whose title is the `Impact | AI Plan`
+/// tab strip (the active tab is ACCENT+BOLD, the inactive MUTED; `AI Plan …` while a
+/// request is in flight). The body is the active tab's view.
 fn render_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let focused = app.focused == Pane::Impact;
-    let impact = &snap.impact;
-    let block = pane_block(
-        Line::from(Span::styled(
-            format!(" Impact{} ", zoom_tag(app, Pane::Impact)),
-            Style::new().fg(TEXT),
-        )),
-        None,
-        focused,
-    );
+    let block = pane_block(bottom_tab_title(app, snap), None, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 6 || inner.height == 0 {
         return;
     }
+    match app.bottom_view {
+        BottomView::Impact => render_impact_body(frame, inner, snap),
+        BottomView::AiPlan => render_ai_plan(frame, inner, app, snap),
+    }
+}
+
+/// The ` Impact | AI Plan ` tab strip: the active tab is ACCENT+BOLD, the inactive
+/// MUTED, separated by a MUTED ` | `. While `snap.ai` is Loading the AI tab gains a
+/// WARN `…` suffix — the label itself keeps its active/inactive style, so the active
+/// tab never loses its cue. The zoom tag trails, as before.
+fn bottom_tab_title(app: &App, snap: &UiSnapshot) -> Line<'static> {
+    let loading = matches!(snap.ai, AiStatus::Loading { .. });
+    let active = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let inactive = Style::new().fg(MUTED);
+    let (impact_style, ai_style) = match app.bottom_view {
+        BottomView::Impact => (active, inactive),
+        BottomView::AiPlan => (inactive, active),
+    };
+    let mut spans = vec![
+        Span::styled(" Impact", impact_style),
+        Span::styled(" | ", Style::new().fg(MUTED)),
+        Span::styled("AI Plan", ai_style),
+    ];
+    if loading {
+        spans.push(Span::styled(" …", Style::new().fg(WARN)));
+    }
+    spans.push(Span::styled(
+        format!("{} ", zoom_tag(app, Pane::Impact)),
+        Style::new().fg(TEXT),
+    ));
+    Line::from(spans)
+}
+
+/// The Impact body: three inner columns (40/30/30) with right-border dividers on the
+/// first two. Headers are the first interior row of each column: `SELECTED CHANGE`,
+/// `CALLERS · {N|…}`, `DOWNSTREAM · {N|…}`.
+fn render_impact_body(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
+    let impact = &snap.impact;
     let cols = Layout::horizontal([
         Constraint::Percentage(40),
         Constraint::Percentage(30),
         Constraint::Percentage(30),
     ])
-    .split(inner);
+    .split(area);
 
     render_selected_change(frame, cols[0], impact);
     render_impact_list(frame, cols[1], "CALLERS", &impact.callers, true);
     render_impact_list(frame, cols[2], "DOWNSTREAM", &impact.downstream, false);
+}
+
+/// The AI plan body: the semantic pane's title row (MUTED+BOLD header + a MUTED ` AI`
+/// badge, with the pane note appended when present), then one indented row per
+/// [`crate::snapshot::SemRow`], scrolled by `app.ai_plan_scroll`. A validated plan with
+/// no rows — or a stale/unavailable one — renders a single MUTED explanation instead,
+/// chosen by AI state so a deterministic pane's note never poses as an AI message.
+fn render_ai_plan(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
+    let sem = &snap.semantic;
+    // No renderable plan: a validated plan that came back empty, or no current plan at
+    // all. Order by AI state; the pane note is only trusted for Failed/stale plans (a
+    // non-AI pane's note never speaks for the AI tab).
+    if !sem.ai_generated || sem.rows.is_empty() {
+        let msg = if sem.ai_generated {
+            // (rows.is_empty(), per the guard above): the plan validated but had nothing
+            // renderable.
+            "AI returned no renderable rows".to_string()
+        } else if matches!(snap.ai, AiStatus::Loading { .. }) {
+            "generating AI plan…".to_string()
+        } else if matches!(snap.ai, AiStatus::Disabled | AiStatus::Idle) {
+            "AI plan unavailable".to_string()
+        } else if matches!(snap.ai, AiStatus::Failed { .. }) {
+            if sem.note.is_empty() {
+                "AI request failed — see status bar".to_string()
+            } else {
+                sem.note.clone()
+            }
+        } else if !sem.note.is_empty() {
+            // Stale plan (Stale status, or a Ready/Loading tagged with an old epoch).
+            sem.note.clone()
+        } else {
+            "AI plan unavailable".to_string()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(msg, Style::new().fg(MUTED)))),
+            area,
+        );
+        return;
+    }
+
+    // Width budget: the ` AI` badge always survives; the title takes what remains, and
+    // the note what is left after that.
+    let width = usize::from(area.width);
+    let title = truncate_cells(&sem.title, width.saturating_sub(3));
+    let mut header = header_line(&title);
+    header.push_span(Span::styled(" AI", Style::new().fg(MUTED)));
+    if !sem.note.is_empty() {
+        let note_budget = width.saturating_sub(header.width() + 2);
+        if note_budget > 0 {
+            header.push_span(Span::styled(
+                format!("  {}", truncate_cells(&sem.note, note_budget)),
+                Style::new().fg(MUTED),
+            ));
+        }
+    }
+    let mut lines: Vec<Line> = vec![header];
+
+    // Rows under the header, windowed by the scroll offset; the last visible row is a
+    // `… +N more` marker when the window does not reach the end.
+    let avail = (area.height as usize).saturating_sub(1);
+    let total = sem.rows.len();
+    let start = app.ai_plan_scroll.min(total);
+    let end = if total - start > avail && avail > 0 {
+        start + avail - 1
+    } else {
+        (start + avail).min(total)
+    };
+    for r in &sem.rows[start..end] {
+        let label_style = if r.changed {
+            Style::new().fg(WARN)
+        } else {
+            Style::new().fg(TEXT)
+        };
+        // Budget the row: indentation is capped, the relation suffix and the
+        // diagnostic ` !` are reserved, and the label is truncated into what remains —
+        // a model-controlled label can never push the suffixes off the row.
+        let indent = (usize::from(r.depth) * 2).min(8);
+        let suffix = match (r.relation.is_empty(), r.has_diagnostic) {
+            (false, false) => UnicodeWidthStr::width(r.relation) + 1,
+            (false, true) => UnicodeWidthStr::width(r.relation) + 1 + 2,
+            (true, true) => 2,
+            (true, false) => 0,
+        };
+        let label = truncate_cells(&r.label, width.saturating_sub(indent + suffix));
+        let mut spans = vec![Span::raw(" ".repeat(indent)), Span::styled(label, label_style)];
+        if !r.relation.is_empty() {
+            spans.push(Span::styled(
+                format!(" {}", r.relation),
+                Style::new().fg(MUTED),
+            ));
+        }
+        if r.has_diagnostic {
+            spans.push(Span::styled(" !", Style::new().fg(ERROR)));
+        }
+        lines.push(Line::from(spans));
+    }
+    if end < total {
+        lines.push(Line::from(Span::styled(
+            format!("… +{} more", total - end),
+            Style::new().fg(MUTED),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// The SELECTED CHANGE column: header, then the symbol label (ACCENT+BOLD) + badge, one
@@ -1249,28 +1445,31 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot
 }
 
 /// The compact help row: styled spans (keys TEXT, separators/explanations MUTED). The
-/// full layout at width >= 96; resize is dropped first at 64..=95; the minimal set at
-/// 30..=63. The help modal holds the rest.
+/// full layout at width >= 96; resize and the impact/AI toggle are dropped first at
+/// 64..=95; the minimal set at 30..=63. The help modal holds the rest.
 fn render_help_bar(frame: &mut Frame, area: Rect) {
     let groups: &[(&str, &str)] = if area.width >= 96 {
         &[
-            ("Tab", "pane"),
+            ("Tab", "analyze"),
+            ("1-3", "pane"),
             ("z", "zoom"),
             ("W", "wrap"),
             ("n/N", "hunk"),
             ("[/]", "resize"),
+            ("v", "impact/AI"),
             ("?", "help"),
         ]
     } else if area.width >= 64 {
         &[
-            ("Tab", "pane"),
+            ("Tab", "analyze"),
+            ("1-3", "pane"),
             ("z", "zoom"),
             ("W", "wrap"),
             ("n/N", "hunk"),
             ("?", "help"),
         ]
     } else {
-        &[("Tab", ""), ("z", ""), ("W", ""), ("n/N", ""), ("?", "")]
+        &[("Tab", ""), ("1-3", ""), ("z", ""), ("W", ""), ("n/N", ""), ("?", "")]
     };
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (key, label)) in groups.iter().enumerate() {
@@ -1301,7 +1500,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("  q / Ctrl-C      quit"),
         Line::from("  ? / Esc         this help / close"),
-        Line::from("  Tab / 1 2 3     focus files / diff / impact"),
+        Line::from("  Tab             expand file + analyze symbols / collapse"),
+        Line::from("  1 / 2 / 3       focus files / diff / impact"),
         Line::from("  j/k · ↑/↓       move selection · scroll"),
         Line::from("  Ctrl-d/u · Pg   half / full page in diff"),
         Line::from("  s / u / B / w   staged / unstaged / branch / working scope"),
@@ -1312,6 +1512,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  [ / ]           resize the files pane"),
         Line::from("  n / N           next / previous diff hunk"),
         Line::from("  z               zoom the focused pane (Tab still switches)"),
+        Line::from("  v               toggle impact / AI plan"),
         Line::from("  W / 0           diff: toggle wrap / reset horizontal scroll"),
         Line::from("  R               rescan git"),
         Line::from("  a / A           AI toggle / refresh"),
@@ -1524,6 +1725,7 @@ mod tests {
             status: "M",
             expanded: true,
             changed_symbol_count: 1,
+            semantic: crate::snapshot::FileSemanticLoad::Ready,
             symbols: vec![SymbolRow {
                 name: "GetDisplayName".to_string(),
                 change: "modified",
@@ -1605,12 +1807,12 @@ mod tests {
             t.draw(|f| render(f, &app, &snap)).unwrap();
             assert!(buffer_text(&t).contains("Changed files"), "{w}x{h} files first");
             assert!(!buffer_text(&t).contains("func (s *UserService)"), "{w}x{h} no diff yet");
-            app.apply(crate::action::Action::FocusNext);
+            app.apply(crate::action::Action::Focus(crate::app::Pane::Diff));
             t.draw(|f| render(f, &app, &snap)).unwrap();
-            assert!(buffer_text(&t).contains("func (s *UserService)"), "{w}x{h} diff after Tab");
-            app.apply(crate::action::Action::FocusNext);
+            assert!(buffer_text(&t).contains("func (s *UserService)"), "{w}x{h} diff after focus");
+            app.apply(crate::action::Action::Focus(crate::app::Pane::Impact));
             t.draw(|f| render(f, &app, &snap)).unwrap();
-            assert!(buffer_text(&t).contains("SELECTED CHANGE"), "{w}x{h} impact after Tab");
+            assert!(buffer_text(&t).contains("SELECTED CHANGE"), "{w}x{h} impact after focus");
         }
     }
 
@@ -1737,6 +1939,7 @@ mod tests {
             status: "A",
             expanded: false,
             changed_symbol_count: 0,
+            semantic: crate::snapshot::FileSemanticLoad::Ready,
             symbols: vec![],
         });
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
@@ -2023,6 +2226,240 @@ mod tests {
         assert!(text.contains("select a changed file or symbol"), "guidance: {text}");
     }
 
+    // -- bottom pane: AI Plan tab (docs/review/16) ----------------------------------------
+
+    /// A snapshot whose semantic pane carries a validated, epoch-matched AI plan.
+    fn ai_plan_snap(rows: usize) -> UiSnapshot {
+        let mut snap = sample();
+        snap.epoch = codescope_core::Epoch(3);
+        snap.ai = AiStatus::Ready {
+            epoch: codescope_core::Epoch(3),
+        };
+        snap.semantic = crate::snapshot::SemanticPane {
+            title: "plan: auth refactor".to_string(),
+            rows: (0..rows)
+                .map(|i| crate::snapshot::SemRow {
+                    depth: (i % 3) as u16,
+                    label: format!("PlanStep{i}"),
+                    relation: "calls",
+                    changed: i % 2 == 0,
+                    has_diagnostic: i == 1,
+                })
+                .collect(),
+            note: String::new(),
+            ai_generated: true,
+        };
+        snap
+    }
+
+    /// Drive the Loading → Ready edge so the app auto-switches to the AI plan.
+    fn app_after_ai_landed(plan: &UiSnapshot) -> App {
+        let mut app = App::new();
+        let mut loading = sample();
+        loading.epoch = codescope_core::Epoch(3);
+        loading.ai = AiStatus::Loading {
+            since_epoch: codescope_core::Epoch(3),
+        };
+        app.update(loading);
+        app.update(plan.clone());
+        app
+    }
+
+    #[test]
+    fn ai_plan_renders_rows_badge_and_title_after_loading_to_ready() {
+        let plan = ai_plan_snap(3);
+        let app = app_after_ai_landed(&plan);
+        assert_eq!(app.bottom_view, crate::app::BottomView::AiPlan);
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        // Tab strip on the block's top border.
+        assert!(
+            row_text(&t, 29).contains("Impact | AI Plan"),
+            "tab strip: {}",
+            row_text(&t, 29)
+        );
+        // Header row: semantic title + the MUTED AI badge.
+        let header = row_text(&t, 30);
+        assert!(
+            header.contains("plan: auth refactor"),
+            "plan title: {header}"
+        );
+        assert!(
+            header.contains("plan: auth refactor AI"),
+            "AI badge: {header}"
+        );
+        // Rows: depth-indented labels with relations; the diagnostic row shows ` !`.
+        let (r0, r1, r2) = (row_text(&t, 31), row_text(&t, 32), row_text(&t, 33));
+        assert!(r0.contains("PlanStep0 calls"), "row 0: {r0}");
+        assert!(r1.contains("  PlanStep1 calls !"), "row 1: {r1}");
+        assert!(r2.contains("    PlanStep2 calls"), "row 2: {r2}");
+        // The deterministic columns are NOT drawn in the AI plan view.
+        let body: String = (30..37).map(|y| row_text(&t, y)).collect();
+        assert!(!body.contains("SELECTED CHANGE"), "impact replaced: {body}");
+    }
+
+    #[test]
+    fn tab_strip_marks_the_active_tab() {
+        let plan = ai_plan_snap(2);
+        let mut app = App::new();
+        app.update(plan.clone()); // no Loading edge: stays on Impact
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let row = row_text(&t, 29);
+        let xi = row.find("Impact").unwrap() as u16;
+        let xa = row.find("AI Plan").unwrap() as u16;
+        assert_eq!(cell(&t, xi, 29).1, ACCENT, "Impact active");
+        assert!(cell(&t, xi, 29).3.contains(Modifier::BOLD));
+        assert_eq!(cell(&t, xa, 29).1, MUTED, "AI Plan inactive");
+        app.apply(crate::action::Action::ToggleBottomView);
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let row = row_text(&t, 29);
+        let xi = row.find("Impact").unwrap() as u16;
+        let xa = row.find("AI Plan").unwrap() as u16;
+        assert_eq!(cell(&t, xi, 29).1, MUTED, "Impact inactive");
+        assert_eq!(cell(&t, xa, 29).1, ACCENT, "AI Plan active");
+        assert!(cell(&t, xa, 29).3.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn ai_tab_shows_ellipsis_while_loading() {
+        let mut snap = sample();
+        snap.ai = AiStatus::Loading {
+            since_epoch: codescope_core::Epoch(3),
+        };
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &App::new(), &snap)).unwrap();
+        assert!(
+            row_text(&t, 29).contains("AI Plan …"),
+            "loading tab: {}",
+            row_text(&t, 29)
+        );
+    }
+
+    #[test]
+    fn ai_plan_view_explains_empty_or_unavailable_states() {
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        // A validated-but-empty plan: nothing to scroll, say so.
+        let mut app = App::new();
+        let empty = ai_plan_snap(0);
+        app.update(empty.clone());
+        app.apply(crate::action::Action::ToggleBottomView);
+        t.draw(|f| render(f, &app, &empty)).unwrap();
+        assert!(
+            row_text(&t, 30).contains("AI returned no renderable rows"),
+            "empty plan: {}",
+            row_text(&t, 30)
+        );
+        // AI off: unavailable. (update() flips the view back; toggle after it.)
+        let mut snap = sample(); // ai: Disabled, semantic: default
+        let mut app = App::new();
+        app.update(snap.clone());
+        app.apply(crate::action::Action::ToggleBottomView);
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        assert!(
+            row_text(&t, 30).contains("AI plan unavailable"),
+            "disabled: {}",
+            row_text(&t, 30)
+        );
+        // A stale publish carries the dispatcher's note.
+        snap.ai = AiStatus::Stale {
+            epoch: codescope_core::Epoch(2),
+        };
+        snap.semantic.note = "AI view stale (repo changed); regenerating…".to_string();
+        let mut app = App::new();
+        app.update(snap.clone());
+        app.apply(crate::action::Action::ToggleBottomView);
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        assert!(
+            row_text(&t, 30).contains("AI view stale (repo changed)"),
+            "stale note: {}",
+            row_text(&t, 30)
+        );
+    }
+
+    #[test]
+    fn ai_plan_scrolls_with_a_truncation_marker() {
+        let plan = ai_plan_snap(8);
+        let app = app_after_ai_landed(&plan);
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        // Inner height 7: header + 5 rows + the marker (8 rows total).
+        let (r5, r6) = (row_text(&t, 35), row_text(&t, 36));
+        assert!(r5.contains("PlanStep4"), "fifth row: {r5}");
+        assert!(r6.contains("… +3 more"), "truncation marker: {r6}");
+        // Scrolling down moves the window; the end needs no marker.
+        let mut app = app_after_ai_landed(&plan);
+        app.apply(crate::action::Action::Focus(Pane::Impact));
+        for _ in 0..3 {
+            app.apply(crate::action::Action::Down);
+        }
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let (r0, r4) = (row_text(&t, 31), row_text(&t, 35));
+        assert!(r0.contains("PlanStep3"), "scrolled: {r0}");
+        assert!(r4.contains("PlanStep7"), "last row: {r4}");
+        let body: String = (31..37).map(|y| row_text(&t, y)).collect();
+        assert!(!body.contains("more"), "no marker at the end: {body}");
+    }
+
+    #[test]
+    fn zoomed_ai_plan_renders_rows_full_area() {
+        let plan = ai_plan_snap(3);
+        let mut app = app_after_ai_landed(&plan);
+        app.apply(crate::action::Action::Focus(Pane::Impact));
+        app.apply(crate::action::Action::ToggleZoom);
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("Impact | AI Plan"), "tabs in zoom: {text}");
+        assert!(text.contains("· ZOOM"), "zoom tag: {text}");
+        assert!(text.contains("PlanStep0"), "rows in zoom: {text}");
+    }
+
+    #[test]
+    fn ai_plan_renders_at_narrow_sizes_without_panic() {
+        let plan = ai_plan_snap(3);
+        // 90x20: normal tier, bottom pane visible.
+        let app = app_after_ai_landed(&plan);
+        let mut t = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        assert!(buffer_text(&t).contains("PlanStep0"), "90x20 rows");
+        // 30x8: focus-only minimum with the bottom pane focused.
+        let mut app = app_after_ai_landed(&plan);
+        app.apply(crate::action::Action::Focus(Pane::Impact));
+        let mut t = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        // 79x40: focus-only fallback also goes through the tabbed dispatcher.
+        let mut app = app_after_ai_landed(&plan);
+        app.apply(crate::action::Action::Focus(Pane::Impact));
+        let mut t = Terminal::new(TestBackend::new(79, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("Impact | AI Plan"), "79x40 tabs: {text}");
+        assert!(text.contains("PlanStep0"), "79x40 rows: {text}");
+    }
+
+    #[test]
+    fn impact_view_still_renders_the_three_columns() {
+        let mut snap = sample();
+        snap.impact = impact_sample();
+        snap.ai = AiStatus::Ready {
+            epoch: codescope_core::Epoch(3),
+        };
+        snap.semantic = ai_plan_snap(3).semantic; // a plan exists but Impact is the view
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &App::new(), &snap)).unwrap();
+        let header_row = row_text(&t, 30);
+        assert!(header_row.contains("SELECTED CHANGE"), "{header_row}");
+        assert!(header_row.contains("CALLERS ·"), "{header_row}");
+        assert!(header_row.contains("DOWNSTREAM ·"), "{header_row}");
+        let tabs = row_text(&t, 29);
+        assert!(tabs.contains("Impact | AI Plan"), "tabs: {tabs}");
+        assert!(
+            !row_text(&t, 31).contains("PlanStep0"),
+            "plan hidden in Impact view"
+        );
+    }
+
     // -- §3.6 / §3.7: status + help bars ------------------------------------------------
 
     #[test]
@@ -2152,5 +2589,82 @@ mod tests {
         assert!(text.contains("filter: main"), "query footer: {text}");
         assert!(text.contains("origin/main"), "matching entry listed");
         assert!(!text.contains("develop"), "non-matching entry filtered: {text}");
+    }
+
+    /// The files pane renders each semantic load state distinctly (lazy per-file
+    /// analysis): Unloaded shows no fake zero, Loading shows the analyzing marker,
+    /// Unsupported/Failed explain themselves, Ready-with-zero says so explicitly.
+    #[test]
+    fn files_pane_semantic_states_render_distinctly() {
+        use crate::snapshot::FileSemanticLoad as L;
+        let mut snap = sample();
+        let mk = |path: &str, expanded: bool, semantic: L, symbols: Vec<SymbolRow>| FileRow {
+            path: path.to_string(),
+            status: "M",
+            changed_symbol_count: symbols.len(),
+            symbols,
+            expanded,
+            semantic,
+        };
+        let sym = SymbolRow {
+            name: "Handle".to_string(),
+            change: "modified",
+            confidence: "",
+            has_diagnostic: false,
+            position: Some((10, 4)),
+        };
+        snap.files = vec![
+            mk("a_unloaded.go", false, L::Unloaded, vec![]),
+            mk("b_loading.go", true, L::Loading, vec![]),
+            mk("c_unsupported.go", true, L::Unsupported, vec![]),
+            mk("d_failed.go", true, L::Failed, vec![]),
+            mk("e_empty.go", true, L::Ready, vec![]),
+            mk("f_ready.go", true, L::Ready, vec![sym]),
+        ];
+        let app = app_with(&snap);
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("… analyzing symbols"), "loading row: {text:?}");
+        assert!(text.contains("semantic analysis unavailable"), "unsupported: {text:?}");
+        assert!(text.contains("analysis failed — Tab to retry"), "failed: {text:?}");
+        assert!(text.contains("no changed symbols mapped"), "ready-empty: {text:?}");
+        assert!(text.contains("Handle"), "ready symbols: {text:?}");
+        // The unloaded row must not claim `0` symbols (unknown): find its pane row and
+        // assert the count cell (right-aligned before the border) is blank, not a digit.
+        let buf = t.backend().buffer();
+        let a_y = (0..40u16)
+            .find(|&y| {
+                (0..42u16)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+                    .contains("a_unloaded.go")
+            })
+            .expect("a_unloaded row rendered");
+        let count_cell = buf.cell((38, a_y)).unwrap().symbol();
+        assert!(
+            count_cell.trim().is_empty() || count_cell == "…",
+            "no fake zero on unloaded (count cell: {count_cell:?})"
+        );
+    }
+
+    /// Tab on the files pane flips the selected file's expansion optimistically (the
+    /// dispatcher reconciles); on other panes it is inert. `1`/`2`/`3` focus panes.
+    #[test]
+    fn tab_toggles_the_selected_file_not_pane_focus() {
+        let mut app = app_with(&sample());
+        assert_eq!(app.focused, Pane::Files);
+        let before = app.focused;
+        app.apply(crate::action::Action::ToggleFileAnalysis);
+        assert_eq!(app.focused, before, "Tab never changes focus");
+        // The selected file flipped expansion.
+        assert!(!app.snapshot.files[0].expanded, "toggled off");
+        app.apply(crate::action::Action::ToggleFileAnalysis);
+        assert!(app.snapshot.files[0].expanded, "toggled back on");
+        // Inert on the diff pane.
+        app.apply(crate::action::Action::Focus(Pane::Diff));
+        let expanded = app.snapshot.files[0].expanded;
+        app.apply(crate::action::Action::ToggleFileAnalysis);
+        assert_eq!(app.snapshot.files[0].expanded, expanded, "inert off-files");
     }
 }

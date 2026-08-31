@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch};
 use codescope_core::ChangeScope;
 
 use crate::action::{map_key, Action};
-use crate::app::App;
+use crate::app::{App, Pane};
 use crate::render::render;
 use crate::snapshot::UiSnapshot;
 
@@ -198,6 +198,21 @@ async fn dispatch(
         }
         Action::RefreshGit | Action::AiToggle | Action::AiRefresh => {
             let _ = tx.send(action).await;
+        }
+        Action::ToggleFileAnalysis => {
+            // Optimistic local flip (responsive collapse/expand), then the dispatcher
+            // reconciles: it owns expansion + the lazy analysis job.
+            app.apply(Action::ToggleFileAnalysis);
+            let _ = tx.send(Action::ToggleFileAnalysis).await;
+        }
+        // Space/h/l are expansion aliases that must not bypass the lazy analysis path:
+        // an Unloaded row cannot be expanded without the dispatcher dispatching the job,
+        // so they route through the same toggle (which forwards to the dispatcher).
+        Action::ToggleExpand | Action::Collapse | Action::Expand
+            if app.focused == Pane::Files =>
+        {
+            app.apply(Action::ToggleFileAnalysis);
+            let _ = tx.send(Action::ToggleFileAnalysis).await;
         }
         Action::ModelPicker => {
             // Toggle locally, and ask the dispatcher to fetch the model list on open.
@@ -422,6 +437,7 @@ mod tests {
                     changed_symbol_count: 2,
                     symbols: vec![symbol("sym0", Some((10, 4))), symbol("sym1", Some((20, 4)))],
                     expanded: true,
+                    semantic: Default::default(),
                 },
                 FileRow {
                     path: "b.go".to_string(),
@@ -429,6 +445,7 @@ mod tests {
                     changed_symbol_count: 0,
                     symbols: Vec::new(),
                     expanded: false,
+                    semantic: Default::default(),
                 },
             ],
             ..UiSnapshot::default()
@@ -536,6 +553,7 @@ mod tests {
                 path: "a.go".to_string(),
                 status: "M",
                 changed_symbol_count: 2,
+                semantic: crate::snapshot::FileSemanticLoad::Ready,
                 symbols: vec![
                     SymbolRow {
                         name: "sym0".to_string(),

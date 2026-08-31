@@ -43,6 +43,23 @@ pub struct FileAnalysis {
     pub notes: Vec<String>,
 }
 
+/// The lazy per-file analysis result the interactive dispatcher caches. Cheap to hold
+/// per file; the eager [`AnalysisSnapshot`] still aggregates [`FileAnalysis`] records.
+#[derive(Debug, Clone)]
+pub struct FileSemanticResult {
+    /// Repo-relative path (the change's current path).
+    pub file: FileId,
+    /// The underlying per-file analysis (trees, mappings, notes).
+    pub analysis: FileAnalysis,
+    /// Changed symbols mapped from the hunks against the worktree/base trees.
+    pub changed: Vec<ChangedSymbolInfo>,
+    /// Diagnostics touching this file (empty when the file has no worktree tree).
+    pub diagnostics: Vec<Diagnostic>,
+    /// The language service does not own this file (binary, gitlink, unowned language):
+    /// semantic analysis will never produce symbols for it.
+    pub unsupported: bool,
+}
+
 /// One epoch-tagged analysis result for a change-set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnalysisSnapshot {
@@ -196,6 +213,45 @@ impl<S: SemanticSource> AnalysisEngine<S> {
             changed,
             graph,
             diagnostics,
+        })
+    }
+
+    /// Analyze one changed file: document symbols, base overlay, hunk mappings, and
+    /// diagnostics for just that file. This is the lazy path the interactive TUI uses —
+    /// the eager [`refresh_with_ctx`](Self::refresh_with_ctx) loops this per changed file
+    /// and additionally builds the cross-file impact graph.
+    pub async fn analyze_changed_file(
+        &self,
+        fc: &FileChange,
+        scope: ChangeScope,
+        repo_ctx: &RepoContext,
+    ) -> Result<FileSemanticResult, AnalysisError> {
+        let base_spec = base_revspec(scope, repo_ctx);
+        let analysis = self.analyse_file(fc, base_spec.as_deref()).await?;
+        let diagnostics = if analysis.worktree.is_some() {
+            self.svc.diagnostics(&analysis.file)
+        } else {
+            Vec::new()
+        };
+        let changed = changed_symbols_detailed(
+            analysis.worktree.as_ref(),
+            analysis.base.as_ref(),
+            fc,
+        );
+        // A file the language service does not own (binary, gitlink, unowned language)
+        // reports no worktree tree and a note; surface that as `unsupported` so the UI
+        // can say so instead of pretending analysis is still pending.
+        let unsupported = analysis.worktree.is_none()
+            && analysis
+                .notes
+                .iter()
+                .any(|n| n.contains("skipped semantic analysis") || n.contains("not owned by the language service"));
+        Ok(FileSemanticResult {
+            file: analysis.file.clone(),
+            analysis,
+            changed,
+            diagnostics,
+            unsupported,
         })
     }
 

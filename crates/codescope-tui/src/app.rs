@@ -1,7 +1,7 @@
 //! Application state and pure `Action` transitions. No I/O — the run loop feeds it
 //! [`UiSnapshot`]s and [`Action`]s; rendering reads it.
 
-use codescope_core::ChangeScope;
+use codescope_core::{AiStatus, ChangeScope};
 
 use crate::action::{next_scope, Action};
 use crate::layout::DEFAULT_FILES_WIDTH;
@@ -20,22 +20,14 @@ pub enum Pane {
     Impact,
 }
 
-impl Pane {
-    fn next(self) -> Self {
-        match self {
-            Pane::Files => Pane::Diff,
-            Pane::Diff => Pane::Impact,
-            Pane::Impact => Pane::Files,
-        }
-    }
-
-    fn prev(self) -> Self {
-        match self {
-            Pane::Files => Pane::Impact,
-            Pane::Diff => Pane::Files,
-            Pane::Impact => Pane::Diff,
-        }
-    }
+/// Which view the bottom pane shows (`v` toggles, docs/review/16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BottomView {
+    /// The deterministic three-column impact view (selected change, callers, downstream).
+    #[default]
+    Impact,
+    /// The validated AI plan published in [`UiSnapshot::semantic`].
+    AiPlan,
 }
 
 /// View-state for the running app.
@@ -61,6 +53,18 @@ pub struct App {
     pub files_width: u16,
     /// Whether the focused pane is zoomed to fill the whole body (`z`).
     pub zoomed: bool,
+    /// Which view the bottom pane renders (`v`): the deterministic Impact columns or the
+    /// validated AI plan.
+    pub bottom_view: BottomView,
+    /// Vertical scroll offset of the AI plan rows (only meaningful in
+    /// [`BottomView::AiPlan`]).
+    pub ai_plan_scroll: usize,
+    /// Edge-detection for the one-shot AI auto-switch: the `since_epoch` of the last
+    /// `Loading` snapshot consumed by [`App::update`]. Keeping the request's epoch (not
+    /// a bare boolean) means only the Ready that answers THAT request for the CURRENT
+    /// repo state can fire the switch — a coalesced/replayed Ready for another epoch
+    /// never does.
+    prev_ai_loading_epoch: Option<codescope_core::Epoch>,
     /// Whether the diff pane smart-wraps long lines (`W`); off = raw clip + h-scroll.
     /// The reference mode is raw (`wrap off`), docs/review/15 §3.4.
     pub diff_wrap: bool,
@@ -102,6 +106,9 @@ impl Default for App {
             should_quit: false,
             zoomed: false,
             diff_wrap: false,
+            bottom_view: BottomView::default(),
+            ai_plan_scroll: 0,
+            prev_ai_loading_epoch: None,
         }
     }
 }
@@ -128,8 +135,57 @@ impl App {
             // First diff for this path (hunks just arrived): start at hunk 1.
             self.current_hunk = 1;
         }
+        self.sync_bottom_view(&snapshot);
         self.snapshot = snapshot;
         self.clamp();
+    }
+
+    /// Bottom-pane view transitions driven by the AI status edge (docs/review/16):
+    /// auto-switch to the AI plan exactly once when a Loading request lands as a Ready
+    /// for the SAME epoch, that epoch is the snapshot's current repo state, and the plan
+    /// pane is a non-empty `ai_generated` one; switch back to Impact when the plan is
+    /// gone for good (Stale/Failed/Disabled, or a Ready/Loading tagged with another
+    /// epoch, without an `ai_generated` pane). A manual `v` switch survives later
+    /// publishes: only the Loading → Ready edge flips the view forward.
+    fn sync_bottom_view(&mut self, snapshot: &UiSnapshot) {
+        let ready_plan_landed = match (self.prev_ai_loading_epoch, &snapshot.ai) {
+            (Some(pending), AiStatus::Ready { epoch }) => {
+                *epoch == pending
+                    && *epoch == snapshot.epoch
+                    && snapshot.semantic.ai_generated
+                    && !snapshot.semantic.rows.is_empty()
+            }
+            _ => false,
+        };
+        if ready_plan_landed {
+            self.bottom_view = BottomView::AiPlan;
+            self.ai_plan_scroll = 0;
+        }
+        // The pending request's epoch is consumed by any non-Loading status (Ready,
+        // Failed, …): only a Ready observed while it is still the in-flight request
+        // can fire the switch, and it can fire exactly once.
+        self.prev_ai_loading_epoch = match &snapshot.ai {
+            AiStatus::Loading { since_epoch } => Some(*since_epoch),
+            _ => None,
+        };
+        // A status tagged with a superseded epoch (a refresh moved `snapshot.epoch` on
+        // without re-requesting AI) is as good as gone when no plan pane is published.
+        let stale_status = match &snapshot.ai {
+            AiStatus::Ready { epoch } | AiStatus::Loading { since_epoch: epoch } => {
+                *epoch != snapshot.epoch
+            }
+            _ => false,
+        };
+        let plan_gone = (stale_status
+            || matches!(
+                snapshot.ai,
+                AiStatus::Stale { .. } | AiStatus::Failed { .. } | AiStatus::Disabled
+            ))
+            && !snapshot.semantic.ai_generated;
+        if self.bottom_view == BottomView::AiPlan && plan_gone {
+            self.bottom_view = BottomView::Impact;
+            self.ai_plan_scroll = 0;
+        }
     }
 
     /// Apply an action to the view state. I/O actions (RefreshGit/Ai*) only toggle flags
@@ -138,20 +194,26 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::ToggleHelp => self.show_help = !self.show_help,
-            Action::FocusNext => self.focused = self.focused.next(),
-            Action::FocusPrev => self.focused = self.focused.prev(),
+            Action::ToggleFileAnalysis => self.toggle_file_analysis(),
             Action::Focus(p) => self.focused = p,
             Action::Down => self.move_sel(1),
             Action::Up => self.move_sel(-1),
-            Action::HalfPageDown => self.scroll_diff(10),
-            Action::HalfPageUp => self.scroll_diff(-10),
-            Action::PageDown => self.scroll_diff(20),
-            Action::PageUp => self.scroll_diff(-20),
+            Action::HalfPageDown => self.page(10),
+            Action::HalfPageUp => self.page(-10),
+            Action::PageDown => self.page(20),
+            Action::PageUp => self.page(-20),
             Action::Top => self.top(),
             Action::Bottom => self.bottom(),
             Action::ToggleExpand => self.toggle_expand(),
             Action::Activate => self.activate(),
             Action::ToggleZoom => self.zoomed = !self.zoomed,
+            Action::ToggleBottomView => {
+                self.bottom_view = match self.bottom_view {
+                    BottomView::Impact => BottomView::AiPlan,
+                    BottomView::AiPlan => BottomView::Impact,
+                };
+                self.ai_plan_scroll = 0;
+            }
             Action::ToggleWrap => self.diff_wrap = !self.diff_wrap,
             Action::ResetHScroll => self.diff_hscroll = 0,
             // View-state resize: two-cell steps clamped to the spec range; the renderer
@@ -263,11 +325,38 @@ impl App {
                 let len = self.flat_file_rows();
                 self.file_sel = step(self.file_sel, delta, len);
             }
-            // The Impact pane has no cursor: it is a three-column summary of the current
-            // files-pane selection (docs/review/15 §3.5).
+            // The Impact view has no cursor: it is a three-column summary of the current
+            // files-pane selection (docs/review/15 §3.5). The AI plan view is a flat row
+            // list, so movement scrolls it.
+            Pane::Impact if self.bottom_view == BottomView::AiPlan => {
+                self.ai_plan_scroll = step(self.ai_plan_scroll, delta, self.ai_plan_rows());
+            }
             Pane::Impact => {}
             Pane::Diff => self.scroll_diff(delta),
         }
+    }
+
+    /// Page keys: the diff, except when the focused bottom pane shows the AI plan — then
+    /// they page the plan (the Impact view itself stays scroll-free).
+    fn page(&mut self, delta: i32) {
+        if self.focused == Pane::Impact && self.bottom_view == BottomView::AiPlan {
+            self.ai_plan_scroll = step(self.ai_plan_scroll, delta, self.ai_plan_rows());
+        } else {
+            self.scroll_diff(delta);
+        }
+    }
+
+    /// Rows the AI plan view can scroll through (0 unless the pane holds a plan).
+    fn ai_plan_rows(&self) -> usize {
+        if self.snapshot.semantic.ai_generated {
+            self.snapshot.semantic.rows.len()
+        } else {
+            0
+        }
+    }
+
+    fn scroll_ai_plan_to(&mut self, pos: usize) {
+        self.ai_plan_scroll = pos.min(self.ai_plan_rows().saturating_sub(1));
     }
 
     fn scroll_diff(&mut self, delta: i32) {
@@ -280,6 +369,7 @@ impl App {
     fn top(&mut self) {
         match self.focused {
             Pane::Files => self.file_sel = 0,
+            Pane::Impact if self.bottom_view == BottomView::AiPlan => self.scroll_ai_plan_to(0),
             Pane::Impact => {}
             Pane::Diff => {
                 self.diff_scroll = 0;
@@ -291,6 +381,9 @@ impl App {
     fn bottom(&mut self) {
         match self.focused {
             Pane::Files => self.file_sel = self.flat_file_rows().saturating_sub(1),
+            Pane::Impact if self.bottom_view == BottomView::AiPlan => {
+                self.scroll_ai_plan_to(usize::MAX);
+            }
             Pane::Impact => {}
             Pane::Diff => {
                 self.diff_scroll = self.snapshot.diff.rows.len().saturating_sub(1) as u16;
@@ -319,6 +412,23 @@ impl App {
 
     fn toggle_expand(&mut self) {
         self.set_expanded_toggle();
+    }
+
+    /// Tab on the files pane: optimistically flip the selected file's expansion. The
+    /// dispatcher is the source of truth — the action is also forwarded to it, and the
+    /// next snapshot reconciles `expanded` (and fills `semantic`/symbols). Optimistic
+    /// flip keeps the UI responsive for the common collapse case.
+    fn toggle_file_analysis(&mut self) {
+        if self.focused != Pane::Files {
+            return;
+        }
+        if let Some(row) = self.current_file_row() {
+            row.expanded = !row.expanded;
+        }
+        // Collapsing may hide the selected symbol row: clamp the selection onto the
+        // visible rows (the clamp pass in `update` handles this on the next snapshot;
+        // do it now for the optimistic frame too).
+        self.clamp();
     }
 
     fn collapse_sel(&mut self) {
@@ -498,6 +608,9 @@ impl App {
         self.base_sel = self
             .base_sel
             .min(self.filtered_bases().len().saturating_sub(1));
+        self.ai_plan_scroll = self
+            .ai_plan_scroll
+            .min(self.ai_plan_rows().saturating_sub(1));
     }
 }
 
@@ -529,6 +642,11 @@ mod tests {
         FileRow {
             path: name.to_string(),
             status: "M",
+            semantic: if symbols > 0 {
+                crate::snapshot::FileSemanticLoad::Ready
+            } else {
+                crate::snapshot::FileSemanticLoad::Unloaded
+            },
             changed_symbol_count: symbols,
             symbols: (0..symbols)
                 .map(|i| SymbolRow {
@@ -577,17 +695,16 @@ mod tests {
     }
 
     #[test]
-    fn focus_cycles() {
+    fn focus_keys_direct() {
+        // Tab no longer cycles panes; 1/2/3 focus directly.
         let mut app = App::new();
         assert_eq!(app.focused, Pane::Files);
-        app.apply(Action::FocusNext);
-        assert_eq!(app.focused, Pane::Diff);
-        app.apply(Action::FocusNext);
-        assert_eq!(app.focused, Pane::Impact);
-        app.apply(Action::FocusPrev);
+        app.apply(Action::Focus(Pane::Diff));
         assert_eq!(app.focused, Pane::Diff);
         app.apply(Action::Focus(Pane::Impact));
         assert_eq!(app.focused, Pane::Impact);
+        app.apply(Action::Focus(Pane::Files));
+        assert_eq!(app.focused, Pane::Files);
     }
 
     #[test]
@@ -907,5 +1024,327 @@ mod tests {
         assert_eq!(app.selected_symbol_name(), Some("sym1"));
         app.file_sel = 3; // b.go file row
         assert_eq!(app.selected_symbol_name(), None);
+    }
+
+    // -- bottom view: Impact | AI Plan --------------------------------------------------
+
+    use codescope_core::Epoch;
+
+    /// The repo-state epoch an AI status describes: Loading/Ready/Stale carry it; the
+    /// epoch-less statuses (Disabled/Idle/Failed) ride whatever repo state is current —
+    /// the fixtures below all stay on epoch 1 unless a test says otherwise.
+    fn status_epoch(ai: &AiStatus) -> Epoch {
+        match ai {
+            AiStatus::Loading { since_epoch } => *since_epoch,
+            AiStatus::Ready { epoch } | AiStatus::Stale { epoch } => *epoch,
+            AiStatus::Disabled | AiStatus::Idle | AiStatus::Failed { .. } => Epoch(1),
+        }
+    }
+
+    /// A snapshot whose `epoch` matches the AI status's epoch (a consistent fixture:
+    /// the production publisher never mixes them).
+    fn ai_plan_snap(ai: AiStatus, ai_generated: bool, rows: usize) -> UiSnapshot {
+        let epoch = status_epoch(&ai);
+        ai_plan_snap_at(epoch, ai, ai_generated, rows)
+    }
+
+    /// [`ai_plan_snap`] with an explicit snapshot epoch — the negative fixture for
+    /// epoch-mismatch tests.
+    fn ai_plan_snap_at(
+        snap_epoch: Epoch,
+        ai: AiStatus,
+        ai_generated: bool,
+        rows: usize,
+    ) -> UiSnapshot {
+        UiSnapshot {
+            ai,
+            epoch: snap_epoch,
+            semantic: crate::snapshot::SemanticPane {
+                title: "plan: auth refactor".to_string(),
+                rows: (0..rows)
+                    .map(|i| crate::snapshot::SemRow {
+                        depth: (i % 2) as u16,
+                        label: format!("step{i}"),
+                        relation: "changed",
+                        changed: true,
+                        has_diagnostic: false,
+                    })
+                    .collect(),
+                note: String::new(),
+                ai_generated,
+            },
+            ..UiSnapshot::default()
+        }
+    }
+
+    /// Drive the app to the AI plan view via the Loading → Ready edge.
+    fn app_with_ai_plan(rows: usize) -> App {
+        let mut app = App::new();
+        app.update(ai_plan_snap(
+            AiStatus::Loading {
+                since_epoch: Epoch(1),
+            },
+            false,
+            0,
+        ));
+        app.update(ai_plan_snap(
+            AiStatus::Ready { epoch: Epoch(1) },
+            true,
+            rows,
+        ));
+        app
+    }
+
+    #[test]
+    fn toggle_bottom_view_flips_and_resets_scroll() {
+        let mut app = App::new();
+        assert_eq!(app.bottom_view, BottomView::Impact, "default is Impact");
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 5));
+        app.apply(Action::ToggleBottomView);
+        assert_eq!(app.bottom_view, BottomView::AiPlan);
+        app.apply(Action::Focus(Pane::Impact));
+        app.apply(Action::Down);
+        app.apply(Action::Down);
+        assert_eq!(app.ai_plan_scroll, 2);
+        app.apply(Action::ToggleBottomView);
+        assert_eq!(app.bottom_view, BottomView::Impact);
+        assert_eq!(app.ai_plan_scroll, 0, "toggling resets the scroll");
+    }
+
+    #[test]
+    fn ai_plan_auto_switch_fires_on_loading_to_ready() {
+        let mut app = App::new();
+        app.update(ai_plan_snap(
+            AiStatus::Loading {
+                since_epoch: Epoch(1),
+            },
+            false,
+            0,
+        ));
+        assert_eq!(app.bottom_view, BottomView::Impact);
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 3));
+        assert_eq!(app.bottom_view, BottomView::AiPlan);
+        assert_eq!(app.ai_plan_scroll, 0);
+    }
+
+    #[test]
+    fn ai_plan_auto_switch_needs_rows_and_a_generated_pane() {
+        // Ready but the semantic pane is not the AI plan (deterministic rows): no flip.
+        let mut app = App::new();
+        app.update(ai_plan_snap(
+            AiStatus::Loading {
+                since_epoch: Epoch(1),
+            },
+            false,
+            0,
+        ));
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, false, 0));
+        assert_eq!(app.bottom_view, BottomView::Impact);
+        // Ready with an AI pane that has no rows: nothing to show, no flip.
+        let mut app = App::new();
+        app.update(ai_plan_snap(
+            AiStatus::Loading {
+                since_epoch: Epoch(1),
+            },
+            false,
+            0,
+        ));
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 0));
+        assert_eq!(app.bottom_view, BottomView::Impact);
+        // Ready without a preceding Loading: no edge, no flip.
+        let mut app = App::new();
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 3));
+        assert_eq!(app.bottom_view, BottomView::Impact);
+    }
+
+    #[test]
+    fn ai_plan_auto_switch_fires_exactly_once() {
+        let mut app = app_with_ai_plan(3);
+        assert_eq!(app.bottom_view, BottomView::AiPlan);
+        // Manual switch back to Impact …
+        app.apply(Action::ToggleBottomView);
+        assert_eq!(app.bottom_view, BottomView::Impact);
+        // … survives identical Ready republishes (no new Loading edge).
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 3));
+        assert_eq!(
+            app.bottom_view,
+            BottomView::Impact,
+            "a manual switch back survives later publishes"
+        );
+        // A fresh request is a new edge and flips forward again.
+        app.update(ai_plan_snap(
+            AiStatus::Loading {
+                since_epoch: Epoch(2),
+            },
+            false,
+            0,
+        ));
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(2) }, true, 3));
+        assert_eq!(app.bottom_view, BottomView::AiPlan);
+    }
+
+    #[test]
+    fn ai_plan_auto_switch_rejects_a_mismatched_ready_epoch() {
+        // A Ready answering a DIFFERENT request than the observed Loading: no switch.
+        let mut app = App::new();
+        app.update(ai_plan_snap(
+            AiStatus::Loading {
+                since_epoch: Epoch(2),
+            },
+            false,
+            0,
+        ));
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 3));
+        assert_eq!(
+            app.bottom_view,
+            BottomView::Impact,
+            "a Ready replay for another request never fires"
+        );
+        // A Ready for the observed request but published against a NEWER repo state
+        // (snap.epoch moved on): stale, no switch — the fixture's epochs intentionally
+        // disagree (the production publisher never emits this).
+        let mut app = App::new();
+        app.update(ai_plan_snap(
+            AiStatus::Loading {
+                since_epoch: Epoch(1),
+            },
+            false,
+            0,
+        ));
+        app.update(ai_plan_snap_at(
+            Epoch(2),
+            AiStatus::Ready { epoch: Epoch(1) },
+            true,
+            3,
+        ));
+        assert_eq!(
+            app.bottom_view,
+            BottomView::Impact,
+            "a Ready for a superseded repo state never fires"
+        );
+        // And neither arms a later switch: the pending epoch was consumed by the Ready.
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(2) }, true, 3));
+        assert_eq!(app.bottom_view, BottomView::Impact);
+    }
+
+    #[test]
+    fn ai_plan_view_unstrands_on_a_stale_ready_or_loading() {
+        // An auto-opened AI view must not strand when a refresh advances the repo epoch
+        // while the AI status still carries the OLD epoch and no plan is published.
+        for stale in [
+            AiStatus::Ready { epoch: Epoch(1) },
+            AiStatus::Loading {
+                since_epoch: Epoch(1),
+            },
+        ] {
+            let mut app = app_with_ai_plan(3);
+            assert_eq!(app.bottom_view, BottomView::AiPlan);
+            app.apply(Action::Focus(Pane::Impact));
+            app.apply(Action::Down);
+            assert_eq!(app.ai_plan_scroll, 1);
+            let label = format!("{stale:?}");
+            // snap.epoch moved to 2; the AI status still tags epoch 1.
+            app.update(ai_plan_snap_at(Epoch(2), stale, false, 0));
+            assert_eq!(app.bottom_view, BottomView::Impact, "unstranded: {label}");
+            assert_eq!(app.ai_plan_scroll, 0, "scroll reset: {label}");
+        }
+        // A stale-tagged status while the epoch-matched AI pane is still published keeps
+        // the plan visible (the pane, not the status, owns the rows).
+        let mut app = app_with_ai_plan(3);
+        app.update(ai_plan_snap_at(
+            Epoch(2),
+            AiStatus::Ready { epoch: Epoch(1) },
+            true,
+            3,
+        ));
+        assert_eq!(app.bottom_view, BottomView::AiPlan);
+    }
+
+    #[test]
+    fn ai_plan_view_falls_back_to_impact_when_the_plan_is_gone() {
+        for gone in [
+            AiStatus::Stale { epoch: Epoch(1) },
+            AiStatus::Failed {
+                reason: "boom".to_string(),
+            },
+            AiStatus::Disabled,
+        ] {
+            let mut app = app_with_ai_plan(3);
+            assert_eq!(app.bottom_view, BottomView::AiPlan);
+            let label = format!("{gone:?}");
+            let mut snap = ai_plan_snap(gone, false, 0);
+            snap.semantic.note = "AI view stale (repo changed); regenerating…".to_string();
+            app.update(snap);
+            assert_eq!(app.bottom_view, BottomView::Impact, "plan gone: {label}");
+        }
+        // A stale status while the (epoch-matched) AI pane is still published keeps the
+        // plan visible.
+        let mut app = app_with_ai_plan(3);
+        app.update(ai_plan_snap(AiStatus::Stale { epoch: Epoch(1) }, true, 3));
+        assert_eq!(app.bottom_view, BottomView::AiPlan);
+        // Idle/Loading keep the current view (the pane shows its note/unavailable line).
+        let mut app = app_with_ai_plan(3);
+        app.update(ai_plan_snap(AiStatus::Idle, false, 0));
+        assert_eq!(app.bottom_view, BottomView::AiPlan);
+    }
+
+    #[test]
+    fn ai_plan_scroll_navigates_and_clamps() {
+        let mut app = app_with_ai_plan(5);
+        app.apply(Action::Focus(Pane::Impact));
+        for _ in 0..10 {
+            app.apply(Action::Down);
+        }
+        assert_eq!(app.ai_plan_scroll, 4, "clamped at the last row");
+        for _ in 0..10 {
+            app.apply(Action::Up);
+        }
+        assert_eq!(app.ai_plan_scroll, 0);
+        app.apply(Action::Bottom);
+        assert_eq!(app.ai_plan_scroll, 4);
+        app.apply(Action::Top);
+        assert_eq!(app.ai_plan_scroll, 0);
+        app.apply(Action::PageDown);
+        assert_eq!(app.ai_plan_scroll, 4);
+        app.apply(Action::HalfPageUp);
+        assert_eq!(app.ai_plan_scroll, 0);
+        // A smaller republished plan clamps the scroll via update().
+        app.apply(Action::Bottom);
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 2));
+        assert_eq!(app.ai_plan_scroll, 1);
+        // Empty plan: everything collapses to 0.
+        app.update(ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 0));
+        assert_eq!(app.ai_plan_scroll, 0);
+        app.apply(Action::Down);
+        assert_eq!(app.ai_plan_scroll, 0);
+    }
+
+    #[test]
+    fn impact_view_keeps_the_bottom_pane_scroll_free() {
+        let mut app = app_with_ai_plan(5);
+        app.apply(Action::ToggleBottomView); // back to Impact
+        app.apply(Action::Focus(Pane::Impact));
+        app.apply(Action::Down);
+        app.apply(Action::PageDown);
+        app.apply(Action::Bottom);
+        assert_eq!(app.ai_plan_scroll, 0, "Impact view has no cursor");
+    }
+
+    #[test]
+    fn page_keys_still_scroll_the_diff_when_it_is_focused() {
+        use crate::snapshot::DiffRow;
+        let mut app = App::new();
+        app.snapshot.diff.rows = (0..30)
+            .map(|i| DiffRow::Context {
+                old_ln: i as u32 + 1,
+                new_ln: i as u32 + 1,
+                text: format!("line {i}"),
+            })
+            .collect();
+        app.focused = Pane::Diff;
+        app.bottom_view = BottomView::AiPlan; // the view toggle must not hijack diff paging
+        app.apply(Action::PageDown);
+        assert_eq!(app.diff_scroll, 20);
+        assert_eq!(app.ai_plan_scroll, 0);
     }
 }

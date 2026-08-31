@@ -59,14 +59,15 @@ shows the active pair as `branch ◂ base`.
 |---|---|
 | `q` / `Ctrl-C` | quit |
 | `?` | help modal |
-| `Tab` / `Shift-Tab`, `1` `2` `3` | focus files / diff / semantic pane |
+| `Tab` (files pane) | expand the selected file and analyze its symbols (lazy) / collapse |
+| `1` `2` `3` | focus files / diff / impact pane |
 | `j`/`k` · `↑`/`↓` | move selection / scroll |
 | `Ctrl-d`/`Ctrl-u`, `PgDn`/`PgUp` | half / full page in diff |
 | `s` / `u` / `B` / `w` | scope: staged / unstaged / branch-vs-base / working (all uncommitted) |
 | `S` | cycle scope |
 | `Enter` | jump to symbol / re-center semantic view |
-| `Space`, `h`/`l` | expand / collapse |
-| `+` / `-` | semantic expansion depth |
+| `Space`, `h`/`l` | expand / collapse (same lazy-analysis path as `Tab`) |
+| `v` | toggle the bottom pane: deterministic impact / AI plan |
 | `n` / `N` | next / previous diff hunk |
 | `g` / `G` | top / bottom |
 | `R` | rescan git |

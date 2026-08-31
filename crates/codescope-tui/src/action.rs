@@ -17,12 +17,12 @@ pub enum Action {
     Quit,
     /// Toggle the help modal.
     ToggleHelp,
-    /// Focus the next / previous pane.
-    FocusNext,
-    /// Focus the previous pane.
-    FocusPrev,
-    /// Focus a pane directly.
+    /// Focus a pane directly (`1`/`2`/`3`; Tab no longer cycles panes).
     Focus(Pane),
+    /// Tab on the files pane: expand a collapsed file (dispatching its lazy semantic
+    /// analysis on first expand), or collapse an expanded one. Forwarded to the
+    /// dispatcher, which owns expansion + the analysis job.
+    ToggleFileAnalysis,
     /// Move the selection/scroll down / up by one.
     Down,
     /// Move the selection/scroll up by one.
@@ -107,6 +107,8 @@ pub enum Action {
     PrevHunk,
     /// Toggle zoom of the focused pane into the whole main area (`z`).
     ToggleZoom,
+    /// Toggle the bottom pane between the deterministic Impact view and the AI plan (`v`).
+    ToggleBottomView,
     /// Toggle smart wrap in the diff pane (`W`); raw mode clips + h-scrolls.
     ToggleWrap,
     /// Reset the diff pane's horizontal scroll to zero (`0`).
@@ -151,8 +153,10 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         // their own Esc above).
         KeyCode::Esc if app.zoomed => Action::ToggleZoom,
         KeyCode::Esc => Action::None,
-        KeyCode::Tab => Action::FocusNext,
-        KeyCode::BackTab => Action::FocusPrev,
+        // Tab is lazy file expansion, not focus cycling: on the files pane it expands
+        // (analyzing on first expand) or collapses the selected file. Elsewhere inert.
+        KeyCode::Tab if app.focused == Pane::Files => Action::ToggleFileAnalysis,
+        KeyCode::Tab | KeyCode::BackTab => Action::None,
         KeyCode::Char('1') => Action::Focus(Pane::Files),
         KeyCode::Char('2') => Action::Focus(Pane::Diff),
         KeyCode::Char('3') => Action::Focus(Pane::Impact),
@@ -179,6 +183,7 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('n') => Action::NextHunk,
         KeyCode::Char('N') => Action::PrevHunk,
         KeyCode::Char('z') => Action::ToggleZoom,
+        KeyCode::Char('v') => Action::ToggleBottomView,
         KeyCode::Char('W') => Action::ToggleWrap,
         KeyCode::Char('0') => Action::ResetHScroll,
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
@@ -283,8 +288,18 @@ mod tests {
 
     #[test]
     fn focus_keys() {
-        assert_eq!(map_key(key(KeyCode::Tab), &app()), Action::FocusNext);
-        assert_eq!(map_key(key(KeyCode::BackTab), &app()), Action::FocusPrev);
+        // Tab is lazy file expansion on the files pane, inert elsewhere; Shift-Tab is
+        // inert everywhere. 1/2/3 focus panes directly.
+        let mut files_focused = app();
+        files_focused.focused = Pane::Files;
+        assert_eq!(
+            map_key(key(KeyCode::Tab), &files_focused),
+            Action::ToggleFileAnalysis
+        );
+        let mut diff_focused = app();
+        diff_focused.focused = Pane::Diff;
+        assert_eq!(map_key(key(KeyCode::Tab), &diff_focused), Action::None);
+        assert_eq!(map_key(key(KeyCode::BackTab), &files_focused), Action::None);
         assert_eq!(
             map_key(key(KeyCode::Char('2')), &app()),
             Action::Focus(Pane::Diff)
@@ -342,6 +357,16 @@ mod tests {
             map_key(key(KeyCode::Char('0')), &app()),
             Action::ResetHScroll
         );
+    }
+
+    #[test]
+    fn v_toggles_bottom_view_and_ai_keys_are_unchanged() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('v')), &app()),
+            Action::ToggleBottomView
+        );
+        assert_eq!(map_key(key(KeyCode::Char('a')), &app()), Action::AiToggle);
+        assert_eq!(map_key(key(KeyCode::Char('A')), &app()), Action::AiRefresh);
     }
 
     #[test]

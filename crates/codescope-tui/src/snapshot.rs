@@ -128,9 +128,30 @@ pub struct ScopeCounts {
     pub unstaged: usize,
 }
 
+/// Per-file semantic-analysis load state (lazy per-file analysis, replacing eager
+/// repo-wide analysis). `Unloaded` means no request has been made; the symbol count is
+/// unknown and must not render as `0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FileSemanticLoad {
+    /// No analysis requested yet (collapsed git row).
+    #[default]
+    Unloaded,
+    /// A per-file analysis job is in flight.
+    Loading,
+    /// Analysis completed; `symbols`/`changed_symbol_count` are authoritative (possibly
+    /// zero — that is a real answer, not "unknown").
+    Ready,
+    /// The language service does not own this file (binary, gitlink, unowned language).
+    Unsupported,
+    /// The analysis job failed (retryable).
+    Failed,
+}
+
 /// One row in the left "changed files + symbols" pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRow {
+    /// Semantic load state for this file's symbols.
+    pub semantic: FileSemanticLoad,
     /// Repo-relative path (display string).
     pub path: String,
     /// Short status badge: `M`, `A`, `D`, `R`, `?`, `U`.

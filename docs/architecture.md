@@ -42,6 +42,12 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    TUI renders a git-only view immediately and the language server is handed over via
    `EngineReady` when its initialize completes. Why: a stale AI plan or analysis must never
    overwrite a newer repo state, and a slow subsystem must never freeze the UI. (research 06)
+
+   **Lazy per-file semantics (TUI)**: the interactive path analyzes a changed file only when
+   the user expands it with `Tab` (`analyze_changed_file`); the files pane lists git changes
+   immediately and each row carries a `FileSemanticLoad` state (Unloaded/Loading/Ready/
+   Unsupported/Failed). Symbol relation queries are gated on the file's Ready state. The
+   non-interactive backend (`analyze`/`digest`) stays eager via `refresh_with_ctx`.
 5. **Channel topology**: per-subsystem unbounded mpsc → one dispatcher actor →
    `watch::channel<UiSnapshot>` → TUI `select!{biased;}` over crossterm EventStream + tick.
 6. **AI**: OpenAI-compatible chat completions via reqwest 0.13; plan returned through a single

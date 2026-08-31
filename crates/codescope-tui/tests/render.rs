@@ -7,7 +7,7 @@ use ratatui::Terminal;
 use codescope_tui::app::App;
 use codescope_tui::render::render;
 use codescope_tui::snapshot::{
-    DiffPane, DiffRow, FileRow, RepoBar, ScopeCounts, SymbolRow, UiSnapshot,
+    DiffPane, DiffRow, FileRow, RepoBar, ScopeCounts, SemRow, SemanticPane, SymbolRow, UiSnapshot,
 };
 
 fn sample() -> UiSnapshot {
@@ -30,6 +30,7 @@ fn sample() -> UiSnapshot {
             status: "M",
             changed_symbol_count: 1,
             expanded: true,
+            semantic: codescope_tui::snapshot::FileSemanticLoad::Ready,
             symbols: vec![SymbolRow {
                 name: "GetDisplayName".to_string(),
                 change: "modified",
@@ -164,6 +165,67 @@ fn empty_state_is_graceful() {
         .unwrap();
     let text = buffer_text(&t);
     assert!(text.contains("no changes") || text.contains("scanning repository"));
+}
+
+#[test]
+fn ai_plan_renders_after_loading_to_ready_transition() {
+    // Regression: the validated AI plan published in `UiSnapshot::semantic` (ai: Ready,
+    // ai_generated rows) must have a rendering path — the Loading → Ready edge switches
+    // the bottom pane to the AI plan view and the rows appear in the buffer.
+    let backend = TestBackend::new(160, 40);
+    let mut t = Terminal::new(backend).unwrap();
+    let mut app = App::new();
+
+    let mut loading = sample();
+    loading.ai = AiStatus::Loading {
+        since_epoch: codescope_core::Epoch(3),
+    };
+    app.update(loading.clone());
+    t.draw(|f| render(f, &app, &loading)).unwrap();
+    assert!(
+        buffer_text(&t).contains("AI Plan …"),
+        "the AI tab shows progress while loading"
+    );
+
+    let mut ready = sample();
+    ready.ai = AiStatus::Ready {
+        epoch: codescope_core::Epoch(3),
+    };
+    ready.semantic = SemanticPane {
+        title: "plan: introduce retry budget".to_string(),
+        rows: vec![
+            SemRow {
+                depth: 0,
+                label: "RetryPolicy".to_string(),
+                relation: "changed",
+                changed: true,
+                has_diagnostic: false,
+            },
+            SemRow {
+                depth: 1,
+                label: "handleRequest".to_string(),
+                relation: "calls",
+                changed: false,
+                has_diagnostic: true,
+            },
+        ],
+        note: String::new(),
+        ai_generated: true,
+    };
+    app.update(ready.clone());
+    t.draw(|f| render(f, &app, &ready)).unwrap();
+    let text = buffer_text(&t);
+    assert!(text.contains("Impact | AI Plan"), "tab strip: {text}");
+    assert!(
+        text.contains("plan: introduce retry budget"),
+        "plan title: {text}"
+    );
+    assert!(text.contains("RetryPolicy"), "plan root row: {text}");
+    assert!(text.contains("handleRequest"), "plan child row: {text}");
+    assert!(
+        !text.contains("SELECTED CHANGE"),
+        "impact columns replaced: {text}"
+    );
 }
 
 use codescope_tui::action::{map_key, Action};

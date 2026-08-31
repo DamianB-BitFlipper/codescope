@@ -32,7 +32,7 @@ pub mod source;
 
 pub use changes::{changed_symbols, changed_symbols_detailed, file_mappings, ChangedSymbolInfo};
 pub use digest::{change_digest, estimate_tokens, ChangeDigest};
-pub use engine::{AnalysisEngine, AnalysisSnapshot, FileAnalysis};
+pub use engine::{AnalysisEngine, AnalysisSnapshot, FileAnalysis, FileSemanticResult};
 pub use error::AnalysisError;
 pub use graph::{annotate_diagnostics, build_impact_graph};
 pub use mapper::{map_changes, map_changes_detailed, map_changes_with_base, MappedHunk};
