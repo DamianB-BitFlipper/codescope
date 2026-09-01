@@ -23,6 +23,7 @@ use crate::error::AiError;
 use crate::tools::MAX_TOOL_CALLS;
 use secrecy::SecretString;
 use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 /// Default chat-completions base for OpenAI.
@@ -93,6 +94,108 @@ impl ToolChoice {
     }
 }
 
+/// Reasoning budget requested from an OpenAI-compatible Chat Completions model.
+///
+/// [`ReasoningEffort::Default`] selects Codescope's automatic provider/model behavior,
+/// which normally omits `reasoning_effort` (Prime-hosted GLM is the compatibility exception:
+/// it uses `minimal`). The remaining variants are sent verbatim as the top-level
+/// `reasoning_effort` field. Providers and models support different subsets, so an explicit
+/// choice can still be rejected honestly by the upstream API.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// Use Codescope's automatic provider/model behavior.
+    #[default]
+    Default,
+    /// Disable reasoning where the model supports it.
+    None,
+    /// Use the smallest non-zero reasoning budget supported by some model families.
+    Minimal,
+    /// Use a low reasoning budget.
+    Low,
+    /// Use a medium reasoning budget.
+    Medium,
+    /// Use a high reasoning budget.
+    High,
+    /// Use an extra-high reasoning budget.
+    XHigh,
+    /// Use the provider's maximum reasoning budget where supported.
+    Max,
+}
+
+impl ReasoningEffort {
+    /// All user-selectable values, in increasing-effort order.
+    pub const ALL: [Self; 8] = [
+        Self::Default,
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
+    /// Stable CLI/config/UI spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Explicit wire value, or `None` when compatibility/default behavior should be used.
+    #[must_use]
+    pub const fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            other => Some(other.as_str()),
+        }
+    }
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" | "x-high" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            other => Err(format!(
+                "reasoning effort must be default|none|minimal|low|medium|high|xhigh|max, got {other:?}"
+            )),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Resolved AI configuration.
 ///
 /// Construct via [`AiConfig::from_env`] / [`AiConfig::resolve`]; the `api_key` is `None`
@@ -105,6 +208,8 @@ pub struct AiConfig {
     pub base_url: String,
     /// Model identifier sent in the request body.
     pub model: String,
+    /// Chat Completions reasoning budget, or [`ReasoningEffort::Default`] for automatic behavior.
+    pub reasoning_effort: ReasoningEffort,
     /// Bearer token, if any (local providers like Ollama run keyless).
     pub api_key: Option<SecretString>,
     /// Per-request timeout.
@@ -127,6 +232,7 @@ impl AiConfig {
             enabled: false,
             base_url: OPENAI_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
+            reasoning_effort: ReasoningEffort::Default,
             api_key: None,
             timeout: DEFAULT_TIMEOUT,
             tool_choice: ToolChoice::Required,
@@ -251,6 +357,7 @@ impl AiConfig {
         let model = file
             .and_then(|f| f.model.clone())
             .unwrap_or_else(|| default_model.to_string());
+        let reasoning_effort = file.and_then(|f| f.reasoning_effort).unwrap_or_default();
 
         let timeout_ms = match env("CODESCOPE_AI_TIMEOUT_MS") {
             Some(v) => v.parse::<u64>().map_err(|e| {
@@ -286,6 +393,7 @@ impl AiConfig {
         tracing::info!(
             base_url = %base_url,
             model = %model,
+            reasoning_effort = %reasoning_effort,
             timeout_ms,
             tool_choice = tool_choice.as_str(),
             max_tool_calls,
@@ -296,6 +404,7 @@ impl AiConfig {
             enabled: true,
             base_url,
             model,
+            reasoning_effort,
             api_key: key.map(SecretString::from),
             timeout: Duration::from_millis(timeout_ms),
             tool_choice,
@@ -358,6 +467,7 @@ impl fmt::Debug for AiConfig {
             .field("enabled", &self.enabled)
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("api_key", &self.api_key.as_ref().map(|_| "«redacted»"))
             .field("timeout", &self.timeout)
             .field("tool_choice", &self.tool_choice)
@@ -382,6 +492,9 @@ pub struct AiFileConfig {
     /// Model override.
     #[serde(default)]
     pub model: Option<String>,
+    /// Chat Completions reasoning budget (`default` uses automatic behavior).
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// *Name* of the env var to read the key from (e.g. `"OPENAI_API_KEY"`).
     #[serde(default)]
     pub api_key_env: Option<String>,

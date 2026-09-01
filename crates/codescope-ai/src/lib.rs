@@ -37,8 +37,9 @@ pub use client::{
     RETRY_AFTER_CAP,
 };
 pub use config::{
-    AiConfig, AiFileConfig, ProviderKind, ToolChoice, ANTHROPIC_BASE_URL, DEFAULT_ANTHROPIC_MODEL,
-    DEFAULT_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_TIMEOUT, OPENAI_BASE_URL, PRIME_BASE_URL,
+    AiConfig, AiFileConfig, ProviderKind, ReasoningEffort, ToolChoice, ANTHROPIC_BASE_URL,
+    DEFAULT_ANTHROPIC_MODEL, DEFAULT_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_TIMEOUT, OPENAI_BASE_URL,
+    PRIME_BASE_URL,
 };
 pub use error::AiError;
 pub use plan::{parse_plan, plan_tool, PlanParams};

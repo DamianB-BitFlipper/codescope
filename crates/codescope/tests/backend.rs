@@ -554,6 +554,8 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
                 "20",
                 "--model",
                 "codescope-fake",
+                "--reasoning-effort",
+                "high",
             ])
             .env("CODESCOPE_CONFIG", config_path)
             .env("CODESCOPE_AI", "on")
@@ -583,6 +585,7 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
     assert!(json["selection"]["file"].is_string());
     assert_eq!(json["provider"], "custom");
     assert_eq!(json["model"], "codescope-fake");
+    assert_eq!(json["reasoning_effort"], "high");
     assert_eq!(
         json["plan"]["intent"],
         "Record request metadata before continuing the request path."
@@ -600,6 +603,8 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 1, "one backend AI request");
     let body = requests[0].body_json().expect("debug-ai request JSON");
+    assert_eq!(body["reasoning_effort"], "high");
+    assert!(body.get("reasoning").is_none());
     let tool_names: Vec<&str> = body["tools"]
         .as_array()
         .unwrap()

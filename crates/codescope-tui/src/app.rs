@@ -85,6 +85,8 @@ pub struct App {
     pub model_sel: usize,
     /// Type-to-filter query of the model picker.
     pub model_query: String,
+    /// Selected reasoning budget in the backend-published picker values.
+    pub reasoning_effort_sel: usize,
     /// Whether the comparison-base picker modal is open.
     pub show_base_picker: bool,
     /// Selected row in the base picker (into the filtered list).
@@ -282,8 +284,34 @@ impl App {
             Action::PrevHunk => self.jump_hunk(-1),
             Action::ModelPicker => {
                 self.show_model_picker = !self.show_model_picker;
-                self.model_sel = 0;
                 self.model_query.clear();
+                if self.show_model_picker {
+                    self.model_sel = self
+                        .snapshot
+                        .available_models
+                        .iter()
+                        .position(|model| *model == self.snapshot.ai_model)
+                        .unwrap_or(0);
+                    self.reasoning_effort_sel = self
+                        .snapshot
+                        .available_reasoning_efforts
+                        .iter()
+                        .position(|effort| *effort == self.snapshot.ai_reasoning_effort)
+                        .unwrap_or(0);
+                }
+            }
+            Action::ReasoningEffortPrevious => {
+                let len = self.snapshot.available_reasoning_efforts.len();
+                if len > 0 {
+                    self.reasoning_effort_sel =
+                        self.reasoning_effort_sel.checked_sub(1).unwrap_or(len - 1);
+                }
+            }
+            Action::ReasoningEffortNext => {
+                let len = self.snapshot.available_reasoning_efforts.len();
+                if len > 0 {
+                    self.reasoning_effort_sel = (self.reasoning_effort_sel + 1) % len;
+                }
             }
             Action::BasePicker => {
                 self.show_base_picker = !self.show_base_picker;
@@ -304,12 +332,12 @@ impl App {
                     self.base_query.pop();
                 }
             }
-            // ModelSelected/BaseSelected are applied by the dispatcher (it owns the
+            // AiSettingsSelected/BaseSelected are applied by the dispatcher (it owns the
             // AiService / base override).
             // RefreshGit is a dispatcher concern; nothing to do here.
             // SelectionChanged / SelectSymbol are derived from the view state by the run
             // loop and forwarded to the dispatcher; applying them locally would be a no-op.
-            Action::ModelSelected(_)
+            Action::AiSettingsSelected { .. }
             | Action::BaseSelected(_)
             | Action::PersistUiPreferences(_)
             | Action::SelectSymbol { .. }
@@ -386,6 +414,22 @@ impl App {
     #[must_use]
     pub fn filtered_models(&self) -> Vec<&str> {
         filter_candidates(&self.snapshot.available_models, &self.model_query)
+    }
+
+    /// Reasoning budget currently highlighted in the model picker.
+    #[must_use]
+    pub fn selected_reasoning_effort(&self) -> &str {
+        self.snapshot
+            .available_reasoning_efforts
+            .get(self.reasoning_effort_sel)
+            .map(String::as_str)
+            .unwrap_or_else(|| {
+                if self.snapshot.ai_reasoning_effort.is_empty() {
+                    "default"
+                } else {
+                    self.snapshot.ai_reasoning_effort.as_str()
+                }
+            })
     }
 
     /// Base candidates matching the picker's filter query (the visible list).
@@ -1067,6 +1111,26 @@ mod tests {
         app.apply(Action::ModelPicker);
         app.apply(Action::PickerInput('z'));
         assert!(app.model_query.is_empty());
+    }
+
+    #[test]
+    fn model_picker_cycles_backend_published_reasoning_efforts() {
+        let mut app = App::new();
+        app.update(UiSnapshot {
+            ai_reasoning_effort: "medium".to_string(),
+            available_reasoning_efforts: ["default", "low", "medium", "high"]
+                .map(str::to_string)
+                .to_vec(),
+            ..UiSnapshot::default()
+        });
+        app.apply(Action::ModelPicker);
+        assert_eq!(app.selected_reasoning_effort(), "medium");
+        app.apply(Action::ReasoningEffortNext);
+        assert_eq!(app.selected_reasoning_effort(), "high");
+        app.apply(Action::ReasoningEffortNext);
+        assert_eq!(app.selected_reasoning_effort(), "default");
+        app.apply(Action::ReasoningEffortPrevious);
+        assert_eq!(app.selected_reasoning_effort(), "high");
     }
 
     #[test]

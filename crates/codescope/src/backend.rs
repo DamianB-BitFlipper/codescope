@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Subcommand, ValueEnum};
-use codescope_ai::AiService;
+use codescope_ai::{AiService, ReasoningEffort};
 use codescope_analysis::{
     AnalysisEngine, AnalysisSnapshot, ChangedSymbolInfo, FileAnalysis, MappedHunk, SemanticSource,
 };
@@ -117,6 +117,9 @@ pub struct DebugAiArgs {
     /// AI model for this run. Overrides the remembered/global model without persisting it.
     #[arg(short = 'm', long, value_name = "MODEL_NAME")]
     pub model: Option<String>,
+    /// Reasoning budget for this run. Use `default` to let the provider/model decide.
+    #[arg(short = 'r', long, value_name = "LEVEL")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Print only the generated one-sentence intent instead of the full debug envelope.
     #[arg(long)]
     pub intent_only: bool,
@@ -317,7 +320,7 @@ async fn debug_ai_session(args: &DebugAiArgs) -> Result<DebugAiOut> {
     let config = ConfigStore::load();
     let mut notes: Vec<String> = config.warning().map(str::to_owned).into_iter().collect();
     let ai_config = config
-        .resolve_ai_config(args.model.as_deref())
+        .resolve_ai_config(args.model.as_deref(), args.reasoning_effort)
         .context("cannot resolve AI configuration")?;
     anyhow::ensure!(
         ai_config.enabled,
@@ -327,6 +330,7 @@ async fn debug_ai_session(args: &DebugAiArgs) -> Result<DebugAiOut> {
         elapsed = ?phase.elapsed(),
         base_url = %ai_config.base_url,
         model = %ai_config.model,
+        reasoning_effort = %ai_config.reasoning_effort,
         request_timeout = ?ai_config.timeout,
         tool_choice = ai_config.tool_choice.as_str(),
         max_tool_calls = ai_config.max_tool_calls,
@@ -540,6 +544,7 @@ async fn drive_debug_ai(
                     },
                     provider: snapshot.ai_provider,
                     model: snapshot.ai_model,
+                    reasoning_effort: snapshot.ai_reasoning_effort,
                     plan,
                     report,
                     notes,
@@ -794,6 +799,7 @@ struct DebugAiOut {
     selection: DebugAiSelection,
     provider: String,
     model: String,
+    reasoning_effort: String,
     plan: VisualizationPlan,
     /// The validation report behind `plan` (verdict, dropped items, notes): the same
     /// transparency the TUI renders, in full detail.

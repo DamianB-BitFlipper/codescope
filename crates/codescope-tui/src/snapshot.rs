@@ -32,6 +32,10 @@ pub struct UiSnapshot {
     pub ai: AiStatus,
     /// The AI model currently selected (empty when AI is off).
     pub ai_model: String,
+    /// Selected Chat Completions reasoning budget (`default` uses automatic behavior).
+    pub ai_reasoning_effort: String,
+    /// Reasoning-budget values accepted by the backend, in picker order.
+    pub available_reasoning_efforts: Vec<String>,
     /// Which AI provider/credential is active ("prime"/"openai"/"anthropic"/"custom"; empty
     /// when AI is off).
     pub ai_provider: String,
@@ -77,6 +81,8 @@ impl Default for UiSnapshot {
             ls: LsStatus::Starting,
             ai: AiStatus::Disabled,
             ai_model: String::new(),
+            ai_reasoning_effort: "default".to_string(),
+            available_reasoning_efforts: Vec::new(),
             ai_provider: String::new(),
             ai_tokens: AiTokenUsage::default(),
             available_models: Vec::new(),

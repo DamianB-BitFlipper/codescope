@@ -255,10 +255,13 @@ async fn dispatch(
             }
             app.apply(Action::Activate);
         }
-        Action::ModelSelected(name) => {
+        Action::AiSettingsSelected {
+            model,
+            reasoning_effort,
+        } => {
             // The modal sends an empty name; resolve it from the selection in the
             // filtered (visible) list.
-            let name = if name.is_empty() {
+            let model = if model.is_empty() {
                 app.filtered_models()
                     .get(app.model_sel)
                     .map(|s| (*s).to_string())
@@ -266,15 +269,30 @@ async fn dispatch(
                         let typed = app.model_query.trim();
                         (!typed.is_empty()).then(|| typed.to_string())
                     })
-                    .unwrap_or_default()
+                    .unwrap_or_else(|| app.snapshot.ai_model.clone())
             } else {
-                name
+                model
             };
-            if !name.is_empty() {
-                let _ = tx.send(Action::ModelSelected(name)).await;
+            let reasoning_effort = if reasoning_effort.is_empty() {
+                app.selected_reasoning_effort().to_string()
+            } else {
+                reasoning_effort
+            };
+            if !model.is_empty() {
+                let _ = tx
+                    .send(Action::AiSettingsSelected {
+                        model,
+                        reasoning_effort,
+                    })
+                    .await;
             }
             app.show_model_picker = false;
             app.model_query.clear();
+        }
+        Action::ReasoningEffortPrevious | Action::ReasoningEffortNext => {
+            if app.snapshot.ai_provider != "anthropic" {
+                app.apply(action);
+            }
         }
         Action::RefreshGit => {
             let _ = tx.send(action).await;
@@ -457,7 +475,10 @@ mod tests {
         }
         dispatch(
             &mut app,
-            Action::ModelSelected(String::new()),
+            Action::AiSettingsSelected {
+                model: String::new(),
+                reasoning_effort: String::new(),
+            },
             &tx,
             &mut pending,
             &mut SelectionTracker::default(),
@@ -465,9 +486,10 @@ mod tests {
         .await;
         assert_eq!(
             rx.recv().await,
-            Some(Action::ModelSelected(
-                "anthropic/claude-fable-5".to_string()
-            )),
+            Some(Action::AiSettingsSelected {
+                model: "anthropic/claude-fable-5".to_string(),
+                reasoning_effort: "default".to_string(),
+            }),
             "the filtered entry under the selection is dispatched"
         );
         assert!(!app.show_model_picker);
@@ -493,7 +515,10 @@ mod tests {
 
         dispatch(
             &mut app,
-            Action::ModelSelected(String::new()),
+            Action::AiSettingsSelected {
+                model: String::new(),
+                reasoning_effort: String::new(),
+            },
             &tx,
             &mut pending,
             &mut SelectionTracker::default(),
@@ -501,10 +526,69 @@ mod tests {
         .await;
         assert_eq!(
             rx.recv().await,
-            Some(Action::ModelSelected("new/model-id".to_string()))
+            Some(Action::AiSettingsSelected {
+                model: "new/model-id".to_string(),
+                reasoning_effort: "default".to_string(),
+            })
         );
         assert!(!app.show_model_picker);
         assert!(app.model_query.is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_picker_stages_reasoning_then_publishes_both_settings_once() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = App::new();
+        let mut pending = PendingScope::default();
+        app.update(UiSnapshot {
+            ai_provider: "openai".to_string(),
+            ai_model: "gpt-test".to_string(),
+            available_models: vec!["gpt-test".to_string()],
+            ai_reasoning_effort: "low".to_string(),
+            available_reasoning_efforts: ["default", "low", "medium", "high"]
+                .map(str::to_string)
+                .to_vec(),
+            ..UiSnapshot::default()
+        });
+        app.apply(Action::ModelPicker);
+
+        dispatch(
+            &mut app,
+            Action::ReasoningEffortNext,
+            &tx,
+            &mut pending,
+            &mut SelectionTracker::default(),
+        )
+        .await;
+
+        assert_eq!(app.selected_reasoning_effort(), "medium");
+        assert!(
+            rx.try_recv().is_err(),
+            "cycling is local and cannot spam AI"
+        );
+
+        dispatch(
+            &mut app,
+            Action::AiSettingsSelected {
+                model: String::new(),
+                reasoning_effort: String::new(),
+            },
+            &tx,
+            &mut pending,
+            &mut SelectionTracker::default(),
+        )
+        .await;
+        assert_eq!(
+            rx.recv().await,
+            Some(Action::AiSettingsSelected {
+                model: "gpt-test".to_string(),
+                reasoning_effort: "medium".to_string(),
+            })
+        );
+        assert!(
+            !app.show_model_picker,
+            "Enter applies and closes the picker"
+        );
     }
 
     #[tokio::test]

@@ -374,6 +374,12 @@ fn picker_snapshot() -> UiSnapshot {
     let mut s = sample();
     s.ai_model = "openai/gpt-5-mini".to_string();
     s.ai_provider = "openai".to_string();
+    s.ai_reasoning_effort = "medium".to_string();
+    s.available_reasoning_efforts = [
+        "default", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    ]
+    .map(str::to_string)
+    .to_vec();
     s.available_models = vec![
         "openai/gpt-5-mini".to_string(),
         "openai/gpt-5".to_string(),
@@ -404,12 +410,23 @@ fn picker_modal_swallows_keys() {
     );
     assert_eq!(map_key(key(KeyCode::Esc), &app), Action::ModelPicker);
     assert_eq!(
+        map_key(key(KeyCode::Left), &app),
+        Action::ReasoningEffortPrevious
+    );
+    assert_eq!(
+        map_key(key(KeyCode::Right), &app),
+        Action::ReasoningEffortNext
+    );
+    assert_eq!(
         map_key(key(KeyCode::Char('j')), &app),
         Action::PickerInput('j')
     );
     assert_eq!(
         map_key(key(KeyCode::Enter), &app),
-        Action::ModelSelected(String::new())
+        Action::AiSettingsSelected {
+            model: String::new(),
+            reasoning_effort: String::new(),
+        }
     );
 }
 
@@ -418,10 +435,13 @@ fn picker_renders_models_and_current() {
     let backend = TestBackend::new(120, 30);
     let mut t = Terminal::new(backend).unwrap();
     let mut app = App::new();
-    app.show_model_picker = true;
-    t.draw(|f| render(f, &app, &picker_snapshot())).unwrap();
+    app.update(picker_snapshot());
+    app.apply(Action::ModelPicker);
+    t.draw(|f| render(f, &app, &app.snapshot)).unwrap();
     let text = buffer_text(&t);
-    assert!(text.contains("AI model"), "picker title");
+    assert!(text.contains("AI settings"), "picker title");
+    assert!(text.contains("reasoning effort"), "reasoning control");
+    assert!(text.contains("medium"), "current reasoning effort");
     assert!(text.contains("openai/gpt-5"), "a listed model");
     assert!(text.contains("claude-fable-5"), "another listed model");
     assert!(text.contains("●"), "current-model marker");
@@ -483,8 +503,8 @@ fn top_bar_shows_provider_selected_model_and_status_in_order() {
     t.draw(|f| render(f, &app, &picker_snapshot())).unwrap();
     let text = buffer_text(&t);
     assert!(
-        text.contains("openai openai/gpt-5-mini ✓"),
-        "provider, selected model, then status: {text:?}"
+        text.contains("openai openai/gpt-5-mini reasoning:medium ✓"),
+        "provider, selected model, reasoning effort, then status: {text:?}"
     );
 }
 

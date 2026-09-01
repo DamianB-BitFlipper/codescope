@@ -106,8 +106,17 @@ pub enum Action {
     RefreshGit,
     /// Open/close the AI model picker modal.
     ModelPicker,
-    /// The user picked a model in the picker (the dispatcher applies it).
-    ModelSelected(String),
+    /// Apply the model picker's staged model and reasoning budget together.
+    AiSettingsSelected {
+        /// Provider model id, or empty while the run loop resolves the highlighted row.
+        model: String,
+        /// Reasoning budget, or empty while the run loop resolves the staged control.
+        reasoning_effort: String,
+    },
+    /// Move to the previous reasoning budget while the model picker is open.
+    ReasoningEffortPrevious,
+    /// Move to the next reasoning budget while the model picker is open.
+    ReasoningEffortNext,
     /// Open/close the comparison-base picker modal.
     BasePicker,
     /// The user picked a base ref in the picker (the dispatcher applies it).
@@ -181,11 +190,18 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         };
     }
     if app.show_model_picker {
-        return picker_key(
-            key,
-            Action::ModelPicker,
-            Action::ModelSelected(String::new()),
-        );
+        return match key.code {
+            KeyCode::Left => Action::ReasoningEffortPrevious,
+            KeyCode::Right => Action::ReasoningEffortNext,
+            _ => picker_key(
+                key,
+                Action::ModelPicker,
+                Action::AiSettingsSelected {
+                    model: String::new(),
+                    reasoning_effort: String::new(),
+                },
+            ),
+        };
     }
     if app.show_base_picker {
         return picker_key(key, Action::BasePicker, Action::BaseSelected(String::new()));
@@ -495,7 +511,10 @@ mod tests {
             (
                 Action::ModelPicker,
                 Action::ModelPicker,
-                Action::ModelSelected(String::new()),
+                Action::AiSettingsSelected {
+                    model: String::new(),
+                    reasoning_effort: String::new(),
+                },
             ),
         ] {
             let mut a = app();

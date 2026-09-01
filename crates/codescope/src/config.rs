@@ -3,7 +3,7 @@
 //! The v1 file lives at `$XDG_CONFIG_HOME/codescope/config.toml` (falling back to
 //! `$HOME/.config/codescope/config.toml`, or the platform config directory on Windows).
 //! `CODESCOPE_CONFIG` overrides the whole path. Runtime writes are deliberately narrow:
-//! only provider-specific model choices and stable TUI preferences are patched, preserving
+//! only provider-specific AI choices and stable TUI preferences are patched, preserving
 //! comments, unknown v1 keys, and manually maintained `[ai]` settings.
 
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-use codescope_ai::{AiConfig, AiError, AiFileConfig};
+use codescope_ai::{AiConfig, AiError, AiFileConfig, ReasoningEffort};
 use codescope_tui::{DividerId, UiPreferences};
 use serde::Deserialize;
 use toml_edit::{value, DocumentMut};
@@ -43,13 +43,36 @@ impl Default for GlobalConfig {
     }
 }
 
-/// Existing AI file settings plus the provider-specific runtime selection slots.
+/// Existing AI file settings plus provider-specific model/reasoning selection slots.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 struct GlobalAiConfig {
     #[serde(flatten)]
     runtime: AiFileConfig,
     last_model: LastModels,
+    last_reasoning_effort: LastReasoningEfforts,
+}
+
+/// The last reasoning budget explicitly picked for each provider family.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+struct LastReasoningEfforts {
+    prime: Option<ReasoningEffort>,
+    openai: Option<ReasoningEffort>,
+    anthropic: Option<ReasoningEffort>,
+    custom: Option<ReasoningEffort>,
+}
+
+impl LastReasoningEfforts {
+    fn get(&self, provider: &str) -> Option<ReasoningEffort> {
+        match provider {
+            "prime" => self.prime,
+            "openai" => self.openai,
+            "anthropic" => self.anthropic,
+            "custom" => self.custom,
+            _ => None,
+        }
+    }
 }
 
 /// The last model explicitly picked for each provider family.
@@ -182,15 +205,26 @@ impl ConfigStore {
         self.warning.as_deref()
     }
 
-    /// Resolve AI settings using CLI model > stored provider model > `[ai].model` > defaults.
+    /// Resolve AI settings using CLI overrides, then stored provider choices, then `[ai]`
+    /// values, then built-in defaults.
     pub(crate) fn resolve_ai_config(
         &self,
         model_override: Option<&str>,
+        reasoning_effort_override: Option<ReasoningEffort>,
     ) -> Result<AiConfig, AiError> {
-        self.resolve_ai_with(|name| std::env::var(name).ok(), model_override)
+        self.resolve_ai_with(
+            |name| std::env::var(name).ok(),
+            model_override,
+            reasoning_effort_override,
+        )
     }
 
-    fn resolve_ai_with<F>(&self, env: F, model_override: Option<&str>) -> Result<AiConfig, AiError>
+    fn resolve_ai_with<F>(
+        &self,
+        env: F,
+        model_override: Option<&str>,
+        reasoning_effort_override: Option<ReasoningEffort>,
+    ) -> Result<AiConfig, AiError>
     where
         F: Fn(&str) -> Option<String>,
     {
@@ -205,6 +239,16 @@ impl ConfigStore {
             resolved.model = model.to_string();
         } else if let Some(model) = self.config.ai.last_model.get(resolved.provider_label()) {
             resolved.model = model.to_string();
+        }
+        if let Some(effort) = reasoning_effort_override {
+            resolved.reasoning_effort = effort;
+        } else if let Some(effort) = self
+            .config
+            .ai
+            .last_reasoning_effort
+            .get(resolved.provider_label())
+        {
+            resolved.reasoning_effort = effort;
         }
         Ok(resolved)
     }
@@ -257,6 +301,10 @@ impl ConfigStore {
                 let slot = provider_slot(provider)?;
                 doc["ai"]["last_model"][slot] = value(model);
             }
+            ConfigUpdate::ReasoningEffort { provider, effort } => {
+                let slot = provider_slot(provider)?;
+                doc["ai"]["last_reasoning_effort"][slot] = value(effort.as_str());
+            }
             ConfigUpdate::Ui(preferences) => {
                 doc["ui"]["diff_wrap"] = value(preferences.diff_wrap);
                 for id in DividerId::ALL {
@@ -277,13 +325,28 @@ impl ConfigPersistence for ConfigStore {
         self.patch(ConfigUpdate::Model { provider, model })
     }
 
+    fn persist_reasoning_effort(
+        &self,
+        provider: &str,
+        effort: ReasoningEffort,
+    ) -> Result<(), String> {
+        self.patch(ConfigUpdate::ReasoningEffort { provider, effort })
+    }
+
     fn persist_ui(&self, preferences: UiPreferences) -> Result<(), String> {
         self.patch(ConfigUpdate::Ui(preferences))
     }
 }
 
 enum ConfigUpdate<'a> {
-    Model { provider: &'a str, model: &'a str },
+    Model {
+        provider: &'a str,
+        model: &'a str,
+    },
+    ReasoningEffort {
+        provider: &'a str,
+        effort: ReasoningEffort,
+    },
     Ui(UiPreferences),
 }
 
@@ -483,6 +546,9 @@ model = "file/fallback"
 prime = "prime/remembered"
 openai = "openai-remembered"
 custom = "custom-remembered"
+[ai.last_reasoning_effort]
+prime = "medium"
+openai = "low"
 [ui]
 diff_wrap = true
 "#,
@@ -490,20 +556,27 @@ diff_wrap = true
         .unwrap();
         let store = ConfigStore::load_path(path);
         let prime = store
-            .resolve_ai_with(env(&[("PRIME_API_KEY", "sk-prime")]), None)
+            .resolve_ai_with(env(&[("PRIME_API_KEY", "sk-prime")]), None, None)
             .unwrap();
         assert_eq!(prime.model, "prime/remembered");
+        assert_eq!(prime.reasoning_effort, ReasoningEffort::Medium);
         assert!(prime.api_key.is_some());
         let openai = store
-            .resolve_ai_with(env(&[("OPENAI_API_KEY", "sk-openai")]), None)
+            .resolve_ai_with(env(&[("OPENAI_API_KEY", "sk-openai")]), None, None)
             .unwrap();
         assert_eq!(openai.model, "openai-remembered");
+        assert_eq!(openai.reasoning_effort, ReasoningEffort::Low);
         let cli_override = store
-            .resolve_ai_with(env(&[("PRIME_API_KEY", "sk-prime")]), Some("cli/model"))
+            .resolve_ai_with(
+                env(&[("PRIME_API_KEY", "sk-prime")]),
+                Some("cli/model"),
+                Some(ReasoningEffort::High),
+            )
             .unwrap();
         assert_eq!(cli_override.model, "cli/model");
+        assert_eq!(cli_override.reasoning_effort, ReasoningEffort::High);
         let anthropic_fallback = store
-            .resolve_ai_with(env(&[("ANTHROPIC_API_KEY", "sk-anthropic")]), None)
+            .resolve_ai_with(env(&[("ANTHROPIC_API_KEY", "sk-anthropic")]), None, None)
             .unwrap();
         assert_eq!(
             anthropic_fallback.model, "file/fallback",
@@ -515,6 +588,7 @@ diff_wrap = true
                     ("OPENAI_API_KEY", "sk-openai"),
                     ("CODESCOPE_AI_BASE_URL", "http://127.0.0.1:11434/v1"),
                 ]),
+                None,
                 None,
             )
             .unwrap();
@@ -540,7 +614,7 @@ diff_wrap = true
             )
             .unwrap();
             let config = ConfigStore::load_path(path)
-                .resolve_ai_with(env(&[(name, "secret")]), None)
+                .resolve_ai_with(env(&[(name, "secret")]), None, None)
                 .unwrap();
             assert_eq!(config.provider_label(), provider, "{name}");
             assert_eq!(config.model, format!("remembered/{provider}"), "{name}");
@@ -554,7 +628,7 @@ diff_wrap = true
         )
         .unwrap();
         let custom = ConfigStore::load_path(path)
-            .resolve_ai_with(env(&[("LOCAL_KEY", "secret")]), None)
+            .resolve_ai_with(env(&[("LOCAL_KEY", "secret")]), None, None)
             .unwrap();
         assert_eq!(custom.provider_label(), "custom");
         assert_eq!(custom.model, "local/remembered");
@@ -571,7 +645,7 @@ diff_wrap = true
         .unwrap();
         let store = ConfigStore::load_path(path);
         assert!(matches!(
-            store.resolve_ai_with(env(&[]), None),
+            store.resolve_ai_with(env(&[]), None, None),
             Err(AiError::LiteralApiKeyInConfig)
         ));
     }
@@ -604,6 +678,9 @@ diff_wrap = true
         .unwrap();
         let store = ConfigStore::load_path(path.clone());
         store.persist_model("openai", "gpt-test").unwrap();
+        store
+            .persist_reasoning_effort("openai", ReasoningEffort::XHigh)
+            .unwrap();
         let mut preferences = UiPreferences {
             diff_wrap: true,
             ..UiPreferences::default()
@@ -626,6 +703,10 @@ diff_wrap = true
         assert_eq!(
             reloaded.config.ai.last_model.openai.as_deref(),
             Some("gpt-test")
+        );
+        assert_eq!(
+            reloaded.config.ai.last_reasoning_effort.openai,
+            Some(ReasoningEffort::XHigh)
         );
         assert_eq!(
             reloaded.ui_preferences().dividers.get(DividerId::FilesDiff),

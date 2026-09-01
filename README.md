@@ -33,6 +33,7 @@ Useful flags:
 ```sh
 codescope --no-ai          # fully deterministic; no AI even if a key is set
 codescope --model z-ai/glm-5.3  # model override for this run (-m is equivalent)
+codescope --reasoning-effort high # reasoning override (-r; default uses automatic behavior)
 codescope --watch          # automatically refresh after repository changes (off by default)
 codescope --log-file /tmp/cs.log   # tracing log (never contains secrets)
 ```
@@ -54,6 +55,7 @@ version = 1
 [ai]
 # enabled = true
 # model = "manual/fallback"
+# reasoning_effort = "default"
 # api_key_env = "OPENAI_API_KEY" # names an env var; never put a key here
 
 [ai.last_model]
@@ -61,6 +63,11 @@ prime = "openai/gpt-5-mini"
 openai = "gpt-5-mini"
 anthropic = "claude-haiku-4-5-latest"
 # custom = "local-model"
+
+[ai.last_reasoning_effort]
+prime = "minimal"
+openai = "medium"
+# custom = "default"
 
 [ui]
 diff_wrap = false
@@ -75,8 +82,10 @@ callers_downstream = 5
 
 Model precedence is `--model` / `-m`, then the selected model remembered for the active
 provider, then `[ai].model`, then the provider default. The CLI override applies only to
-the current run. Codescope writes model
-choices and stable UI preferences atomically; API keys and repository state are never
+the current run. Reasoning effort follows the same precedence through
+`--reasoning-effort` / `-r`; `default` uses automatic provider/model behavior (normally
+omitting the parameter, with a `minimal` compatibility default for Prime-hosted GLM). Codescope writes model
+and reasoning choices plus stable UI preferences atomically; API keys and repository state are never
 persisted. `api_key_env` recognizes the three built-in provider key names; an arbitrary
 credential variable requires an explicit `base_url` so its value is never sent to a
 guessed endpoint.
@@ -148,11 +157,13 @@ off by default.
 
 AI is **off unless configured**. Set one of `PRIME_API_KEY`, `OPENAI_API_KEY`, or
 `ANTHROPIC_API_KEY` (the first one found wins; the provider is inferred from the key), and
-optionally use the global `[ai]` table, `CODESCOPE_AI_BASE_URL`, or
-`--model <model_name>`. Providers that reject forced tool calls can use
+optionally use the global `[ai]` table, `CODESCOPE_AI_BASE_URL`, `--model <model_name>`, or
+`--reasoning-effort <default|none|minimal|low|medium|high|xhigh|max>`. Providers that reject forced tool calls can use
 `CODESCOPE_AI_TOOL_CHOICE=auto` (the default is `required`). Environment variables override
 the global file. The app runs identically without it.
-Press `m` in the TUI to switch models at runtime (fetches the provider's model list). AI output is a reviewer-first *visualization plan* — a title, intent, review focus, evidence, and at most two structural forms made of typed nodes and relationships — that the app validates against
+Press `m` in the TUI to switch models at runtime (fetches the provider's model list); use
+left/right in that picker to stage reasoning effort, then Enter to apply both settings once.
+AI output is a reviewer-first *visualization plan* — a title, intent, review focus, evidence, and at most two structural forms made of typed nodes and relationships — that the app validates against
 known repository facts before rendering. Each node also carries one or two exact, side-aware
 `code_refs` copied from annotated rows in the selected diff plus optional `expanded_detail`. Hovering a rendered
 node highlights those old/new rows in the main diff; clicking it (or pressing `Space` while it is
@@ -203,7 +214,8 @@ For example, an OpenAI-compatible provider that only accepts automatic tool sele
 
 ```bash
 CODESCOPE_AI_TOOL_CHOICE=auto \
-  codescope debug-ai . --scope branch --model 'z-ai/glm-5.3' --timeout-secs 180
+  codescope debug-ai . --scope branch --model 'z-ai/glm-5.3' \
+    --reasoning-effort minimal --timeout-secs 180
 ```
 
 ## Documentation

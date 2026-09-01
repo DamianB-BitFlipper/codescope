@@ -21,7 +21,7 @@
 //! time and marked sensitive; message/tool contents are never logged (counts only); reqwest
 //! errors are sanitized with [`reqwest::Error::without_url`].
 
-use crate::config::{AiConfig, ProviderKind, ToolChoice};
+use crate::config::{AiConfig, ProviderKind, ReasoningEffort, ToolChoice};
 use crate::error::AiError;
 use crate::plan::plan_tool;
 use crate::tools::{ToolDef, PLAN_TOOL_NAME};
@@ -89,6 +89,24 @@ impl ChatMessage {
     #[must_use]
     pub fn assistant_raw(message: Value) -> Self {
         ChatMessage(message)
+    }
+
+    /// Build a replay-safe assistant text turn for a structured-call repair.
+    ///
+    /// Some reasoning providers return `content: null` plus output-only reasoning metadata
+    /// when automatic tool choice produces no tool call. Echoing that object into
+    /// Chat Completions is invalid: an assistant message without `tool_calls` must carry
+    /// content. Keep only valid text/content blocks and omit the turn entirely otherwise.
+    #[must_use]
+    pub fn assistant_text_for_repair(message: &Value) -> Option<Self> {
+        let content = message.get("content")?;
+        let present = match content {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Array(parts) => !parts.is_empty(),
+            Value::Null => false,
+            _ => true,
+        };
+        present.then(|| ChatMessage(json!({"role": "assistant", "content": content})))
     }
 
     /// Borrow the wire object.
@@ -191,6 +209,7 @@ pub struct AiClient {
     http: reqwest::Client,
     endpoint: String,
     model: Mutex<String>,
+    reasoning_effort: Mutex<ReasoningEffort>,
     api_key: Option<SecretString>,
     prime_team_id: Option<String>,
     timeout: Duration,
@@ -209,6 +228,7 @@ impl std::fmt::Debug for AiClient {
         f.debug_struct("AiClient")
             .field("endpoint", &self.endpoint)
             .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("api_key", &self.api_key.as_ref().map(|_| "«redacted»"))
             .field("timeout", &self.timeout)
             .field("tool_choice", &self.tool_choice)
@@ -246,6 +266,14 @@ impl AiClient {
         );
         let base = config.base_url.trim_end_matches('/');
         let provider = config.provider();
+        if provider == ProviderKind::Anthropic
+            && config.reasoning_effort != ReasoningEffort::Default
+        {
+            return Err(AiError::Config(
+                "reasoning_effort is only supported by OpenAI-compatible Chat Completions providers; use default with Anthropic's native API"
+                    .into(),
+            ));
+        }
         let endpoint = match provider {
             ProviderKind::OpenAiCompatible => format!("{base}/chat/completions"),
             ProviderKind::Anthropic => format!("{base}/messages"),
@@ -254,6 +282,7 @@ impl AiClient {
             http,
             endpoint,
             model: Mutex::new(config.model.clone()),
+            reasoning_effort: Mutex::new(config.reasoning_effort),
             api_key: config.api_key.clone(),
             prime_team_id: config.prime_team_id.clone(),
             timeout: config.timeout,
@@ -304,6 +333,25 @@ impl AiClient {
         tracing::info!(model = %model, "ai model changed");
         if let Ok(mut m) = self.model.lock() {
             *m = model;
+        }
+    }
+
+    /// The reasoning budget currently used for subsequent requests.
+    #[must_use]
+    pub fn reasoning_effort(&self) -> ReasoningEffort {
+        self.reasoning_effort
+            .lock()
+            .map(|effort| *effort)
+            .unwrap_or_default()
+    }
+
+    /// Switch the reasoning budget used for subsequent requests.
+    ///
+    /// Cheap: only the request-body `reasoning_effort` field changes; no reconnect is needed.
+    pub fn set_reasoning_effort(&self, effort: ReasoningEffort) {
+        tracing::info!(reasoning_effort = %effort, "ai reasoning effort changed");
+        if let Ok(mut selected) = self.reasoning_effort.lock() {
+            *selected = effort;
         }
     }
 
@@ -365,13 +413,21 @@ impl AiClient {
                     "tool_choice": self.tool_choice.as_str(),
                     "stream": false,
                 });
+                let reasoning_effort = self.reasoning_effort();
+                if let Some(effort) = reasoning_effort.wire_value() {
+                    // Chat Completions uses a top-level `reasoning_effort` field. The
+                    // Responses API's nested `reasoning: { effort }` shape is invalid here.
+                    body["reasoning_effort"] = json!(effort);
+                }
                 if is_glm_model(&model) {
                     body["max_tokens"] = json!(GLM_PLAN_MAX_TOKENS);
-                    if self.endpoint.contains("pinference.ai") {
+                    if reasoning_effort == ReasoningEffort::Default
+                        && self.endpoint.contains("pinference.ai")
+                    {
                         // Prime's GLM route requires reasoning to remain enabled, but accepts
-                        // the OpenAI-style minimal effort that leaves room for the tool call.
-                        body["reasoning"] = json!({"effort": "minimal"});
-                    } else {
+                        // Chat Completions' minimal effort that leaves room for the tool call.
+                        body["reasoning_effort"] = json!("minimal");
+                    } else if reasoning_effort == ReasoningEffort::Default {
                         // Native Z.AI-compatible GLM endpoints use the family-specific knob.
                         body["thinking"] = json!({"type": "disabled"});
                     }
@@ -897,6 +953,7 @@ mod tests {
             enabled: true,
             base_url: "http://127.0.0.1:1/v1/".into(),
             model: "test/model".into(),
+            reasoning_effort: ReasoningEffort::Default,
             api_key: Some(SecretString::from("sk-test".to_string())),
             timeout: Duration::from_millis(50),
             tool_choice: ToolChoice::Required,
@@ -909,6 +966,15 @@ mod tests {
     fn disabled_config_builds_no_client() {
         let cfg = AiConfig::disabled();
         assert!(matches!(AiClient::new(&cfg), Err(AiError::Disabled)));
+    }
+
+    #[test]
+    fn native_anthropic_rejects_chat_completions_reasoning_effort() {
+        let mut cfg = enabled_config();
+        cfg.base_url = crate::ANTHROPIC_BASE_URL.to_string();
+        cfg.reasoning_effort = ReasoningEffort::High;
+        let error = AiClient::new(&cfg).expect_err("native Anthropic must not silently ignore it");
+        assert!(error.to_string().contains("OpenAI-compatible"), "{error}");
     }
 
     #[test]
@@ -959,7 +1025,8 @@ mod tests {
         cfg.base_url = "https://api.pinference.ai/api/v1".into();
         let client = AiClient::new(&cfg).unwrap();
         let body = client.build_body(&[ChatMessage::user("digest")], &[]);
-        assert_eq!(body["reasoning"]["effort"], "minimal");
+        assert_eq!(body["reasoning_effort"], "minimal");
+        assert!(body.get("reasoning").is_none());
         assert!(body.get("thinking").is_none());
         assert_eq!(body["max_tokens"], GLM_PLAN_MAX_TOKENS);
 
@@ -968,6 +1035,13 @@ mod tests {
         let body = client.build_body(&[ChatMessage::user("digest")], &[]);
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+
+        cfg.reasoning_effort = ReasoningEffort::High;
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[]);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("thinking").is_none());
 
         cfg.model = "openai/gpt-5-mini".into();
         let client = AiClient::new(&cfg).unwrap();
@@ -1042,6 +1116,27 @@ mod tests {
         .unwrap();
         assert!(plain.tool_calls.is_empty());
         assert_eq!(plain.message["content"], "hello");
+    }
+
+    #[test]
+    fn repair_assistant_omits_null_content_and_strips_output_only_fields() {
+        assert!(ChatMessage::assistant_text_for_repair(&json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning": "internal"
+        }))
+        .is_none());
+
+        let replay = ChatMessage::assistant_text_for_repair(&json!({
+            "role": "assistant",
+            "content": "I should call the tool.",
+            "reasoning": "internal"
+        }))
+        .expect("text response is replayable");
+        assert_eq!(
+            replay.as_value(),
+            &json!({"role": "assistant", "content": "I should call the tool."})
+        );
     }
 
     #[test]

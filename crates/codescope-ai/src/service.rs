@@ -18,7 +18,7 @@
 //! their epoch gate.
 
 use crate::client::{AiClient, AiClientOptions, ChatMessage, RawPlanResponse, TokenUsage};
-use crate::config::AiConfig;
+use crate::config::{AiConfig, ReasoningEffort};
 use crate::error::AiError;
 use crate::plan::{
     parse_plan, IMPLEMENTED_INTENT_PREFIX, IMPLEMENTED_TITLE_PREFIX, MAX_AI_EVIDENCE,
@@ -139,6 +139,17 @@ impl AiService {
     /// Switch the model for subsequent plan requests (the TUI model picker).
     pub fn set_model(&self, model: impl Into<String>) {
         self.client.set_model(model);
+    }
+
+    /// The reasoning budget currently used for subsequent requests.
+    #[must_use]
+    pub fn reasoning_effort(&self) -> ReasoningEffort {
+        self.client.reasoning_effort()
+    }
+
+    /// Switch the reasoning budget for subsequent requests.
+    pub fn set_reasoning_effort(&self, effort: ReasoningEffort) {
+        self.client.set_reasoning_effort(effort);
     }
 
     /// Request, execute tools for, parse, and validate one visualization plan.
@@ -288,7 +299,6 @@ impl AiService {
                 remaining,
                 "tool turn"
             );
-            let assistant = ChatMessage::assistant_raw(response.message.clone());
             let mut tool_messages = Vec::new();
             for call in response.read_only_calls() {
                 if remaining == 0 {
@@ -303,16 +313,21 @@ impl AiService {
                 tool_messages.push(ChatMessage::tool(call.id.clone(), result));
             }
             if tool_messages.is_empty() {
-                // Automatic tool choice can yield a plain-text answer even though the plan
-                // tool was offered. Preserve that assistant turn and spend one bounded repair
-                // asking for the required structured call; never loop indefinitely.
+                // Automatic tool choice can yield prose or a null-content reasoning response
+                // even though the plan tool was offered. Preserve replay-safe assistant text,
+                // skip invalid null-content turns, and spend one bounded repair asking for the
+                // required structured call; never loop indefinitely.
                 if plan_repairs < MAX_PLAN_REPAIRS {
                     plan_repairs += 1;
                     tracing::info!(
                         attempt = plan_repairs,
                         "requesting structured plan after plain-text response"
                     );
-                    messages.push(assistant);
+                    if let Some(assistant) =
+                        ChatMessage::assistant_text_for_repair(&response.message)
+                    {
+                        messages.push(assistant);
+                    }
                     messages.push(ChatMessage::user(format!(
                         "Your previous response did not call the required tool. Call submit_visualization_plan now with one complete plan_version {PLAN_VERSION} document for epoch {}. Return no plain text. Every node must include id, label, detail, and 1-{MAX_NODE_CODE_REFS} exact code_refs copied from the focused diff.",
                         epoch.get()
@@ -321,7 +336,9 @@ impl AiService {
                 }
                 return AiOutcome::Failed(AiError::NoToolCall.to_string());
             }
-            messages.push(assistant);
+            // A tool-calling assistant turn is replayable with `content: null` because its
+            // `tool_calls` satisfy the Chat Completions message contract.
+            messages.push(ChatMessage::assistant_raw(response.message.clone()));
             messages.extend(tool_messages);
         }
         AiOutcome::Failed(format!(

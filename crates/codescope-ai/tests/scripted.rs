@@ -5,7 +5,8 @@
 
 use codescope_ai::{
     AiClient, AiClientOptions, AiConfig, AiError, AiOutcome, AiService, ChatMessage, FactView,
-    Lookup, NoToolExecutor, RetryPolicy, ToolChoice, ToolExecError, ToolExecutor, PLAN_TOOL_NAME,
+    Lookup, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolChoice, ToolExecError, ToolExecutor,
+    PLAN_TOOL_NAME,
 };
 use codescope_core::{
     DiffSide, EntityRef, Epoch, FileId, FormKind, LineRange, PlanCodeRef, PlanEdge, PlanEdgeKind,
@@ -30,6 +31,7 @@ fn config_for(provider: &ScriptedProvider, timeout: Duration) -> AiConfig {
         enabled: true,
         base_url: format!("{}/v1", provider.base_url()),
         model: "codescope-test/model".into(),
+        reasoning_effort: ReasoningEffort::Default,
         api_key: Some(SecretString::from("sk-test".to_string())),
         timeout,
         tool_choice: ToolChoice::Required,
@@ -603,6 +605,73 @@ async fn plain_text_response_gets_structured_repair_then_validates() {
         4,
         "initial turn plus exactly three bounded repairs"
     );
+}
+
+/// Reasoning providers may return `content: null` plus output-only reasoning metadata when
+/// automatic tool choice skips the required call. The repair transcript must not echo that
+/// invalid assistant message: Chat Completions rejects null-content assistant turns unless
+/// they contain `tool_calls`.
+#[tokio::test]
+async fn null_content_reasoning_response_repairs_without_invalid_assistant_replay() {
+    let null_completion = json!({
+        "id": "chatcmpl-null",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "codescope-fake",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "reasoning": "I should have called the plan tool"
+            },
+            "finish_reason": "stop"
+        }]
+    });
+    let provider = ScriptedProvider::start([
+        AiScriptStep::Raw {
+            status: 200,
+            content_type: "application/json".into(),
+            body: null_completion.to_string(),
+        },
+        AiScriptStep::valid_plan(Epoch(1)).unwrap(),
+    ])
+    .await
+    .unwrap();
+    let mut config = config_for(&provider, Duration::from_secs(5));
+    config.tool_choice = ToolChoice::Auto;
+    config.reasoning_effort = ReasoningEffort::High;
+    let service =
+        AiService::with_options(config, REPO_ROOT, AiClientOptions::default(), fast_retry())
+            .unwrap();
+
+    let outcome = service
+        .request_plan(
+            "digest",
+            &RecordingExecutor::default(),
+            &FixtureFacts,
+            Epoch(1),
+        )
+        .await;
+    assert!(matches!(outcome, AiOutcome::Plan(_, _)), "{outcome:?}");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let repair_body = requests[1].body_json().unwrap();
+    assert_eq!(repair_body["reasoning_effort"], "high");
+    let messages = repair_body["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["system", "user", "user"]);
+    assert!(messages.iter().all(|message| {
+        message["role"] != "assistant"
+            || !message
+                .get("content")
+                .is_none_or(serde_json::Value::is_null)
+            || message.get("tool_calls").is_some()
+    }));
 }
 
 #[tokio::test]

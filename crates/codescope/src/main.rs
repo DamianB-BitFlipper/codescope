@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use clap::Parser;
-use codescope_ai::AiService;
+use codescope_ai::{AiService, ReasoningEffort};
 use codescope_analysis::AnalysisEngine;
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
@@ -48,6 +48,10 @@ struct Cli {
     /// AI model for this run. Overrides the remembered/global model without persisting it.
     #[arg(short = 'm', long, value_name = "MODEL_NAME")]
     model: Option<String>,
+
+    /// Reasoning budget for this run. Use `default` to let the provider/model decide.
+    #[arg(short = 'r', long, value_name = "LEVEL")]
+    reasoning_effort: Option<ReasoningEffort>,
 
     /// Watch the working tree and Git state, refreshing automatically after changes.
     /// Off by default; without this flag, press R to refresh manually.
@@ -110,7 +114,7 @@ async fn main() -> Result<()> {
     let ai = if cli.no_ai {
         None
     } else {
-        match config_store.resolve_ai_config(cli.model.as_deref()) {
+        match config_store.resolve_ai_config(cli.model.as_deref(), cli.reasoning_effort) {
             Ok(config) if config.enabled => match AiService::new(config, root.clone()) {
                 Ok(s) => Some(s),
                 Err(e) => {
@@ -250,6 +254,9 @@ mod tests {
         assert!(cli.no_ai);
         let cli = Cli::try_parse_from(["codescope", "-m", "z-ai/glm-5.3", "/some/repo"]).unwrap();
         assert_eq!(cli.model.as_deref(), Some("z-ai/glm-5.3"));
+        let cli =
+            Cli::try_parse_from(["codescope", "--reasoning-effort", "high", "/some/repo"]).unwrap();
+        assert_eq!(cli.reasoning_effort, Some(ReasoningEffort::High));
         let cli = Cli::try_parse_from(["codescope", "--watch", "/some/repo"]).unwrap();
         assert!(cli.watch);
         assert_eq!(cli.path, PathBuf::from("/some/repo"));
@@ -288,6 +295,8 @@ mod tests {
             "run",
             "--model",
             "z-ai/glm-5.3",
+            "--reasoning-effort",
+            "minimal",
         ])
         .unwrap();
         match cli.command {
@@ -297,6 +306,7 @@ mod tests {
                 assert_eq!(args.file.as_deref(), Some("src/main.rs"));
                 assert_eq!(args.symbol.as_deref(), Some("run"));
                 assert_eq!(args.model.as_deref(), Some("z-ai/glm-5.3"));
+                assert_eq!(args.reasoning_effort, Some(ReasoningEffort::Minimal));
             }
             other => panic!("expected debug-ai, got {other:?}"),
         }

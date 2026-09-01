@@ -184,7 +184,8 @@ fn zoom_tag(app: &App, pane: Pane) -> &'static str {
 // -- top bar (docs/review/15 §3.1) ---------------------------------------------
 
 /// The top repository/service bar: `codescope  {repo}  {base} ← {branch}  {N} files`
-/// on the left, and `{scope}  LSP {status}  {provider} {model} {status}` on the right.
+/// on the left, and
+/// `{scope}  LSP {status}  {provider} {model} reasoning:{effort} {status}` on the right.
 /// The comparison direction and current change-set size replace the retired summary row.
 fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     let r = &snap.repo;
@@ -218,6 +219,20 @@ fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     if !model.is_empty() {
         right.push(Span::raw(" "));
         right.push(Span::styled(model, Style::new().fg(TEXT)));
+    }
+    // `default` is itself useful state: it tells the user that Codescope/provider
+    // compatibility logic, rather than an explicit budget, controls this model. Only
+    // suppress it when no AI configuration is present at all; snapshot defaults should
+    // not make an entirely disabled installation look configured.
+    if (!snap.ai_provider.is_empty() || !snap.ai_model.is_empty())
+        && !snap.ai_reasoning_effort.is_empty()
+    {
+        right.push(Span::raw(" "));
+        right.push(Span::styled("reasoning:", Style::new().fg(MUTED)));
+        right.push(Span::styled(
+            snap.ai_reasoning_effort.clone(),
+            Style::new().fg(TEXT),
+        ));
     }
     right.push(Span::raw(" "));
     right.push(Span::styled(ai_g, ai_style));
@@ -1960,16 +1975,41 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
         format!(" · via {}", snap.ai_provider)
     };
     let title = if snap.ai_model.is_empty() {
-        format!(" AI model{provider} ")
+        format!(" AI settings{provider} ")
     } else {
-        format!(" AI model (current: {}){provider} ", snap.ai_model)
+        format!(" AI settings (model: {}){provider} ", snap.ai_model)
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(ACCENT))
         .title(title);
     let models = filter_candidates(&snap.available_models, &app.model_query);
-    let mut items: Vec<ListItem> = if snap.available_models.is_empty() {
+    let supports_reasoning_effort = snap.ai_provider != "anthropic";
+    let selected_effort = app.selected_reasoning_effort();
+    let mut items = if supports_reasoning_effort {
+        vec![
+            ListItem::new(Line::from(vec![
+                Span::styled("  reasoning effort  ", Style::new().fg(MUTED)),
+                Span::styled(
+                    format!("← {selected_effort} →"),
+                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            ListItem::new(Line::from(Span::styled(
+                "  default is automatic; explicit support varies by model",
+                Style::new().fg(MUTED),
+            ))),
+        ]
+    } else {
+        vec![
+            ListItem::new(Line::from(Span::styled(
+                "  reasoning effort is unavailable through Anthropic's native API",
+                Style::new().fg(MUTED),
+            ))),
+            ListItem::new(Line::from("")),
+        ]
+    };
+    let model_items: Vec<ListItem> = if snap.available_models.is_empty() {
         let message = if snap.ai_model.is_empty() && snap.ai_provider.is_empty() {
             "  AI is not configured; set a provider API key".to_string()
         } else if snap.model_list_loading {
@@ -2005,6 +2045,7 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
             })
             .collect()
     };
+    items.extend(model_items);
     if snap.model_list_loading && !snap.available_models.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "  fetching additional models…",
@@ -2026,12 +2067,16 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
         Style::new().fg(WARN),
     ))));
     items.push(ListItem::new(Line::from(Span::styled(
-        "  type to filter or enter exact id · ↑/↓ move · Enter select · Esc close",
+        if supports_reasoning_effort {
+            "  ←/→ reasoning · type to filter · ↑/↓ move · Enter apply · Esc close"
+        } else {
+            "  type to filter · ↑/↓ move · Enter model · Esc close"
+        },
         Style::new().fg(MUTED),
     ))));
     let mut state = ListState::default();
     if !models.is_empty() {
-        state.select(Some(app.model_sel.min(models.len().saturating_sub(1))));
+        state.select(Some(2 + app.model_sel.min(models.len().saturating_sub(1))));
     }
     let list = List::new(items)
         .block(block)
@@ -2323,7 +2368,7 @@ mod tests {
             "explicit branch/base labels: {top}"
         );
         assert!(
-            top.contains("branch  LSP ✓  prime z-ai/glm-5.3 ×"),
+            top.contains("branch  LSP ✓  prime z-ai/glm-5.3 reasoning:default ×"),
             "right group: {top}"
         );
         // The right group is reserved flush against the terminal's right edge.
@@ -2340,8 +2385,8 @@ mod tests {
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
         let top = row_text(&t, 0);
         assert!(
-            top.contains("prime z-ai/glm-5.3 ✓"),
-            "provider/model/status order: {top}"
+            top.contains("prime z-ai/glm-5.3 reasoning:default ✓"),
+            "provider/model/reasoning/status order: {top}"
         );
         assert!(!top.contains("AI ✓ prime"), "retired order: {top}");
     }
