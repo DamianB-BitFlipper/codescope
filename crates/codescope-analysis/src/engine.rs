@@ -47,7 +47,7 @@ pub struct FileAnalysis {
     pub notes: Vec<String>,
 }
 
-/// The lazy per-file analysis result the interactive dispatcher caches. Cheap to hold
+/// The asynchronous per-file analysis result the interactive dispatcher caches. Cheap to hold
 /// per file; the eager [`AnalysisSnapshot`] still aggregates [`FileAnalysis`] records.
 #[derive(Debug, Clone)]
 pub struct FileSemanticResult {
@@ -145,6 +145,18 @@ impl<S: SemanticSource> AnalysisEngine<S> {
         crate::graph::expand_symbol_relations(&self.svc, file, pos)
             .await
             .1
+    }
+
+    /// Lazily fetch both directions of the symbol's one-hop call hierarchy in a single
+    /// expansion. Callers that need both lists should use this method so the language
+    /// server receives one incoming request and one outgoing request, rather than two of
+    /// each through the direction-specific convenience methods.
+    pub async fn relations_of(
+        &self,
+        file: &FileId,
+        pos: Position,
+    ) -> (Evidence<Vec<SymbolRef>>, Evidence<Vec<SymbolRef>>) {
+        crate::graph::expand_symbol_relations(&self.svc, file, pos).await
     }
 
     /// Consume the engine and return the semantic service (for graceful shutdown).
@@ -641,6 +653,19 @@ mod tests {
         // needs both.
         assert_eq!(engine.svc().calls_of("incoming_calls"), 2);
         assert_eq!(engine.svc().calls_of("outgoing_calls"), 2);
+    }
+
+    #[tokio::test]
+    async fn relations_of_expands_both_directions_once() {
+        let (_tmp, engine) = fixture_engine().await;
+        let file = FileId::new(MEMSTORE).unwrap();
+        let pos = Position::new(13, 5);
+
+        let (callers, callees) = engine.relations_of(&file, pos).await;
+        assert_eq!(callers.value.len(), 1);
+        assert_eq!(callees.value.len(), 1);
+        assert_eq!(engine.svc().calls_of("incoming_calls"), 1);
+        assert_eq!(engine.svc().calls_of("outgoing_calls"), 1);
     }
 
     #[tokio::test]

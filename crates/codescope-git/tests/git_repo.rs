@@ -461,11 +461,9 @@ async fn stacked_branch_infers_nearest_ancestor_not_default() {
     );
 }
 
-/// Remote-tracking branches never factor into the nearest-ancestor pick: with local `a`
-/// and its `origin/a` twin at the SAME commit, the inferred base is the LOCAL `a`, and
-/// `origin/a` is not an ancestor candidate (it may still appear as the upstream entry).
+/// Local and remote twins at the same tip collapse to one local presentation identity.
 #[tokio::test]
-async fn remote_tracking_twin_is_not_an_ancestor_candidate() {
+async fn local_branch_wins_same_tip_remote_twin() {
     let (_tmp, top) = scratch_repo();
     let remote_tmp = TempDir::new().unwrap();
     git(remote_tmp.path(), &["init", "-q", "--bare", "-b", "main"]);
@@ -503,7 +501,7 @@ async fn remote_tracking_twin_is_not_an_ancestor_candidate() {
     );
     assert_eq!(base.merge_base.as_str(), a_sha.trim());
 
-    // Picker: no remote-tracking ref in the ancestor tier; local `a` is first (no upstream).
+    // Picker: the local twin is first and the remote spelling is collapsed.
     let candidates = repo.base_candidates().await.expect("candidates");
     assert_eq!(candidates[0].source, BaseSource::Ancestor);
     assert_eq!(candidates[0].ref_name, "a");
@@ -511,14 +509,15 @@ async fn remote_tracking_twin_is_not_an_ancestor_candidate() {
         !candidates
             .iter()
             .any(|c| c.source == BaseSource::Ancestor && c.ref_name.starts_with("origin/")),
-        "remote-tracking refs must not be ancestor candidates: {candidates:?}"
+        "the same-tip remote twin is collapsed: {candidates:?}"
     );
     assert!(
         !candidates.iter().any(|c| c.ref_name == "origin/a"),
-        "origin/a appears only as a configured upstream, never otherwise: {candidates:?}"
+        "origin/a is represented by local a: {candidates:?}"
     );
 
-    // A configured upstream MAY be a remote-tracking ref: it stays first, deduped.
+    // If the configured upstream is the remote twin, its priority/source survives while
+    // the local spelling still wins presentation.
     git(
         top.as_std_path(),
         &["branch", "--set-upstream-to=origin/a", "b"],
@@ -528,17 +527,223 @@ async fn remote_tracking_twin_is_not_an_ancestor_candidate() {
         .await
         .expect("candidates with upstream");
     assert_eq!(candidates[0].source, BaseSource::Upstream);
-    assert_eq!(candidates[0].ref_name, "origin/a");
-    assert!(
-        candidates.iter().skip(1).all(|c| c.ref_name != "origin/a"),
-        "the upstream entry is deduped out of the later tiers: {candidates:?}"
-    );
+    assert_eq!(candidates[0].ref_name, "a");
     assert!(
         candidates
             .iter()
-            .any(|c| c.source == BaseSource::Ancestor && c.ref_name == "a"),
-        "local `a` is still listed as an ancestor: {candidates:?}"
+            .skip(1)
+            .all(|c| c.ref_name != "a" && c.ref_name != "origin/a"),
+        "the upstream/local twin is deduped out of later tiers: {candidates:?}"
     );
+}
+
+/// Review 26 regression: a stacked parent may exist only as a remote-tracking ref while
+/// the checked-out branch's upstream is a useless same-tip alias.
+#[tokio::test]
+async fn remote_only_stacked_parent_beats_far_local_ancestor() {
+    let (_tmp, top) = scratch_repo();
+    git(top.as_std_path(), &["branch", "rootfs-1", "HEAD"]);
+    git(top.as_std_path(), &["checkout", "-q", "-b", "rootfs-2"]);
+    write(top.as_std_path(), "rootfs-2.txt", "two\n");
+    git(top.as_std_path(), &["add", "rootfs-2.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "rootfs-2"]);
+    let rootfs_2 = git(top.as_std_path(), &["rev-parse", "HEAD"]);
+
+    git(top.as_std_path(), &["checkout", "-q", "-b", "rootfs-3"]);
+    write(top.as_std_path(), "rootfs-3.txt", "three\n");
+    git(top.as_std_path(), &["add", "rootfs-3.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "rootfs-3"]);
+    git(top.as_std_path(), &["remote", "add", "origin", "."]);
+    git(
+        top.as_std_path(),
+        &[
+            "update-ref",
+            "refs/remotes/origin/rootfs-2",
+            rootfs_2.trim(),
+        ],
+    );
+    git(
+        top.as_std_path(),
+        &["update-ref", "refs/remotes/origin/rootfs-3", "HEAD"],
+    );
+    git(
+        top.as_std_path(),
+        &["branch", "--set-upstream-to=origin/rootfs-3", "rootfs-3"],
+    );
+    git(top.as_std_path(), &["branch", "-D", "rootfs-2"]);
+
+    // An unreachable remote sibling must not leak into the graph-ranked picker.
+    git(
+        top.as_std_path(),
+        &["checkout", "-q", "--orphan", "sibling"],
+    );
+    git(top.as_std_path(), &["rm", "-q", "-rf", "."]);
+    write(top.as_std_path(), "sibling.txt", "unrelated\n");
+    git(top.as_std_path(), &["add", "."]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "sibling"]);
+    git(
+        top.as_std_path(),
+        &["update-ref", "refs/remotes/origin/sibling", "HEAD"],
+    );
+    git(top.as_std_path(), &["checkout", "-q", "rootfs-3"]);
+    git(top.as_std_path(), &["branch", "-D", "sibling"]);
+
+    let repo = open_repo(&top).await;
+    let ctx = repo.repo_context().await.expect("context");
+    let base = ctx.base.expect("remote-only base inferred");
+    assert_eq!(base.source, BaseSource::Ancestor);
+    assert_eq!(base.ref_name, "origin/rootfs-2");
+    assert_eq!(base.merge_base.as_str(), rootfs_2.trim());
+
+    let candidates = repo.base_candidates().await.expect("candidates");
+    assert_eq!(candidates[0].ref_name, "origin/rootfs-2");
+    assert!(
+        !candidates
+            .iter()
+            .any(|base| base.ref_name == "origin/rootfs-3"),
+        "same-tip upstream is excluded: {candidates:?}"
+    );
+    assert!(
+        !candidates
+            .iter()
+            .any(|base| base.ref_name == "origin/sibling"),
+        "unreachable sibling is excluded: {candidates:?}"
+    );
+
+    let changes = repo
+        .changeset(ChangeScope::Branch)
+        .await
+        .expect("branch changes");
+    let paths: Vec<_> = changes
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(paths, ["rootfs-3.txt"], "diff direction is rootfs-2 → HEAD");
+}
+
+#[tokio::test]
+async fn remote_only_parent_is_discovered_outside_the_origin_namespace() {
+    let (_tmp, top) = scratch_repo();
+    git(top.as_std_path(), &["checkout", "-q", "-b", "stack-2"]);
+    write(top.as_std_path(), "stack-2.txt", "parent\n");
+    git(top.as_std_path(), &["add", "stack-2.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "stack-2"]);
+    let parent = git(top.as_std_path(), &["rev-parse", "HEAD"]);
+    git(top.as_std_path(), &["checkout", "-q", "-b", "stack-3"]);
+    write(top.as_std_path(), "stack-3.txt", "child\n");
+    git(top.as_std_path(), &["add", "stack-3.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "stack-3"]);
+    git(
+        top.as_std_path(),
+        &["update-ref", "refs/remotes/review/stack-2", parent.trim()],
+    );
+    git(top.as_std_path(), &["branch", "-D", "stack-2"]);
+
+    let repo = open_repo(&top).await;
+    let base = repo.repo_context().await.unwrap().base.unwrap();
+    assert_eq!(base.ref_name, "review/stack-2");
+    assert_eq!(base.merge_base.as_str(), parent.trim());
+}
+
+#[tokio::test]
+async fn moved_local_remote_twins_remain_distinct_and_nearest_tip_wins() {
+    let (_tmp, top) = scratch_repo();
+    let main = git(top.as_std_path(), &["rev-parse", "main"]);
+    git(top.as_std_path(), &["checkout", "-q", "-b", "stack"]);
+    write(top.as_std_path(), "stack.txt", "parent\n");
+    git(top.as_std_path(), &["add", "stack.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "stack"]);
+    let remote_tip = git(top.as_std_path(), &["rev-parse", "stack"]);
+    git(
+        top.as_std_path(),
+        &["update-ref", "refs/remotes/origin/stack", remote_tip.trim()],
+    );
+    git(top.as_std_path(), &["checkout", "-q", "-b", "child"]);
+    write(top.as_std_path(), "child.txt", "child\n");
+    git(top.as_std_path(), &["add", "child.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "child"]);
+    git(top.as_std_path(), &["branch", "-f", "stack", main.trim()]);
+
+    let repo = open_repo(&top).await;
+    let base = repo.repo_context().await.unwrap().base.unwrap();
+    assert_eq!(base.ref_name, "origin/stack");
+    assert_eq!(base.merge_base.as_str(), remote_tip.trim());
+    let names: Vec<_> = repo
+        .base_candidates()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|base| base.ref_name)
+        .collect();
+    assert!(names.contains(&"origin/stack".to_string()), "{names:?}");
+    assert!(names.contains(&"stack".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn bounded_picker_reports_truncation_without_deduping_unrelated_names() {
+    let (_tmp, top) = scratch_repo();
+    let parent = git(top.as_std_path(), &["rev-parse", "HEAD"]);
+    git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
+    write(top.as_std_path(), "feature.txt", "feature\n");
+    git(top.as_std_path(), &["add", "feature.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "feature"]);
+    for index in 0..300 {
+        let name = format!("refs/remotes/review/base-{index:03}");
+        git(
+            top.as_std_path(),
+            &["update-ref", name.as_str(), parent.trim()],
+        );
+    }
+
+    let candidates = open_repo(&top)
+        .await
+        .base_candidates_with_metadata()
+        .await
+        .unwrap();
+    assert!(candidates.truncated);
+    assert_eq!(
+        candidates.entries.len(),
+        codescope_git::MAX_ANCESTOR_PICKER_ENTRIES
+    );
+    let distinct: std::collections::HashSet<_> = candidates
+        .entries
+        .iter()
+        .map(|base| base.ref_name.as_str())
+        .collect();
+    assert_eq!(distinct.len(), candidates.entries.len());
+}
+
+#[tokio::test]
+async fn branch_diff_and_base_content_are_base_to_head() {
+    let (_tmp, top) = scratch_repo();
+    git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
+    write(
+        top.as_std_path(),
+        "b.txt",
+        "one\ntwo\nthree\nHEAD-VALUE\nfive\nsix\nseven\neight\n",
+    );
+    git(top.as_std_path(), &["add", "b.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "feature edit"]);
+
+    let repo = open_repo(&top).await;
+    let base = repo.repo_context().await.unwrap().base.unwrap();
+    let changes = repo.branch_changeset_from_base(&base).await.unwrap();
+    let file = changes.find_file(Utf8Path::new("b.txt")).unwrap();
+    let lines = &file.hunks[0].lines;
+    assert!(lines
+        .iter()
+        .any(|line| { line.kind == codescope_core::DiffLineKind::Del && line.text == "four" }));
+    assert!(lines.iter().any(|line| {
+        line.kind == codescope_core::DiffLineKind::Add && line.text == "HEAD-VALUE"
+    }));
+    let old = repo
+        .base_file_content(base.merge_base.as_str(), Utf8Path::new("b.txt"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(old.contains("\nfour\n"));
+    assert!(!old.contains("HEAD-VALUE"));
 }
 
 #[tokio::test]

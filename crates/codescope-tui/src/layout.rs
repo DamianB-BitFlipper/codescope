@@ -16,36 +16,52 @@ pub enum Tier {
     /// The focused pane gets the whole body between the chrome rows (explicit zoom, or
     /// the viewport is below the normal minimum).
     FocusOnly,
-    /// The reference master-detail layout (docs/review/15 §1.1): top bar, summary bar,
-    /// files+diff work row, full-width Impact pane, status bar, help bar.
+    /// The reference master-detail layout: top context bar, files+diff work row,
+    /// full-width Impact pane, and one combined commands/usage/path footer.
     Normal,
 }
 
-/// Default width of the files pane in the normal layout (`App::files_width` starts here).
+/// Default width of the files pane in the normal layout.
 pub const DEFAULT_FILES_WIDTH: u16 = 42;
-/// Narrowest the files pane can be resized to with `[`.
+/// Narrowest the files pane can be resized to by dragging its divider.
 pub const MIN_FILES_WIDTH: u16 = 28;
-/// Widest the files pane can be resized to with `]`.
+/// Preferred maximum width of the files pane before live layout constraints apply.
 pub const MAX_FILES_WIDTH: u16 = 56;
 /// The diff pane never gets narrower than this; the files width yields first.
 pub const MIN_DIFF_WIDTH: u16 = 48;
-/// Height of the full-width Impact pane, including its border.
-pub const IMPACT_HEIGHT: u16 = 9;
+/// Height of the full-width Impact pane, including its border. The default gives the
+/// generated half enough inner rows for the header block (title, intent, trust notes)
+/// plus several visual lines; smaller terminals clamp back toward the minimum.
+pub const IMPACT_HEIGHT: u16 = 16;
 /// Default requested Impact-pane height.
-pub const DEFAULT_IMPACT_HEIGHT: u16 = 9;
+pub const DEFAULT_IMPACT_HEIGHT: u16 = 16;
 /// Minimum Impact-pane height.
 pub const MIN_IMPACT_HEIGHT: u16 = 5;
 /// Maximum Impact-pane height.
 pub const MAX_IMPACT_HEIGHT: u16 = 18;
 /// Minimum height of the work (files+diff) row the Impact pane may not consume.
 pub const MIN_WORK_HEIGHT: u16 = 7;
+/// Default width of the deterministic relationship stack inside Impact.
+pub const DEFAULT_IMPACT_LEFT_WIDTH: u16 = 52;
+/// Preferred minimum width of the deterministic relationship stack.
+pub const MIN_IMPACT_LEFT_WIDTH: u16 = 24;
+/// Preferred minimum width of the generated Impact breakdown.
+pub const MIN_GENERATED_IMPACT_WIDTH: u16 = 36;
+/// Preferred selected-change section height inside the deterministic relationship stack.
+pub const DEFAULT_SELECTED_CHANGE_HEIGHT: u16 = 4;
+/// Preferred callers section height inside the deterministic relationship stack.
+pub const DEFAULT_CALLERS_HEIGHT: u16 = 5;
+/// Minimum useful selected-change section height.
+pub const MIN_SELECTED_CHANGE_HEIGHT: u16 = 3;
+/// Minimum useful height of callers and downstream sections.
+pub const MIN_RELATION_SECTION_HEIGHT: u16 = 2;
 
 /// Choose the layout tier for a viewport of `area` cells.
 ///
 /// Hard stop below 30x8. Zoom always wins (an explicit full-body inspection is honored at
-/// every usable size). The normal layout needs at least 80x20: the six chrome/fixed rows
-/// (1+1+9+1+1) plus the minimum seven-row work area exactly fill 20 lines, and the
-/// files+diff split needs 80 columns to keep the diff at or above [`MIN_DIFF_WIDTH`].
+/// every usable size). The normal layout needs at least 80x20: two chrome rows, the
+/// minimum seven-row work area, and room for the Impact pane; the files+diff split needs
+/// 80 columns to keep the diff at or above [`MIN_DIFF_WIDTH`].
 #[must_use]
 pub fn choose_tier(area: Rect, zoomed: bool) -> Tier {
     let w = area.width;
@@ -68,10 +84,10 @@ pub fn choose_tier(area: Rect, zoomed: bool) -> Tier {
 /// changing the stored preference.
 /// The Impact-pane height for a frame of `frame_height` rows, given the App-owned
 /// `request`: clamped to `MIN_IMPACT_HEIGHT..=MAX_IMPACT_HEIGHT`, then yields to the
-/// `MIN_WORK_HEIGHT` work area (top bar + summary + status + help each take a row).
+/// `MIN_WORK_HEIGHT` work area after reserving the top bar and combined bottom bar.
 #[must_use]
 pub fn impact_height(request: u16, frame_height: u16) -> u16 {
-    let available = frame_height.saturating_sub(1 + 1 + MIN_WORK_HEIGHT + 1 + 1);
+    let available = frame_height.saturating_sub(1 + MIN_WORK_HEIGHT + 1);
     // No arbitrary maximum: the Impact pane may grow until the work area hits its
     // minimum. A small floor keeps the pane grabbable.
     request
@@ -90,6 +106,48 @@ pub fn files_width(request: u16, work_width: u16) -> u16 {
             .saturating_sub(MIN_DIFF_WIDTH)
             .max(MIN_FILES_WIDTH),
     )
+}
+
+/// Width of the deterministic left half inside the Impact pane. At ordinary terminal
+/// sizes both halves retain their useful minimum; constrained focus-only layouts split
+/// the available cells evenly so generated content never disappears completely.
+#[must_use]
+pub fn impact_left_width(request: u16, content_width: u16) -> u16 {
+    if content_width < MIN_IMPACT_LEFT_WIDTH + MIN_GENERATED_IMPACT_WIDTH {
+        return content_width / 2;
+    }
+    request.max(MIN_IMPACT_LEFT_WIDTH).min(
+        content_width
+            .saturating_sub(MIN_GENERATED_IMPACT_WIDTH)
+            .max(MIN_IMPACT_LEFT_WIDTH),
+    )
+}
+
+/// Heights of selected-change, callers, and downstream sections. At useful heights the
+/// first two honor their independent requests while reserving a minimum for everything
+/// after them. Very short layouts degrade with the old deterministic 3/even split.
+#[must_use]
+pub fn impact_section_heights(
+    selected_request: u16,
+    callers_request: u16,
+    total_height: u16,
+) -> [u16; 3] {
+    let required = MIN_SELECTED_CHANGE_HEIGHT + 2 * MIN_RELATION_SECTION_HEIGHT;
+    if total_height < required {
+        let selected = total_height.min(MIN_SELECTED_CHANGE_HEIGHT);
+        let remaining = total_height.saturating_sub(selected);
+        let callers = remaining / 2;
+        return [selected, callers, remaining.saturating_sub(callers)];
+    }
+
+    let selected = selected_request
+        .max(MIN_SELECTED_CHANGE_HEIGHT)
+        .min(total_height.saturating_sub(2 * MIN_RELATION_SECTION_HEIGHT));
+    let remaining = total_height.saturating_sub(selected);
+    let callers = callers_request
+        .max(MIN_RELATION_SECTION_HEIGHT)
+        .min(remaining.saturating_sub(MIN_RELATION_SECTION_HEIGHT));
+    [selected, callers, remaining.saturating_sub(callers)]
 }
 
 #[cfg(test)]
@@ -143,5 +201,30 @@ mod tests {
         assert_eq!(files_width(56, 80), 32);
         // Pathological widths fall back to the floor, never panic or zero the pane.
         assert_eq!(files_width(42, 10), MIN_FILES_WIDTH);
+    }
+
+    #[test]
+    fn impact_split_preserves_both_halves_and_degrades_evenly() {
+        assert_eq!(impact_left_width(52, 138), 52);
+        assert_eq!(impact_left_width(10, 100), MIN_IMPACT_LEFT_WIDTH);
+        assert_eq!(
+            impact_left_width(200, 100),
+            100 - MIN_GENERATED_IMPACT_WIDTH
+        );
+        assert_eq!(impact_left_width(52, 40), 20);
+    }
+
+    #[test]
+    fn impact_height_reserves_only_the_visible_chrome_and_work_floor() {
+        assert_eq!(impact_height(12, 40), 12);
+        assert_eq!(impact_height(12, 20), 11);
+    }
+
+    #[test]
+    fn impact_sections_honor_both_requests_and_reserve_downstream() {
+        assert_eq!(impact_section_heights(4, 5, 14), [4, 5, 5]);
+        assert_eq!(impact_section_heights(8, 9, 14), [8, 4, 2]);
+        assert_eq!(impact_section_heights(99, 99, 7), [3, 2, 2]);
+        assert_eq!(impact_section_heights(4, 5, 3), [3, 0, 0]);
     }
 }

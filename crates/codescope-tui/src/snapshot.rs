@@ -35,13 +35,22 @@ pub struct UiSnapshot {
     /// Which AI provider/credential is active ("prime"/"openai"/"anthropic"/"custom"; empty
     /// when AI is off).
     pub ai_provider: String,
+    /// Provider-reported tokens consumed by this running process.
+    pub ai_tokens: AiTokenUsage,
     /// Models the provider advertises (for the picker modal; empty until fetched).
     pub available_models: Vec<String>,
+    /// `true` while the user-triggered provider model-discovery request is in flight.
+    pub model_list_loading: bool,
+    /// Safe, user-visible reason model discovery failed. The configured/current model
+    /// remains usable and a model id may still be entered manually.
+    pub model_list_error: Option<String>,
     /// The base ref the `Branch` scope compares against (empty until known). Shown in the
     /// top bar; defaults to the nearest ancestor branch, overridable via the base picker.
     pub base_ref: String,
     /// Base candidates for the picker modal (empty until fetched).
     pub available_bases: Vec<String>,
+    /// `true` when the base picker list was bounded before every ancestor was visited.
+    pub base_candidates_truncated: bool,
     /// Transient status/help message for the bottom bar.
     ///
     /// Legacy plain-text mirror of [`UiSnapshot::status`] (`status.text`); kept while the
@@ -69,15 +78,28 @@ impl Default for UiSnapshot {
             ai: AiStatus::Disabled,
             ai_model: String::new(),
             ai_provider: String::new(),
+            ai_tokens: AiTokenUsage::default(),
             available_models: Vec::new(),
+            model_list_loading: false,
+            model_list_error: None,
             base_ref: String::new(),
             available_bases: Vec::new(),
+            base_candidates_truncated: false,
             message: String::new(),
             status: StatusMessage::default(),
             epoch: Epoch::ZERO,
             refreshing: false,
         }
     }
+}
+
+/// Process-lifetime provider usage displayed in the bottom bar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AiTokenUsage {
+    /// Input/prompt tokens.
+    pub input: u64,
+    /// Output/completion tokens.
+    pub output: u64,
 }
 
 impl UiSnapshot {
@@ -128,12 +150,11 @@ pub struct ScopeCounts {
     pub unstaged: usize,
 }
 
-/// Per-file semantic-analysis load state (lazy per-file analysis, replacing eager
-/// repo-wide analysis). `Unloaded` means no request has been made; the symbol count is
-/// unknown and must not render as `0`.
+/// Per-file asynchronous semantic-analysis state. `Unloaded` is the brief interval before
+/// the dispatcher queues the file; the symbol count is unknown and must not render as `0`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FileSemanticLoad {
-    /// No analysis requested yet (collapsed git row).
+    /// No analysis request has been queued yet.
     #[default]
     Unloaded,
     /// A per-file analysis job is in flight.
@@ -158,6 +179,10 @@ pub struct FileRow {
     pub status: &'static str,
     /// Number of changed symbols inside the file (right-aligned in the files pane).
     pub changed_symbol_count: usize,
+    /// Added source lines in this file's parsed hunks.
+    pub added_lines: usize,
+    /// Removed source lines in this file's parsed hunks.
+    pub removed_lines: usize,
     /// Changed symbols inside the file (indented under it).
     pub symbols: Vec<SymbolRow>,
     /// Whether the row's symbol list is expanded in the UI.
@@ -230,29 +255,17 @@ pub enum DiffRow {
 /// The right semantic pane: how the selection relates to the rest of the system.
 #[derive(Debug, Clone, Default)]
 pub struct SemanticPane {
-    /// Title of the current view (e.g. "callers of GetDisplayName").
-    pub title: String,
-    /// Tree rows (already indented via `depth`).
-    pub rows: Vec<SemRow>,
+    /// Validated, structured plan. Layout is deliberately deferred until render time so
+    /// diagrams (ladders, trees, adjacency) can respond to the pane's current width.
+    pub plan: Option<codescope_core::VisualizationPlan>,
+    /// The validation report that produced `plan` (verdict, dropped items, notes).
+    /// `Some` only for published AI panes; fallback/stale panes carry `None` so a prior
+    /// selection's report can never leak (Terra: sanitized content must stay labeled).
+    pub report: Option<codescope_core::ValidationReport>,
     /// A one-line note when the data is partial/approximate/AI-interpretive.
     pub note: String,
     /// `true` when this view came from the AI plan (vs the deterministic fallback).
     pub ai_generated: bool,
-}
-
-/// One row in the semantic tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemRow {
-    /// Indentation depth (0 = root).
-    pub depth: u16,
-    /// Display label (real symbol/file name).
-    pub label: String,
-    /// Relationship tag, e.g. `calls`, `implements`, `changed`.
-    pub relation: &'static str,
-    /// `true` for nodes that are themselves part of the change.
-    pub changed: bool,
-    /// `true` when a diagnostic badge should be shown.
-    pub has_diagnostic: bool,
 }
 
 /// The right impact pane: the selected change, its callers, and its downstream one-hop

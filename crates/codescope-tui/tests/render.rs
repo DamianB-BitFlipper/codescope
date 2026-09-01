@@ -1,13 +1,16 @@
 //! Headless render tests (ratatui `TestBackend`): no real terminal is touched.
 
-use codescope_core::{AiStatus, ChangeScope, LsStatus};
+use codescope_core::{
+    AiStatus, ChangeScope, FileId, FormKind, LsStatus, PlanEdge, PlanEdgeKind, PlanEvidence,
+    PlanNode, PlanNodeChange, VisualizationPlan, VizForm,
+};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use codescope_tui::app::App;
 use codescope_tui::render::render;
 use codescope_tui::snapshot::{
-    DiffPane, DiffRow, FileRow, RepoBar, ScopeCounts, SemRow, SemanticPane, SymbolRow, UiSnapshot,
+    DiffPane, DiffRow, FileRow, RepoBar, ScopeCounts, SemanticPane, SymbolRow, UiSnapshot,
 };
 
 fn sample() -> UiSnapshot {
@@ -29,6 +32,8 @@ fn sample() -> UiSnapshot {
             path: "internal/service/service.go".to_string(),
             status: "M",
             changed_symbol_count: 1,
+            added_lines: 1,
+            removed_lines: 1,
             expanded: true,
             semantic: codescope_tui::snapshot::FileSemanticLoad::Ready,
             symbols: vec![SymbolRow {
@@ -90,7 +95,10 @@ fn wide_layout_shows_all_panes() {
     assert!(text.contains("branch  LSP ✓"), "scope + lsp in the top bar");
     assert!(text.contains("service.go"), "file row");
     assert!(text.contains("GetDisplayName"), "symbol row");
-    assert!(text.contains("+prefix + name"), "diff add line");
+    assert!(
+        text.contains("+        prefix + name"),
+        "tab-indented diff add line"
+    );
     assert!(text.contains("SELECTED CHANGE"), "impact header");
 }
 
@@ -115,7 +123,7 @@ fn narrow_layout_shows_one_pane() {
     let text = buffer_text(&t);
     assert!(text.contains("service.go"), "files pane present");
     assert!(
-        !text.contains("+prefix + name"),
+        !text.contains("+        prefix + name"),
         "diff pane not simultaneously visible"
     );
 }
@@ -152,7 +160,7 @@ fn help_modal_covers_screen() {
     let mut app = App::new();
     app.show_help = true;
     t.draw(|f| render(f, &app, &sample())).unwrap();
-    assert!(buffer_text(&t).contains("keyboard controls"));
+    assert!(buffer_text(&t).contains("codescope — controls"));
 }
 
 #[test]
@@ -168,19 +176,15 @@ fn empty_state_is_graceful() {
 
 #[test]
 fn ai_plan_renders_after_loading_to_ready_transition() {
-    // Regression: the validated AI plan published in `UiSnapshot::semantic` (ai: Ready,
-    // ai_generated rows) must have a rendering path — the Loading → Ready edge switches
-    // the bottom pane to the AI plan view and the rows appear in the buffer.
+    // Regression: the validated generated breakdown published in `UiSnapshot::semantic`
+    // must render beside deterministic Impact after Loading → Ready.
     let backend = TestBackend::new(160, 40);
     let mut t = Terminal::new(backend).unwrap();
     let mut app = App::new();
 
-    // The chain starts at the keypress: `A` is the AI refresh (never `a`, the toggle).
-    assert_eq!(
-        map_key(key(KeyCode::Char('A')), &app),
-        Action::AiRefresh,
-        "A requests an AI plan"
-    );
+    // AI generation is automatic; the old manual a/A controls are intentionally inert.
+    assert_eq!(map_key(key(KeyCode::Char('a')), &app), Action::None);
+    assert_eq!(map_key(key(KeyCode::Char('A')), &app), Action::None);
 
     let mut loading = sample();
     loading.ai = AiStatus::Loading {
@@ -189,49 +193,174 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
     app.update(loading.clone());
     t.draw(|f| render(f, &app, &loading)).unwrap();
     assert!(
-        buffer_text(&t).contains("AI Plan …"),
-        "the AI tab shows progress while loading"
+        buffer_text(&t).contains("Generating a deeper explanation…"),
+        "the generated half shows progress while loading"
     );
 
     let mut ready = sample();
     ready.ai = AiStatus::Ready {
         epoch: codescope_core::Epoch(3),
     };
+    let mut plan = VisualizationPlan::new(codescope_core::Epoch(3), "How are retries bounded?");
+    plan.title = "Bounded request retries".to_string();
+    plan.intent = "RetryPolicy limits the attempts consumed by handleRequest.".to_string();
+    plan.forms.push(VizForm {
+        kind: FormKind::RelationshipFlow,
+        title: "runtime".into(),
+        summary: String::new(),
+        nodes: vec![
+            PlanNode::new("policy", "RetryPolicy", PlanNodeChange::Modified)
+                .with_detail("introduces a bounded retry budget"),
+            PlanNode::new("handler", "handleRequest", PlanNodeChange::Modified)
+                .with_detail("consumes one retry attempt"),
+        ],
+        edges: vec![PlanEdge {
+            from: "policy".into(),
+            to: "handler".into(),
+            kind: PlanEdgeKind::Calls,
+            label: Some("grants each attempt".into()),
+        }],
+    });
+    plan.evidence.push(PlanEvidence {
+        file: FileId::new("src/retry.rs").unwrap(),
+        hunk: Some(0),
+        symbol: Some("RetryPolicy".into()),
+        range: None,
+        reason: "defines the retry budget".into(),
+    });
     ready.semantic = SemanticPane {
-        title: "plan: introduce retry budget".to_string(),
-        rows: vec![
-            SemRow {
-                depth: 0,
-                label: "RetryPolicy".to_string(),
-                relation: "changed",
-                changed: true,
-                has_diagnostic: false,
+        plan: Some(plan),
+        report: None,
+        note: String::new(),
+        ai_generated: true,
+    };
+    app.update(ready.clone());
+    app.dividers.set(codescope_tui::DividerId::WorkReview, 16);
+    t.draw(|f| render(f, &app, &ready)).unwrap();
+    let text = buffer_text(&t);
+    assert!(!text.contains("Impact"), "combined title removed: {text}");
+    assert!(!text.contains("AI Plan"), "retired tab name: {text}");
+    assert!(
+        text.contains("Bounded request retries"),
+        "plan title: {text}"
+    );
+    assert_eq!(
+        text.matches("Bounded request retries").count(),
+        1,
+        "behavioral title must not be repeated"
+    );
+    assert!(text.contains("RetryPolicy"), "plan root row: {text}");
+    assert!(text.contains("handleRequest"), "plan child row: {text}");
+    assert!(
+        text.contains("introduces a bounded retry") && text.contains("budget"),
+        "reviewer-facing explanation: {text}"
+    );
+    assert!(
+        text.contains("▷"),
+        "inferred relationship arrow is dashed: {text}"
+    );
+    assert!(
+        !text.contains("▶"),
+        "solid arrows stay reserved for verified relationships: {text}"
+    );
+    assert!(
+        text.contains("≈ ┊ = inferred from cited diff"),
+        "one provenance note for the inferred form: {text}"
+    );
+    assert!(text.contains("hunk 1"), "one-based evidence hunk: {text}");
+    assert!(!text.contains("diff modified"), "old change badge: {text}");
+    assert!(
+        !text.contains("LSP warning"),
+        "old diagnostic badge: {text}"
+    );
+    assert!(
+        !text.contains(" !"),
+        "opaque diagnostic marker removed: {text}"
+    );
+    assert!(
+        text.contains("SELECTED CHANGE"),
+        "deterministic context remains visible: {text}"
+    );
+}
+
+/// The dispatcher publishes the validation report with every AI plan; a sanitized plan
+/// (the sequence extra-edge sanitizer dropped the back-edge) renders one WARN line
+/// before the diagram. Snapshot-level contract: reasons never reach the small pane.
+#[test]
+fn sanitized_sequence_plan_warns_in_the_generated_pane() {
+    let backend = TestBackend::new(160, 40);
+    let mut t = Terminal::new(backend).unwrap();
+    let mut app = App::new();
+    let mut ready = sample();
+    let mut plan = VisualizationPlan::new(codescope_core::Epoch(3), "How does shutdown drain?");
+    plan.title = "Graceful drain of the API server".to_string();
+    plan.intent = "The server stops accepting work before closing listeners.".to_string();
+    plan.forms.push(VizForm {
+        kind: FormKind::Sequence,
+        title: "drain".into(),
+        summary: String::new(),
+        nodes: vec![
+            PlanNode::new("n1", "markUnready", PlanNodeChange::Modified)
+                .with_detail("flips readiness to false first"),
+            PlanNode::new("n2", "drain", PlanNodeChange::Added)
+                .with_detail("waits out in-flight requests"),
+            PlanNode::new("n3", "closeListeners", PlanNodeChange::Modified)
+                .with_detail("closes listeners last"),
+        ],
+        // The sanitizer keeps the consecutive chain; n3 -> n1 is dropped and recorded.
+        edges: vec![
+            PlanEdge {
+                from: "n1".into(),
+                to: "n2".into(),
+                kind: PlanEdgeKind::Writes,
+                label: Some("unready precedes drain".into()),
             },
-            SemRow {
-                depth: 1,
-                label: "handleRequest".to_string(),
-                relation: "calls",
-                changed: false,
-                has_diagnostic: true,
+            PlanEdge {
+                from: "n2".into(),
+                to: "n3".into(),
+                kind: PlanEdgeKind::Writes,
+                label: Some("drain completes before close".into()),
+            },
+            PlanEdge {
+                from: "n3".into(),
+                to: "n1".into(),
+                kind: PlanEdgeKind::Writes,
+                label: Some("closes the loop".into()),
             },
         ],
+    });
+    plan.evidence.push(PlanEvidence {
+        file: FileId::new("internal/service/service.go").unwrap(),
+        hunk: Some(0),
+        symbol: None,
+        range: None,
+        reason: "the drain ordering hunk".into(),
+    });
+    ready.semantic = SemanticPane {
+        plan: Some(plan),
+        report: Some(codescope_core::ValidationReport::with_drops(vec![
+            codescope_core::DroppedItem {
+                subject: "edge n3 -> n1 in form 0".to_string(),
+                reason: "nonconsecutive or duplicate sequence edge".to_string(),
+            },
+        ])),
         note: String::new(),
         ai_generated: true,
     };
     app.update(ready.clone());
     t.draw(|f| render(f, &app, &ready)).unwrap();
     let text = buffer_text(&t);
-    assert!(text.contains("Impact | AI Plan"), "tab strip: {text}");
     assert!(
-        text.contains("plan: introduce retry budget"),
-        "plan title: {text}"
+        text.contains("⚠ sanitized AI plan · 1 item removed"),
+        "one concise WARN line before the plan (singular): {text}"
     );
-    assert!(text.contains("RetryPolicy"), "plan root row: {text}");
-    assert!(text.contains("handleRequest"), "plan child row: {text}");
     assert!(
-        !text.contains("SELECTED CHANGE"),
-        "impact columns replaced: {text}"
+        !text.contains("nonconsecutive or duplicate sequence edge"),
+        "drop reasons stay out of the pane: {text}"
     );
+    let warning = text.find("sanitized AI plan").expect("warning rendered");
+    let title = text.find("Graceful drain").expect("plan title rendered");
+    assert!(warning < title, "the warning precedes the plan: {text}");
 }
 
 use codescope_tui::action::{map_key, Action};
@@ -299,6 +428,37 @@ fn picker_renders_models_and_current() {
 }
 
 #[test]
+fn picker_distinguishes_discovery_failure_from_disabled_ai() {
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new();
+    app.show_model_picker = true;
+    let mut snap = picker_snapshot();
+    snap.available_models = vec![snap.ai_model.clone()];
+    snap.model_list_error = Some("provider returned http 404".to_string());
+    terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("discovery failed"), "{text}");
+    assert!(text.contains("current model remains selectable"), "{text}");
+    assert!(!text.contains("AI is not configured"), "{text}");
+}
+
+#[test]
+fn picker_offers_unmatched_query_as_an_exact_model_id() {
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new();
+    app.show_model_picker = true;
+    app.model_query = "vendor/new-model".to_string();
+    terminal
+        .draw(|frame| render(frame, &app, &picker_snapshot()))
+        .unwrap();
+    let text = buffer_text(&terminal);
+    assert!(text.contains("Enter to use"), "{text}");
+    assert!(text.contains("vendor/new-model"), "{text}");
+}
+
+#[test]
 fn picker_filter_shows_query_and_only_matching_models() {
     let backend = TestBackend::new(120, 30);
     let mut t = Terminal::new(backend).unwrap();
@@ -316,18 +476,15 @@ fn picker_filter_shows_query_and_only_matching_models() {
 }
 
 #[test]
-fn top_bar_shows_provider_not_long_model() {
+fn top_bar_shows_provider_selected_model_and_status_in_order() {
     let backend = TestBackend::new(160, 40);
     let mut t = Terminal::new(backend).unwrap();
     let app = App::new();
     t.draw(|f| render(f, &app, &picker_snapshot())).unwrap();
-    // The compact top bar shows the provider, not the long model name (docs/review/15 §3.1:
-    // the model is exposed via the `m` picker). Assert the provider badge and that the model
-    // appears in the open picker.
     let text = buffer_text(&t);
     assert!(
-        text.contains("prime") || text.contains("openai") || text.contains("anthropic"),
-        "provider badge in top bar: {text:?}"
+        text.contains("openai openai/gpt-5-mini ✓"),
+        "provider, selected model, then status: {text:?}"
     );
 }
 

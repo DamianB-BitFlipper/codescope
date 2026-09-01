@@ -12,6 +12,7 @@
 use crate::error::{GitError, Result};
 use camino::Utf8Path;
 use std::process::{Output, Stdio};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// Config/env hardening shared by every git call.
@@ -107,6 +108,85 @@ impl GitCommand {
         let out = self.output().await?;
         out.require_success()?;
         Ok(out)
+    }
+
+    /// Stream newline-delimited stdout through `visit` while draining stderr.
+    ///
+    /// Returning `false` from `visit` intentionally terminates and reaps git. The return
+    /// value is `true` when git ran to natural completion and `false` when the visitor
+    /// stopped it. Natural completion still requires exit status zero. This is used by
+    /// graph walks whose exact answer may be known long before `rev-list` reaches the root.
+    pub(crate) async fn stream_stdout_lines(
+        mut self,
+        mut visit: impl FnMut(&str) -> bool,
+    ) -> Result<bool> {
+        tracing::trace!(args = ?self.args, "streaming git");
+        let mut child = self.command.spawn().map_err(|source| GitError::Spawn {
+            args: self.args.clone(),
+            source,
+        })?;
+        let stdout = child.stdout.take().expect("stdout configured as piped");
+        let mut stderr = child.stderr.take().expect("stderr configured as piped");
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let result = stderr.read_to_end(&mut bytes).await;
+            (result, bytes)
+        });
+
+        let mut stdout = BufReader::new(stdout);
+        let mut bytes = Vec::new();
+        let mut completed = true;
+        loop {
+            bytes.clear();
+            let count = stdout
+                .read_until(b'\n', &mut bytes)
+                .await
+                .map_err(|source| GitError::Spawn {
+                    args: self.args.clone(),
+                    source,
+                })?;
+            if count == 0 {
+                break;
+            }
+            if bytes.last() == Some(&b'\n') {
+                bytes.pop();
+                if bytes.last() == Some(&b'\r') {
+                    bytes.pop();
+                }
+            }
+            let line = std::str::from_utf8(&bytes).map_err(|_| GitError::NonUtf8 {
+                context: format!("git {:?} stdout", self.args),
+            })?;
+            if !visit(line) {
+                completed = false;
+                // The answer is complete. Terminate the remaining graph walk and always
+                // wait for it so no child/zombie survives the refresh.
+                let _ = child.kill().await;
+                break;
+            }
+        }
+
+        let status = child.wait().await.map_err(|source| GitError::Spawn {
+            args: self.args.clone(),
+            source,
+        })?;
+        let (stderr_result, stderr) = stderr_task.await.map_err(|join| GitError::Command {
+            args: self.args.clone(),
+            status: -1,
+            stderr: format!("stderr reader task failed: {join}"),
+        })?;
+        stderr_result.map_err(|source| GitError::Spawn {
+            args: self.args.clone(),
+            source,
+        })?;
+        if completed && !status.success() {
+            return Err(GitError::Command {
+                args: self.args,
+                status: status.code().unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
+            });
+        }
+        Ok(completed)
     }
 }
 

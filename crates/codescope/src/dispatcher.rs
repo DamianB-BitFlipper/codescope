@@ -9,16 +9,66 @@ use std::collections::HashSet;
 
 use codescope_ai::{AiOutcome, AiService, FactView, NoToolExecutor};
 use codescope_analysis::{AnalysisEngine, AnalysisSnapshot};
-use codescope_core::{AiStatus, ChangeScope, EntityRef, Epoch, LineRange, LsStatus, PlanEdgeKind};
+use codescope_core::{
+    AiStatus, ChangeScope, DiffSide, EntityRef, Epoch, LineRange, LsStatus, PlanEdgeKind,
+};
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
 use codescope_tui::snapshot::{
-    DiffPane, DiffRow, FileRow, ImpactList, ImpactLoadState, ImpactPane, ImpactRow,
-    InterpretationSource, RepoBar, ScopeCounts, SelectedChange, SemRow, SemanticPane, StatusLevel,
+    AiTokenUsage, DiffPane, DiffRow, FileRow, ImpactList, ImpactLoadState, ImpactPane, ImpactRow,
+    InterpretationSource, RepoBar, ScopeCounts, SelectedChange, SemanticPane, StatusLevel,
     StatusMessage, SymbolRow, UiSnapshot,
 };
 use codescope_tui::Action;
+use codescope_tui::UiPreferences;
 use tokio::sync::{mpsc, watch};
+
+use crate::request_coordinator::{Admission, RequestCoordinator, RequestPriority};
+
+/// Publication boundary between the backend dispatcher and a state consumer.
+///
+/// The interactive application implements this with a latest-value [`watch`] channel;
+/// the headless debug backend implements it with an ordered [`mpsc`] channel. Both paths
+/// therefore observe the exact same [`UiSnapshot`] assembled by the dispatcher.
+pub(crate) trait BackendOutput: Send + Sync {
+    /// Publish one immutable backend state snapshot.
+    fn publish(&self, snapshot: UiSnapshot);
+}
+
+impl BackendOutput for watch::Sender<UiSnapshot> {
+    fn publish(&self, snapshot: UiSnapshot) {
+        let _ = self.send(snapshot);
+    }
+}
+
+impl BackendOutput for mpsc::UnboundedSender<UiSnapshot> {
+    fn publish(&self, snapshot: UiSnapshot) {
+        let _ = self.send(snapshot);
+    }
+}
+
+/// Narrow persistence boundary used by the dispatcher. Tests can inject a memory/failing
+/// implementation without ever touching the user's real global config.
+pub(crate) trait ConfigPersistence: Send + Sync {
+    /// Remember an explicit picker selection in the active provider's slot.
+    fn persist_model(&self, provider: &str, model: &str) -> Result<(), String>;
+    /// Remember stable, repository-independent TUI preferences.
+    fn persist_ui(&self, preferences: UiPreferences) -> Result<(), String>;
+}
+
+/// Owned writes sent to the single FIFO config worker. Serial execution preserves the
+/// user's action order while `spawn_blocking` keeps filesystem locking/fsync off the
+/// dispatcher runtime thread.
+enum ConfigWrite {
+    Model { provider: String, model: String },
+    Ui(UiPreferences),
+}
+
+fn flatten_config_write_result(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+) -> Result<(), String> {
+    result.map_err(|error| format!("config writer task failed: {error}"))?
+}
 
 /// Events the dispatcher reacts to.
 #[derive(Debug)]
@@ -46,7 +96,23 @@ pub enum DispatchEvent {
         /// The current scope's changeset (files pane + diff before symbols land).
         changeset: codescope_core::ChangeSet,
     },
-    /// A lazy per-file analysis job completed (spawned; epoch-tagged).
+    /// Branch context resolved successfully, but no meaningful comparison base exists.
+    /// This is distinct from an empty changeset: the UI must clear stale branch facts and
+    /// say `base: none`, never imply that a comparison ran and found no changes.
+    BranchUnavailable {
+        /// Epoch the resolution ran against; stale results are dropped on apply.
+        epoch: Epoch,
+        /// Current repository context with `base: None`.
+        ctx: codescope_core::RepoContext,
+    },
+    /// A background global-config write failed. The live selection remains applied.
+    ConfigSaveFailed {
+        /// Human-readable description of the preference that remained session-only.
+        what: &'static str,
+        /// Filesystem/config failure detail.
+        error: String,
+    },
+    /// An asynchronous per-file analysis job completed (spawned; epoch-tagged).
     FileAnalysisDone {
         /// Epoch the job ran against; stale results are dropped on apply.
         epoch: Epoch,
@@ -59,6 +125,9 @@ pub enum DispatchEvent {
     AiDone {
         /// Epoch the plan was requested against.
         epoch: Epoch,
+        /// Exact file/function row the plan explains. Completion is cached for this row
+        /// even when focus moved while the provider was answering.
+        selection: AiSelectionKey,
         /// The AI request generation (monotonic per dispatcher): distinguishes two
         /// requests in the same epoch, so a slow older request can never overwrite a
         /// newer plan (review 18 M7).
@@ -66,14 +135,34 @@ pub enum DispatchEvent {
         /// The validated outcome.
         outcome: AiOutcome,
     },
+    /// The selection stayed on one changed file/symbol long enough to request its AI plan.
+    /// Navigation increments `generation`, so earlier debounce events become inert before
+    /// they can spend a provider request.
+    AiSelectionSettled {
+        /// Repo-state epoch the selection belongs to.
+        epoch: Epoch,
+        /// Latest selection-debounce generation.
+        generation: u64,
+    },
     /// The language server finished initializing; semantic analysis can begin.
     EngineReady(Box<AnalysisEngine<LanguageService>>),
     /// The language server failed to start; stay in git-only mode.
     EngineUnavailable(String),
-    /// The provider's model list was fetched for the picker.
-    ModelsLoaded(Vec<String>),
+    /// The provider's model list request completed for the picker. Failure is distinct
+    /// from AI being disabled: the current or manually entered model remains usable.
+    ModelsLoaded {
+        /// Monotonic request generation; late older responses are ignored.
+        generation: u64,
+        /// Normalized model ids or a safe discovery error.
+        result: Result<Vec<String>, String>,
+    },
     /// The repo's base candidates were fetched for the base picker.
-    BaseLoaded(Vec<String>),
+    BaseLoaded {
+        /// Ordered selectable ref names.
+        bases: Vec<String>,
+        /// The bounded graph walk stopped before exhausting all possible ancestors.
+        truncated: bool,
+    },
     /// The selected symbol's lazy callers/callees resolved.
     RelationsLoaded {
         /// Epoch the job ran against; stale results are dropped on apply.
@@ -108,9 +197,10 @@ pub struct RelationRows {
 /// Picker entry that returns base selection to inference.
 const AUTO_BASE: &str = "(auto / inferred)";
 
-/// Appended to every AI failure in the status bar (spec §3.6): `A` re-requests the plan
-/// and `m` opens the model picker, and the deterministic impact view is unaffected.
-const AI_FAILURE_SUFFIX: &str = "A retry · m change model · deterministic impact remains available";
+/// Appended to every AI failure in the status bar. File/selection changes retry
+/// automatically; `m` remains available to change the model.
+const AI_FAILURE_SUFFIX: &str =
+    "m change model · retries automatically when the selection or file changes · deterministic impact remains available";
 
 /// Lazy per-file semantic state (the interactive counterpart of the eager
 /// `AnalysisSnapshot.files`). The files pane renders this directly.
@@ -122,7 +212,7 @@ enum FileSemanticState {
     Ready(Box<codescope_analysis::FileSemanticResult>),
     /// The language service does not own this file (binary, gitlink, unowned language).
     Unsupported,
-    /// The job failed (retryable via re-expand).
+    /// The job failed (retried after the next repository/file change).
     Failed,
 }
 
@@ -135,6 +225,109 @@ struct SelectedRelations {
     callees: RelationRows,
 }
 
+/// Stable identity of the changed-file/function row an AI plan explains.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct AiSelectionKey {
+    file: String,
+    symbol: Option<(String, u32, u32)>,
+}
+
+impl AiSelectionKey {
+    fn label(&self) -> &str {
+        self.symbol
+            .as_ref()
+            .map(|(name, _, _)| name.as_str())
+            .unwrap_or(self.file.as_str())
+    }
+}
+
+/// Stable identity for carrying a validated design across repository revisions.
+///
+/// Line and column deliberately do not participate: an edit above a function may move it
+/// without changing the behavior the prior diagram explains. Revision entries are prompt
+/// seeds only; they are never rendered as facts for a newer epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AiRevisionKey {
+    file: String,
+    symbol: Option<String>,
+}
+
+impl From<&AiSelectionKey> for AiRevisionKey {
+    fn from(selection: &AiSelectionKey) -> Self {
+        Self {
+            file: selection.file.clone(),
+            symbol: selection.symbol.as_ref().map(|(name, _, _)| name.clone()),
+        }
+    }
+}
+
+/// Render-ready validated plan cached for one selection.
+#[derive(Debug, Clone)]
+struct CachedAiPlan {
+    plan: codescope_core::VisualizationPlan,
+    /// The validation report that produced the (already sanitized) plan. Cached with the
+    /// plan so cache hits and selection changes keep flagging dropped content instead of
+    /// presenting a sanitized plan as fully trusted (Terra's report-preservation fix).
+    report: codescope_core::ValidationReport,
+}
+
+/// How broadly a dispatcher warms AI plans. The interactive TUI uses `Adaptive`; the
+/// one-shot debug backend uses `FocusedOnly` so it never spends requests on unrelated rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AiPrefetchPolicy {
+    Adaptive,
+    FocusedOnly,
+}
+
+/// Lower values run first. Queue entries are reclassified whenever focus/expansion moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AiJobPriority {
+    Focused = 0,
+    ExpandedSymbol = 1,
+    FileSummary = 2,
+}
+
+impl From<AiJobPriority> for RequestPriority {
+    fn from(priority: AiJobPriority) -> Self {
+        match priority {
+            AiJobPriority::Focused => RequestPriority::Focused,
+            AiJobPriority::ExpandedSymbol => RequestPriority::Interactive,
+            AiJobPriority::FileSummary => RequestPriority::Background,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AiQueuedJob {
+    selection: AiSelectionKey,
+    epoch: Epoch,
+    priority: AiJobPriority,
+    order: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AiRunningJob {
+    selection: AiSelectionKey,
+    epoch: Epoch,
+    generation: u64,
+    priority: AiJobPriority,
+    /// Model and fact changes can make an answer ineligible before its task observes
+    /// cancellation. The generation ledger still rejects a completion already in flight.
+    accept_result: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticJobPriority {
+    Focused,
+    Background,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticRunningJob {
+    epoch: Epoch,
+    priority: SemanticJobPriority,
+}
+
 /// The dispatcher actor. Single writer of all published state.
 pub struct Dispatcher {
     repo: GitRepo,
@@ -144,10 +337,30 @@ pub struct Dispatcher {
     epoch: Epoch,
     ls_status: LsStatus,
     ai_status: AiStatus,
-    ai_enabled: bool,
     analysis: Option<AnalysisSnapshot>,
-    /// Validated AI plan rows with the epoch they were validated against.
-    ai_rows: Option<(Epoch, Vec<SemRow>, String)>,
+    /// The plan currently displayed, scoped to exactly one changed-file/function row.
+    ai_rows: Option<(Epoch, AiSelectionKey, CachedAiPlan)>,
+    /// Per-selection plan cache for this epoch. Arrowing back to a previously visited row
+    /// restores its plan without another provider request.
+    ai_cache: std::collections::HashMap<AiSelectionKey, CachedAiPlan>,
+    /// Last validated design for a stable file/symbol identity. Unlike `ai_cache`, this
+    /// survives repository epochs and is supplied only as a continuity seed to the next
+    /// request. Current git/LSP facts still own validation and rendering.
+    ai_revision_cache: std::collections::HashMap<AiRevisionKey, CachedAiPlan>,
+    /// Deduplicated priority queue of eligible plan generations.
+    ai_queue: Vec<AiQueuedJob>,
+    ai_queue_order: u64,
+    /// Active AI requests, indexed by their unique generation.
+    ai_running: std::collections::HashMap<u64, AiRunningJob>,
+    /// Central admission, burst, and FIFO overflow-cancellation policy for AI work.
+    ai_requests: RequestCoordinator,
+    /// Per-selection terminal failures, surfaced when that row is focused.
+    ai_failures: std::collections::HashMap<AiSelectionKey, String>,
+    ai_consecutive_failures: u8,
+    ai_background_paused: bool,
+    ai_prefetch: AiPrefetchPolicy,
+    /// Monotonic debounce generation for selection-follow requests.
+    ai_selection_seq: u64,
     /// The file the diff pane is aimed at (the files-pane selection; falls back to the
     /// changeset's first file when unset or absent from the set).
     selected_file: Option<String>,
@@ -157,6 +370,10 @@ pub struct Dispatcher {
     /// The selected symbol's lazily-expanded callers/callees, kept as separate lists so
     /// the impact pane can show both columns.
     selected_relations: Option<SelectedRelations>,
+    /// Per-symbol relationship facts shared by the focused pane and adaptive AI prefetch.
+    relation_cache: std::collections::HashMap<AiSelectionKey, SelectedRelations>,
+    relation_in_flight: std::collections::HashMap<AiSelectionKey, SemanticRunningJob>,
+    relation_queue: std::collections::VecDeque<AiSelectionKey>,
     /// The epoch that produced the current `repo_ctx`/`changeset`. Jobs that clone
     /// those as inputs (per-file analysis, AI digest) must only launch when this equals
     /// `self.epoch` — otherwise they would tag old git facts with the new epoch
@@ -164,19 +381,19 @@ pub struct Dispatcher {
     data_epoch: Epoch,
     /// Monotonic AI request counter: `AiDone.generation` must match to apply.
     ai_request_seq: u64,
-    /// Per-file lazy semantic analysis, keyed by repo-relative path. Absent = Unloaded.
+    /// Per-file asynchronous semantic analysis, keyed by repo-relative path. Absent = Unloaded.
     /// Cleared on every epoch bump (scope/base/repo change invalidates file content).
     file_semantics: std::collections::HashMap<String, FileSemanticState>,
-    /// Files the user expanded with Tab (dispatcher owns expansion so the snapshot is the
-    /// single source of truth; the app forwards ToggleFileAnalysis).
+    /// Files the user expanded with Tab. Expansion controls visibility only; symbol
+    /// analysis is scheduled independently for every changed file.
     expanded_files: std::collections::HashSet<String>,
     /// In-flight per-file analysis jobs: path → the epoch its job was launched under.
     /// A completing job removes only its own entry (matching epoch); a stale-epoch
     /// completion never disturbs a newer job's ledger entry (review 18 M2).
-    analysis_in_flight: std::collections::HashMap<String, Epoch>,
+    analysis_in_flight: std::collections::HashMap<String, SemanticRunningJob>,
     /// FIFO queue for per-file analysis beyond the concurrency bound.
     analysis_queue: std::collections::VecDeque<String>,
-    snapshot_tx: watch::Sender<UiSnapshot>,
+    output: std::sync::Arc<dyn BackendOutput>,
     /// Where completed jobs report back.
     job_tx: mpsc::Sender<DispatchEvent>,
     /// Typed status message surfaced in the bottom bar (`UiSnapshot::message` mirrors
@@ -184,23 +401,35 @@ pub struct Dispatcher {
     status: StatusMessage,
     /// Available AI models for the picker (from the provider).
     available_models: Vec<String>,
+    /// Whether provider model discovery is in flight.
+    model_list_loading: bool,
+    /// Last safe provider model-discovery error.
+    model_list_error: Option<String>,
+    /// Latest user-triggered model-discovery generation.
+    model_list_seq: u64,
     /// User-picked comparison base (overrides inference until cleared).
     base_override: Option<String>,
     /// Base candidates for the picker (from `git base_candidates`).
     available_bases: Vec<String>,
+    /// Honesty marker for a bounded base-candidate graph scan.
+    available_bases_truncated: bool,
     /// Latest repo context (cheap to re-read).
     repo_ctx: Option<codescope_core::RepoContext>,
     /// Latest raw changeset for the current scope (for the diff pane before analysis lands).
     changeset: Option<codescope_core::ChangeSet>,
+    /// FIFO sender for nonblocking persistence. The worker owns the persistence sink.
+    config_write_tx: Option<mpsc::UnboundedSender<ConfigWrite>>,
+    /// Joined during dispatcher shutdown so the last explicit preference reaches disk.
+    config_writer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Dispatcher {
     /// Build a dispatcher for an already-discovered repo.
-    pub fn new(
+    pub(crate) fn new<O: BackendOutput + 'static>(
         repo: GitRepo,
         engine: Option<AnalysisEngine<LanguageService>>,
         ai: Option<AiService>,
-        snapshot_tx: watch::Sender<UiSnapshot>,
+        output: O,
         job_tx: mpsc::Sender<DispatchEvent>,
     ) -> Self {
         let ls_status = if engine.is_some() {
@@ -223,13 +452,29 @@ impl Dispatcher {
             } else {
                 AiStatus::Disabled
             },
-            ai_enabled,
             analysis: None,
             ai_rows: None,
+            ai_cache: std::collections::HashMap::new(),
+            ai_revision_cache: std::collections::HashMap::new(),
+            ai_queue: Vec::new(),
+            ai_queue_order: 0,
+            ai_running: std::collections::HashMap::new(),
+            ai_requests: RequestCoordinator::default(),
+            ai_failures: std::collections::HashMap::new(),
+            ai_consecutive_failures: 0,
+            ai_background_paused: false,
+            ai_prefetch: AiPrefetchPolicy::Adaptive,
+            ai_selection_seq: 0,
             available_models: Vec::new(),
+            model_list_loading: false,
+            model_list_error: None,
+            model_list_seq: 0,
             selected_file: None,
             selected_symbol: None,
             selected_relations: None,
+            relation_cache: std::collections::HashMap::new(),
+            relation_in_flight: std::collections::HashMap::new(),
+            relation_queue: std::collections::VecDeque::new(),
             file_semantics: std::collections::HashMap::new(),
             expanded_files: std::collections::HashSet::new(),
             ai_request_seq: 0,
@@ -238,16 +483,79 @@ impl Dispatcher {
             analysis_queue: std::collections::VecDeque::new(),
             base_override: None,
             available_bases: Vec::new(),
-            snapshot_tx,
+            available_bases_truncated: false,
+            output: std::sync::Arc::new(output),
             job_tx,
             status: StatusMessage::default(),
             repo_ctx: None,
             changeset: None,
+            config_write_tx: None,
+            config_writer: None,
         }
     }
 
+    /// Select the background warm-up policy while retaining the same scheduler/cache path.
+    pub(crate) fn with_ai_prefetch_policy(mut self, policy: AiPrefetchPolicy) -> Self {
+        self.ai_prefetch = policy;
+        self
+    }
+
+    /// Attach global config persistence without making it a requirement for dispatcher
+    /// construction or tests.
+    pub(crate) fn with_config_persistence(
+        mut self,
+        persistence: std::sync::Arc<dyn ConfigPersistence>,
+    ) -> Self {
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<ConfigWrite>();
+        let result_tx = self.job_tx.clone();
+        let worker_persistence = persistence.clone();
+        let writer = tokio::spawn(async move {
+            while let Some(write) = write_rx.recv().await {
+                let persistence = worker_persistence.clone();
+                let (what, result) = match write {
+                    ConfigWrite::Model { provider, model } => {
+                        let result = tokio::task::spawn_blocking(move || {
+                            persistence.persist_model(&provider, &model)
+                        })
+                        .await;
+                        ("AI model", flatten_config_write_result(result))
+                    }
+                    ConfigWrite::Ui(preferences) => {
+                        let result = tokio::task::spawn_blocking(move || {
+                            persistence.persist_ui(preferences)
+                        })
+                        .await;
+                        ("view preferences", flatten_config_write_result(result))
+                    }
+                };
+                if let Err(error) = result {
+                    let _ = result_tx
+                        .send(DispatchEvent::ConfigSaveFailed { what, error })
+                        .await;
+                }
+            }
+        });
+        self.config_write_tx = Some(write_tx);
+        self.config_writer = Some(writer);
+        self
+    }
+
+    /// Seed a warning that is visible in the first TUI snapshot (for example, a
+    /// malformed/future global config that has deliberately been opened read-only).
+    pub(crate) fn with_startup_warning(mut self, warning: impl Into<String>) -> Self {
+        self.set_status(warning, StatusLevel::Warning);
+        self
+    }
+
+    /// Mark a dispatcher whose language-server startup already failed before the actor
+    /// starts (the headless path). The TUI reports the same state later through an event.
+    pub(crate) fn with_engine_unavailable(mut self, reason: impl Into<String>) -> Self {
+        self.apply_engine_unavailable(reason.into());
+        self
+    }
+
     fn publish(&self) {
-        let _ = self.snapshot_tx.send(self.build_snapshot());
+        self.output.publish(self.build_snapshot());
     }
 
     /// Set the bottom-bar status message; `UiSnapshot::message` mirrors the text while
@@ -270,6 +578,18 @@ impl Dispatcher {
                 ctx,
                 changeset,
             } => self.on_changeset_ready(epoch, ctx, changeset),
+            DispatchEvent::BranchUnavailable { epoch, ctx } => {
+                self.on_branch_unavailable(epoch, ctx)
+            }
+            DispatchEvent::ConfigSaveFailed { what, error } => {
+                self.set_status(
+                    format!(
+                        "{what} could not be saved; the session change remains active: {error}"
+                    ),
+                    StatusLevel::Warning,
+                );
+                self.publish();
+            }
             DispatchEvent::FileAnalysisDone {
                 epoch,
                 file,
@@ -277,34 +597,54 @@ impl Dispatcher {
             } => self.on_file_analysis_done(epoch, file, result),
             DispatchEvent::AiDone {
                 epoch,
+                selection,
                 generation,
                 outcome,
-            } => self.on_ai_done(epoch, generation, outcome),
+            } => self.on_ai_done(epoch, selection, generation, outcome),
+            DispatchEvent::AiSelectionSettled { epoch, generation } => {
+                if epoch == self.epoch && generation == self.ai_selection_seq {
+                    if let Some(selection) = self.current_ai_selection() {
+                        self.enqueue_ai_job(selection, AiJobPriority::Focused);
+                        self.pump_ai_queue();
+                        self.publish();
+                    }
+                }
+            }
             DispatchEvent::EngineReady(engine) => {
                 self.ls_status = LsStatus::Ready;
                 self.engine = Some(std::sync::Arc::new(*engine));
-                // No eager repo-wide analysis (the lazy redesign): the files pane is
-                // already populated from git; semantics load per file on Tab. A refresh
-                // would only re-run the git phase, so just publish the new LSP status.
+                // A changeset may have landed while the language server initialized.
+                // Drain its already-queued per-file work now; the bounded queue keeps this
+                // asynchronous and prevents a large change-set from flooding the server.
+                self.schedule_all_file_analysis();
+                self.drain_analysis_queue();
+                self.drain_relation_queue();
                 self.publish();
             }
             DispatchEvent::EngineUnavailable(reason) => {
-                self.ls_status = LsStatus::Failed;
-                if reason.contains("no supported language detected") {
-                    self.set_status(
-                        "git-only (no supported language detected)",
-                        StatusLevel::Warning,
-                    );
-                } else {
-                    self.set_status(
-                        format!("git-only (language server failed: {reason})"),
-                        StatusLevel::Warning,
-                    );
-                }
+                self.apply_engine_unavailable(reason);
                 self.publish();
             }
-            DispatchEvent::ModelsLoaded(models) => {
-                self.available_models = models;
+            DispatchEvent::ModelsLoaded { generation, result } => {
+                if generation != self.model_list_seq {
+                    return;
+                }
+                self.model_list_loading = false;
+                match result {
+                    Ok(models) => {
+                        self.model_list_error = None;
+                        self.merge_available_models(models);
+                    }
+                    Err(error) => {
+                        self.model_list_error = Some(error.clone());
+                        self.set_status(
+                            format!(
+                                "model discovery failed; current/manual model remains available: {error}"
+                            ),
+                            StatusLevel::Warning,
+                        );
+                    }
+                }
                 self.publish();
             }
             DispatchEvent::RelationsLoaded {
@@ -316,40 +656,111 @@ impl Dispatcher {
                 callers,
                 callees,
             } => {
-                // Staleness gate: the result applies only while it answers the CURRENT
-                // selection in the CURRENT repo state. Navigation no longer needs Enter, so
-                // a slow fetch for a row the user has since left must never overwrite the
-                // pane (the epoch gate covers refreshes; the identity gate covers j/k moves
-                // within one epoch).
-                let current = self
-                    .selected_symbol
-                    .as_ref()
-                    .is_some_and(|s| *s == (file, name.clone(), line, col));
-                if epoch != self.epoch || !current {
+                let selection = AiSelectionKey {
+                    file,
+                    symbol: Some((name, line, col)),
+                };
+                if self
+                    .relation_in_flight
+                    .get(&selection)
+                    .is_some_and(|job| job.epoch == epoch)
+                {
+                    self.relation_in_flight.remove(&selection);
+                }
+                if epoch != self.epoch {
+                    self.drain_relation_queue();
                     return;
                 }
-                // Callers and callees stay separate lists: the impact pane shows them
-                // in their own columns, each with its evidence honesty flag.
-                self.selected_relations = Some(SelectedRelations { callers, callees });
+                let relations = SelectedRelations { callers, callees };
+                self.relation_cache
+                    .insert(selection.clone(), relations.clone());
+                let current = self.current_ai_selection();
+                if current.as_ref() == Some(&selection) {
+                    self.selected_relations = Some(relations);
+                    // The short relation grace period may have elapsed while the LSP was
+                    // still answering. Cancel requests built from incomplete Impact facts;
+                    // their replacement is immediately eligible for focused capacity.
+                    let incomplete: Vec<u64> = self
+                        .ai_running
+                        .iter()
+                        .filter(|(_, running)| {
+                            running.epoch == self.epoch && running.selection == selection
+                        })
+                        .map(|(generation, _)| *generation)
+                        .collect();
+                    for generation in incomplete {
+                        self.abort_ai_request(generation, false);
+                    }
+                    self.enqueue_ai_job(selection, AiJobPriority::Focused);
+                } else if self.ai_prefetch == AiPrefetchPolicy::Adaptive
+                    && (self.selected_file.as_deref() == Some(selection.file.as_str())
+                        || self.expanded_files.contains(&selection.file))
+                {
+                    self.enqueue_ai_job(selection, AiJobPriority::ExpandedSymbol);
+                }
+                self.drain_relation_queue();
+                self.pump_ai_queue();
                 self.publish();
             }
-            DispatchEvent::BaseLoaded(bases) => {
+            DispatchEvent::BaseLoaded { bases, truncated } => {
                 // The picker always offers "(auto / inferred)" first to escape an override.
                 let mut list = vec![AUTO_BASE.to_string()];
                 list.extend(bases);
                 self.available_bases = list;
+                self.available_bases_truncated = truncated;
                 self.publish();
             }
         }
     }
 
     fn bump_and_refresh(&mut self) {
-        self.epoch = self.epoch.next();
-        // Any earlier AI rows no longer describe the repo.
-        if self.ai_rows.is_some() {
-            self.ai_status = AiStatus::Stale { epoch: self.epoch };
-        }
+        // `spawn_refresh` is the single epoch owner. Keeping the bump there prevents one
+        // filesystem notification from invalidating two generations of otherwise valid
+        // work.
         self.spawn_refresh();
+    }
+
+    fn apply_engine_unavailable(&mut self, reason: String) {
+        self.ls_status = LsStatus::Failed;
+        // No symbol request can ever complete in this epoch. Mark every changed file
+        // terminal/unsupported so file-level AI can still explain its diff.
+        if let Some(changeset) = &self.changeset {
+            for file in &changeset.files {
+                self.file_semantics
+                    .insert(file.path.to_string(), FileSemanticState::Unsupported);
+            }
+        }
+        self.analysis_queue.clear();
+        self.relation_queue.clear();
+        if reason.contains("no supported language detected") {
+            self.set_status(
+                "git-only (no supported language detected)",
+                StatusLevel::Warning,
+            );
+        } else {
+            self.set_status(
+                format!("git-only (language server failed: {reason})"),
+                StatusLevel::Warning,
+            );
+        }
+        if self.current_ai_selection().is_some() {
+            self.retarget_ai_to_current_selection(true);
+        }
+        let paths: Vec<String> = self
+            .changeset
+            .as_ref()
+            .map(|changeset| {
+                changeset
+                    .files
+                    .iter()
+                    .map(|file| file.path.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for path in paths {
+            self.enqueue_adaptive_prefetch_for_file(&path);
+        }
+        self.pump_ai_queue();
     }
 
     fn on_action(&mut self, action: Action) {
@@ -369,26 +780,11 @@ impl Dispatcher {
                 };
                 self.set_scope(next);
             }
-            Action::AiToggle => {
-                if self.ai.is_none() {
-                    self.set_status(
-                        "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)",
-                        StatusLevel::Warning,
-                    );
-                    self.publish();
-                    return;
-                }
-                self.ai_enabled = !self.ai_enabled;
-                self.ai_status = if self.ai_enabled {
-                    AiStatus::Idle
-                } else {
-                    AiStatus::Disabled
-                };
-                self.publish();
-            }
-            Action::AiRefresh => self.spawn_ai(),
             Action::ModelPicker => self.spawn_list_models(),
             Action::ModelSelected(name) => self.set_model(&name),
+            Action::PersistUiPreferences(preferences) => {
+                self.queue_config_write(ConfigWrite::Ui(preferences));
+            }
             Action::SelectSymbol {
                 file,
                 name,
@@ -410,7 +806,7 @@ impl Dispatcher {
 
     /// Fetch the provider's model list for the picker (spawned; non-blocking).
     fn spawn_list_models(&mut self) {
-        let Some(ai) = &self.ai else {
+        let Some(ai) = self.ai.clone() else {
             self.set_status(
                 "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)",
                 StatusLevel::Warning,
@@ -418,29 +814,87 @@ impl Dispatcher {
             self.publish();
             return;
         };
-        let ai = ai.clone();
+        // The currently configured model is always a valid picker fallback, even when the
+        // provider has no `/models` endpoint or discovery fails after an inference error.
+        self.merge_available_models([ai.model()]);
+        self.model_list_seq = self.model_list_seq.saturating_add(1);
+        let generation = self.model_list_seq;
+        self.model_list_loading = true;
+        self.model_list_error = None;
+        self.publish();
         let tx = self.job_tx.clone();
         tokio::spawn(async move {
-            let models = ai.client().list_models().await.unwrap_or_default();
-            let _ = tx.send(DispatchEvent::ModelsLoaded(models)).await;
+            let result = ai
+                .client()
+                .list_models()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx
+                .send(DispatchEvent::ModelsLoaded { generation, result })
+                .await;
         });
+    }
+
+    fn merge_available_models(&mut self, models: impl IntoIterator<Item = String>) {
+        for model in models {
+            let model = model.trim();
+            if !model.is_empty() && !self.available_models.iter().any(|item| item == model) {
+                self.available_models.push(model.to_string());
+            }
+        }
     }
 
     /// Apply a model selection from the picker.
     fn set_model(&mut self, name: &str) {
-        match &self.ai {
+        let changed = match &self.ai {
             Some(ai) => {
                 ai.set_model(name);
+                self.queue_config_write(ConfigWrite::Model {
+                    provider: ai.provider_label().to_string(),
+                    model: name.to_string(),
+                });
                 self.set_status(format!("AI model: {name}"), StatusLevel::Info);
+                true
             }
             None => {
                 self.set_status(
                     "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)",
                     StatusLevel::Warning,
                 );
+                false
+            }
+        };
+        if changed {
+            self.ai_cache.clear();
+            // An explicit model change asks the newly selected model for its own design;
+            // do not anchor it to output generated by the previous model.
+            self.ai_revision_cache.clear();
+            self.ai_queue.clear();
+            self.ai_failures.clear();
+            self.ai_consecutive_failures = 0;
+            self.ai_background_paused = false;
+            self.abort_all_ai_requests();
+            self.ai_rows = None;
+            if self.ai.is_some() {
+                self.retarget_ai_to_current_selection(true);
+            } else {
+                self.ai_status = AiStatus::Idle;
             }
         }
         self.publish();
+    }
+
+    fn queue_config_write(&mut self, write: ConfigWrite) {
+        let Some(tx) = &self.config_write_tx else {
+            return;
+        };
+        if tx.send(write).is_err() {
+            self.set_status(
+                "preference changed for this session but the config writer is unavailable",
+                StatusLevel::Warning,
+            );
+            self.publish();
+        }
     }
 
     /// Fetch base candidates for the base picker (spawned; non-blocking).
@@ -448,12 +902,21 @@ impl Dispatcher {
         let repo = self.repo.clone();
         let tx = self.job_tx.clone();
         tokio::spawn(async move {
-            let bases = repo
-                .base_candidates()
-                .await
-                .map(|c| c.into_iter().map(|b| b.ref_name).collect())
-                .unwrap_or_default();
-            let _ = tx.send(DispatchEvent::BaseLoaded(bases)).await;
+            let result = repo.base_candidates_with_metadata().await;
+            let (bases, truncated) = match result {
+                Ok(candidates) => (
+                    candidates
+                        .entries
+                        .into_iter()
+                        .map(|base| base.ref_name)
+                        .collect(),
+                    candidates.truncated,
+                ),
+                Err(_) => (Vec::new(), false),
+            };
+            let _ = tx
+                .send(DispatchEvent::BaseLoaded { bases, truncated })
+                .await;
         });
     }
 
@@ -462,44 +925,587 @@ impl Dispatcher {
     /// immediately (deterministic interpretation; spec §5.3/§5.6), and lazily expand a
     /// selected symbol's callers/callees — the impact lists read `Loading` until the
     /// fetch lands. Moving OFF a symbol (file row / empty list) clears the relations
-    /// view back to the impact/AI pane and leaves the impact lists `Idle`.
+    /// view and leaves the impact lists `Idle`. The same selection transition retargets
+    /// the automatically generated plan.
     fn on_selection_changed(&mut self, file: Option<String>, symbol: Option<(String, u32, u32)>) {
+        let previous_ai_selection = self.current_ai_selection();
         self.selected_file = file.clone();
         self.selected_symbol = match (file, symbol) {
             (Some(file), Some((name, line, col))) => Some((file, name, line, col)),
             _ => None,
         };
+        self.reprioritize_semantic_work();
         // Drop the previous selection's rows immediately: nothing stale may linger while
         // the new fetch is in flight.
-        self.selected_relations = None;
+        self.selected_relations = self
+            .current_ai_selection()
+            .as_ref()
+            .and_then(|selection| self.relation_cache.get(selection).cloned());
         if let Some((file, name, line, col)) = self.selected_symbol.clone() {
-            self.spawn_expand(file, name, line, col);
+            if self.selected_relations.is_none() {
+                self.spawn_expand(file, name, line, col);
+            }
         }
+        if self.current_ai_selection() != previous_ai_selection {
+            self.reprioritize_ai_queue();
+            self.retarget_ai_to_current_selection(false);
+        }
+        if let Some(file) = self.selected_file.clone() {
+            // Loading may mean queued rather than running. Reprioritization has already
+            // moved this file to the front; draining lets it claim the focused lane now.
+            self.drain_analysis_queue();
+            self.enqueue_adaptive_prefetch_for_file(&file);
+        }
+        self.drain_relation_queue();
+        self.pump_ai_queue();
         self.publish();
     }
 
-    /// Lazily expand a selected symbol's callers/callees (spawned; non-blocking). The job
-    /// carries the current epoch and the symbol's identity; the result is dropped on apply
-    /// when either has moved on (see RelationsLoaded).
-    fn spawn_expand(&mut self, file: String, name: String, line: u32, col: u32) {
-        let Some(engine) = &self.engine else {
+    fn current_ai_selection(&self) -> Option<AiSelectionKey> {
+        if let Some((file, name, line, col)) = &self.selected_symbol {
+            return Some(AiSelectionKey {
+                file: file.clone(),
+                symbol: Some((name.clone(), *line, *col)),
+            });
+        }
+        self.selected_file.as_ref().map(|file| AiSelectionKey {
+            file: file.clone(),
+            symbol: None,
+        })
+    }
+
+    /// Move the generated pane to the current changed-file/function row. `invalidate_cache`
+    /// is used when its symbols or file contents changed; navigation reuses cached plans.
+    fn retarget_ai_to_current_selection(&mut self, invalidate_cache: bool) {
+        // Invalidate only the pending navigation debounce. An already-sent provider request
+        // is deliberately allowed to finish and cache for its own selection.
+        self.ai_selection_seq = self.ai_selection_seq.saturating_add(1);
+        self.ai_rows = None;
+
+        let Some(selection) = self.current_ai_selection() else {
+            self.ai_status = AiStatus::Idle;
+            self.set_status(
+                "select a changed file or function before generating Impact",
+                StatusLevel::Warning,
+            );
             return;
         };
-        // Relations exist only for a symbol whose file analysis is Ready: loading,
-        // stale, collapsed, or unmapped rows never issue a relation request.
+        if invalidate_cache {
+            self.ai_cache.remove(&selection);
+            self.ai_failures.remove(&selection);
+            self.ai_queue.retain(|job| job.selection != selection);
+        } else if let Some(plan) = self.ai_cache.get(&selection).cloned() {
+            self.ai_rows = Some((self.epoch, selection, plan));
+            self.ai_status = AiStatus::Ready { epoch: self.epoch };
+            return;
+        }
+        if self.ai.is_none() {
+            self.ai_status = AiStatus::Disabled;
+            return;
+        }
+
+        // The plan must never race the selected file's symbol inventory. `Unsupported`
+        // is terminal and honest (there are no loadable symbols), while Failed remains
+        // non-ready until the next repository refresh retries it.
+        match self.file_semantics.get(&selection.file) {
+            Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Unsupported) => {}
+            Some(FileSemanticState::Failed) => {
+                self.ai_status = AiStatus::Idle;
+                return;
+            }
+            Some(FileSemanticState::Loading) | None => {
+                self.ai_status = AiStatus::WaitingForSymbols { epoch: self.epoch };
+                self.spawn_file_analysis(&selection.file);
+                return;
+            }
+        }
+
+        // A symbol's AI breakdown should include the same caller/downstream evidence as
+        // Impact. Wait for the already-spawned relation fetch; file rows have no such wait.
+        if self.selection_waits_for_relations() {
+            self.ai_status = AiStatus::WaitingForRelations { epoch: self.epoch };
+            // Do not hang forever on a slow/unsupported call hierarchy request. A later
+            // RelationsLoaded event supersedes this generation; otherwise the fallback
+            // composes from the selected change after a short grace period.
+            self.schedule_ai_selection_after(750);
+        } else {
+            self.ai_status = AiStatus::Queued {
+                epoch: self.epoch,
+                position: 1,
+            };
+            self.schedule_ai_selection();
+        }
+    }
+
+    fn selection_waits_for_relations(&self) -> bool {
+        let Some((file, _, _, _)) = &self.selected_symbol else {
+            return false;
+        };
+        self.engine.is_some()
+            && matches!(
+                self.file_semantics.get(file),
+                Some(FileSemanticState::Ready(_))
+            )
+            && self.selected_relations.is_none()
+    }
+
+    /// Debounce arrow navigation so holding Up/Down does not issue—and bill—one request
+    /// per intermediate row. Cache hits bypass this path and render immediately.
+    fn schedule_ai_selection(&mut self) {
+        self.schedule_ai_selection_after(250);
+    }
+
+    fn schedule_ai_selection_after(&mut self, delay_ms: u64) {
+        self.ai_selection_seq = self.ai_selection_seq.saturating_add(1);
+        let generation = self.ai_selection_seq;
+        let epoch = self.epoch;
+        let tx = self.job_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let _ = tx
+                .send(DispatchEvent::AiSelectionSettled { epoch, generation })
+                .await;
+        });
+    }
+
+    fn enqueue_ai_job(&mut self, selection: AiSelectionKey, priority: AiJobPriority) {
+        if self.ai.is_none()
+            || self.ai_cache.contains_key(&selection)
+            || self.ai_running.values().any(|job| {
+                job.epoch == self.epoch && job.selection == selection && job.accept_result
+            })
+        {
+            return;
+        }
+        if let Some(existing) = self
+            .ai_queue
+            .iter_mut()
+            .find(|job| job.epoch == self.epoch && job.selection == selection)
+        {
+            existing.priority = existing.priority.min(priority);
+            return;
+        }
+        self.ai_queue_order = self.ai_queue_order.saturating_add(1);
+        self.ai_queue.push(AiQueuedJob {
+            selection,
+            epoch: self.epoch,
+            priority,
+            order: self.ai_queue_order,
+        });
+    }
+
+    fn ai_priority_for_selection(&self, selection: &AiSelectionKey) -> AiJobPriority {
+        if self.current_ai_selection().as_ref() == Some(selection) {
+            return AiJobPriority::Focused;
+        }
+        if selection.symbol.is_some()
+            && self.ai_prefetch == AiPrefetchPolicy::Adaptive
+            && (self.selected_file.as_deref() == Some(selection.file.as_str())
+                || self.expanded_files.contains(&selection.file))
+        {
+            return AiJobPriority::ExpandedSymbol;
+        }
+        AiJobPriority::FileSummary
+    }
+
+    /// Active work follows focus too. This prevents a request that used to be focused
+    /// from retaining focused protection after the pointer moves elsewhere.
+    fn reprioritize_ai_running(&mut self) {
+        let updates: Vec<(u64, AiJobPriority)> = self
+            .ai_running
+            .iter()
+            .map(|(generation, running)| {
+                (
+                    *generation,
+                    self.ai_priority_for_selection(&running.selection),
+                )
+            })
+            .collect();
+        for (generation, priority) in updates {
+            if let Some(running) = self.ai_running.get_mut(&generation) {
+                running.priority = priority;
+            }
+            self.ai_requests.reprioritize(generation, priority.into());
+        }
+    }
+
+    fn abort_ai_request(&mut self, generation: u64, requeue: bool) {
+        self.ai_requests.abort(generation);
+        let Some(running) = self.ai_running.remove(&generation) else {
+            return;
+        };
+        tracing::debug!(
+            generation,
+            file = %running.selection.file,
+            ?running.priority,
+            requeue,
+            "cancelled AI request"
+        );
+        if requeue
+            && running.accept_result
+            && running.epoch == self.epoch
+            && !self.ai_cache.contains_key(&running.selection)
+        {
+            self.enqueue_ai_job(running.selection, running.priority);
+        }
+    }
+
+    fn abort_all_ai_requests(&mut self) {
+        self.ai_requests.abort_all();
+        self.ai_running.clear();
+    }
+
+    /// Reclassify or remove unsent work after focus/expansion changes. File summaries are
+    /// always useful in adaptive mode; symbol work remains only for the current or an
+    /// explicitly expanded file.
+    fn reprioritize_ai_queue(&mut self) {
+        let current = self.current_ai_selection();
+        let selected_file = self.selected_file.as_deref();
+        let expanded = &self.expanded_files;
+        self.ai_queue.retain_mut(|job| {
+            if job.epoch != self.epoch {
+                return false;
+            }
+            if current.as_ref() == Some(&job.selection) {
+                job.priority = AiJobPriority::Focused;
+                return true;
+            }
+            if job.selection.symbol.is_some() {
+                if self.ai_prefetch == AiPrefetchPolicy::FocusedOnly {
+                    return false;
+                }
+                let eligible = selected_file == Some(job.selection.file.as_str())
+                    || expanded.contains(&job.selection.file);
+                if eligible {
+                    job.priority = AiJobPriority::ExpandedSymbol;
+                }
+                return eligible;
+            }
+            if self.ai_prefetch == AiPrefetchPolicy::Adaptive {
+                job.priority = AiJobPriority::FileSummary;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn ai_queue_position(&self, selection: &AiSelectionKey) -> Option<u32> {
+        let mut pending: Vec<&AiQueuedJob> = self
+            .ai_queue
+            .iter()
+            .filter(|job| job.epoch == self.epoch)
+            .collect();
+        pending.sort_by_key(|job| (job.priority, job.order));
+        pending
+            .iter()
+            .position(|job| &job.selection == selection)
+            .map(|index| u32::try_from(index + 1).unwrap_or(u32::MAX))
+    }
+
+    fn pump_ai_queue(&mut self) {
+        if self.ai.is_none() {
+            self.refresh_current_ai_status();
+            return;
+        }
+        self.ai_queue.retain(|job| job.epoch == self.epoch);
+        self.reprioritize_ai_queue();
+        self.reprioritize_ai_running();
+
+        while let Some(index) = self
+            .ai_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, job)| !self.ai_background_paused || job.priority == AiJobPriority::Focused)
+            .min_by_key(|(_, job)| (job.priority, job.order))
+            .map(|(index, _)| index)
+        {
+            let priority = self.ai_queue[index].priority;
+            let Admission::Admitted { preempted } = self.ai_requests.admit(priority.into()) else {
+                break;
+            };
+            if let Some(generation) = preempted {
+                // `admit` already aborted and removed the task handle. Remove its
+                // dispatcher metadata and put still-valid work at the queue tail.
+                if let Some(running) = self.ai_running.remove(&generation) {
+                    tracing::debug!(
+                        generation,
+                        file = %running.selection.file,
+                        ?running.priority,
+                        "focused AI request dequeued oldest overflow request"
+                    );
+                    if running.accept_result
+                        && running.epoch == self.epoch
+                        && !self.ai_cache.contains_key(&running.selection)
+                    {
+                        self.enqueue_ai_job(running.selection, running.priority);
+                    }
+                }
+            }
+            let job = self.ai_queue.swap_remove(index);
+            self.spawn_ai_job(job);
+        }
+        self.refresh_current_ai_status();
+    }
+
+    fn refresh_current_ai_status(&mut self) {
+        let Some(selection) = self.current_ai_selection() else {
+            self.ai_rows = None;
+            self.ai_status = if self.ai.is_some() {
+                AiStatus::Idle
+            } else {
+                AiStatus::Disabled
+            };
+            return;
+        };
+        if let Some(plan) = self.ai_cache.get(&selection).cloned() {
+            self.ai_rows = Some((self.epoch, selection, plan));
+            self.ai_status = AiStatus::Ready { epoch: self.epoch };
+            return;
+        }
+        self.ai_rows = None;
+        if let Some(reason) = self.ai_failures.get(&selection).cloned() {
+            self.ai_status = AiStatus::Failed { reason };
+            return;
+        }
+        if self.ai.is_none() {
+            self.ai_status = AiStatus::Disabled;
+            return;
+        }
+        match self.file_semantics.get(&selection.file) {
+            Some(FileSemanticState::Loading) | None => {
+                self.ai_status = AiStatus::WaitingForSymbols { epoch: self.epoch };
+                return;
+            }
+            Some(FileSemanticState::Failed) => {
+                self.ai_status = AiStatus::Idle;
+                return;
+            }
+            Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Unsupported) => {}
+        }
+        if self
+            .ai_running
+            .values()
+            .any(|job| job.epoch == self.epoch && job.selection == selection)
+        {
+            self.ai_status = AiStatus::Loading {
+                since_epoch: self.epoch,
+            };
+            return;
+        }
+        if let Some(position) = self.ai_queue_position(&selection) {
+            self.ai_status = AiStatus::Queued {
+                epoch: self.epoch,
+                position,
+            };
+            return;
+        }
+        if self.selection_waits_for_relations() {
+            self.ai_status = AiStatus::WaitingForRelations { epoch: self.epoch };
+        } else {
+            self.ai_status = AiStatus::Queued {
+                epoch: self.epoch,
+                position: 1,
+            };
+        }
+    }
+
+    fn enqueue_adaptive_prefetch_for_file(&mut self, file: &str) {
+        if self.ai_prefetch != AiPrefetchPolicy::Adaptive || self.ai.is_none() {
+            return;
+        }
         if !matches!(
-            self.file_semantics.get(&file),
-            Some(FileSemanticState::Ready(_))
+            self.file_semantics.get(file),
+            Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Unsupported)
         ) {
             return;
         }
+        let file_selection = AiSelectionKey {
+            file: file.to_string(),
+            symbol: None,
+        };
+        if self.current_ai_selection().as_ref() != Some(&file_selection) {
+            self.enqueue_ai_job(file_selection, AiJobPriority::FileSummary);
+        }
+        let symbols_eligible =
+            self.selected_file.as_deref() == Some(file) || self.expanded_files.contains(file);
+        if !symbols_eligible {
+            return;
+        }
+        let symbols: Vec<AiSelectionKey> = match self.file_semantics.get(file) {
+            Some(FileSemanticState::Ready(result)) => result
+                .changed
+                .iter()
+                .map(|symbol| AiSelectionKey {
+                    file: file.to_string(),
+                    symbol: Some((
+                        symbol.name.clone(),
+                        symbol.selection.start_line,
+                        symbol.selection.start_col,
+                    )),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let current = self.current_ai_selection();
+        for selection in symbols {
+            if current.as_ref() != Some(&selection) {
+                self.enqueue_relation_job(selection.clone());
+                if self.relation_cache.contains_key(&selection) || self.engine.is_none() {
+                    self.enqueue_ai_job(selection, AiJobPriority::ExpandedSymbol);
+                }
+            }
+        }
+        self.drain_relation_queue();
+    }
+
+    /// Queue a symbol's callers/callees through the same bounded prerequisite path used by
+    /// focused navigation and adaptive sibling prefetch.
+    fn spawn_expand(&mut self, file: String, name: String, line: u32, col: u32) {
+        let selection = AiSelectionKey {
+            file,
+            symbol: Some((name, line, col)),
+        };
+        self.enqueue_relation_job(selection);
+        self.drain_relation_queue();
+    }
+
+    const MAX_RELATION_JOBS: usize = 2;
+    const MAX_BACKGROUND_RELATION_JOBS: usize = 1;
+
+    fn semantic_priority_for_file(&self, file: &str) -> SemanticJobPriority {
+        if self.selected_file.as_deref() == Some(file) {
+            SemanticJobPriority::Focused
+        } else {
+            SemanticJobPriority::Background
+        }
+    }
+
+    fn semantic_priority_for_selection(&self, selection: &AiSelectionKey) -> SemanticJobPriority {
+        if self.current_ai_selection().as_ref() == Some(selection) {
+            SemanticJobPriority::Focused
+        } else {
+            SemanticJobPriority::Background
+        }
+    }
+
+    fn reprioritize_semantic_work(&mut self) {
+        let selected_file = self.selected_file.as_deref();
+        for (file, job) in &mut self.analysis_in_flight {
+            job.priority = if selected_file == Some(file.as_str()) {
+                SemanticJobPriority::Focused
+            } else {
+                SemanticJobPriority::Background
+            };
+        }
+        if let Some(file) = &self.selected_file {
+            if let Some(index) = self.analysis_queue.iter().position(|queued| queued == file) {
+                if let Some(queued) = self.analysis_queue.remove(index) {
+                    self.analysis_queue.push_front(queued);
+                }
+            }
+        }
+
+        let current = self.current_ai_selection();
+        for (selection, job) in &mut self.relation_in_flight {
+            job.priority = if current.as_ref() == Some(selection) {
+                SemanticJobPriority::Focused
+            } else {
+                SemanticJobPriority::Background
+            };
+        }
+        if let Some(selection) = current {
+            if let Some(index) = self
+                .relation_queue
+                .iter()
+                .position(|queued| queued == &selection)
+            {
+                if let Some(queued) = self.relation_queue.remove(index) {
+                    self.relation_queue.push_front(queued);
+                }
+            }
+        }
+    }
+
+    fn can_launch_relation(&self, priority: SemanticJobPriority) -> bool {
+        if self.relation_in_flight.len() >= Self::MAX_RELATION_JOBS {
+            return false;
+        }
+        priority == SemanticJobPriority::Focused
+            || self
+                .relation_in_flight
+                .values()
+                .filter(|job| job.priority == SemanticJobPriority::Background)
+                .count()
+                < Self::MAX_BACKGROUND_RELATION_JOBS
+    }
+
+    fn enqueue_relation_job(&mut self, selection: AiSelectionKey) {
+        if selection.symbol.is_none()
+            || self.engine.is_none()
+            || self.relation_cache.contains_key(&selection)
+            || self.relation_in_flight.contains_key(&selection)
+            || self
+                .relation_queue
+                .iter()
+                .any(|queued| queued == &selection)
+            || !matches!(
+                self.file_semantics.get(&selection.file),
+                Some(FileSemanticState::Ready(_))
+            )
+        {
+            return;
+        }
+        if self.semantic_priority_for_selection(&selection) == SemanticJobPriority::Focused {
+            self.relation_queue.push_front(selection);
+        } else {
+            self.relation_queue.push_back(selection);
+        }
+    }
+
+    fn drain_relation_queue(&mut self) {
+        if self.engine.is_none() || self.data_epoch != self.epoch {
+            return;
+        }
+        // Inspect each queued entry at most once per drain. A saturated background lane
+        // therefore leaves work queued instead of pop/requeue spinning the actor.
+        let mut remaining = self.relation_queue.len();
+        while self.relation_in_flight.len() < Self::MAX_RELATION_JOBS && remaining > 0 {
+            remaining -= 1;
+            let Some(selection) = self.relation_queue.pop_front() else {
+                break;
+            };
+            if self.relation_cache.contains_key(&selection)
+                || self.relation_in_flight.contains_key(&selection)
+            {
+                continue;
+            }
+            let priority = self.semantic_priority_for_selection(&selection);
+            if !self.can_launch_relation(priority) {
+                self.relation_queue.push_back(selection);
+                continue;
+            }
+            self.spawn_relation_job_now(selection);
+        }
+    }
+
+    fn spawn_relation_job_now(&mut self, selection: AiSelectionKey) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let Some((name, line, col)) = selection.symbol.clone() else {
+            return;
+        };
+        let file = selection.file.clone();
         let epoch = self.epoch;
-        let engine = engine.clone();
         let tx = self.job_tx.clone();
         let file_id = match codescope_core::FileId::new(file.clone()) {
             Ok(f) => f,
             Err(_) => return,
         };
+        let priority = self.semantic_priority_for_selection(&selection);
+        self.relation_in_flight
+            .insert(selection, SemanticRunningJob { epoch, priority });
         tokio::spawn(async move {
             let pos = codescope_core::Position::new(line, col);
             let (callers, callees) = relations_for(&engine, &file_id, pos).await;
@@ -553,6 +1559,20 @@ impl Dispatcher {
         // newest base/scope/repo state always wins.
         self.epoch = self.epoch.next();
         let epoch = self.epoch;
+        self.ai_selection_seq = self.ai_selection_seq.saturating_add(1);
+        self.ai_queue.clear();
+        self.abort_all_ai_requests();
+        self.ai_failures.clear();
+        self.ai_consecutive_failures = 0;
+        self.ai_background_paused = false;
+        self.ai_rows = None;
+        // Epoch-exact plans may no longer render after any repository refresh. Preserve
+        // their stable revision counterparts: once fresh facts land they become prompt
+        // seeds, never current UI state.
+        self.ai_cache.clear();
+        if self.ai.is_some() {
+            self.ai_status = AiStatus::Stale { epoch };
+        }
         let repo = self.repo.clone();
         let scope = self.scope;
         let base_override = self.base_override.clone();
@@ -576,10 +1596,15 @@ impl Dispatcher {
                 })
                 .await;
         });
-        // A new epoch invalidates per-file semantics (content may differ) and the queue.
+        // A new epoch invalidates cached semantics and queued intent. Keep the in-flight
+        // ledger: if the same file changed while its old analysis was running, the fresh
+        // request queues behind that job instead of racing two language-server overlays.
+        // The stale completion removes its own epoch-exact ledger entry and drains the
+        // fresh queue.
         self.file_semantics.clear();
-        self.analysis_in_flight.clear();
         self.analysis_queue.clear();
+        self.relation_cache.clear();
+        self.relation_queue.clear();
         // Relations for the selected symbol are re-fetched in `on_analysis_done`, once the
         // new analysis exists. Firing the query here would race the language server's own
         // refresh and tag a pre-refresh answer with the new epoch. The previously loaded
@@ -588,23 +1613,31 @@ impl Dispatcher {
         self.selected_relations = None;
     }
 
-    fn spawn_ai(&mut self) {
+    fn spawn_ai_job(&mut self, job: AiQueuedJob) {
+        let selection = job.selection;
+        let priority = job.priority;
         let (Some(_ai), Some(changeset)) = (&self.ai, &self.changeset) else {
             return;
         };
         let Some(ctx) = &self.repo_ctx else { return };
-        if !self.ai_enabled {
+        if job.epoch != self.epoch || self.data_epoch != self.epoch {
             return;
         }
+        // A validated plan from an older epoch is not current UI state, but it is a useful
+        // design draft for the same file/symbol. The AI service labels it as untrusted
+        // continuity context and requires the new facts to win.
+        let previous_plan = self
+            .ai_revision_cache
+            .get(&AiRevisionKey::from(&selection))
+            .map(|cached| cached.plan.clone());
         let epoch = self.epoch;
-        self.ai_request_seq += 1;
+        self.ai_request_seq = self.ai_request_seq.saturating_add(1);
         let generation = self.ai_request_seq;
-        self.ai_status = AiStatus::Loading { since_epoch: epoch };
-        self.publish();
         // Digest from the git changeset + the symbols of files the user explicitly
-        // analyzed (Ready), in CHANGSET order (deterministic). Unloaded files contribute
+        // analyzed (Ready), in CHANGESET order (deterministic). Unloaded files contribute
         // hunks only; Loading/Failed/Unsupported are reported separately. Never triggers
-        // analysis. The relation graph was never queried — `Unknown`, not a partial answer.
+        // analysis. The global relation graph was not queried — `Unknown`, not a partial
+        // answer. Selection-scoped callers/callees are appended separately below when ready.
         let mut changed: Vec<codescope_analysis::ChangedSymbolInfo> = Vec::new();
         let mut diags: Vec<codescope_core::Diagnostic> = Vec::new();
         let (mut loading, mut failed, mut unsupported) = (0usize, 0usize, 0usize);
@@ -620,19 +1653,23 @@ impl Dispatcher {
                 None => {}
             }
         }
-        let mut digest = codescope_analysis::change_digest(
+        let mut digest_model = codescope_analysis::change_digest(
             &changed,
             changeset,
             &codescope_core::Evidence {
                 value: codescope_core::ImpactGraph::default(),
                 completeness: codescope_core::Completeness::Unknown,
-                notes: vec!["relations not queried (lazy per-file semantics)".to_string()],
+                notes: vec!["relations not queried (asynchronous per-file semantics)".to_string()],
             },
             &diags,
             ctx,
-        )
-        .render();
-        let unloaded = changeset
+        );
+        // Reserve half the normal prompt budget for exact, selection-scoped source.
+        // Branch context remains useful, but it must not crowd out the code the diagram
+        // is actually expected to explain.
+        digest_model.truncate_to_budget(4_000);
+        let mut digest = digest_model.render();
+        let without_symbol_catalog = changeset
             .files
             .iter()
             .filter(|f| {
@@ -642,8 +1679,10 @@ impl Dispatcher {
                 )
             })
             .count();
-        if unloaded > 0 {
-            let mut parts = vec![format!("{unloaded} not yet analyzed")];
+        if without_symbol_catalog > 0 {
+            let mut parts = vec![format!(
+                "{without_symbol_catalog} without a loaded symbol catalog"
+            )];
             if loading > 0 {
                 parts.push(format!("{loading} analyzing"));
             }
@@ -654,47 +1693,118 @@ impl Dispatcher {
                 parts.push(format!("{unsupported} unsupported"));
             }
             digest.push_str(&format!(
-                "\nnote: {}; expand a file with Tab for symbol detail",
+                "\nnote: {}. Only exact entries in `## changed symbols` are usable as symbols; for every other file omit symbol/range metadata and cite exact file+hunk evidence",
                 parts.join(", ")
             ));
         }
-        let facts = SnapshotFacts::from_lazy(changeset, &self.file_semantics);
+        // The repo digest supplies validation facts, while this section makes the model's
+        // one required question selection-scoped and mirrors the deterministic Impact pane.
+        append_impact_focus(&mut digest, &self.build_impact_for_selection(&selection));
+        append_selected_evidence_contract(&mut digest, &selection, &self.file_semantics);
+        append_focused_source_packet(&mut digest, &selection, changeset, &self.file_semantics);
+        let facts = SnapshotFacts::from_lazy(changeset, &self.file_semantics, &selection.file);
         let ai = self.ai.clone();
         let tx = self.job_tx.clone();
-        tokio::spawn(async move {
+        let running_selection = selection.clone();
+        let task = tokio::spawn(async move {
             let outcome = match &ai {
                 Some(ai) => {
-                    ai.request_plan(&digest, &NoToolExecutor, &facts, epoch)
-                        .await
+                    ai.request_plan_with_previous(
+                        &digest,
+                        previous_plan.as_ref(),
+                        &NoToolExecutor,
+                        &facts,
+                        epoch,
+                    )
+                    .await
                 }
                 None => AiOutcome::Unavailable,
             };
             let _ = tx
                 .send(DispatchEvent::AiDone {
                     epoch,
+                    selection,
                     generation,
                     outcome,
                 })
                 .await;
         });
+        self.ai_requests
+            .register(generation, priority.into(), task.abort_handle());
+        self.ai_running.insert(
+            generation,
+            AiRunningJob {
+                selection: running_selection.clone(),
+                epoch,
+                generation,
+                priority,
+                accept_result: true,
+            },
+        );
+        tracing::debug!(
+            generation,
+            file = %running_selection.file,
+            ?priority,
+            active = self.ai_requests.len(),
+            "started AI request"
+        );
+        if self.current_ai_selection().as_ref() == Some(&running_selection) {
+            self.ai_status = AiStatus::Loading { since_epoch: epoch };
+            self.ai_rows = None;
+        }
+        self.publish();
     }
 
-    /// Max concurrent per-file analysis jobs (keeps the language server responsive when
-    /// the user expands several files quickly).
-    const MAX_FILE_JOBS: usize = 4;
+    /// One focused file may run alongside one background warm-up. This preserves eventual
+    /// automatic loading without allowing a large change-set to saturate the language
+    /// server before the row under the pointer can be analyzed.
+    const MAX_FILE_JOBS: usize = 2;
+    const MAX_BACKGROUND_FILE_JOBS: usize = 1;
 
-    /// Start (or queue) the lazy per-file analysis for `path`. Coalesces duplicates: a
+    fn can_launch_file_analysis(&self, priority: SemanticJobPriority) -> bool {
+        if self.analysis_in_flight.len() >= Self::MAX_FILE_JOBS {
+            return false;
+        }
+        priority == SemanticJobPriority::Focused
+            || self
+                .analysis_in_flight
+                .values()
+                .filter(|job| job.priority == SemanticJobPriority::Background)
+                .count()
+                < Self::MAX_BACKGROUND_FILE_JOBS
+    }
+
+    /// Schedule every file in the current change-set through the bounded per-file queue.
+    fn schedule_all_file_analysis(&mut self) {
+        let paths: Vec<String> = self
+            .changeset
+            .as_ref()
+            .map(|changeset| {
+                changeset
+                    .files
+                    .iter()
+                    .map(|file| file.path.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for path in paths {
+            self.spawn_file_analysis(&path);
+        }
+    }
+
+    /// Start (or queue) asynchronous per-file analysis for `path`. Coalesces duplicates: a
     /// file already Loading/Ready this epoch launches nothing; a path with a job in
     /// flight (any epoch) is queued so the language server's per-file overlay never sees
     /// two writers (review 18 M2).
     fn spawn_file_analysis(&mut self, path: &str) {
         // Coalesce terminal/ready states: a cached Ready or a definitive Unsupported is
-        // reused within the epoch. Failed retries on re-expand (the user asked again).
+        // reused within the epoch. Failed files retry on the next repository epoch.
         if matches!(
             self.file_semantics.get(path),
             Some(FileSemanticState::Loading)
                 | Some(FileSemanticState::Ready(_))
                 | Some(FileSemanticState::Unsupported)
+                | Some(FileSemanticState::Failed)
         ) {
             return;
         }
@@ -704,7 +1814,6 @@ impl Dispatcher {
             if self.ls_status == codescope_core::LsStatus::Failed {
                 self.file_semantics
                     .insert(path.to_string(), FileSemanticState::Unsupported);
-                self.publish();
             } else {
                 self.enqueue_file_analysis(path);
             }
@@ -717,7 +1826,7 @@ impl Dispatcher {
             self.enqueue_file_analysis(path);
             return;
         }
-        if self.analysis_in_flight.len() >= Self::MAX_FILE_JOBS {
+        if !self.can_launch_file_analysis(self.semantic_priority_for_file(path)) {
             self.enqueue_file_analysis(path);
             return;
         }
@@ -725,10 +1834,15 @@ impl Dispatcher {
     }
 
     /// Queue `path` for a later spawn (bounded concurrency / stale data epoch / engine
-    /// starting), marking the row Loading so the UI shows the pending state.
+    /// starting), marking the row Loading so the UI shows the pending state. Callers
+    /// publish once after batching all changed files.
     fn enqueue_file_analysis(&mut self, path: &str) {
         if !self.analysis_queue.iter().any(|p| p == path) {
-            self.analysis_queue.push_back(path.to_string());
+            if self.semantic_priority_for_file(path) == SemanticJobPriority::Focused {
+                self.analysis_queue.push_front(path.to_string());
+            } else {
+                self.analysis_queue.push_back(path.to_string());
+            }
         }
         if !matches!(
             self.file_semantics.get(path),
@@ -737,7 +1851,6 @@ impl Dispatcher {
             self.file_semantics
                 .insert(path.to_string(), FileSemanticState::Loading);
         }
-        self.publish();
     }
 
     /// The actual spawn: assumes the caller verified coalescing, the data epoch, the
@@ -760,10 +1873,15 @@ impl Dispatcher {
         let Some(ctx) = self.repo_ctx.clone() else {
             return;
         };
-        self.analysis_in_flight.insert(path.to_string(), self.epoch);
+        self.analysis_in_flight.insert(
+            path.to_string(),
+            SemanticRunningJob {
+                epoch: self.epoch,
+                priority: self.semantic_priority_for_file(path),
+            },
+        );
         self.file_semantics
             .insert(path.to_string(), FileSemanticState::Loading);
-        self.publish();
         let epoch = self.epoch;
         let scope = self.scope;
         let tx = self.job_tx.clone();
@@ -790,9 +1908,16 @@ impl Dispatcher {
         file: String,
         result: Result<Box<codescope_analysis::FileSemanticResult>, String>,
     ) {
+        let selected_ai_file_changed = self
+            .current_ai_selection()
+            .is_some_and(|selection| selection.file == file);
         // Ledger removal is epoch-exact: a stale completion never disturbs a newer job's
         // entry for the same path (review 18 M2).
-        if self.analysis_in_flight.get(&file) == Some(&epoch) {
+        if self
+            .analysis_in_flight
+            .get(&file)
+            .is_some_and(|job| job.epoch == epoch)
+        {
             self.analysis_in_flight.remove(&file);
         }
         // Epoch + data-epoch gates: a refresh superseded this job or its inputs.
@@ -851,16 +1976,34 @@ impl Dispatcher {
                     format!("semantic analysis failed for {file}: {e}"),
                     StatusLevel::Warning,
                 );
-                self.file_semantics.insert(file, FileSemanticState::Failed);
+                self.file_semantics
+                    .insert(file.clone(), FileSemanticState::Failed);
             }
         }
+        if selected_ai_file_changed {
+            // The deterministic Impact interpretation/symbol inventory changed while the
+            // selection stayed put; its cached AI explanation is no longer current.
+            self.retarget_ai_to_current_selection(true);
+        }
+        self.enqueue_adaptive_prefetch_for_file(&file);
+        self.pump_ai_queue();
         self.publish();
         self.drain_analysis_queue();
     }
 
     /// Start the next queued per-file job when a slot frees and the data epoch is current.
     fn drain_analysis_queue(&mut self) {
-        while self.analysis_in_flight.len() < Self::MAX_FILE_JOBS && self.data_epoch == self.epoch {
+        // While the language server is starting, queued work must remain queued. Popping
+        // and immediately re-enqueuing it would spin the dispatcher forever.
+        if self.engine.is_none() {
+            return;
+        }
+        let mut remaining = self.analysis_queue.len();
+        while self.analysis_in_flight.len() < Self::MAX_FILE_JOBS
+            && self.data_epoch == self.epoch
+            && remaining > 0
+        {
+            remaining -= 1;
             let Some(next) = self.analysis_queue.pop_front() else {
                 break;
             };
@@ -870,6 +2013,11 @@ impl Dispatcher {
                 Some(FileSemanticState::Ready(_))
             ) || self.analysis_in_flight.contains_key(&next)
             {
+                continue;
+            }
+            let priority = self.semantic_priority_for_file(&next);
+            if !self.can_launch_file_analysis(priority) {
+                self.analysis_queue.push_back(next);
                 continue;
             }
             // Clear the queued Loading marker so the spawn path runs the real job.
@@ -894,10 +2042,10 @@ impl Dispatcher {
             if !self.expanded_files.insert(path.to_string()) {
                 return; // already expanded
             }
+            self.enqueue_adaptive_prefetch_for_file(path);
+            self.reprioritize_ai_queue();
+            self.pump_ai_queue();
             self.publish();
-            // First expand dispatches the lazy analysis; cached/queued/in-flight
-            // coalesces inside spawn_file_analysis.
-            self.spawn_file_analysis(path);
             return;
         }
         if !self.expanded_files.remove(path) {
@@ -905,14 +2053,17 @@ impl Dispatcher {
         }
         // Collapsing the file that owns the selected symbol: the relation view no longer
         // has a visible anchor.
-        if self
+        let collapsed_selected_symbol = self
             .selected_symbol
             .as_ref()
-            .is_some_and(|(f, _, _, _)| f == path)
-        {
+            .is_some_and(|(f, _, _, _)| f == path);
+        if collapsed_selected_symbol {
             self.selected_symbol = None;
             self.selected_relations = None;
+            self.retarget_ai_to_current_selection(false);
         }
+        self.reprioritize_ai_queue();
+        self.pump_ai_queue();
         self.publish();
     }
 
@@ -932,32 +2083,68 @@ impl Dispatcher {
         // The git-fact bundle is now current: per-file analysis and AI digests may launch
         // against it. Replay expansion intent for files that survived the refresh.
         self.data_epoch = epoch;
-        // The message must not claim analysis is "running": in the lazy world the
-        // pipeline ends here and symbols load only on demand (review 18 m6).
-        if self.analysis.is_none()
-            && self.status.text == "files listed; symbol analysis still running…"
-        {
-            self.status = StatusMessage::default();
-        }
-        // Replay expansion intent: files still in the (new) changeset that the user had
-        // expanded get their analysis relaunched against current data; vanished files
-        // drop out of the expansion set.
+        // Preserve expansion only for files that still exist. Independently schedule
+        // every changed file so opening a row only reveals already-loading/ready symbols.
         if let Some(cs) = &self.changeset {
-            let present: Vec<String> = self
-                .expanded_files
-                .iter()
-                .filter(|p| cs.files.iter().any(|f| f.path.as_str() == p.as_str()))
-                .cloned()
-                .collect();
-            self.expanded_files = present.iter().cloned().collect();
-            for path in present {
-                self.spawn_file_analysis(&path);
-            }
+            self.expanded_files
+                .retain(|path| cs.files.iter().any(|file| file.path.as_str() == path));
+            self.ai_revision_cache.retain(|selection, _| {
+                cs.files
+                    .iter()
+                    .any(|file| file.path.as_str() == selection.file)
+            });
         }
-        // Jobs queued while the data epoch was stale may launch now.
+        self.schedule_all_file_analysis();
         self.drain_analysis_queue();
+        if self.current_ai_selection().is_some() {
+            self.retarget_ai_to_current_selection(false);
+        }
+        let prefetch_paths: Vec<String> = self
+            .changeset
+            .as_ref()
+            .map(|changeset| {
+                changeset
+                    .files
+                    .iter()
+                    .map(|file| file.path.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for path in prefetch_paths {
+            self.enqueue_adaptive_prefetch_for_file(&path);
+        }
+        self.pump_ai_queue();
         // Analysis is still in flight: keep the refreshing marker on.
         self.publish_refreshing();
+    }
+
+    fn on_branch_unavailable(&mut self, epoch: Epoch, ctx: codescope_core::RepoContext) {
+        if epoch != self.epoch {
+            return;
+        }
+        debug_assert!(ctx.base.is_none());
+        self.repo_ctx = Some(ctx);
+        // No comparison ran, so an empty ChangeSet would be a false fact. Remove every
+        // branch-scoped artifact retained while refresh was in flight instead.
+        self.changeset = None;
+        self.analysis = None;
+        self.file_semantics.clear();
+        self.ai_revision_cache.clear();
+        self.ai_queue.clear();
+        self.abort_all_ai_requests();
+        self.ai_failures.clear();
+        self.relation_cache.clear();
+        self.relation_queue.clear();
+        self.ai_consecutive_failures = 0;
+        self.ai_background_paused = false;
+        self.selected_file = None;
+        self.selected_symbol = None;
+        self.selected_relations = None;
+        self.set_status(
+            "branch comparison unavailable: no meaningful base could be inferred",
+            StatusLevel::Warning,
+        );
+        self.publish();
     }
 
     fn on_analysis_done(&mut self, epoch: Epoch, result: anyhow::Result<Box<AnalysisSnapshot>>) {
@@ -997,65 +2184,104 @@ impl Dispatcher {
                 }
             }
             Err(e) => {
-                self.set_status(format!("analysis failed: {e}"), StatusLevel::Error);
+                if e.to_string().contains("no base") {
+                    self.set_status(
+                        "branch comparison unavailable: no meaningful base could be inferred",
+                        StatusLevel::Warning,
+                    );
+                } else {
+                    self.set_status(format!("analysis failed: {e}"), StatusLevel::Error);
+                }
             }
         }
         self.publish();
     }
 
-    fn on_ai_done(&mut self, epoch: Epoch, generation: u64, outcome: AiOutcome) {
-        if epoch != self.epoch {
-            // A newer state superseded this plan; do not apply.
+    fn on_ai_done(
+        &mut self,
+        epoch: Epoch,
+        selection: AiSelectionKey,
+        generation: u64,
+        outcome: AiOutcome,
+    ) {
+        self.ai_requests.complete(generation);
+        let Some(running) = self.ai_running.remove(&generation) else {
+            // A completion may already be queued when a focused request cancels this
+            // generation. Its ledger entry is gone, so it cannot publish stale output.
+            return;
+        };
+        if running.epoch != epoch
+            || running.generation != generation
+            || running.selection != selection
+        {
+            // The generation key is unique. A mismatched payload is malformed and must
+            // not affect any of the other concurrently running requests.
             return;
         }
-        if generation != self.ai_request_seq {
-            // A newer AI request in the same epoch superseded this one (review 18 M7).
-            return;
-        }
+        let accept_result = running.accept_result;
+        let is_current_epoch = epoch == self.epoch;
+        let is_focused = self.current_ai_selection().as_ref() == Some(&selection);
         match outcome {
-            AiOutcome::Plan(plan, report) if report.is_renderable() => {
-                let rows = plan_rows(&plan);
-                // Pane title: the first form's title, else the plan's focus question.
-                // (Rows carry per-form section headers, so the title is just the tab's
-                // headline.)
-                let title = plan
-                    .forms
-                    .first()
-                    .map(|f| f.title.clone())
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or_else(|| plan.focus.clone());
-                self.ai_rows = Some((epoch, rows, title));
-                self.ai_status = AiStatus::Ready { epoch };
+            AiOutcome::Plan(plan, report) if accept_result && report.is_renderable() => {
+                self.ai_consecutive_failures = 0;
+                self.ai_background_paused = false;
+                let cached = CachedAiPlan { plan, report };
+                self.ai_revision_cache
+                    .insert(AiRevisionKey::from(&selection), cached.clone());
+                if is_current_epoch {
+                    self.ai_cache.insert(selection.clone(), cached.clone());
+                    self.ai_failures.remove(&selection);
+                    if is_focused {
+                        self.ai_rows = Some((epoch, selection.clone(), cached));
+                    }
+                }
             }
-            AiOutcome::Stale => self.ai_status = AiStatus::Stale { epoch },
-            AiOutcome::Failed(reason) => {
+            AiOutcome::Stale if is_current_epoch && is_focused => {
+                self.ai_status = AiStatus::Stale { epoch }
+            }
+            AiOutcome::Failed(reason) if accept_result && is_current_epoch => {
+                self.ai_consecutive_failures = self.ai_consecutive_failures.saturating_add(1);
+                if self.ai_consecutive_failures >= 3 {
+                    self.ai_background_paused = true;
+                }
+                self.ai_failures.insert(selection.clone(), reason.clone());
                 // Every AI failure carries the recovery suffix (spec §3.6); the
                 // deterministic impact pane is unaffected by the failure.
-                self.set_status(
-                    format!("AI: {reason} · {AI_FAILURE_SUFFIX}"),
-                    StatusLevel::Warning,
-                );
-                self.ai_status = AiStatus::Failed { reason };
+                if is_focused {
+                    self.set_status(
+                        format!("AI: {reason} · {AI_FAILURE_SUFFIX}"),
+                        StatusLevel::Warning,
+                    );
+                }
             }
-            _ => self.ai_status = AiStatus::Idle,
+            AiOutcome::Unavailable if accept_result && is_current_epoch => {
+                self.ai_background_paused = true;
+                self.ai_failures.insert(
+                    selection.clone(),
+                    "AI provider is temporarily unavailable".to_string(),
+                );
+            }
+            _ => {}
         }
+        self.pump_ai_queue();
+        self.refresh_current_ai_status();
         self.publish();
     }
 
     fn publish_refreshing(&self) {
         let mut snap = self.build_snapshot();
         snap.refreshing = true;
-        let _ = self.snapshot_tx.send(snap);
+        self.output.publish(snap);
     }
 
     fn build_snapshot(&self) -> UiSnapshot {
         let (repo_bar, counts) = repo_bar(self.repo_ctx.as_ref());
-        // Files come from the changeset immediately; symbol rows fill in lazily from the
-        // per-file cache as the user expands files with Tab.
+        // Files come from the changeset immediately; symbol rows fill in asynchronously
+        // from the bounded per-file analysis queue.
         let files = self
             .changeset
             .as_ref()
-            .map(|cs| lazy_file_rows(cs, &self.file_semantics, &self.expanded_files))
+            .map(|cs| file_rows(cs, &self.file_semantics, &self.expanded_files))
             .unwrap_or_default();
         let (diff, semantic) = self.panes();
         let impact = self.build_impact();
@@ -1067,6 +2293,15 @@ impl Dispatcher {
             .and_then(|c| c.base.as_ref())
             .map(|b| b.ref_name.clone())
             .or_else(|| self.base_override.clone())
+            .unwrap_or_default();
+        let ai_tokens = self
+            .ai
+            .as_ref()
+            .map(|ai| ai.token_usage())
+            .map(|usage| AiTokenUsage {
+                input: usage.input,
+                output: usage.output,
+            })
             .unwrap_or_default();
         UiSnapshot {
             repo: repo_bar,
@@ -1084,9 +2319,13 @@ impl Dispatcher {
                 .as_ref()
                 .map(|a| a.provider_label().to_string())
                 .unwrap_or_default(),
+            ai_tokens,
             available_models: self.available_models.clone(),
+            model_list_loading: self.model_list_loading,
+            model_list_error: self.model_list_error.clone(),
             base_ref,
             available_bases: self.available_bases.clone(),
+            base_candidates_truncated: self.available_bases_truncated,
             message: self.status.text.clone(),
             status: self.status.clone(),
             epoch: self.epoch,
@@ -1112,21 +2351,29 @@ impl Dispatcher {
         // `impact.callers`/`impact.downstream` (`build_impact`); the legacy flattened
         // relation rows are gone.
         // AI rows render only while their epoch matches the current repo state (H3).
+        let current_ai_selection = self.current_ai_selection();
         let semantic = match &self.ai_rows {
-            Some((ep, rows, title)) if *ep == self.epoch => SemanticPane {
-                title: title.clone(),
-                rows: rows.clone(),
-                note: String::new(),
-                ai_generated: true,
-            },
-            Some(_) => SemanticPane {
-                title: "impact".to_string(),
-                rows: Vec::new(),
+            Some((ep, selection, plan))
+                if *ep == self.epoch && current_ai_selection.as_ref() == Some(selection) =>
+            {
+                SemanticPane {
+                    plan: Some(plan.plan.clone()),
+                    // The report travels with the plan: sanitized content keeps its
+                    // verdict/dropped-items trail in every publish, cache hit included.
+                    report: Some(plan.report.clone()),
+                    note: selection.label().to_string(),
+                    ai_generated: true,
+                }
+            }
+            Some((ep, _, _)) if *ep != self.epoch => SemanticPane {
+                plan: None,
+                report: None,
                 note: "AI view stale (repo changed); regenerating…".to_string(),
                 ai_generated: false,
             },
-            // Deterministic relations live in `impact`; `semantic` stays AI-only.
-            None => SemanticPane::default(),
+            // A selection mismatch must never display the previous row's explanation —
+            // or its validation report.
+            _ => SemanticPane::default(),
         };
         (diff, semantic)
     }
@@ -1135,15 +2382,26 @@ impl Dispatcher {
     /// the callers/downstream columns. Lazy LSP relations and the one-hop impact graph
     /// merge into both lists; AI plan rows never replace this pane.
     fn build_impact(&self) -> ImpactPane {
+        let Some(selection) = self.current_ai_selection() else {
+            return ImpactPane::default();
+        };
+        self.build_impact_for_selection(&selection)
+    }
+
+    /// Selection-scoped Impact packet used by both the focused UI and background AI jobs.
+    /// Off-focus symbol prefetch intentionally has no selected-only relation rows; its
+    /// source/symbol facts remain complete and deterministic.
+    fn build_impact_for_selection(&self, selection: &AiSelectionKey) -> ImpactPane {
         // Selected change: the symbol's per-file cache entry carries its change kind and
         // interpretation; a file row falls back to the file-level summary.
         let mut impact = ImpactPane {
-            selected_change: self.selected_change_lazy(),
+            selected_change: self.selected_change_for(selection),
             ..Default::default()
         };
-        let Some((file, name, _, _)) = &self.selected_symbol else {
+        let Some((name, _, _)) = &selection.symbol else {
             return impact;
         };
+        let file = &selection.file;
         // Relations only make sense for a symbol whose file analysis is Ready (the
         // identity is verified against that result).
         let file_ready = matches!(
@@ -1162,7 +2420,12 @@ impl Dispatcher {
             }
             return impact;
         }
-        match &self.selected_relations {
+        let relations = self.relation_cache.get(selection).or_else(|| {
+            (self.current_ai_selection().as_ref() == Some(selection))
+                .then_some(self.selected_relations.as_ref())
+                .flatten()
+        });
+        match relations {
             Some(relations) => {
                 impact.callers = ImpactList {
                     rows: relations.callers.rows.clone(),
@@ -1192,10 +2455,9 @@ impl Dispatcher {
         impact
     }
 
-    /// The SelectedChange for the impact pane's left column, sourced from the lazy
-    /// per-file cache (symbol rows) or the changeset (file rows).
-    fn selected_change_lazy(&self) -> Option<SelectedChange> {
-        if let Some((file, name, line, col)) = &self.selected_symbol {
+    fn selected_change_for(&self, selection: &AiSelectionKey) -> Option<SelectedChange> {
+        if let Some((name, line, col)) = &selection.symbol {
+            let file = &selection.file;
             let info = self
                 .file_semantics
                 .get(file)
@@ -1233,7 +2495,7 @@ impl Dispatcher {
                 interpretation_source: InterpretationSource::Deterministic,
             });
         }
-        let file = self.selected_file.as_deref()?;
+        let file = selection.file.as_str();
         // The numeric count is real only for Ready; other states describe themselves
         // (review 18 m6).
         let interpretation = match self.file_semantics.get(file) {
@@ -1248,8 +2510,10 @@ impl Dispatcher {
             Some(FileSemanticState::Unsupported) => {
                 "semantic analysis unavailable for this file".to_string()
             }
-            Some(FileSemanticState::Failed) => "symbol analysis failed; Tab to retry".to_string(),
-            None => "not analyzed; Tab to load symbols".to_string(),
+            Some(FileSemanticState::Failed) => {
+                "symbol analysis failed; retrying after the next file change".to_string()
+            }
+            None => "symbol analysis pending…".to_string(),
         };
         let change = self
             .changeset
@@ -1267,6 +2531,308 @@ impl Dispatcher {
     }
 }
 
+/// Append the current deterministic Impact view as the AI plan's required focus. The
+/// branch-wide digest remains available for validation/context, but the model is explicitly
+/// forbidden from turning a neighboring file/function into the plan's subject.
+fn append_impact_focus(digest: &mut String, impact: &ImpactPane) {
+    let Some(selected) = &impact.selected_change else {
+        return;
+    };
+    digest.push_str("\n## current impact selection (required plan focus)\n");
+    digest.push_str(&format!("file: {}\n", one_line(&selected.file)));
+    digest.push_str(&format!("label: {}\n", one_line(&selected.label)));
+    digest.push_str(&format!("change: {}\n", selected.change));
+    if !selected.interpretation.is_empty() {
+        digest.push_str(&format!(
+            "deterministic interpretation: {}\n",
+            one_line(&selected.interpretation)
+        ));
+    }
+    append_impact_rows(digest, "callers", &impact.callers);
+    append_impact_rows(digest, "downstream", &impact.downstream);
+    if !impact.note.is_empty() {
+        digest.push_str(&format!("impact caveat: {}\n", one_line(&impact.note)));
+    }
+    digest.push_str(
+        "focus question: Visually explain this selected change to a reviewer seeing it for the first time. Show its intent, the most important runtime/data/control relationship, and the direct implication or review risk. The main pane already shows the raw diff, so do not restate a list of modified symbols. The plan MUST be about this file/function only; every node code_ref MUST use this selected file, and other digest files are plan-level evidence only. If this diff publishes input to an external system, end the visual at that publication; put the unshown external actor name, mapping, and outcome only in review_focus, and do not repeat them in a node detail or evidence reason.\n",
+    );
+}
+
+/// State the selected file's semantic capabilities next to the exact focused hunks. A
+/// branch-wide digest may contain symbols from neighboring files, so the model needs an
+/// explicit local contract—especially for YAML and other files no language server owns.
+fn append_selected_evidence_contract(
+    digest: &mut String,
+    selection: &AiSelectionKey,
+    semantics: &std::collections::HashMap<String, FileSemanticState>,
+) {
+    let available_symbols = match semantics.get(&selection.file) {
+        Some(FileSemanticState::Ready(result)) => result
+            .changed
+            .iter()
+            .filter(|changed| changed.file.as_path().as_str() == selection.file)
+            .count(),
+        _ => 0,
+    };
+    digest.push_str("\n## selected file evidence contract (mandatory)\n");
+    if available_symbols == 0 {
+        let state = match semantics.get(&selection.file) {
+            Some(FileSemanticState::Unsupported) => {
+                "unavailable: this file type has no semantic analyzer"
+            }
+            Some(FileSemanticState::Failed) => "unavailable: semantic analysis failed",
+            Some(FileSemanticState::Loading) => {
+                "unavailable in this snapshot: analysis is still loading"
+            }
+            Some(FileSemanticState::Ready(_)) => "unavailable: analysis found no changed symbols",
+            None => "unavailable in this snapshot: analysis has not loaded",
+        };
+        digest.push_str(&format!("symbol catalog: {state}\n"));
+        digest.push_str(
+            "- Every plan-level evidence item MUST use the exact selected file plus a supplied zero-based hunk_id and MUST omit symbol and range.\n\
+             - Node entities MUST be absent or use the exact file only. Prefer sequence, relationship_flow, or before_after with conceptual entityless nodes; do not assert symbol, call-tree, or type-ownership facts.\n\
+             - Words that describe the change (for example `changes`, `workflow`, `configuration`, or an action label) are concepts, NOT symbols.\n",
+        );
+    } else {
+        digest.push_str(&format!(
+            "symbol catalog: {available_symbols} exact changed symbol{} available for this file\n",
+            if available_symbols == 1 { "" } else { "s" }
+        ));
+        digest.push_str(
+            "- A symbol or range may be used only when the exact selected-file symbol appears verbatim in `## changed symbols`; otherwise cite exact file+hunk evidence and omit symbol/range.\n",
+        );
+    }
+}
+
+/// Caps for the selection-scoped source evidence appended to AI plan requests.
+/// `FOCUSED_MAX_HUNKS` bounds how many hunks a selection may cover; the line/byte caps
+/// are hard totals, sliced fairly across the selected hunks so a huge early hunk cannot
+/// starve the final one of its header and body evidence.
+const FOCUSED_MAX_HUNKS: usize = 8;
+const FOCUSED_MAX_LINES: usize = 160;
+const FOCUSED_MAX_BYTES: usize = 20_000;
+
+/// Append exact changed lines for the selected file/symbol. This is intentionally capped
+/// and selection-scoped: the AI needs the actual control/data change to draw a useful
+/// relationship, while the compact digest supplies branch-wide context and validation ids.
+/// File-level selections cover every hunk while the file fits the hunk cap and balance
+/// head/tail coverage beyond it; the line and byte budgets are sliced fairly across the
+/// selected hunks, so late finalization edits keep their evidence even when early hunks
+/// are huge.
+fn append_focused_source_packet(
+    digest: &mut String,
+    selection: &AiSelectionKey,
+    changeset: &codescope_core::ChangeSet,
+    semantics: &std::collections::HashMap<String, FileSemanticState>,
+) {
+    fn rendered_line(line: &codescope_core::DiffLine) -> String {
+        let marker = match line.kind {
+            codescope_core::DiffLineKind::Add => '+',
+            codescope_core::DiffLineKind::Del => '-',
+            codescope_core::DiffLineKind::Context => ' ',
+        };
+        let old = line
+            .old_ln
+            .map_or_else(|| "-".to_string(), |line| line.to_string());
+        let new = line
+            .new_ln
+            .map_or_else(|| "-".to_string(), |line| line.to_string());
+        let text: String = line.text.chars().take(1_000).collect();
+        format!("[old:{old} new:{new}] {marker}{text}\n")
+    }
+
+    let Some(file) = changeset
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == selection.file)
+    else {
+        return;
+    };
+
+    let mut wanted: Vec<u32> = selection
+        .symbol
+        .as_ref()
+        .and_then(|(name, _, _)| match semantics.get(&selection.file) {
+            Some(FileSemanticState::Ready(result)) => Some(
+                result
+                    .changed
+                    .iter()
+                    .filter(|changed| changed.name == *name)
+                    .flat_map(|changed| changed.record.hunks.iter().map(|hunk| hunk.index))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if wanted.is_empty() {
+        if let Some((_, line, _)) = &selection.symbol {
+            let line = line.saturating_add(1);
+            wanted.extend(file.hunks.iter().enumerate().filter_map(|(index, hunk)| {
+                let (start, end) = hunk.new_span();
+                (line >= start && line < end).then_some(index as u32)
+            }));
+        }
+    }
+    if wanted.is_empty() {
+        // File-level fallback: every hunk while the file fits the cap. Beyond the cap
+        // balance head and tail coverage — leading hunks carry entry-point changes
+        // while trailing ones carry shutdown/finalization edits, and dropping the
+        // tail hid the close-last shutdown behavior in the six-hunk
+        // vm-sandboxes/packages/api/main.go case.
+        let len = file.hunks.len();
+        if len > FOCUSED_MAX_HUNKS {
+            let tail = FOCUSED_MAX_HUNKS / 2;
+            let head = FOCUSED_MAX_HUNKS - tail;
+            wanted.extend(0..head as u32);
+            wanted.extend((len - tail) as u32..len as u32);
+        } else {
+            wanted.extend(0..len as u32);
+        }
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.len() > FOCUSED_MAX_HUNKS {
+        let tail = FOCUSED_MAX_HUNKS / 2;
+        let head = FOCUSED_MAX_HUNKS - tail;
+        let mut balanced = wanted[..head].to_vec();
+        balanced.extend_from_slice(&wanted[wanted.len() - tail..]);
+        wanted = balanced;
+    }
+    if wanted.is_empty() {
+        return;
+    }
+
+    let selected: Vec<(u32, &codescope_core::Hunk)> = wanted
+        .iter()
+        .filter_map(|index| Some((*index, file.hunks.get(*index as usize)?)))
+        .collect();
+    if selected.is_empty() {
+        return;
+    }
+
+    // Fair line slice per selected hunk: each hunk may emit at least its share of the
+    // line budget, and shares small hunks do not use flow forward to later ones. A
+    // selection whose hunks fit the budget therefore emits exactly what a plain greedy
+    // fill would, while a huge early hunk can only spend its share plus the leftovers.
+    let count = selected.len();
+    let fair_lines = FOCUSED_MAX_LINES / count;
+    let mut line_allowance: Vec<usize> = selected
+        .iter()
+        .map(|(_, hunk)| hunk.lines.len().min(fair_lines))
+        .collect();
+    let mut spare = FOCUSED_MAX_LINES - line_allowance.iter().sum::<usize>();
+    for (allowance, (_, hunk)) in line_allowance.iter_mut().zip(&selected) {
+        let extra = spare.min(hunk.lines.len() - *allowance);
+        *allowance += extra;
+        spare -= extra;
+    }
+
+    // Render every selected hunk's header and line-capped body once.
+    let intro = "\n## focused source evidence (exact selected hunks; hunk ids are zero-based; body annotations use one-based old/new lines)\n";
+    let headers: Vec<String> = selected
+        .iter()
+        .map(|(index, hunk)| {
+            format!(
+                "hunk_id: {index}  file: {}  @@ -{},{} +{},{} @@ {}\n",
+                file.path,
+                hunk.old_start,
+                hunk.old_len,
+                hunk.new_start,
+                hunk.new_len,
+                hunk.section.as_deref().unwrap_or_default()
+            )
+        })
+        .collect();
+    let bodies: Vec<Vec<String>> = selected
+        .iter()
+        .zip(&line_allowance)
+        .map(|((_, hunk), share)| hunk.lines.iter().take(*share).map(rendered_line).collect())
+        .collect();
+
+    // Fair byte slice over the rendered hunks, same forward flow: a wide early hunk can
+    // spend its own share plus what later hunks cannot use, never their shares. That
+    // reservation is what guarantees the final selected hunk's header and body evidence.
+    let byte_budget = FOCUSED_MAX_BYTES.saturating_sub(intro.len());
+    let byte_need: Vec<usize> = headers
+        .iter()
+        .zip(&bodies)
+        .map(|(header, body)| header.len() + body.iter().map(|line| line.len()).sum::<usize>())
+        .collect();
+    let fair_bytes = byte_budget / count;
+    let mut byte_allowance: Vec<usize> = byte_need
+        .iter()
+        .copied()
+        .map(|need| need.min(fair_bytes))
+        .collect();
+    let mut spare_bytes = byte_budget - byte_allowance.iter().sum::<usize>();
+    for (allowance, need) in byte_allowance.iter_mut().zip(&byte_need) {
+        let extra = spare_bytes.min(need - *allowance);
+        *allowance += extra;
+        spare_bytes -= extra;
+    }
+
+    // Emit each hunk within both of its allowances. Byte cuts are per hunk, so a hunk
+    // that overflows its slice no longer ends the packet — the remaining hunks (above
+    // all the final one) still get their reserved evidence. `truncated` flags any hunk
+    // that had more evidence than its slice allowed.
+    let mut packet = String::from(intro);
+    let mut truncated = false;
+    for k in 0..count {
+        let header = &headers[k];
+        if packet.len() + header.len() > FOCUSED_MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        packet.push_str(header);
+        let mut hunk_bytes = header.len();
+        for rendered in &bodies[k] {
+            if hunk_bytes + rendered.len() > byte_allowance[k] {
+                truncated = true;
+                break;
+            }
+            packet.push_str(rendered);
+            hunk_bytes += rendered.len();
+        }
+        if selected[k].1.lines.len() > line_allowance[k] {
+            truncated = true;
+        }
+    }
+    if truncated {
+        packet.push_str("… focused source truncated to prompt budget\n");
+    }
+    digest.push_str(&packet);
+}
+
+fn append_impact_rows(digest: &mut String, heading: &str, list: &ImpactList) {
+    const MAX_PROMPT_ROWS: usize = 20;
+    digest.push_str(&format!("{heading} (state {:?}):\n", list.state));
+    if list.rows.is_empty() {
+        digest.push_str("- (none available)\n");
+        return;
+    }
+    for row in list.rows.iter().take(MAX_PROMPT_ROWS) {
+        let relation = if row.relation.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", row.relation)
+        };
+        digest.push_str(&format!("- {}{relation}\n", one_line(&row.label)));
+    }
+    if list.rows.len() > MAX_PROMPT_ROWS {
+        digest.push_str(&format!(
+            "- … {} more omitted\n",
+            list.rows.len() - MAX_PROMPT_ROWS
+        ));
+    }
+    if list.partial {
+        digest.push_str("- caveat: relationship evidence is partial\n");
+    }
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The git+analysis pipeline, run as one spawned job. A base override (from the base
 /// picker) flows into the repo context and, for the `Branch` scope, into the diff itself.
 async fn run_pipeline(
@@ -1280,8 +2846,23 @@ async fn run_pipeline(
     let ctx = repo
         .repo_context_with_base(base_override.as_deref())
         .await?;
-    let changeset = match (scope, &base_override) {
-        (ChangeScope::Branch, Some(base)) => repo.branch_changeset_with_base(base).await?,
+    let changeset = match scope {
+        ChangeScope::Branch => {
+            let Some(base) = ctx.base.as_ref() else {
+                // Publish the honest current context and explicitly invalidate a retained
+                // branch diff. This is not an empty comparison: no comparison can run.
+                let _ = tx
+                    .send(DispatchEvent::BranchUnavailable {
+                        epoch,
+                        ctx: ctx.clone(),
+                    })
+                    .await;
+                return Err(codescope_git::GitError::NoBase.into());
+            };
+            // Use the merge-base captured in the same context rendered by the top bar.
+            // Re-resolving a mutable ref here could label one base while diffing another.
+            repo.branch_changeset_from_base(base).await?
+        }
         _ => repo.changeset(scope).await?,
     };
     // Report the git-level result immediately: the files pane and top bar can render long
@@ -1294,11 +2875,11 @@ async fn run_pipeline(
             changeset: changeset.clone(),
         })
         .await;
-    // Lazy semantics (the interactive path): the pipeline ends at the git phase. The
-    // language server analyzes a file only when the user expands it with Tab — a
-    // repo-wide refresh over every changed file took tens of seconds on large repos and
-    // blocked the files pane on startup. `engine` is accepted but unused here; per-file
-    // jobs go through `Dispatcher::spawn_file_analysis`. The non-interactive backend
+    // The interactive pipeline ends at the git phase so files appear immediately. The
+    // dispatcher then fans each file into a bounded asynchronous analysis queue; this
+    // retains incremental rendering without tying symbol availability to expansion.
+    // `engine` is accepted but unused here; per-file jobs go through
+    // `Dispatcher::spawn_file_analysis`. The non-interactive backend
     // (`backend analyze/digest`) still calls `refresh_with_ctx` directly.
     let _ = engine;
     Ok(git_only_snapshot(epoch, ctx, changeset))
@@ -1336,11 +2917,9 @@ fn repo_bar(ctx: Option<&codescope_core::RepoContext>) -> (RepoBar, ScopeCounts)
         codescope_core::HeadState::Detached(_) => "(detached)".to_string(),
         codescope_core::HeadState::Unborn => "(no commits)".to_string(),
     };
-    let base = ctx
-        .base
-        .as_ref()
-        .map(|b| b.ref_name.clone())
-        .or_else(|| ctx.upstream.as_ref().map(|u| u.name.clone()));
+    // An upstream is tracking metadata, not necessarily a meaningful comparison. In
+    // particular, a same-tip upstream must not be relabeled as the active base.
+    let base = ctx.base.as_ref().map(|b| b.ref_name.clone());
     let (ahead, behind) = ctx
         .upstream
         .as_ref()
@@ -1359,10 +2938,10 @@ fn repo_bar(ctx: Option<&codescope_core::RepoContext>) -> (RepoBar, ScopeCounts)
     )
 }
 
-/// One files-pane row from the changeset + the lazy per-file cache. `expanded` comes
-/// from the dispatcher's `expanded_files` (the app's Tab toggles); symbol rows come from
-/// a Ready per-file result. Unloaded rows show no symbol count.
-fn lazy_file_rows(
+/// One files-pane row from the changeset + the asynchronous per-file cache. `expanded`
+/// controls visibility only; symbol rows come from a Ready per-file result. Unloaded rows
+/// show no symbol count.
+fn file_rows(
     cs: &codescope_core::ChangeSet,
     semantics: &std::collections::HashMap<String, FileSemanticState>,
     expanded: &std::collections::HashSet<String>,
@@ -1396,6 +2975,12 @@ fn lazy_file_rows(
             };
             FileRow {
                 changed_symbol_count: symbols.len(),
+                added_lines: f.hunks.iter().map(codescope_core::Hunk::count_added).sum(),
+                removed_lines: f
+                    .hunks
+                    .iter()
+                    .map(codescope_core::Hunk::count_deleted)
+                    .sum(),
                 symbols,
                 path,
                 status: status_badge(&f.status),
@@ -1536,139 +3121,15 @@ fn file_change_label(status: &codescope_core::FileStatus) -> &'static str {
     }
 }
 
-/// Flatten a validated plan into display rows. Every form renders, in plan order:
-/// a section header (the form's title + kind — the provenance of the rows beneath),
-/// its summary lines, then its nodes and edges. Tree forms nest via `children`;
-/// flow/sequence/other forms list their nodes flat and their edges as relationship
-/// rows (`from → to · kind [· edge label]`). Previously only the first form's tree
-/// roots rendered, silently dropping the second form, summaries, and every edge.
-fn plan_rows(plan: &codescope_core::VisualizationPlan) -> Vec<SemRow> {
-    let mut rows = Vec::new();
-    for form in &plan.forms {
-        // Section header: which form this block answers with.
-        rows.push(SemRow {
-            depth: 0,
-            label: form.title.clone(),
-            relation: form_kind_label(form.kind),
-            changed: false,
-            has_diagnostic: false,
-        });
-        for line in form.summary.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                rows.push(SemRow {
-                    depth: 1,
-                    label: line.to_string(),
-                    relation: "",
-                    changed: false,
-                    has_diagnostic: false,
-                });
-            }
-        }
-        let by_id: std::collections::HashMap<&str, &codescope_core::PlanNode> =
-            form.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-        if form.kind.is_tree_form() {
-            // Tree: roots (nodes nobody claims as a child) recurse through children.
-            let is_child: HashSet<&str> = form
-                .nodes
-                .iter()
-                .flat_map(|n| n.children.iter().map(String::as_str))
-                .collect();
-            for n in &form.nodes {
-                if !is_child.contains(n.id.as_str()) {
-                    push_plan_node(n, &by_id, 1, &mut rows);
-                }
-            }
-        } else {
-            // Flow/sequence/summary/diff forms: nodes are peers, edges carry the shape.
-            for n in &form.nodes {
-                rows.push(plan_node_row(n, 1));
-            }
-        }
-        for e in &form.edges {
-            let from = by_id
-                .get(e.from.as_str())
-                .map(|n| n.label.as_str())
-                .unwrap_or(&e.from);
-            let to = by_id
-                .get(e.to.as_str())
-                .map(|n| n.label.as_str())
-                .unwrap_or(&e.to);
-            let label = match &e.label {
-                Some(l) if !l.is_empty() => format!("{from} → {to} · {l}"),
-                _ => format!("{from} → {to}"),
-            };
-            rows.push(SemRow {
-                depth: 1,
-                label,
-                relation: edge_kind_label(e.kind),
-                changed: false,
-                has_diagnostic: false,
-            });
-        }
-    }
-    rows
-}
-
-/// A node as a display row (change badge + diagnostic marker preserved).
-fn plan_node_row(n: &codescope_core::PlanNode, depth: u16) -> SemRow {
-    SemRow {
-        depth,
-        label: n.label.clone(),
-        relation: "",
-        changed: !matches!(n.change, codescope_core::PlanNodeChange::Unchanged),
-        has_diagnostic: n.severity.is_some(),
-    }
-}
-
-/// Short static label for a form's kind (row provenance in the AI plan view).
-fn form_kind_label(kind: codescope_core::FormKind) -> &'static str {
-    use codescope_core::FormKind as F;
-    match kind {
-        F::ChangedSymbolTree => "changed symbols",
-        F::CallTree => "call tree",
-        F::TypeImplTree => "types",
-        F::RelationshipFlow => "flow",
-        F::ImpactSummary => "summary",
-        F::FocusedDiff => "diff",
-        F::BeforeAfter => "before/after",
-        F::Sequence => "sequence",
-    }
-}
-
-/// Short static label for a plan edge's relationship kind.
-fn edge_kind_label(kind: PlanEdgeKind) -> &'static str {
-    match kind {
-        PlanEdgeKind::Calls => "calls",
-        PlanEdgeKind::Imports => "imports",
-        PlanEdgeKind::Implements => "implements",
-        PlanEdgeKind::Contains => "contains",
-        PlanEdgeKind::Reads => "reads",
-        PlanEdgeKind::Writes => "writes",
-    }
-}
-
-fn push_plan_node(
-    n: &codescope_core::PlanNode,
-    by_id: &std::collections::HashMap<&str, &codescope_core::PlanNode>,
-    depth: u16,
-    rows: &mut Vec<SemRow>,
-) {
-    rows.push(plan_node_row(n, depth));
-    for c in &n.children {
-        if let Some(child) = by_id.get(c.as_str()) {
-            push_plan_node(child, by_id, depth + 1, rows);
-        }
-    }
-}
-
 // -- FactView over the current analysis snapshot ------------------------------
 
 struct SnapshotFacts {
+    focus_file: String,
     files: HashSet<String>,
     symbols: std::collections::HashMap<(String, String), LineRange>,
     edges: HashSet<(String, String, PlanEdgeKind)>,
     hunks: std::collections::HashMap<String, usize>,
+    diff_lines: HashSet<(String, u32, DiffSide, u32)>,
 }
 
 use codescope_ai::Lookup;
@@ -1681,16 +3142,37 @@ impl SnapshotFacts {
     fn from_lazy(
         changeset: &codescope_core::ChangeSet,
         semantics: &std::collections::HashMap<String, FileSemanticState>,
+        focus_file: &str,
     ) -> Self {
         let mut facts = SnapshotFacts {
+            focus_file: focus_file.to_string(),
             files: HashSet::new(),
             symbols: std::collections::HashMap::new(),
             edges: HashSet::new(),
             hunks: std::collections::HashMap::new(),
+            diff_lines: HashSet::new(),
         };
         for f in &changeset.files {
-            facts.files.insert(f.path.to_string());
-            facts.hunks.insert(f.path.to_string(), f.hunks.len());
+            let path = f.path.to_string();
+            facts.files.insert(path.clone());
+            facts.hunks.insert(path.clone(), f.hunks.len());
+            for (hunk_index, hunk) in f.hunks.iter().enumerate() {
+                let Ok(hunk_index) = u32::try_from(hunk_index) else {
+                    continue;
+                };
+                for line in &hunk.lines {
+                    if let Some(old_ln) = line.old_ln {
+                        facts
+                            .diff_lines
+                            .insert((path.clone(), hunk_index, DiffSide::Old, old_ln));
+                    }
+                    if let Some(new_ln) = line.new_ln {
+                        facts
+                            .diff_lines
+                            .insert((path.clone(), hunk_index, DiffSide::New, new_ln));
+                    }
+                }
+            }
         }
         for res in semantics.values() {
             if let FileSemanticState::Ready(res) = res {
@@ -1714,6 +3196,10 @@ fn entity_key(e: &EntityRef) -> String {
 }
 
 impl FactView for SnapshotFacts {
+    fn is_focus_file(&self, file: &codescope_core::FileId) -> bool {
+        file.as_path().as_str() == self.focus_file
+    }
+
     fn file(&self, file: &codescope_core::FileId) -> Lookup<()> {
         if self.files.contains(&file.to_string()) {
             Lookup::Present(())
@@ -1755,6 +3241,23 @@ impl FactView for SnapshotFacts {
             None => Lookup::Unknown,
         }
     }
+
+    fn diff_line(
+        &self,
+        file: &codescope_core::FileId,
+        index: u32,
+        side: DiffSide,
+        line: u32,
+    ) -> Lookup<()> {
+        let path = file.to_string();
+        if self.diff_lines.contains(&(path.clone(), index, side, line)) {
+            Lookup::Present(())
+        } else if self.hunks.contains_key(&path) {
+            Lookup::Absent
+        } else {
+            Lookup::Unknown
+        }
+    }
 }
 
 /// Fetch a symbol's callers + callees lazily and shape them as impact rows. The
@@ -1766,8 +3269,7 @@ pub(crate) async fn relations_for(
     file: &codescope_core::FileId,
     pos: codescope_core::Position,
 ) -> (RelationRows, RelationRows) {
-    let callers = engine.callers_of(file, pos).await;
-    let callees = engine.callees_of(file, pos).await;
+    let (callers, callees) = engine.relations_of(file, pos).await;
     let to_rows = |ev: codescope_core::Evidence<Vec<codescope_core::SymbolRef>>| RelationRows {
         partial: !ev.is_complete(),
         rows: ev
@@ -1848,6 +3350,16 @@ pub async fn run(
             engine.into_service().shutdown().await;
         }
     }
+    // No more UI can consume completion events. Closing the receivers also guarantees a
+    // pending config-error report cannot block writer shutdown on a full event channel.
+    drop(events);
+    drop(actions);
+    // Closing and joining the FIFO writer makes a final model/tab/resize selection durable
+    // before the runtime exits. No config filesystem work ever ran on this dispatcher task.
+    disp.config_write_tx.take();
+    if let Some(writer) = disp.config_writer.take() {
+        let _ = writer.await;
+    }
 }
 
 #[cfg(test)]
@@ -1920,6 +3432,148 @@ mod tests {
             snapshot_rx,
             job_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn backend_output_supports_headless_ordered_snapshots() {
+        let root = scratch_repo();
+        let repo_root = camino::Utf8PathBuf::from_path_buf(root).expect("utf-8 temp path");
+        let repo = GitRepo::discover(&repo_root).await.unwrap();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        let (job_tx, _job_rx) = mpsc::channel(4);
+        let disp = Dispatcher::new(repo, None, None, output_tx, job_tx);
+
+        disp.publish();
+        let snapshot = output_rx.recv().await.expect("headless snapshot");
+        assert_eq!(snapshot.epoch, Epoch::ZERO);
+        assert!(snapshot.semantic.plan.is_none());
+        // Snapshot default: no AI plan means no report either.
+        assert!(snapshot.semantic.report.is_none());
+    }
+
+    struct SlowFailingConfig;
+
+    impl ConfigPersistence for SlowFailingConfig {
+        fn persist_model(&self, _provider: &str, _model: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn persist_ui(&self, _preferences: UiPreferences) -> Result<(), String> {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Err("disk unavailable".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn config_write_is_nonblocking_and_failure_returns_as_an_event() {
+        let root = scratch_repo();
+        let (disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+        let mut disp = disp.with_config_persistence(std::sync::Arc::new(SlowFailingConfig));
+        let start = std::time::Instant::now();
+        disp.handle(DispatchEvent::Work(Action::PersistUiPreferences(
+            UiPreferences::default(),
+        )))
+        .await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "filesystem work blocked the dispatcher"
+        );
+
+        let failed = recv_until(&mut job_rx, |event| {
+            matches!(event, DispatchEvent::ConfigSaveFailed { .. })
+        })
+        .await;
+        disp.handle(failed).await;
+        assert!(snapshot_rx
+            .borrow()
+            .status
+            .text
+            .contains("disk unavailable"));
+        assert_eq!(snapshot_rx.borrow().status.level, StatusLevel::Warning);
+
+        disp.config_write_tx.take();
+        if let Some(writer) = disp.config_writer.take() {
+            writer.await.unwrap();
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn startup_config_warning_is_published_in_the_tui_status() {
+        let root = scratch_repo();
+        let (disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let mut disp = disp.with_startup_warning("global config is malformed; using defaults");
+        disp.handle(DispatchEvent::RepoChanged).await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.status.level, StatusLevel::Warning);
+        assert!(snap.status.text.contains("global config is malformed"));
+        assert!(snap.refreshing);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn model_discovery_failure_keeps_current_model_and_reports_configured_ai() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+        let config = codescope_ai::AiConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "current/model".to_string(),
+            api_key: None,
+            timeout: std::time::Duration::from_millis(100),
+            tool_choice: codescope_ai::ToolChoice::Required,
+            max_tool_calls: 1,
+            prime_team_id: None,
+        };
+        let service = AiService::new(
+            config,
+            camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+        )
+        .unwrap();
+        disp.ai = Some(std::sync::Arc::new(service));
+        disp.ai_status = AiStatus::Idle;
+
+        disp.handle(DispatchEvent::Work(Action::ModelPicker)).await;
+        {
+            let snap = snapshot_rx.borrow().clone();
+            assert!(snap.model_list_loading);
+            assert_eq!(snap.available_models, ["current/model"]);
+            assert_eq!(snap.ai_model, "current/model");
+            assert_eq!(snap.ai_provider, "custom");
+        }
+
+        let loaded = recv_until(&mut job_rx, |event| {
+            matches!(event, DispatchEvent::ModelsLoaded { .. })
+        })
+        .await;
+        disp.handle(loaded).await;
+        let snap = snapshot_rx.borrow().clone();
+        assert!(!snap.model_list_loading);
+        assert!(snap.model_list_error.is_some());
+        assert_eq!(snap.available_models, ["current/model"]);
+        assert!(snap
+            .status
+            .text
+            .contains("current/manual model remains available"));
+        assert!(!snap.status.text.contains("AI not configured"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repo_bar_does_not_promote_upstream_to_comparison_base() {
+        let ctx = codescope_core::RepoContext {
+            toplevel: camino::Utf8PathBuf::from("/tmp/demo"),
+            head: codescope_core::HeadState::Branch("feature".to_string()),
+            upstream: Some(codescope_core::Upstream {
+                name: "origin/feature".to_string(),
+                ahead: 0,
+                behind: 0,
+            }),
+            base: None,
+        };
+        let (bar, _) = repo_bar(Some(&ctx));
+        assert_eq!(bar.base, None, "tracking metadata is not an active base");
     }
 
     /// Receive dispatcher events until `pred` matches (spawned jobs report back here).
@@ -2008,6 +3662,53 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[tokio::test]
+    async fn losing_the_only_base_publishes_none_and_clears_stale_branch_facts() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+
+        disp.handle(DispatchEvent::RepoChanged).await;
+        let ready = recv_until(&mut job_rx, |event| {
+            matches!(event, DispatchEvent::ChangesetReady { .. })
+        })
+        .await;
+        disp.handle(ready).await;
+        assert_eq!(snapshot_rx.borrow().repo.base.as_deref(), Some("main"));
+        assert_eq!(snapshot_rx.borrow().files.len(), 1);
+
+        let output = Command::new("git")
+            .args(["branch", "-D", "main"])
+            .current_dir(&root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .output()
+            .expect("delete the only base ref");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        disp.handle(DispatchEvent::RepoChanged).await;
+        let unavailable = recv_until(&mut job_rx, |event| {
+            matches!(event, DispatchEvent::BranchUnavailable { .. })
+        })
+        .await;
+        disp.handle(unavailable).await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.repo.branch, "feature");
+        assert_eq!(snap.repo.base, None);
+        assert!(snap.base_ref.is_empty());
+        assert!(snap.files.is_empty(), "the old base's diff must be cleared");
+        assert!(snap.status.text.contains("no meaningful base"));
+        assert_eq!(snap.status.level, StatusLevel::Warning);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Regression test: starting a refresh must not blank the top bar. While a refresh is
     /// in flight the previously known repo/branch/base stay visible (the spinner signals
     /// staleness); an empty bar reading "codescope ?" made branch mode look broken.
@@ -2084,7 +3785,10 @@ mod tests {
         let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
 
         disp.handle(DispatchEvent::Work(Action::BasePicker)).await;
-        let loaded = recv_until(&mut job_rx, |e| matches!(e, DispatchEvent::BaseLoaded(_))).await;
+        let loaded = recv_until(&mut job_rx, |e| {
+            matches!(e, DispatchEvent::BaseLoaded { .. })
+        })
+        .await;
         disp.handle(loaded).await;
         let snap = snapshot_rx.borrow().clone();
         assert!(
@@ -2134,6 +3838,67 @@ mod tests {
             rows: labels.iter().map(|l| impact_row(l)).collect(),
             partial: false,
         }
+    }
+
+    /// A cached plan whose report records one dropped item tagged with `label`, so
+    /// report-preservation assertions can tell selections apart.
+    fn cached_ai_plan(label: &str) -> CachedAiPlan {
+        let mut plan = codescope_core::VisualizationPlan::new(Epoch(1), "selection impact");
+        plan.title = format!("plan for {label}");
+        plan.intent = "Explains the selected change.".to_string();
+        plan.forms.push(codescope_core::VizForm {
+            kind: codescope_core::FormKind::CallTree,
+            title: "runtime".to_string(),
+            summary: String::new(),
+            nodes: vec![codescope_core::PlanNode::new(
+                "n1",
+                label,
+                codescope_core::PlanNodeChange::Modified,
+            )
+            .with_detail("explains the selected change")],
+            edges: Vec::new(),
+        });
+        CachedAiPlan {
+            plan,
+            report: codescope_core::ValidationReport::with_drops(vec![
+                codescope_core::DroppedItem {
+                    subject: format!("node extra in form 0 ({label})"),
+                    reason: "entity does not resolve".to_string(),
+                },
+            ]),
+        }
+    }
+
+    #[test]
+    fn revision_cache_identity_survives_symbol_line_movement() {
+        let before = AiSelectionKey {
+            file: "src/service.rs".to_string(),
+            symbol: Some(("request_plan".to_string(), 120, 4)),
+        };
+        let after = AiSelectionKey {
+            file: "src/service.rs".to_string(),
+            symbol: Some(("request_plan".to_string(), 164, 4)),
+        };
+        assert_ne!(
+            before, after,
+            "epoch-exact render keys include source position"
+        );
+        assert_eq!(
+            AiRevisionKey::from(&before),
+            AiRevisionKey::from(&after),
+            "revision seeds follow the same symbol through surrounding edits"
+        );
+    }
+
+    fn semantic_node_label(snap: &UiSnapshot) -> Option<&str> {
+        snap.semantic
+            .plan
+            .as_ref()?
+            .forms
+            .first()?
+            .nodes
+            .first()
+            .map(|node| node.label.as_str())
     }
 
     #[tokio::test]
@@ -2235,7 +4000,7 @@ mod tests {
         // never leak into it (they render via `impact` once an analysis exists).
         let snap = snapshot_rx.borrow().clone();
         assert!(!snap.semantic.ai_generated);
-        assert!(snap.semantic.rows.is_empty());
+        assert!(snap.semantic.plan.is_none());
 
         // Navigating back to a file row clears the relations immediately.
         disp.handle(DispatchEvent::Work(Action::SelectionChanged {
@@ -2316,7 +4081,7 @@ mod tests {
             disp.selected_relations.is_none(),
             "a late result after leaving the symbol is dropped"
         );
-        assert!(snapshot_rx.borrow().semantic.rows.is_empty());
+        assert!(snapshot_rx.borrow().semantic.plan.is_none());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2390,7 +4155,7 @@ mod tests {
         }
     }
 
-    /// A lazy per-file cache entry wrapping `changed` symbols (the post-redesign home
+    /// An asynchronous per-file cache entry wrapping `changed` symbols (the post-redesign home
     /// of what `analysis_with` used to carry for the impact pane).
     fn ready_semantics(
         file: &str,
@@ -2468,16 +4233,29 @@ mod tests {
         );
     }
 
-    /// Every AI failure maps to a Warning status carrying the retry/model/deterministic
-    /// suffix (spec §3.6); the legacy `message` field mirrors the status text.
+    /// Every AI failure maps to a Warning status describing automatic regeneration,
+    /// model recovery, and deterministic fallback; the legacy `message` mirrors it.
     #[tokio::test]
     async fn ai_failure_status_carries_retry_suffix() {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
 
+        disp.selected_file = Some("a.txt".to_string());
+        let selection = disp.current_ai_selection().unwrap();
         let generation = disp.ai_request_seq;
+        disp.ai_running.insert(
+            generation,
+            AiRunningJob {
+                selection: selection.clone(),
+                epoch: disp.epoch,
+                generation,
+                priority: AiJobPriority::Focused,
+                accept_result: true,
+            },
+        );
         disp.handle(DispatchEvent::AiDone {
             epoch: disp.epoch,
+            selection,
             generation,
             outcome: AiOutcome::Failed("ai request timed out after 20s".to_string()),
         })
@@ -2486,7 +4264,7 @@ mod tests {
         assert_eq!(snap.status.level, StatusLevel::Warning);
         assert_eq!(
             snap.status.text,
-            "AI: ai request timed out after 20s · A retry · m change model · deterministic impact remains available"
+            "AI: ai request timed out after 20s · m change model · retries automatically when the selection or file changes · deterministic impact remains available"
         );
         assert_eq!(
             snap.message, snap.status.text,
@@ -2596,8 +4374,8 @@ mod tests {
         assert_eq!(selected.label, "b.txt");
         assert_eq!(selected.change, "modified");
         assert_eq!(
-            selected.interpretation, "not analyzed; Tab to load symbols",
-            "an unanalyzed file says so, not a fake zero"
+            selected.interpretation, "symbol analysis pending…",
+            "a pending file says so, not a fake zero"
         );
         assert_eq!(snap.impact.callers.state, ImpactLoadState::Idle);
         assert_eq!(snap.impact.downstream.state, ImpactLoadState::Idle);
@@ -2683,9 +4461,1095 @@ mod tests {
         assert_eq!(snap.impact.note, "partial: some relationships unavailable");
         // The semantic pane is the AI plan's slot: deterministic relations never leak.
         assert!(!snap.semantic.ai_generated);
-        assert!(snap.semantic.rows.is_empty());
+        assert!(snap.semantic.plan.is_none());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn ai_plan_follows_file_navigation_and_reuses_selection_cache() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        let a = AiSelectionKey {
+            file: "a.txt".to_string(),
+            symbol: None,
+        };
+        let b = AiSelectionKey {
+            file: "b.txt".to_string(),
+            symbol: None,
+        };
+        disp.ai_cache.insert(a.clone(), cached_ai_plan("plan-a"));
+        disp.ai_cache.insert(b.clone(), cached_ai_plan("plan-b"));
+
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        {
+            let snap = snapshot_rx.borrow().clone();
+            assert_eq!(semantic_node_label(&snap), Some("plan-a"));
+            assert_eq!(snap.semantic.note, "a.txt");
+            assert_report_for(&snap, "plan-a");
+        }
+
+        // This is the dispatcher's Up/Down input: the plan switches with Impact instead
+        // of leaving a.txt's explanation fixed beneath b.txt — and its report switches
+        // with it (never a.txt's drops beneath b.txt's plan).
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        {
+            let snap = snapshot_rx.borrow().clone();
+            assert_eq!(semantic_node_label(&snap), Some("plan-b"));
+            assert_eq!(snap.semantic.note, "b.txt");
+            assert_report_for(&snap, "plan-b");
+        }
+
+        // Moving back restores the cached plan — and its cached report — without any
+        // provider request.
+        let request_generation = disp.ai_request_seq;
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        assert_eq!(semantic_node_label(&snapshot_rx.borrow()), Some("plan-a"));
+        assert_report_for(&snapshot_rx.borrow(), "plan-a");
+        assert_eq!(
+            disp.ai_request_seq, request_generation,
+            "a cache hit launches no provider request"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The semantic pane publishes the validation report that produced the plan — verdict
+    /// plus dropped items — and keeps it scoped to the matching selection (Terra's
+    /// report-preservation contract).
+    fn assert_report_for(snap: &UiSnapshot, label: &str) {
+        let report = snap
+            .semantic
+            .report
+            .as_ref()
+            .unwrap_or_else(|| panic!("plan for {label} must carry its validation report"));
+        assert_eq!(
+            report.verdict,
+            codescope_core::ValidationVerdict::ValidWithDrops,
+            "cached report verdict for {label}"
+        );
+        assert_eq!(report.dropped.len(), 1, "dropped items survive for {label}");
+        assert!(
+            report.dropped[0].subject.contains(label),
+            "report belongs to {label}: {:?}",
+            report.dropped
+        );
+    }
+
+    #[tokio::test]
+    async fn uncached_ai_selection_hides_previous_plan_and_waits_for_symbols() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.repo_ctx = Some(codescope_core::RepoContext {
+            toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            head: codescope_core::HeadState::Branch("feature".to_string()),
+            upstream: None,
+            base: None,
+        });
+        disp.data_epoch = disp.epoch;
+        let config = codescope_ai::AiConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test/model".to_string(),
+            api_key: None,
+            timeout: std::time::Duration::from_millis(50),
+            tool_choice: codescope_ai::ToolChoice::Required,
+            max_tool_calls: 1,
+            prime_team_id: None,
+        };
+        disp.ai = Some(std::sync::Arc::new(
+            AiService::new(
+                config,
+                camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            )
+            .unwrap(),
+        ));
+        let a = AiSelectionKey {
+            file: "a.txt".to_string(),
+            symbol: None,
+        };
+        disp.ai_cache.insert(a, cached_ai_plan("plan-a"));
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        assert_eq!(semantic_node_label(&snapshot_rx.borrow()), Some("plan-a"));
+
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        assert!(
+            !snap.semantic.ai_generated && snap.semantic.plan.is_none(),
+            "the old selection's plan disappears immediately"
+        );
+        assert!(
+            snap.semantic.report.is_none(),
+            "the old selection's report disappears with its plan"
+        );
+        assert_eq!(snap.ai, AiStatus::WaitingForSymbols { epoch: disp.epoch });
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn adaptive_ai_queue_orders_focus_then_visible_symbols_then_file_summaries() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let focused = AiSelectionKey {
+            file: "a.txt".to_string(),
+            symbol: Some(("focused".to_string(), 10, 2)),
+        };
+        let sibling = AiSelectionKey {
+            file: "a.txt".to_string(),
+            symbol: Some(("sibling".to_string(), 20, 2)),
+        };
+        let file_summary = AiSelectionKey {
+            file: "b.txt".to_string(),
+            symbol: None,
+        };
+        disp.selected_file = Some("a.txt".to_string());
+        disp.selected_symbol = Some(("a.txt".to_string(), "focused".to_string(), 10, 2));
+        // Insert in the opposite order to prove priority, not FIFO, owns the hierarchy.
+        disp.ai_queue = vec![
+            AiQueuedJob {
+                selection: file_summary.clone(),
+                epoch: disp.epoch,
+                priority: AiJobPriority::FileSummary,
+                order: 1,
+            },
+            AiQueuedJob {
+                selection: sibling.clone(),
+                epoch: disp.epoch,
+                priority: AiJobPriority::ExpandedSymbol,
+                order: 2,
+            },
+            AiQueuedJob {
+                selection: focused.clone(),
+                epoch: disp.epoch,
+                priority: AiJobPriority::FileSummary,
+                order: 3,
+            },
+        ];
+
+        disp.reprioritize_ai_queue();
+
+        assert_eq!(disp.ai_queue_position(&focused), Some(1));
+        assert_eq!(disp.ai_queue_position(&sibling), Some(2));
+        assert_eq!(disp.ai_queue_position(&file_summary), Some(3));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn focused_only_policy_discards_every_unrelated_prefetch_job() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.ai_prefetch = AiPrefetchPolicy::FocusedOnly;
+        disp.selected_file = Some("a.txt".to_string());
+        let focused = AiSelectionKey {
+            file: "a.txt".to_string(),
+            symbol: None,
+        };
+        disp.ai_queue = vec![
+            AiQueuedJob {
+                selection: AiSelectionKey {
+                    file: "b.txt".to_string(),
+                    symbol: None,
+                },
+                epoch: disp.epoch,
+                priority: AiJobPriority::FileSummary,
+                order: 1,
+            },
+            AiQueuedJob {
+                selection: focused.clone(),
+                epoch: disp.epoch,
+                priority: AiJobPriority::FileSummary,
+                order: 2,
+            },
+        ];
+
+        disp.reprioritize_ai_queue();
+
+        assert_eq!(disp.ai_queue.len(), 1);
+        assert_eq!(disp.ai_queue[0].selection, focused);
+        assert_eq!(disp.ai_queue[0].priority, AiJobPriority::Focused);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn disabled_ai_leaves_pending_jobs_untouched() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let running = AiRunningJob {
+            selection: AiSelectionKey {
+                file: "a.txt".to_string(),
+                symbol: None,
+            },
+            epoch: disp.epoch,
+            generation: 7,
+            priority: AiJobPriority::FileSummary,
+            accept_result: true,
+        };
+        disp.ai_running.insert(7, running.clone());
+        disp.ai_queue.push(AiQueuedJob {
+            selection: AiSelectionKey {
+                file: "b.txt".to_string(),
+                symbol: None,
+            },
+            epoch: disp.epoch,
+            priority: AiJobPriority::FileSummary,
+            order: 1,
+        });
+
+        disp.pump_ai_queue();
+
+        assert_eq!(disp.ai_running.get(&7).unwrap().generation, 7);
+        assert_eq!(disp.ai_queue.len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn late_focused_relations_replace_an_incomplete_running_plan() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let config = codescope_ai::AiConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test/model".to_string(),
+            api_key: None,
+            timeout: std::time::Duration::from_millis(25),
+            tool_choice: codescope_ai::ToolChoice::Required,
+            max_tool_calls: 1,
+            prime_team_id: None,
+        };
+        disp.ai = Some(std::sync::Arc::new(
+            AiService::new(
+                config,
+                camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            )
+            .unwrap(),
+        ));
+        disp.selected_file = Some("a.txt".to_string());
+        disp.selected_symbol = Some(("a.txt".to_string(), "focused".to_string(), 10, 2));
+        let selection = disp.current_ai_selection().unwrap();
+        disp.ai_running.insert(
+            9,
+            AiRunningJob {
+                selection: selection.clone(),
+                epoch: disp.epoch,
+                generation: 9,
+                priority: AiJobPriority::Focused,
+                accept_result: true,
+            },
+        );
+
+        disp.handle(DispatchEvent::RelationsLoaded {
+            epoch: disp.epoch,
+            file: "a.txt".to_string(),
+            name: "focused".to_string(),
+            line: 10,
+            col: 2,
+            callers: relation_rows(&["caller"]),
+            callees: relation_rows(&["callee"]),
+        })
+        .await;
+
+        assert!(
+            !disp.ai_running.contains_key(&9),
+            "the incomplete request is cancelled instead of occupying capacity"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn repeated_provider_failures_pause_only_background_prefetch() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        for generation in 1..=3 {
+            let selection = AiSelectionKey {
+                file: format!("background-{generation}.txt"),
+                symbol: None,
+            };
+            disp.ai_running.insert(
+                generation,
+                AiRunningJob {
+                    selection: selection.clone(),
+                    epoch: disp.epoch,
+                    generation,
+                    priority: AiJobPriority::FileSummary,
+                    accept_result: true,
+                },
+            );
+            disp.on_ai_done(
+                disp.epoch,
+                selection,
+                generation,
+                AiOutcome::Failed("provider unavailable".to_string()),
+            );
+        }
+
+        assert_eq!(disp.ai_consecutive_failures, 3);
+        assert!(disp.ai_background_paused);
+        // The queue itself remains intact: moving focus to one of these rows reclassifies
+        // it as Focused, which is still eligible while background warming is paused.
+        let focused = AiSelectionKey {
+            file: "still-useful.txt".to_string(),
+            symbol: None,
+        };
+        disp.ai_queue.push(AiQueuedJob {
+            selection: focused.clone(),
+            epoch: disp.epoch,
+            priority: AiJobPriority::FileSummary,
+            order: 1,
+        });
+        disp.selected_file = Some(focused.file);
+        disp.reprioritize_ai_queue();
+        assert_eq!(disp.ai_queue.len(), 1);
+        assert_eq!(disp.ai_queue[0].priority, AiJobPriority::Focused);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn automatic_ai_waits_for_selected_file_symbols_then_starts() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.repo_ctx = Some(codescope_core::RepoContext {
+            toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            head: codescope_core::HeadState::Branch("feature".to_string()),
+            upstream: None,
+            base: None,
+        });
+        disp.data_epoch = disp.epoch;
+        disp.file_semantics
+            .insert("b.txt".to_string(), FileSemanticState::Loading);
+        let config = codescope_ai::AiConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test/model".to_string(),
+            api_key: None,
+            timeout: std::time::Duration::from_millis(25),
+            tool_choice: codescope_ai::ToolChoice::Required,
+            max_tool_calls: 1,
+            prime_team_id: None,
+        };
+        disp.ai = Some(std::sync::Arc::new(
+            AiService::new(
+                config,
+                camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            )
+            .unwrap(),
+        ));
+
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        assert!(
+            disp.ai_running.is_empty(),
+            "provider request is gated while symbols are Loading"
+        );
+        let before_ready = disp.ai_selection_seq;
+
+        let FileSemanticState::Ready(result) = ready_semantics("b.txt", Vec::new()) else {
+            unreachable!("helper always returns Ready")
+        };
+        disp.handle(DispatchEvent::FileAnalysisDone {
+            epoch: disp.epoch,
+            file: "b.txt".to_string(),
+            result: Ok(result),
+        })
+        .await;
+        assert!(
+            disp.ai_selection_seq > before_ready,
+            "Ready schedules the automatic selection debounce"
+        );
+        assert!(disp.ai_running.is_empty(), "debounce has not fired yet");
+
+        disp.handle(DispatchEvent::AiSelectionSettled {
+            epoch: disp.epoch,
+            generation: disp.ai_selection_seq,
+        })
+        .await;
+        assert_eq!(
+            disp.ai_running.values().map(|job| &job.selection).next(),
+            Some(&AiSelectionKey {
+                file: "b.txt".to_string(),
+                symbol: None,
+            }),
+            "the provider request starts only after semantic readiness"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn repository_change_invalidates_symbols_and_automatically_regenerates() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
+        let config = codescope_ai::AiConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test/model".to_string(),
+            api_key: None,
+            timeout: std::time::Duration::from_millis(25),
+            tool_choice: codescope_ai::ToolChoice::Required,
+            max_tool_calls: 1,
+            prime_team_id: None,
+        };
+        disp.ai = Some(std::sync::Arc::new(
+            AiService::new(
+                config,
+                camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            )
+            .unwrap(),
+        ));
+        disp.selected_file = Some("a.txt".to_string());
+        disp.file_semantics
+            .insert("a.txt".to_string(), ready_semantics("a.txt", Vec::new()));
+        let selection = disp.current_ai_selection().unwrap();
+        let cached = cached_ai_plan("old plan");
+        disp.ai_cache.insert(selection.clone(), cached.clone());
+        let revision_key = AiRevisionKey::from(&selection);
+        disp.ai_revision_cache
+            .insert(revision_key.clone(), cached.clone());
+        disp.ai_rows = Some((disp.epoch, selection, cached.clone()));
+
+        disp.handle(DispatchEvent::RepoChanged).await;
+        assert!(
+            disp.file_semantics.is_empty(),
+            "old symbol facts are invalidated"
+        );
+        assert!(
+            disp.ai_cache.is_empty(),
+            "old generated plans cannot render in the new epoch"
+        );
+        assert_eq!(
+            disp.ai_revision_cache
+                .get(&revision_key)
+                .map(|item| &item.plan),
+            Some(&cached.plan),
+            "the old validated design survives only as a revision seed"
+        );
+        assert!(disp.ai_running.is_empty());
+
+        let changeset_ready = recv_until(&mut job_rx, |event| {
+            matches!(event, DispatchEvent::ChangesetReady { .. })
+        })
+        .await;
+        disp.handle(changeset_ready).await;
+        assert!(
+            disp.ai_revision_cache.contains_key(&revision_key),
+            "a still-changed file keeps its revision seed"
+        );
+        assert!(matches!(
+            disp.file_semantics.get("a.txt"),
+            Some(FileSemanticState::Loading)
+        ));
+        let before_ready = disp.ai_selection_seq;
+
+        let FileSemanticState::Ready(result) = ready_semantics("a.txt", Vec::new()) else {
+            unreachable!("helper always returns Ready")
+        };
+        disp.handle(DispatchEvent::FileAnalysisDone {
+            epoch: disp.epoch,
+            file: "a.txt".to_string(),
+            result: Ok(result),
+        })
+        .await;
+        assert!(
+            disp.ai_selection_seq > before_ready,
+            "fresh symbols schedule regeneration without a keypress"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A cached plan whose epoch no longer matches the repo state publishes the stale
+    /// pane: no plan, no report — the old report must never leak into the new epoch's
+    /// fallback view.
+    #[tokio::test]
+    async fn stale_epoch_ai_pane_carries_neither_plan_nor_report() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.selected_file = Some("a.txt".to_string());
+        let stale_epoch = disp.epoch.next();
+        disp.ai_rows = Some((
+            stale_epoch,
+            AiSelectionKey {
+                file: "a.txt".to_string(),
+                symbol: None,
+            },
+            cached_ai_plan("plan-a"),
+        ));
+        disp.publish();
+        let snap = snapshot_rx.borrow().clone();
+        assert!(
+            !snap.semantic.ai_generated && snap.semantic.plan.is_none(),
+            "stale plan never renders: {:?}",
+            snap.semantic
+        );
+        assert!(
+            snap.semantic.report.is_none(),
+            "the stale epoch's report must not leak into the fallback pane"
+        );
+        assert_eq!(
+            snap.semantic.note,
+            "AI view stale (repo changed); regenerating…"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn late_ai_response_cannot_overwrite_a_new_arrow_selection() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.selected_file = Some("a.txt".to_string());
+        disp.ai_request_seq = 10;
+        let old_selection = disp.current_ai_selection().unwrap();
+        disp.ai_running.insert(
+            10,
+            AiRunningJob {
+                selection: old_selection.clone(),
+                epoch: disp.epoch,
+                generation: 10,
+                priority: AiJobPriority::Focused,
+                accept_result: true,
+            },
+        );
+
+        // Arrow to b.txt invalidates a.txt's in-flight generation before its answer lands.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        let mut old_plan = codescope_core::VisualizationPlan::new(disp.epoch, "old selection");
+        old_plan.forms.push(codescope_core::VizForm {
+            kind: codescope_core::FormKind::ImpactSummary,
+            title: "stale a.txt plan".to_string(),
+            summary: "must never render".to_string(),
+            nodes: vec![codescope_core::PlanNode::new(
+                "n1",
+                "a.txt",
+                codescope_core::PlanNodeChange::Modified,
+            )],
+            edges: Vec::new(),
+        });
+        disp.handle(DispatchEvent::AiDone {
+            epoch: disp.epoch,
+            selection: old_selection.clone(),
+            generation: 10,
+            outcome: AiOutcome::Plan(old_plan, codescope_core::ValidationReport::valid()),
+        })
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.impact.selected_change.unwrap().file, "b.txt");
+        assert!(!snap.semantic.ai_generated);
+        assert!(snap.semantic.plan.is_none());
+        assert!(
+            disp.ai_cache.contains_key(&old_selection),
+            "off-focus completion is cached instead of discarded"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn impact_focus_prompt_is_explicitly_selection_scoped() {
+        let impact = ImpactPane {
+            selected_change: Some(SelectedChange {
+                file: "pkg/api.go".to_string(),
+                label: "readinessHandler".to_string(),
+                change: "added",
+                interpretation: "Added function across 1 hunk.".to_string(),
+                interpretation_source: InterpretationSource::Deterministic,
+            }),
+            callers: ImpactList {
+                rows: vec![impact_row("run")],
+                state: ImpactLoadState::Ready,
+                partial: false,
+            },
+            downstream: ImpactList {
+                rows: vec![impact_row("http.HandlerFunc")],
+                state: ImpactLoadState::Ready,
+                partial: true,
+            },
+            note: "partial: some relationships unavailable".to_string(),
+        };
+        let mut digest = "# change digest\n".to_string();
+        append_impact_focus(&mut digest, &impact);
+        assert!(digest.contains("current impact selection (required plan focus)"));
+        assert!(digest.contains("label: readinessHandler"));
+        assert!(digest.contains("- run (calls)"));
+        assert!(digest.contains("- http.HandlerFunc (calls)"));
+        assert!(digest.contains("relationship evidence is partial"));
+        assert!(digest.contains("MUST be about this file/function only"));
+        assert!(digest.contains("every node code_ref MUST use this selected file"));
+        assert!(digest.contains("end the visual at that publication"));
+        assert!(digest.contains("do not repeat them in a node detail or evidence reason"));
+    }
+
+    #[test]
+    fn unsupported_yaml_focus_requires_file_hunk_evidence() {
+        let path = ".github/workflows/vm-sandbox-deploy.yaml";
+        let selection = file_selection(path);
+        let mut semantics = std::collections::HashMap::new();
+        semantics.insert(path.to_string(), FileSemanticState::Unsupported);
+        let mut digest = String::new();
+
+        append_selected_evidence_contract(&mut digest, &selection, &semantics);
+
+        assert!(digest.contains("this file type has no semantic analyzer"));
+        assert!(digest.contains("MUST use the exact selected file"));
+        assert!(digest.contains("MUST omit symbol and range"));
+        assert!(digest.contains("Node entities MUST be absent or use the exact file only"));
+        assert!(digest.contains("`changes`"));
+        assert!(digest.contains("are concepts, NOT symbols"));
+    }
+
+    /// One hunk spec for [`variable_hunk_changeset`]: `lines` body lines, each rendered
+    /// as `{text} {hunk_index}/{line_number}` so tests can tell hunk and line apart.
+    struct HunkSpec {
+        lines: usize,
+        text: String,
+    }
+
+    /// One modified file with one hunk per spec; hunk `i` adds `specs[i].lines` lines
+    /// labelled `{text} {i}/{n}`, so the focused-packet tests can control both hunk
+    /// sizes and line widths and identify exactly which hunks were selected.
+    fn variable_hunk_changeset(path: &str, specs: &[HunkSpec]) -> codescope_core::ChangeSet {
+        use codescope_core::{ChangeSet, DiffLine, FileChange, FileStatus, Hunk};
+        let hunks = specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let start = 10 * index as u32 + 1;
+                Hunk {
+                    old_start: start,
+                    old_len: 1,
+                    new_start: start,
+                    new_len: spec.lines as u32,
+                    section: None,
+                    lines: (0..spec.lines as u32)
+                        .map(|n| DiffLine::add(start + n, format!("{} {index}/{n}", spec.text)))
+                        .collect(),
+                }
+            })
+            .collect();
+        ChangeSet::new(
+            ChangeScope::Branch,
+            vec![FileChange {
+                path: path.into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                hunks,
+                binary: false,
+            }],
+        )
+    }
+
+    /// One modified file with `count` single-line hunks; hunk `i` adds `change {i}` so
+    /// the focused-packet tests can tell exactly which hunks were selected.
+    fn many_hunk_changeset(path: &str, count: usize) -> codescope_core::ChangeSet {
+        let specs = (0..count)
+            .map(|_| HunkSpec {
+                lines: 1,
+                text: "change".to_string(),
+            })
+            .collect::<Vec<_>>();
+        variable_hunk_changeset(path, &specs)
+    }
+
+    fn file_selection(path: &str) -> AiSelectionKey {
+        AiSelectionKey {
+            file: path.to_string(),
+            symbol: None,
+        }
+    }
+
+    fn focused_packet(
+        selection: &AiSelectionKey,
+        changeset: &codescope_core::ChangeSet,
+        semantics: &std::collections::HashMap<String, FileSemanticState>,
+    ) -> String {
+        let mut digest = String::new();
+        append_focused_source_packet(&mut digest, selection, changeset, semantics);
+        digest
+    }
+
+    #[test]
+    fn focused_packet_numbers_both_diff_sides_for_exact_node_code_refs() {
+        use codescope_core::{ChangeSet, DiffLine, FileChange, FileStatus, Hunk};
+        let path = "src/main.rs";
+        let changeset = ChangeSet::new(
+            ChangeScope::Branch,
+            vec![FileChange {
+                path: path.into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                hunks: vec![Hunk {
+                    old_start: 7,
+                    old_len: 2,
+                    new_start: 7,
+                    new_len: 2,
+                    section: Some("fn main".to_string()),
+                    lines: vec![
+                        DiffLine::del(7, "old();"),
+                        DiffLine::add(7, "new();"),
+                        DiffLine::context(8, 8, "finish();"),
+                    ],
+                }],
+                binary: false,
+            }],
+        );
+        let packet = focused_packet(
+            &file_selection(path),
+            &changeset,
+            &std::collections::HashMap::new(),
+        );
+        assert!(packet.contains("body annotations use one-based old/new lines"));
+        assert!(packet.contains("[old:7 new:-] -old();"), "{packet}");
+        assert!(packet.contains("[old:- new:7] +new();"), "{packet}");
+        assert!(packet.contains("[old:8 new:8]  finish();"), "{packet}");
+
+        let facts = SnapshotFacts::from_lazy(&changeset, &std::collections::HashMap::new(), path);
+        let file = codescope_core::FileId::new_unchecked(path);
+        assert!(facts.is_focus_file(&file));
+        assert!(!facts.is_focus_file(&codescope_core::FileId::new_unchecked("src/other.rs")));
+        assert_eq!(
+            facts.diff_line(&file, 0, DiffSide::Old, 7),
+            Lookup::Present(())
+        );
+        assert_eq!(
+            facts.diff_line(&file, 0, DiffSide::New, 7),
+            Lookup::Present(())
+        );
+        assert_eq!(
+            facts.diff_line(&file, 0, DiffSide::New, 8),
+            Lookup::Present(())
+        );
+        assert_eq!(facts.diff_line(&file, 0, DiffSide::Old, 9), Lookup::Absent);
+        assert_eq!(facts.diff_line(&file, 1, DiffSide::Old, 7), Lookup::Absent);
+    }
+
+    /// File-level packets must carry the whole file while it fits the hunk cap: the
+    /// vm-sandboxes/packages/api/main.go case has six hunks, and the sixth holds the
+    /// close-last shutdown behavior the plan is asked to explain.
+    #[test]
+    fn file_level_packet_covers_all_six_hunks_including_the_final_one() {
+        let path = "sandbox/vm-sandboxes/packages/api/main.go";
+        let packet = focused_packet(
+            &file_selection(path),
+            &many_hunk_changeset(path, 6),
+            &std::collections::HashMap::new(),
+        );
+        for index in 0..6 {
+            assert!(
+                packet.contains(&format!("hunk_id: {index}")),
+                "hunk {index} missing from packet:\n{packet}"
+            );
+        }
+        assert!(
+            packet.contains("change 5"),
+            "final hunk body missing:\n{packet}"
+        );
+        assert!(!packet.contains("truncated"));
+    }
+
+    /// Beyond the cap the packet stays bounded but keeps balanced head and tail
+    /// coverage: the leading and trailing hunks, so late finalization edits are never
+    /// silently dropped while entry-point changes stay visible.
+    #[test]
+    fn file_level_packet_stays_bounded_with_balanced_head_and_tail() {
+        let path = "pkg/server.go";
+        let total = FOCUSED_MAX_HUNKS + 1;
+        let packet = focused_packet(
+            &file_selection(path),
+            &many_hunk_changeset(path, total),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            packet.matches("hunk_id:").count(),
+            FOCUSED_MAX_HUNKS,
+            "hunk cap not enforced:\n{packet}"
+        );
+        let tail = FOCUSED_MAX_HUNKS / 2;
+        let head = FOCUSED_MAX_HUNKS - tail;
+        for index in (0..head).chain(total - tail..total) {
+            assert!(
+                packet.contains(&format!("hunk_id: {index}")),
+                "hunk {index} missing from packet:\n{packet}"
+            );
+        }
+        assert!(
+            packet.contains(&format!("change {}/0", total - 1)),
+            "final hunk body dropped:\n{packet}"
+        );
+        for dropped in head..total - tail {
+            assert!(
+                !packet.contains(&format!("hunk_id: {dropped}")),
+                "hunk {dropped} should be beyond the cap:\n{packet}"
+            );
+        }
+    }
+
+    /// The hunk cap never overrides the hard line budget: a six-hunk file whose hunks
+    /// together exceed the line cap still cuts off with the truncation marker — but the
+    /// fair slices keep every hunk's header, including the final one, in the packet.
+    #[test]
+    fn file_level_packet_respects_the_line_budget() {
+        let path = "pkg/generated.go";
+        let specs = (0..6)
+            .map(|_| HunkSpec {
+                lines: 40,
+                text: "bulk".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let packet = focused_packet(
+            &file_selection(path),
+            &variable_hunk_changeset(path, &specs),
+            &std::collections::HashMap::new(),
+        );
+        let emitted = packet.lines().filter(|line| line.contains("] +")).count();
+        assert_eq!(
+            emitted, FOCUSED_MAX_LINES,
+            "line budget not enforced:\n{packet}"
+        );
+        assert!(packet.contains("focused source truncated to prompt budget"));
+        for index in 0..6 {
+            assert!(
+                packet.contains(&format!("hunk_id: {index}")),
+                "hunk {index} header lost under line pressure:\n{packet}"
+            );
+        }
+        assert!(
+            packet.contains("+bulk 5/0"),
+            "final hunk body lost under line pressure:\n{packet}"
+        );
+    }
+
+    /// Budget pressure from a huge early hunk must not starve the tail: the fair line
+    /// slice guarantees the final hunk's header and body evidence while the early hunk
+    /// absorbs only its share plus the leftover lines, and the totals stay bounded.
+    #[test]
+    fn file_level_packet_keeps_final_hunk_evidence_when_an_early_hunk_is_huge() {
+        let path = "sandbox/vm-sandboxes/packages/api/main.go";
+        let specs = vec![
+            HunkSpec {
+                lines: 200,
+                text: "handle".to_string(),
+            },
+            HunkSpec {
+                lines: 20,
+                text: "route".to_string(),
+            },
+            HunkSpec {
+                lines: 20,
+                text: "auth".to_string(),
+            },
+            HunkSpec {
+                lines: 20,
+                text: "pool".to_string(),
+            },
+            HunkSpec {
+                lines: 20,
+                text: "metrics".to_string(),
+            },
+            HunkSpec {
+                lines: 5,
+                text: "closeLastShutdown".to_string(),
+            },
+        ];
+        let packet = focused_packet(
+            &file_selection(path),
+            &variable_hunk_changeset(path, &specs),
+            &std::collections::HashMap::new(),
+        );
+        // The final hunk keeps its header plus its full body evidence.
+        assert!(
+            packet.contains("hunk_id: 5"),
+            "final hunk header lost to the huge early hunk:\n{packet}"
+        );
+        assert!(
+            packet.contains("+closeLastShutdown 5/0"),
+            "final hunk body lost to the huge early hunk:\n{packet}"
+        );
+        // Every other hunk keeps its fair slice; the huge one gets the leftover.
+        for index in 0..5 {
+            assert!(
+                packet.contains(&format!("hunk_id: {index}")),
+                "hunk {index} header lost:\n{packet}"
+            );
+        }
+        assert!(
+            packet.contains("+handle 0/0"),
+            "early hunk body lost:\n{packet}"
+        );
+        // Totals stay bounded: exactly the line budget, with the cut flagged.
+        let emitted = packet.lines().filter(|line| line.contains("] +")).count();
+        assert_eq!(
+            emitted, FOCUSED_MAX_LINES,
+            "line budget not enforced:\n{packet}"
+        );
+        assert!(packet.contains("focused source truncated to prompt budget"));
+    }
+
+    /// Byte pressure from a very wide early hunk must not starve the tail either: the
+    /// fair byte slice reserves room for the final hunk's header and body evidence
+    /// while the wide hunk keeps whatever budget remains. Totals stay bounded.
+    #[test]
+    fn file_level_packet_keeps_final_hunk_evidence_when_an_early_hunk_is_wide() {
+        let path = "pkg/generated.go";
+        let wide = "x".repeat(900);
+        let specs = vec![
+            HunkSpec {
+                lines: 30,
+                text: wide,
+            },
+            HunkSpec {
+                lines: 3,
+                text: "route".to_string(),
+            },
+            HunkSpec {
+                lines: 3,
+                text: "auth".to_string(),
+            },
+            HunkSpec {
+                lines: 3,
+                text: "pool".to_string(),
+            },
+            HunkSpec {
+                lines: 3,
+                text: "metrics".to_string(),
+            },
+            HunkSpec {
+                lines: 3,
+                text: "closeLastShutdown".to_string(),
+            },
+        ];
+        let packet = focused_packet(
+            &file_selection(path),
+            &variable_hunk_changeset(path, &specs),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            packet.contains("hunk_id: 5"),
+            "final hunk header lost to the wide early hunk:\n{packet}"
+        );
+        assert!(
+            packet.contains("+closeLastShutdown 5/0"),
+            "final hunk body lost to the wide early hunk:\n{packet}"
+        );
+        assert!(
+            packet.contains("hunk_id: 0") && packet.contains("+xxxx"),
+            "wide early hunk lost its evidence:\n{packet}"
+        );
+        // Totals stay bounded: lines within the line cap, bytes within the byte cap
+        // (the truncation marker itself may overshoot by its own short length).
+        let emitted = packet.lines().filter(|line| line.contains("] +")).count();
+        assert!(
+            emitted <= FOCUSED_MAX_LINES,
+            "line budget not enforced:\n{packet}"
+        );
+        assert!(
+            packet.len() <= FOCUSED_MAX_BYTES + 64,
+            "byte budget not enforced:\n{packet}"
+        );
+        assert!(packet.contains("focused source truncated to prompt budget"));
+    }
+
+    /// Symbol-scoped selections stay focused: the packet carries only the hunks the
+    /// semantic mapping assigns to the selected symbol, never the file-level fallback.
+    #[test]
+    fn symbol_scoped_packet_stays_limited_to_the_symbols_hunks() {
+        let path = "pkg/server.go";
+        let mut symbol = changed_symbol(
+            path,
+            "Shutdown",
+            codescope_core::SymbolKind::Function,
+            codescope_core::ChangeKind::Modified,
+            0,
+            false,
+        );
+        symbol.record.hunks = vec![1, 7]
+            .into_iter()
+            .map(|index| codescope_core::HunkId {
+                file: path.into(),
+                index,
+            })
+            .collect();
+        let mut semantics = std::collections::HashMap::new();
+        semantics.insert(path.to_string(), ready_semantics(path, vec![symbol]));
+        let selection = AiSelectionKey {
+            file: path.to_string(),
+            symbol: Some(("Shutdown".to_string(), 2, 4)),
+        };
+        let packet = focused_packet(&selection, &many_hunk_changeset(path, 9), &semantics);
+        assert!(packet.contains("hunk_id: 1"));
+        assert!(packet.contains("hunk_id: 7"));
+        for absent in [0, 2, 8] {
+            assert!(
+                !packet.contains(&format!("hunk_id: {absent}")),
+                "hunk {absent} leaked into the symbol packet:\n{packet}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_symbol_packet_balances_entry_and_finalization_hunks() {
+        let path = "pkg/server.go";
+        let total = FOCUSED_MAX_HUNKS + 2;
+        let mut symbol = changed_symbol(
+            path,
+            "Run",
+            codescope_core::SymbolKind::Function,
+            codescope_core::ChangeKind::Modified,
+            0,
+            false,
+        );
+        symbol.record.hunks = (0..total as u32)
+            .map(|index| codescope_core::HunkId {
+                file: path.into(),
+                index,
+            })
+            .collect();
+        let mut semantics = std::collections::HashMap::new();
+        semantics.insert(path.to_string(), ready_semantics(path, vec![symbol]));
+        let selection = AiSelectionKey {
+            file: path.to_string(),
+            symbol: Some(("Run".to_string(), 2, 4)),
+        };
+        let packet = focused_packet(&selection, &many_hunk_changeset(path, total), &semantics);
+        let tail = FOCUSED_MAX_HUNKS / 2;
+        let head = FOCUSED_MAX_HUNKS - tail;
+        for index in (0..head).chain(total - tail..total) {
+            assert!(packet.contains(&format!("hunk_id: {index}")), "{packet}");
+        }
+        for omitted in head..total - tail {
+            assert!(!packet.contains(&format!("hunk_id: {omitted}")), "{packet}");
+        }
     }
 
     /// The semantic pane is the AI plan's durable slot: a ready, epoch-current plan keeps
@@ -2711,24 +5575,19 @@ mod tests {
                 )],
             ),
         );
-        // A validated plan for the current epoch.
-        disp.ai_rows = Some((
-            disp.epoch,
-            vec![SemRow {
-                depth: 0,
-                label: "RetryPolicy".to_string(),
-                relation: "changed",
-                changed: true,
-                has_diagnostic: false,
-            }],
-            "plan: retry budget".to_string(),
-        ));
+        // A validated plan for the current epoch and selected symbol.
+        disp.selected_file = Some("a.txt".to_string());
+        disp.selected_symbol = Some(("a.txt".to_string(), "sym0".to_string(), 2, 4));
+        let selection = disp.current_ai_selection().expect("selected symbol");
+        let plan = cached_ai_plan("RetryPolicy");
+        disp.ai_cache.insert(selection.clone(), plan.clone());
+        disp.ai_rows = Some((disp.epoch, selection, plan));
         disp.ai_status = AiStatus::Ready { epoch: disp.epoch };
         disp.publish();
         {
             let snap = snapshot_rx.borrow();
             assert!(snap.semantic.ai_generated);
-            assert_eq!(snap.semantic.rows[0].label, "RetryPolicy");
+            assert_eq!(semantic_node_label(&snap), Some("RetryPolicy"));
         }
 
         // Select a symbol and land its relations: the plan must stay in `semantic`.
@@ -2753,8 +5612,12 @@ mod tests {
             snap.semantic.ai_generated,
             "the ready plan survives loaded relations"
         );
-        assert_eq!(snap.semantic.title, "plan: retry budget");
-        assert_eq!(snap.semantic.rows[0].label, "RetryPolicy");
+        assert_eq!(
+            snap.semantic.plan.as_ref().map(|plan| plan.title.as_str()),
+            Some("plan for RetryPolicy")
+        );
+        assert_eq!(semantic_node_label(&snap), Some("RetryPolicy"));
+        assert_report_for(&snap, "RetryPolicy");
         // …and the relations are where the deterministic view reads them.
         let callers: Vec<&str> = snap
             .impact
@@ -2768,33 +5631,42 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Lazy startup: the initial refresh publishes every git file as collapsed +
-    /// Unloaded with zero per-file analysis jobs launched.
+    /// Startup lists files immediately and independently queues their symbol analysis,
+    /// even while every file remains collapsed.
     #[tokio::test]
-    async fn startup_publishes_git_files_without_eager_analysis() {
+    async fn startup_queues_symbols_without_expanding_files() {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
         disp.handle(DispatchEvent::RepoChanged).await;
-        let done = recv_until(&mut job_rx, |e| {
-            matches!(e, DispatchEvent::AnalysisDone { .. })
-        })
-        .await;
-        disp.handle(done).await;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(30), job_rx.recv())
+                .await
+                .expect("refresh timed out")
+                .expect("event channel closed");
+            let done = matches!(event, DispatchEvent::AnalysisDone { .. });
+            disp.handle(event).await;
+            if done {
+                break;
+            }
+        }
         let snap = snapshot_rx.borrow().clone();
         assert_eq!(snap.files.len(), 1, "git file listed");
         assert!(!snap.files[0].expanded, "initially collapsed");
         assert_eq!(
             snap.files[0].semantic,
-            codescope_tui::snapshot::FileSemanticLoad::Unloaded
+            codescope_tui::snapshot::FileSemanticLoad::Loading
         );
         assert_eq!(
             snap.files[0].changed_symbol_count, 0,
             "no fake zero-symbol count"
         );
-        // No per-file analysis job was launched (no FileAnalysisDone queued).
-        assert!(
-            job_rx.try_recv().is_err(),
-            "no per-file analysis without an explicit expand"
+        assert_eq!(
+            disp.analysis_queue
+                .iter()
+                .filter(|path| *path == "a.txt")
+                .count(),
+            1,
+            "collapsed file is queued exactly once while the engine starts"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2819,18 +5691,24 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Tab on a collapsed file: one analysis request + a Loading row; repeated Tabs while
-    /// in flight coalesce (collapse keeps the cache and relaunches nothing).
+    /// Tab only changes visibility: background analysis is already queued, and repeated
+    /// collapse/expand actions neither launch nor duplicate semantic work.
     #[tokio::test]
     async fn tab_expands_with_loading_row_and_coalesces() {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
         disp.handle(DispatchEvent::RepoChanged).await;
-        let done = recv_until(&mut job_rx, |e| {
-            matches!(e, DispatchEvent::AnalysisDone { .. })
-        })
-        .await;
-        disp.handle(done).await;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(30), job_rx.recv())
+                .await
+                .expect("refresh timed out")
+                .expect("event channel closed");
+            let done = matches!(event, DispatchEvent::AnalysisDone { .. });
+            disp.handle(event).await;
+            if done {
+                break;
+            }
+        }
         // Aim the selection at the file row.
         disp.handle(DispatchEvent::Work(Action::SelectionChanged {
             file: Some("a.txt".to_string()),
@@ -2838,9 +5716,14 @@ mod tests {
         }))
         .await;
 
-        // No engine yet (LsStatus::Starting in this fixture): the expand queues the
-        // file as Loading rather than mislabeling it unsupported (review 18 m2); the
-        // queued job waits for the engine.
+        assert_eq!(
+            disp.analysis_queue
+                .iter()
+                .filter(|path| *path == "a.txt")
+                .count(),
+            1,
+            "analysis was queued before expansion"
+        );
         disp.handle(DispatchEvent::Work(Action::SetFileExpanded {
             path: "a.txt".to_string(),
             expanded: true,
@@ -2854,8 +5737,7 @@ mod tests {
                 codescope_tui::snapshot::FileSemanticLoad::Loading
             );
         }
-        // Collapse, then re-expand: the second expand coalesces onto the queued job
-        // (no duplicate spawn).
+        // Collapse, then re-expand: visibility changes do not touch the queued job.
         disp.handle(DispatchEvent::Work(Action::SetFileExpanded {
             path: "a.txt".to_string(),
             expanded: false,
@@ -2876,7 +5758,7 @@ mod tests {
                 .filter(|p| p.as_str() == "a.txt")
                 .count(),
             1,
-            "exactly one queued analysis for the file"
+            "expansion never duplicates analysis"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3037,71 +5919,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// plan_rows renders EVERY validated form in order: a per-form section header
-    /// (title + kind), summary lines, tree nesting for tree forms, flat nodes plus
-    /// `from → to` edge rows for flow forms.
-    #[test]
-    fn plan_rows_covers_both_forms_with_summaries_and_edges() {
-        use codescope_core::{FormKind, PlanEdge, PlanEdgeKind, PlanNode, PlanNodeChange, VizForm};
-        let mut plan = codescope_core::VisualizationPlan::new(Epoch::ZERO, "what changed?");
-        // Form 1: a tree (roots nest children).
-        let mut root = PlanNode::new("r", "Server", PlanNodeChange::Modified);
-        root.children = vec!["c".to_string()];
-        let child = PlanNode::new("c", "handle", PlanNodeChange::Added);
-        plan.forms.push(VizForm {
-            kind: FormKind::ChangedSymbolTree,
-            title: "Changed symbols".to_string(),
-            summary: "Server changed.\nhandle is new.".to_string(),
-            nodes: vec![root, child],
-            edges: Vec::new(),
-        });
-        // Form 2: a flow — nodes are peers; the edge carries the relationship.
-        plan.forms.push(VizForm {
-            kind: FormKind::RelationshipFlow,
-            title: "Call flow".to_string(),
-            summary: String::new(),
-            nodes: vec![
-                PlanNode::new("a", "handle", PlanNodeChange::Added),
-                PlanNode::new("b", "store", PlanNodeChange::Unchanged),
-            ],
-            edges: vec![PlanEdge {
-                from: "a".to_string(),
-                to: "b".to_string(),
-                kind: PlanEdgeKind::Calls,
-                label: Some("on hit".to_string()),
-            }],
-        });
-        let rows = plan_rows(&plan);
-        let labels: Vec<(&str, u16, &str)> = rows
-            .iter()
-            .map(|r| (r.label.as_str(), r.depth, r.relation))
-            .collect();
-        assert_eq!(
-            labels,
-            [
-                ("Changed symbols", 0, "changed symbols"),
-                ("Server changed.", 1, ""),
-                ("handle is new.", 1, ""),
-                ("Server", 1, ""),
-                ("handle", 2, ""),
-                ("Call flow", 0, "flow"),
-                ("handle", 1, ""),
-                ("store", 1, ""),
-                ("handle → store · on hit", 1, "calls"),
-            ],
-            "both forms render in order with headers, summaries, nesting, and edges"
-        );
-        // Change badges survive the mapping.
-        assert!(rows[3].changed, "Modified node marked changed");
-        assert!(rows[4].changed, "Added node marked changed");
-        assert!(rows[6].changed, "form-2 node keeps its Added badge");
-        assert!(!rows[7].changed, "Unchanged node is not marked");
-        assert!(!rows[8].changed, "edge rows carry no change badge");
-    }
-
     /// Regression: a valid `AiOutcome::Plan` and a symbol's loaded relations coexist —
-    /// the Impact pane shows the relations while `semantic` (the AI Plan tab) keeps the
-    /// AI rows. Goes through the real `AiDone`/`RelationsLoaded` events, not direct
+    /// the Impact pane shows the relations while `semantic` keeps the structured AI
+    /// visual. Goes through the real `AiDone`/`RelationsLoaded` events, not direct
     /// field writes.
     #[tokio::test]
     async fn ai_plan_and_loaded_relations_coexist_via_events() {
@@ -3124,6 +5944,13 @@ mod tests {
         );
         disp.expanded_files.insert("a.txt".to_string());
 
+        // Select sym0 first: plans are now owned by one Impact selection.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: Some(("sym0".to_string(), 2, 4)),
+        }))
+        .await;
+
         // A real validated plan lands via AiDone (as spawn_ai's job would report).
         let mut plan = codescope_core::VisualizationPlan::new(disp.epoch, "What does sym0 affect?");
         plan.forms.push(codescope_core::VizForm {
@@ -3137,26 +5964,47 @@ mod tests {
             )],
             edges: Vec::new(),
         });
+        let selection = disp.current_ai_selection().unwrap();
         let generation = disp.ai_request_seq;
+        disp.ai_running.insert(
+            generation,
+            AiRunningJob {
+                selection: selection.clone(),
+                epoch: disp.epoch,
+                generation,
+                priority: AiJobPriority::Focused,
+                accept_result: true,
+            },
+        );
         disp.handle(DispatchEvent::AiDone {
             epoch: disp.epoch,
+            selection,
             generation,
             outcome: AiOutcome::Plan(plan, codescope_core::ValidationReport::valid()),
         })
         .await;
+        let revision_key = AiRevisionKey {
+            file: "a.txt".to_string(),
+            symbol: Some("sym0".to_string()),
+        };
+        assert!(
+            disp.ai_revision_cache.contains_key(&revision_key),
+            "every renderable generation is retained for the next file revision"
+        );
         {
             let snap = snapshot_rx.borrow().clone();
             assert!(snap.semantic.ai_generated, "plan published to semantic");
-            assert_eq!(snap.semantic.rows[0].label, "call tree");
-            assert_eq!(snap.semantic.rows[1].label, "sym0");
+            assert_eq!(semantic_node_label(&snap), Some("sym0"));
+            // The real AiDone path preserves the report alongside the plan.
+            let report = snap
+                .semantic
+                .report
+                .as_ref()
+                .expect("AiDone carries the validation report into the snapshot");
+            assert_eq!(report.verdict, codescope_core::ValidationVerdict::Valid);
+            assert!(report.dropped.is_empty());
         }
-
-        // The user selects sym0 and its relations land.
-        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
-            file: Some("a.txt".to_string()),
-            symbol: Some(("sym0".to_string(), 2, 4)),
-        }))
-        .await;
+        // Its relations land without displacing that selection-owned plan.
         disp.handle(DispatchEvent::RelationsLoaded {
             epoch: disp.epoch,
             file: "a.txt".to_string(),
@@ -3178,14 +6026,55 @@ mod tests {
             .map(|r| r.label.as_str())
             .collect();
         assert_eq!(callers, ["caller_fn"], "impact shows the relations");
-        // AI Plan tab: the plan is NOT displaced by the relations.
+        // Generated visual: the plan is NOT displaced by the relations.
         assert!(snap.semantic.ai_generated, "plan survives loaded relations");
-        assert!(
-            snap.semantic.rows.iter().any(|r| r.label == "sym0"),
-            "AI rows still published"
-        );
+        assert_eq!(semantic_node_label(&snap), Some("sym0"));
         assert_eq!(snap.ai, AiStatus::Ready { epoch: disp.epoch });
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn focused_semantic_work_preempts_the_background_queue() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.selected_file = Some("b.txt".to_string());
+        disp.analysis_queue = ["a.txt", "c.txt", "b.txt"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        disp.analysis_in_flight.insert(
+            "a.txt".to_string(),
+            SemanticRunningJob {
+                epoch: disp.epoch,
+                priority: SemanticJobPriority::Focused,
+            },
+        );
+
+        disp.reprioritize_semantic_work();
+
+        assert_eq!(
+            disp.analysis_queue.front().map(String::as_str),
+            Some("b.txt")
+        );
+        assert_eq!(
+            disp.analysis_in_flight["a.txt"].priority,
+            SemanticJobPriority::Background
+        );
+        assert!(disp.can_launch_file_analysis(SemanticJobPriority::Focused));
+        assert!(!disp.can_launch_file_analysis(SemanticJobPriority::Background));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn one_repo_signal_advances_exactly_one_epoch() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let before = disp.epoch;
+
+        disp.bump_and_refresh();
+
+        assert_eq!(disp.epoch, before.next());
         std::fs::remove_dir_all(&root).ok();
     }
 }

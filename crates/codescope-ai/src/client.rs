@@ -1,8 +1,8 @@
 //! Provider-neutral OpenAI-compatible chat-completions client (research 05 §5, 07 §4).
 //!
-//! One endpoint: `POST {base_url}/chat/completions` with `tool_choice: "required"` and the
-//! `submit_visualization_plan` tool always attached, so every completion must end in a
-//! tool call. Streaming is off (`"stream": false`): a plan is atomic — it must be complete
+//! One endpoint: `POST {base_url}/chat/completions` with the configured tool choice
+//! (`required` by default) and the `submit_visualization_plan` tool always attached.
+//! Streaming is off (`"stream": false`): a plan is atomic — it must be complete
 //! and validated before render.
 //!
 //! Local protections (all before/around the network call):
@@ -21,7 +21,7 @@
 //! time and marked sensitive; message/tool contents are never logged (counts only); reqwest
 //! errors are sanitized with [`reqwest::Error::without_url`].
 
-use crate::config::{AiConfig, ProviderKind};
+use crate::config::{AiConfig, ProviderKind, ToolChoice};
 use crate::error::AiError;
 use crate::plan::plan_tool;
 use crate::tools::{ToolDef, PLAN_TOOL_NAME};
@@ -32,11 +32,25 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Cap applied to provider `Retry-After` values (research 07 §4).
 pub const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
+
+/// Provider-reported token usage accumulated for this running process.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Input/prompt tokens consumed by completed provider responses.
+    pub input: u64,
+    /// Output/completion tokens consumed by completed provider responses.
+    pub output: u64,
+}
+
+/// GLM enables long-form reasoning by default. Codescope needs one bounded structured plan,
+/// not an open-ended agent trajectory, so keep enough output room for the complete schema.
+const GLM_PLAN_MAX_TOKENS: u64 = 4096;
 
 /// One chat message, stored as its OpenAI wire object.
 ///
@@ -112,14 +126,17 @@ pub struct RawPlanResponse {
 }
 
 impl RawPlanResponse {
+    /// First `submit_visualization_plan` call, when present.
+    #[must_use]
+    pub fn plan_call(&self) -> Option<&RawToolCall> {
+        self.tool_calls.iter().find(|c| c.name == PLAN_TOOL_NAME)
+    }
+
     /// Arguments of the first `submit_visualization_plan` call, if present: the JSON plan
     /// text.
     #[must_use]
     pub fn plan_arguments(&self) -> Option<&str> {
-        self.tool_calls
-            .iter()
-            .find(|c| c.name == PLAN_TOOL_NAME)
-            .map(|c| c.arguments.as_str())
+        self.plan_call().map(|c| c.arguments.as_str())
     }
 
     /// Tool calls other than plan submission (the read-only surface).
@@ -178,9 +195,12 @@ pub struct AiClient {
     prime_team_id: Option<String>,
     timeout: Duration,
     provider: ProviderKind,
+    tool_choice: ToolChoice,
     limiter: DirectLimiter,
     clock: QuantaClock,
     breaker: Mutex<BreakerState>,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
     options: AiClientOptions,
 }
 
@@ -191,6 +211,7 @@ impl std::fmt::Debug for AiClient {
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "«redacted»"))
             .field("timeout", &self.timeout)
+            .field("tool_choice", &self.tool_choice)
             .field("options", &self.options)
             .finish_non_exhaustive()
     }
@@ -237,9 +258,12 @@ impl AiClient {
             prime_team_id: config.prime_team_id.clone(),
             timeout: config.timeout,
             provider,
+            tool_choice: config.tool_choice,
             limiter,
             clock,
             breaker: Mutex::new(BreakerState::default()),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
             options,
         })
     }
@@ -260,6 +284,16 @@ impl AiClient {
     #[must_use]
     pub fn model(&self) -> String {
         self.model.lock().map(|m| m.clone()).unwrap_or_default()
+    }
+
+    /// Provider-reported usage accumulated across all requests, retries, and repair turns
+    /// made by this client since the process started.
+    #[must_use]
+    pub fn token_usage(&self) -> TokenUsage {
+        TokenUsage {
+            input: self.input_tokens.load(Ordering::Relaxed),
+            output: self.output_tokens.load(Ordering::Relaxed),
+        }
     }
 
     /// Switch the model used for subsequent requests (the TUI model picker).
@@ -289,12 +323,13 @@ impl AiClient {
 
     /// List the models the provider exposes (`GET {base}/models`).
     ///
-    /// Both OpenAI-compatible providers and Anthropic implement this endpoint; the response
-    /// is normalized to plain id strings. Returns an empty list on a provider that errors.
+    /// Both OpenAI-compatible providers and Anthropic may implement this endpoint; the
+    /// response is normalized to plain id strings. This user-triggered control-plane request
+    /// intentionally does not share inference's token bucket or circuit breaker: the model
+    /// picker is a recovery path after an inference failure. Provider/transport errors are
+    /// still returned to the caller and shown honestly.
     pub async fn list_models(&self) -> Result<Vec<String>, AiError> {
         let url = self.models_url();
-        self.check_breaker()?;
-        self.check_limiter()?;
         let request = self.apply_auth(self.http.get(&url).timeout(self.timeout));
         let response = match request.send().await {
             Ok(r) => r,
@@ -321,14 +356,31 @@ impl AiClient {
     /// Build the provider-shaped request body.
     fn build_body(&self, messages: &[ChatMessage], tool_values: &[Value]) -> Value {
         match self.provider {
-            ProviderKind::OpenAiCompatible => json!({
-                "model": self.model(),
-                "messages": messages,
-                "tools": tool_values,
-                "tool_choice": "required",
-                "stream": false,
-            }),
-            ProviderKind::Anthropic => build_anthropic_body(&self.model(), messages, tool_values),
+            ProviderKind::OpenAiCompatible => {
+                let model = self.model();
+                let mut body = json!({
+                    "model": model,
+                    "messages": messages,
+                    "tools": tool_values,
+                    "tool_choice": self.tool_choice.as_str(),
+                    "stream": false,
+                });
+                if is_glm_model(&model) {
+                    body["max_tokens"] = json!(GLM_PLAN_MAX_TOKENS);
+                    if self.endpoint.contains("pinference.ai") {
+                        // Prime's GLM route requires reasoning to remain enabled, but accepts
+                        // the OpenAI-style minimal effort that leaves room for the tool call.
+                        body["reasoning"] = json!({"effort": "minimal"});
+                    } else {
+                        // Native Z.AI-compatible GLM endpoints use the family-specific knob.
+                        body["thinking"] = json!({"type": "disabled"});
+                    }
+                }
+                body
+            }
+            ProviderKind::Anthropic => {
+                build_anthropic_body(&self.model(), messages, tool_values, self.tool_choice)
+            }
         }
     }
 
@@ -381,11 +433,11 @@ impl AiClient {
     }
 
     /// One chat turn: send `messages` with `tools` + the always-attached
-    /// `submit_visualization_plan` tool, `tool_choice: "required"`, streaming off.
+    /// `submit_visualization_plan` tool, configured tool choice, streaming off.
     ///
     /// Returns the parsed completion; the caller decides whether it is a plan submission
     /// or a batch of read-only tool calls. Fails with [`AiError::NoToolCall`] when the
-    /// provider ignored `tool_choice`.
+    /// provider returned an answer without selecting a tool.
     #[tracing::instrument(level = "debug", skip_all, fields(messages = messages.len(), tools = tools.len()))]
     pub async fn chat_with_plan(
         &self,
@@ -394,7 +446,35 @@ impl AiClient {
     ) -> Result<RawPlanResponse, AiError> {
         self.check_breaker()?;
         self.check_limiter()?;
+        let response = self.chat_with_plan_admitted(messages, tools).await?;
+        if response.tool_calls.is_empty() {
+            Err(AiError::NoToolCall)
+        } else {
+            Ok(response)
+        }
+    }
 
+    /// Scheduler path: wait asynchronously for token-bucket capacity instead of turning
+    /// normal background pacing into a user-visible throttle failure. Unlike the public
+    /// one-shot method, this keeps a tool-less assistant message so the service can spend one
+    /// bounded repair turn asking an auto-choice model for the required structured call.
+    pub(crate) async fn chat_with_plan_waiting(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+    ) -> Result<RawPlanResponse, AiError> {
+        self.check_breaker()?;
+        self.limiter.until_ready().await;
+        // The circuit may have opened while this turn waited behind another request.
+        self.check_breaker()?;
+        self.chat_with_plan_admitted(messages, tools).await
+    }
+
+    async fn chat_with_plan_admitted(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+    ) -> Result<RawPlanResponse, AiError> {
         let mut tool_values: Vec<Value> = tools.iter().map(ToolDef::to_openai).collect();
         if !tools.iter().any(|t| t.name == PLAN_TOOL_NAME) {
             tool_values.push(plan_tool().to_openai());
@@ -453,6 +533,10 @@ impl AiClient {
             }
         };
         self.record_success();
+        let usage = parse_token_usage(&completion);
+        self.input_tokens.fetch_add(usage.input, Ordering::Relaxed);
+        self.output_tokens
+            .fetch_add(usage.output, Ordering::Relaxed);
         match self.provider {
             ProviderKind::OpenAiCompatible => parse_completion(completion),
             ProviderKind::Anthropic => parse_anthropic_response(completion),
@@ -515,6 +599,46 @@ impl AiClient {
     }
 }
 
+/// Read the two common provider usage shapes. OpenAI-compatible responses report
+/// `prompt_tokens` / `completion_tokens`; Anthropic reports `input_tokens` /
+/// `output_tokens` and may split cached input into two additional counters.
+fn parse_token_usage(body: &Value) -> TokenUsage {
+    let Some(usage) = body.get("usage") else {
+        return TokenUsage::default();
+    };
+    let ordinary_input = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_input = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(
+            usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+    let output = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    TokenUsage {
+        input: ordinary_input.saturating_add(cached_input),
+        output,
+    }
+}
+
+fn is_glm_model(model: &str) -> bool {
+    model
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.to_ascii_lowercase().starts_with("glm-"))
+}
+
 fn lock_breaker(breaker: &Mutex<BreakerState>) -> std::sync::MutexGuard<'_, BreakerState> {
     breaker.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -540,7 +664,12 @@ fn body_snippet(text: String) -> String {
 /// with `tool_calls` / `tool` results). Anthropic expects: `system` hoisted to a top-level
 /// field, `messages` alternating user/assistant, tool calls as assistant `tool_use` content
 /// blocks, and tool results as user `tool_result` blocks.
-fn build_anthropic_body(model: &str, messages: &[ChatMessage], tool_values: &[Value]) -> Value {
+fn build_anthropic_body(
+    model: &str,
+    messages: &[ChatMessage],
+    tool_values: &[Value],
+    tool_choice: ToolChoice,
+) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
     let mut out_messages: Vec<Value> = Vec::new();
     for msg in messages {
@@ -581,7 +710,7 @@ fn build_anthropic_body(model: &str, messages: &[ChatMessage], tool_values: &[Va
         "max_tokens": 4096,
         "messages": merged,
         "tools": anthropic_tools(tool_values),
-        "tool_choice": { "type": "any" },
+        "tool_choice": { "type": tool_choice.anthropic_type() },
     });
     if !system_parts.is_empty() {
         body["system"] = Value::String(system_parts.join("\n\n"));
@@ -751,9 +880,6 @@ fn parse_completion(completion: Value) -> Result<RawPlanResponse, AiError> {
             });
         }
     }
-    if tool_calls.is_empty() {
-        return Err(AiError::NoToolCall);
-    }
     tracing::debug!(calls = tool_calls.len(), "completion parsed");
     Ok(RawPlanResponse {
         message,
@@ -773,6 +899,7 @@ mod tests {
             model: "test/model".into(),
             api_key: Some(SecretString::from("sk-test".to_string())),
             timeout: Duration::from_millis(50),
+            tool_choice: ToolChoice::Required,
             max_tool_calls: 8,
             prime_team_id: None,
         }
@@ -795,6 +922,58 @@ mod tests {
         let client = AiClient::new(&enabled_config()).unwrap();
         let debug = format!("{client:?}");
         assert!(!debug.contains("sk-test"), "leaked: {debug}");
+    }
+
+    #[test]
+    fn parses_openai_and_anthropic_token_usage() {
+        assert_eq!(
+            parse_token_usage(&json!({
+                "usage": {"prompt_tokens": 1_234, "completion_tokens": 56}
+            })),
+            TokenUsage {
+                input: 1_234,
+                output: 56,
+            }
+        );
+        assert_eq!(
+            parse_token_usage(&json!({
+                "usage": {
+                    "input_tokens": 900,
+                    "cache_creation_input_tokens": 100,
+                    "cache_read_input_tokens": 200,
+                    "output_tokens": 75
+                }
+            })),
+            TokenUsage {
+                input: 1_200,
+                output: 75,
+            }
+        );
+        assert_eq!(parse_token_usage(&json!({})), TokenUsage::default());
+    }
+
+    #[test]
+    fn glm_requests_bound_reasoning_and_plan_output() {
+        let mut cfg = enabled_config();
+        cfg.model = "z-ai/glm-5.3".into();
+        cfg.base_url = "https://api.pinference.ai/api/v1".into();
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[]);
+        assert_eq!(body["reasoning"]["effort"], "minimal");
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], GLM_PLAN_MAX_TOKENS);
+
+        cfg.base_url = "https://api.z.ai/api/paas/v4".into();
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[]);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning").is_none());
+
+        cfg.model = "openai/gpt-5-mini".into();
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[]);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]
@@ -856,13 +1035,13 @@ mod tests {
             parse_completion(serde_json::json!({"nope": true})),
             Err(AiError::MalformedResponse(_))
         ));
-        // Assistant text without tool calls → NoToolCall.
-        assert!(matches!(
-            parse_completion(serde_json::json!({
-                "choices": [{"message": {"role": "assistant", "content": "hello"}}]
-            })),
-            Err(AiError::NoToolCall)
-        ));
+        // Assistant text is preserved for the service's one bounded tool-call repair.
+        let plain = parse_completion(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hello"}}]
+        }))
+        .unwrap();
+        assert!(plain.tool_calls.is_empty());
+        assert_eq!(plain.message["content"], "hello");
     }
 
     #[test]
@@ -939,7 +1118,7 @@ mod tests {
             "type": "function",
             "function": {"name": "get_hunk", "description": "d", "parameters": {"type":"object"}},
         })];
-        let body = build_anthropic_body("claude-x", &messages, &tools);
+        let body = build_anthropic_body("claude-x", &messages, &tools, ToolChoice::Required);
         assert_eq!(body["model"], "claude-x");
         assert_eq!(body["system"], "sys");
         assert_eq!(body["tool_choice"]["type"], "any");
@@ -951,6 +1130,9 @@ mod tests {
         assert_eq!(msgs[2]["content"][0]["tool_use_id"], "c1");
         // tools mapped to input_schema
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+
+        let auto = build_anthropic_body("claude-x", &messages, &tools, ToolChoice::Auto);
+        assert_eq!(auto["tool_choice"]["type"], "auto");
     }
 
     #[test]

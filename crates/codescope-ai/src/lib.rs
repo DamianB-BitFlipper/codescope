@@ -5,8 +5,8 @@
 //!
 //! - [`AiConfig`]: env-first opt-in configuration; disabled by default without a key;
 //!   literal keys in config files are rejected ([`AiError::LiteralApiKeyInConfig`]).
-//! - [`AiClient`]: OpenAI-compatible `POST {base}/chat/completions` with a required
-//!   `submit_visualization_plan` tool call, local rate limiting (governor) and a
+//! - [`AiClient`]: OpenAI-compatible `POST {base}/chat/completions` with a configurable
+//!   (required by default) `submit_visualization_plan` tool call, local rate limiting and a
 //!   3-strikes/60 s circuit breaker.
 //! - [`parse_plan`]: tool-call arguments → [`codescope_core::VisualizationPlan`].
 //! - [`validate`]: the deterministic fact-validation boundary (epoch gate, entity
@@ -19,6 +19,7 @@
 //! Everything degrades deterministically: any failure maps to an [`AiOutcome`] the TUI
 //! can render as a status-line reason, never a blocking error.
 
+#![recursion_limit = "256"]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -32,10 +33,11 @@ pub mod tools;
 mod validator;
 
 pub use client::{
-    AiClient, AiClientOptions, ChatMessage, RawPlanResponse, RawToolCall, RETRY_AFTER_CAP,
+    AiClient, AiClientOptions, ChatMessage, RawPlanResponse, RawToolCall, TokenUsage,
+    RETRY_AFTER_CAP,
 };
 pub use config::{
-    AiConfig, AiFileConfig, ProviderKind, ANTHROPIC_BASE_URL, DEFAULT_ANTHROPIC_MODEL,
+    AiConfig, AiFileConfig, ProviderKind, ToolChoice, ANTHROPIC_BASE_URL, DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_TIMEOUT, OPENAI_BASE_URL, PRIME_BASE_URL,
 };
 pub use error::AiError;

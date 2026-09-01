@@ -11,9 +11,9 @@
 //!   root or >20% invalid nodes rejects the form.
 //! - **Flow/sequence forms**: any invalid endpoint (node or edge) rejects the form, because
 //!   it breaks ordering semantics.
-//! - **`impact_summary` / `focused_diff`**: invalid bullets are dropped; an empty result
-//!   rejects the form. `focused_diff` bullets reference hunks as
-//!   `entity.symbol = "hunk:<index>"` and are re-checked via [`FactView::hunk`].
+//! - **Reviewer-first contract**: the primary form must be structural. Legacy
+//!   `impact_summary` / `focused_diff` forms cannot cross this boundary; typed plan
+//!   evidence references hunks directly and is re-checked via [`FactView::hunk`].
 //! - **Caps** (Show Me rule S4/S5) are enforced with truncation recorded in the report:
 //!   ≤ [`MAX_FORMS_PER_PLAN`] forms, ≤ [`MAX_FORM_NODES`] nodes, depth ≤
 //!   [`MAX_FORM_DEPTH`], summary ≤ [`MAX_SUMMARY_LINES`] lines (and ≤
@@ -24,9 +24,10 @@
 //! "unverified" note when their endpoints resolve.
 
 use codescope_core::{
-    DroppedItem, EntityRef, Epoch, FileId, LineRange, PlanEdgeKind, PlanNode, ValidationReport,
-    ValidationVerdict, VisualizationPlan, VizForm, MAX_FORMS_PER_PLAN, MAX_FORM_DEPTH,
-    MAX_FORM_NODES, MAX_SUMMARY_LINES, PLAN_VERSION,
+    DiffSide, DroppedItem, EntityRef, Epoch, FileId, FormKind, LineRange, PlanCodeRef, PlanEdge,
+    PlanEdgeKind, PlanEvidence, PlanNode, ValidationReport, ValidationVerdict, VisualizationPlan,
+    VizForm, MAX_CODE_REF_LINES, MAX_FORMS_PER_PLAN, MAX_FORM_DEPTH, MAX_FORM_NODES,
+    MAX_NODE_CODE_REFS, MAX_PLAN_EVIDENCE, MAX_SUMMARY_LINES, PLAN_VERSION,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -73,6 +74,18 @@ pub trait FactView: Sync {
 
     /// Whether hunk `index` (zero-based, diff order) exists for `file`.
     fn hunk(&self, file: &FileId, index: u32) -> Lookup<()>;
+
+    /// Whether `file` is the diff currently being explained. Production plans keep every
+    /// node link in this file so hover never points at a hidden, different diff. Generic
+    /// validators without a selection context may accept all files.
+    fn is_focus_file(&self, _file: &FileId) -> bool {
+        true
+    }
+
+    /// Whether a one-based source `line` exists on `side` of hunk `index` in `file`.
+    /// This exact lookup grounds hover highlights in diff rows rather than arbitrary source
+    /// ranges that happen to fall inside a file.
+    fn diff_line(&self, file: &FileId, index: u32, side: DiffSide, line: u32) -> Lookup<()>;
 }
 
 /// Validate and sanitize `plan` in place against `facts`, gated on `current_epoch`.
@@ -110,10 +123,21 @@ pub fn validate(
     let mut notes: Vec<String> = Vec::new();
 
     if plan.focus.trim().is_empty() {
-        notes.push("plan focus is empty".to_string());
+        return ValidationReport::rejected("plan focus is empty");
+    }
+    if plan.title.trim().is_empty() {
+        return ValidationReport::rejected("plan title is empty");
+    }
+    if plan.intent.trim().is_empty() {
+        return ValidationReport::rejected("plan intent is empty");
     }
     if plan.forms.is_empty() {
         return ValidationReport::rejected("plan has no forms");
+    }
+    if !is_reviewer_visual(plan.forms[0].kind) {
+        return ValidationReport::rejected(
+            "primary form must be a structural relationship visual, not a prose or diff list",
+        );
     }
     while plan.forms.len() > MAX_FORMS_PER_PLAN {
         let form = plan
@@ -124,6 +148,17 @@ pub fn validate(
             subject: format!("form {} ({:?})", plan.forms.len(), form.kind),
             reason: format!("exceeds MAX_FORMS_PER_PLAN ({MAX_FORMS_PER_PLAN})"),
         });
+    }
+
+    // The dropped-evidence reasons recorded by sanitize_evidence stay in `dropped` so
+    // rejection feedback names the concrete invalid citations; the Err only fires when
+    // nothing valid remains.
+    if let Err(reason) = sanitize_evidence(plan, facts, &mut dropped) {
+        return ValidationReport {
+            verdict: ValidationVerdict::Rejected,
+            dropped,
+            notes: vec![reason],
+        };
     }
 
     let mut kept_forms: Vec<VizForm> = Vec::new();
@@ -159,12 +194,221 @@ pub fn validate(
     }
 }
 
+fn is_reviewer_visual(kind: FormKind) -> bool {
+    matches!(
+        kind,
+        FormKind::ChangedSymbolTree
+            | FormKind::CallTree
+            | FormKind::TypeImplTree
+            | FormKind::RelationshipFlow
+            | FormKind::BeforeAfter
+            | FormKind::Sequence
+    )
+}
+
+fn evidence_invalid_reason(evidence: &PlanEvidence, facts: &dyn FactView) -> Option<String> {
+    if evidence.reason.trim().is_empty() {
+        return Some("evidence has no explanation".to_string());
+    }
+    match facts.file(&evidence.file) {
+        Lookup::Present(()) => {}
+        Lookup::Absent => return Some(format!("file {} does not exist", evidence.file)),
+        Lookup::Unknown => {
+            return Some(format!(
+                "file {} not queried (cannot validate)",
+                evidence.file
+            ))
+        }
+    }
+    if let Some(hunk) = evidence.hunk {
+        match facts.hunk(&evidence.file, hunk) {
+            Lookup::Present(()) => {}
+            Lookup::Absent => {
+                return Some(format!("hunk {}#h{hunk} does not exist", evidence.file))
+            }
+            Lookup::Unknown => {
+                return Some(format!(
+                    "hunk {}#h{hunk} not queried (cannot validate)",
+                    evidence.file
+                ))
+            }
+        }
+    }
+    if let Some(symbol) = &evidence.symbol {
+        let extent = match facts.symbol(&evidence.file, symbol) {
+            Lookup::Present(extent) => extent,
+            Lookup::Absent => {
+                return Some(format!(
+                    "symbol {symbol} not found in {} (analyzed)",
+                    evidence.file
+                ))
+            }
+            Lookup::Unknown => {
+                return Some(format!(
+                    "symbol {symbol} not queried in {} (cannot validate)",
+                    evidence.file
+                ))
+            }
+        };
+        if let Some(range) = &evidence.range {
+            if !extent.contains_lines(range) {
+                return Some(format!(
+                    "range {}..{} outside symbol extent {}..{}",
+                    range.start_line, range.end_line, extent.start_line, extent.end_line
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Sanitize the plan's evidence. Invalid items are dropped with their concrete reasons;
+/// if NOTHING valid remains the plan is rejected — a reviewer-first plan with no valid
+/// typed source has nothing grounding it (mirroring the parse boundary's nonempty
+/// evidence requirement, which this path could previously defeat by dropping every item).
+fn sanitize_evidence(
+    plan: &mut VisualizationPlan,
+    facts: &dyn FactView,
+    dropped: &mut Vec<DroppedItem>,
+) -> Result<(), String> {
+    if plan.evidence.len() > MAX_PLAN_EVIDENCE {
+        for evidence in plan.evidence.drain(MAX_PLAN_EVIDENCE..) {
+            dropped.push(DroppedItem {
+                subject: format!("evidence {}", evidence.file),
+                reason: format!("exceeds evidence cap ({MAX_PLAN_EVIDENCE})"),
+            });
+        }
+    }
+    let evidence = std::mem::take(&mut plan.evidence);
+    let before = evidence.len();
+    for mut item in evidence {
+        // A focused diff can be perfectly reviewable even when its language has no
+        // semantic provider (YAML is the common case). Models occasionally decorate an
+        // otherwise exact file+hunk citation with an English concept such as `changes`
+        // in the `symbol` field. When the hunk itself resolves but that symbol universe
+        // was never queried, retain the exact diff evidence and strip only the
+        // unverifiable semantic decoration. Do not do this for a complete analysis that
+        // proved the symbol absent, or without an exact hunk to ground the citation.
+        if let (Some(hunk), Some(symbol)) = (item.hunk, item.symbol.clone()) {
+            if matches!(facts.file(&item.file), Lookup::Present(()))
+                && matches!(facts.hunk(&item.file, hunk), Lookup::Present(()))
+                && matches!(facts.symbol(&item.file, &symbol), Lookup::Unknown)
+            {
+                item.symbol = None;
+                item.range = None;
+                dropped.push(DroppedItem {
+                    subject: format!("evidence {}#h{hunk}", item.file),
+                    reason: format!(
+                        "symbol-level detail {symbol} was unavailable; retained exact hunk evidence"
+                    ),
+                });
+            }
+        }
+        if let Some(reason) = evidence_invalid_reason(&item, facts) {
+            dropped.push(DroppedItem {
+                subject: format!("evidence {}", item.file),
+                reason,
+            });
+        } else {
+            plan.evidence.push(item);
+        }
+    }
+    if before > 0 && plan.evidence.is_empty() {
+        return Err(
+            "no valid evidence remains: every cited source was dropped - cite at least one \
+             exact supplied file with a zero-based hunk, or an exact catalog symbol or range"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Why an exact node-to-diff range failed validation, or `None` when every referenced
+/// line exists on the declared side of the declared hunk.
+fn code_ref_invalid_reason(code_ref: &PlanCodeRef, facts: &dyn FactView) -> Option<String> {
+    if !facts.is_focus_file(&code_ref.file) {
+        return Some(format!(
+            "code_ref {}#h{} is outside the focused diff",
+            code_ref.file, code_ref.hunk
+        ));
+    }
+    if code_ref.start_line == 0 || code_ref.end_line < code_ref.start_line {
+        return Some(format!(
+            "code_ref {}#h{} has invalid inclusive range {}..{}",
+            code_ref.file, code_ref.hunk, code_ref.start_line, code_ref.end_line
+        ));
+    }
+    let lines = code_ref.end_line - code_ref.start_line + 1;
+    if lines > MAX_CODE_REF_LINES {
+        return Some(format!(
+            "code_ref {}#h{} covers {lines} lines (max {MAX_CODE_REF_LINES})",
+            code_ref.file, code_ref.hunk
+        ));
+    }
+    match facts.hunk(&code_ref.file, code_ref.hunk) {
+        Lookup::Present(()) => {}
+        Lookup::Absent => {
+            return Some(format!(
+                "code_ref hunk {}#h{} does not exist",
+                code_ref.file, code_ref.hunk
+            ))
+        }
+        Lookup::Unknown => {
+            return Some(format!(
+                "code_ref hunk {}#h{} not queried (cannot validate)",
+                code_ref.file, code_ref.hunk
+            ))
+        }
+    }
+    for line in code_ref.start_line..=code_ref.end_line {
+        match facts.diff_line(&code_ref.file, code_ref.hunk, code_ref.side, line) {
+            Lookup::Present(()) => {}
+            Lookup::Absent => {
+                return Some(format!(
+                    "code_ref {}#h{} {:?} line {line} is not in that hunk",
+                    code_ref.file, code_ref.hunk, code_ref.side
+                ))
+            }
+            Lookup::Unknown => {
+                return Some(format!(
+                    "code_ref {}#h{} {:?} line {line} not queried (cannot validate)",
+                    code_ref.file, code_ref.hunk, code_ref.side
+                ))
+            }
+        }
+    }
+    None
+}
+
 /// Why a node failed validation, or `None` when it is valid.
 fn node_invalid_reason(
     node: &PlanNode,
     form_kind: FormClass,
     facts: &dyn FactView,
 ) -> Option<String> {
+    // AI-facing parsing requires at least one ref per node. Validator-only callers may
+    // still construct legacy/internal nodes without refs; any refs that are present must
+    // be exact and fully valid before they can drive highlighting.
+    if node.code_refs.len() > MAX_NODE_CODE_REFS {
+        return Some(format!(
+            "node has {} code_refs (max {MAX_NODE_CODE_REFS})",
+            node.code_refs.len()
+        ));
+    }
+    if let Some(reason) = node
+        .code_refs
+        .iter()
+        .find_map(|code_ref| code_ref_invalid_reason(code_ref, facts))
+    {
+        return Some(reason);
+    }
+    if node
+        .detail
+        .as_deref()
+        .is_none_or(|detail| detail.trim().is_empty())
+    {
+        return Some("node has no reviewer-facing detail".to_string());
+    }
     match form_kind {
         FormClass::FocusedDiff => {
             let Some(entity) = &node.entity else {
@@ -287,6 +531,9 @@ fn sanitize_form(
     dropped: &mut Vec<DroppedItem>,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
+    if !is_reviewer_visual(form.kind) {
+        return Err("list-shaped forms are not renderable reviewer visuals".to_string());
+    }
     let class = classify(form);
 
     if form.nodes.len() > RAW_NODE_SANITY {
@@ -313,6 +560,14 @@ fn sanitize_form(
         notes.push(format!(
             "form {form_idx}: summary truncated from {summary_lines} to {MAX_SUMMARY_LINES} lines"
         ));
+    }
+
+    // BeforeAfter renders exactly nodes[0] (before) and nodes[1] (after) with at most one
+    // transition edge (render_before_after). The renderer silently ignores anything past
+    // two nodes, children, and extra edges, so validation must reject the shape instead
+    // of losing content.
+    if form.kind == FormKind::BeforeAfter {
+        check_before_after_shape(form)?;
     }
 
     // Per-node validity; duplicate ids are invalid (first occurrence wins).
@@ -530,18 +785,63 @@ fn sanitize_flow(
     dropped: &mut Vec<DroppedItem>,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
+    if form.nodes.len() < 2 {
+        return Err("relationship visual needs at least two nodes".to_string());
+    }
+    if form.edges.is_empty() {
+        return Err("relationship visual needs at least one labeled edge".to_string());
+    }
     for (i, reason) in validity.iter().enumerate() {
         if let Some(reason) = reason {
             return Err(format!("endpoint {} invalid: {reason}", form.nodes[i].id));
         }
     }
-    // Every edge endpoint must name a declared node.
+
+    // Sequences first reduce the raw edge set to the retained consecutive chain, so an
+    // irrelevant back/cross/duplicate edge with a blank label or an unknown endpoint is
+    // dropped rather than poisoning the form. Only then do the generic label, endpoint,
+    // connectivity, and fact checks run — on the retained required edges. A required
+    // consecutive edge that is itself malformed still rejects (no synthesis, no rescue).
+    // RelationshipFlow keeps the original order and strictness.
+    if form.kind == FormKind::Sequence {
+        sanitize_sequence_edges(form, form_idx, dropped)?;
+    }
+
+    // Every retained edge endpoint must name a declared node.
     for edge in &form.edges {
+        if edge
+            .label
+            .as_deref()
+            .is_none_or(|label| label.trim().is_empty())
+        {
+            return Err(format!(
+                "edge {} -> {} has no explanatory label",
+                edge.from, edge.to
+            ));
+        }
         for endpoint in [&edge.from, &edge.to] {
             if !id_to_idx.contains_key(endpoint) {
                 return Err(format!("edge references unknown node {endpoint:?}"));
             }
         }
+    }
+
+    let mut connected: HashSet<&str> = HashSet::new();
+    let mut queue = VecDeque::from([form.nodes[0].id.as_str()]);
+    while let Some(id) = queue.pop_front() {
+        if !connected.insert(id) {
+            continue;
+        }
+        for edge in &form.edges {
+            if edge.from == id {
+                queue.push_back(edge.to.as_str());
+            } else if edge.to == id {
+                queue.push_back(edge.from.as_str());
+            }
+        }
+    }
+    if connected.len() != form.nodes.len() {
+        return Err("relationship visual is disconnected".to_string());
     }
     // Asserted relationships must exist (the AI selects edges, never asserts new ones).
     for edge in &form.edges {
@@ -604,6 +904,141 @@ fn sanitize_flow(
     for node in &mut form.nodes {
         node.children.retain(|c| kept.contains(c));
     }
+    Ok(())
+}
+
+/// BeforeAfter shape contract: exactly two flat nodes, no children, at most one edge,
+/// and that edge directed nodes[0].id -> nodes[1].id. Anything else would be silently
+/// truncated by the renderer, so the form is rejected with a precise reason instead.
+fn check_before_after_shape(form: &VizForm) -> Result<(), String> {
+    if form.nodes.len() != 2 {
+        return Err(format!(
+            "before_after needs exactly two nodes (before, after); this form has {} - use a \
+             tree or flow form for nested structure",
+            form.nodes.len()
+        ));
+    }
+    let with_children: Vec<&str> = form
+        .nodes
+        .iter()
+        .filter(|node| !node.children.is_empty())
+        .map(|node| node.id.as_str())
+        .collect();
+    if !with_children.is_empty() {
+        return Err(format!(
+            "before_after nodes must be flat; nodes {} carry children - use a tree or flow \
+             form for nested structure",
+            with_children.join(", ")
+        ));
+    }
+    match form.edges.as_slice() {
+        [] => Ok(()),
+        [edge] => {
+            // BeforeAfter classifies as a tree form, so sanitize_flow's nonempty-label
+            // check never runs on it; the shape contract enforces the label itself.
+            if edge
+                .label
+                .as_deref()
+                .is_none_or(|label| label.trim().is_empty())
+            {
+                return Err(
+                    "before_after transition edge needs an explanatory label naming the \
+                     state change"
+                        .to_string(),
+                );
+            }
+            if edge.from == form.nodes[0].id && edge.to == form.nodes[1].id {
+                Ok(())
+            } else {
+                Err(format!(
+                    "before_after edge must run {} -> {} (before -> after); got {} -> {}",
+                    form.nodes[0].id, form.nodes[1].id, edge.from, edge.to
+                ))
+            }
+        }
+        _ => Err(format!(
+            "before_after allows at most one transition edge; this form has {}",
+            form.edges.len()
+        )),
+    }
+}
+
+/// Reduce a sequence form's edges to exactly one directed edge per consecutive node
+/// pair in document order (the renderer's linear-chain grammar). For each pair the FIRST
+/// matching edge is kept with its label; back edges (e.g. `n5 -> n2`), cross edges, and
+/// duplicate consecutive edges are dropped and recorded. Missing required pairs must have
+/// been rejected by the caller already — this never synthesizes edges. Edge order in the
+/// submission does not matter: each pair's first match wins regardless of position.
+/// Sequence edge pipeline. Runs FIRST in `sanitize_flow`, before any generic label,
+/// endpoint, connectivity, or fact check, so an irrelevant extra edge cannot poison the
+/// form:
+///
+/// 1. For each consecutive node pair in document order, pick the best matching edge: the
+///    first one with a non-blank label and both endpoints declared among the form's node
+///    ids. If none matches that bar, retain the first raw match anyway — the generic
+///    checks then reject with the real defect named ("no explanatory label" / "unknown
+///    endpoint") rather than the misleading "no ordered edge". A pair with NO raw match
+///    rejects immediately with the ordered-edge reason: missing pairs are never
+///    synthesized.
+/// 2. Every other edge (back/cross/duplicate/unmatched extras, including ones pointing at
+///    unknown nodes) is dropped and recorded — with whatever defect it carried — so the
+///    surviving chain is exactly one edge per consecutive pair in document order.
+fn sanitize_sequence_edges(
+    form: &mut VizForm,
+    form_idx: usize,
+    dropped: &mut Vec<DroppedItem>,
+) -> Result<(), String> {
+    let declared: HashSet<&str> = form.nodes.iter().map(|node| node.id.as_str()).collect();
+    let edges = std::mem::take(&mut form.edges);
+    let mut consumed: Vec<bool> = vec![false; edges.len()];
+    let mut kept: Vec<PlanEdge> = Vec::new();
+
+    for pair in form.nodes.windows(2) {
+        let raw_match = edges
+            .iter()
+            .enumerate()
+            .find(|(idx, edge)| !consumed[*idx] && edge.from == pair[0].id && edge.to == pair[1].id)
+            .map(|(idx, _)| idx);
+        let Some(first_raw) = raw_match else {
+            form.edges = edges;
+            return Err(format!(
+                "sequence has no ordered edge {} -> {}",
+                pair[0].id, pair[1].id
+            ));
+        };
+        // Prefer the first well-formed match; fall back to the first raw match so the
+        // generic checks reject on the genuine required-edge defect.
+        let choice = edges
+            .iter()
+            .enumerate()
+            .find(|(idx, edge)| {
+                !consumed[*idx]
+                    && edge.from == pair[0].id
+                    && edge.to == pair[1].id
+                    && edge
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| !label.trim().is_empty())
+                    && declared.contains(edge.from.as_str())
+                    && declared.contains(edge.to.as_str())
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(first_raw);
+        consumed[choice] = true;
+        kept.push(edges[choice].clone());
+    }
+
+    for (idx, edge) in edges.into_iter().enumerate() {
+        if !consumed[idx] {
+            dropped.push(DroppedItem {
+                subject: format!("edge {} -> {} in form {form_idx}", edge.from, edge.to),
+                reason: "nonconsecutive or duplicate sequence edge (sequence edges follow \
+                          document order, one per pair)"
+                    .to_string(),
+            });
+        }
+    }
+    form.edges = kept;
     Ok(())
 }
 
@@ -728,6 +1163,8 @@ mod tests {
         symbols: HashMap<(String, String), LineRange>,
         edges: HashSet<(String, String, PlanEdgeKind)>,
         hunks: HashSet<(String, u32)>,
+        diff_lines: HashSet<(String, u32, DiffSide, u32)>,
+        focus_file: Option<String>,
         /// When true, symbol/edge misses are authoritative `Absent` (a complete query ran);
         /// when false they are `Unknown` (never queried). Default true to preserve the
         /// existing fixtures' closed-universe semantics.
@@ -741,6 +1178,8 @@ mod tests {
                 symbols: HashMap::new(),
                 edges: HashSet::new(),
                 hunks: HashSet::new(),
+                diff_lines: HashSet::new(),
+                focus_file: None,
                 complete: true,
             }
         }
@@ -750,6 +1189,11 @@ mod tests {
         /// Mark the universe unqueried: misses report `Unknown`, not `Absent`.
         fn incomplete(mut self) -> Self {
             self.complete = false;
+            self
+        }
+
+        fn focused_on(mut self, file: &str) -> Self {
+            self.focus_file = Some(file.to_string());
             self
         }
 
@@ -771,9 +1215,22 @@ mod tests {
             self.hunks.insert((file.to_string(), index));
             self
         }
+
+        fn with_diff_line(mut self, file: &str, index: u32, side: DiffSide, line: u32) -> Self {
+            self.hunks.insert((file.to_string(), index));
+            self.diff_lines
+                .insert((file.to_string(), index, side, line));
+            self
+        }
     }
 
     impl FactView for StubFacts {
+        fn is_focus_file(&self, file: &FileId) -> bool {
+            self.focus_file
+                .as_deref()
+                .is_none_or(|focus| focus == file.as_path().as_str())
+        }
+
         fn file(&self, file: &FileId) -> Lookup<()> {
             if self.files.contains(file.as_path().as_str()) {
                 Lookup::Present(())
@@ -814,6 +1271,22 @@ mod tests {
                 Lookup::Absent
             }
         }
+
+        fn diff_line(&self, file: &FileId, index: u32, side: DiffSide, line: u32) -> Lookup<()> {
+            if self
+                .diff_lines
+                .contains(&(file.as_path().as_str().to_string(), index, side, line))
+            {
+                Lookup::Present(())
+            } else if self
+                .hunks
+                .contains(&(file.as_path().as_str().to_string(), index))
+            {
+                Lookup::Absent
+            } else {
+                Lookup::Unknown
+            }
+        }
     }
 
     fn sym_entity(file: &str, name: &str) -> EntityRef {
@@ -821,7 +1294,8 @@ mod tests {
     }
 
     fn node(id: &str, entity: Option<EntityRef>, children: &[&str]) -> PlanNode {
-        let mut n = PlanNode::new(id, id, PlanNodeChange::Modified);
+        let mut n = PlanNode::new(id, id, PlanNodeChange::Modified)
+            .with_detail(format!("explains the role of {id}"));
         n.entity = entity;
         n.children = children.iter().map(|c| (*c).to_string()).collect();
         n
@@ -848,7 +1322,7 @@ mod tests {
             from: from.into(),
             to: to.into(),
             kind,
-            label: None,
+            label: Some(format!("{kind:?} from {from} to {to}")),
         }
     }
 
@@ -865,7 +1339,7 @@ mod tests {
     #[test]
     fn stale_epoch_gates_everything() {
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![node("n1", Some(sym_entity("main.go", "A")), &[])],
             vec![],
         )]);
@@ -1053,7 +1527,7 @@ mod tests {
     fn unqueried_symbol_is_unknown_not_absent() {
         let facts = abc_facts().incomplete();
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![node("n1", Some(sym_entity("main.go", "ZZZ")), &[])],
             vec![],
         )]);
@@ -1108,7 +1582,7 @@ mod tests {
     fn analyzed_missing_symbol_says_not_found() {
         let facts = abc_facts(); // complete universe
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![node("n1", Some(sym_entity("main.go", "ZZZ")), &[])],
             vec![],
         )]);
@@ -1167,8 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn impact_summary_drops_bullets_and_rejects_when_empty() {
-        // One ghost bullet among two → dropped, still renderable.
+    fn legacy_list_form_is_rejected_as_a_primary_visual() {
         let mut plan = plan_with(vec![form(
             FormKind::ImpactSummary,
             vec![
@@ -1178,67 +1651,120 @@ mod tests {
             vec![],
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
-        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
-        assert_eq!(plan.forms[0].nodes.len(), 1);
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("structural relationship visual")));
+    }
 
-        // All bullets ghost → form rejected → plan rejected.
+    #[test]
+    fn evidence_hunks_are_rechecked_by_reference() {
+        let facts = abc_facts().with_hunk("main.go", 0).with_hunk("main.go", 2);
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
-            vec![node("n1", Some(sym_entity("ghost.go", "Ghost")), &[])],
+            FormKind::ChangedSymbolTree,
+            vec![node("n1", Some(sym_entity("main.go", "A")), &[])],
             vec![],
         )]);
-        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        plan.evidence = [0, 1, 2]
+            .into_iter()
+            .map(|hunk| PlanEvidence {
+                file: FileId::new_unchecked("main.go"),
+                hunk: Some(hunk),
+                symbol: None,
+                range: None,
+                reason: format!("supports hunk {hunk}"),
+            })
+            .collect();
+        let report = validate(&mut plan, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        let hunks: Vec<u32> = plan.evidence.iter().filter_map(|item| item.hunk).collect();
+        assert_eq!(hunks, [0, 2]);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|item| item.reason.contains("#h1")));
+    }
+
+    #[test]
+    fn node_code_refs_require_exact_lines_on_the_declared_hunk_side() {
+        let facts = abc_facts()
+            .focused_on("main.go")
+            .with_diff_line("main.go", 0, DiffSide::New, 42)
+            .with_diff_line("main.go", 0, DiffSide::New, 43)
+            .with_diff_line("main.go", 0, DiffSide::New, 44)
+            .with_diff_line("main.go", 0, DiffSide::Old, 41);
+        let make_plan = |side, start_line, end_line| {
+            let mut focus = node("n1", Some(sym_entity("main.go", "A")), &[]);
+            focus.code_refs.push(PlanCodeRef::new(
+                FileId::new_unchecked("main.go"),
+                0,
+                side,
+                start_line,
+                end_line,
+            ));
+            plan_with(vec![form(FormKind::ChangedSymbolTree, vec![focus], vec![])])
+        };
+
+        let mut valid = make_plan(DiffSide::New, 42, 44);
+        let report = validate(&mut valid, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Valid);
+        assert_eq!(valid.forms[0].nodes[0].code_refs[0].end_line, 44);
+
+        let mut missing = make_plan(DiffSide::New, 42, 45);
+        let report = validate(&mut missing, &facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
         assert!(report
             .dropped
             .iter()
-            .any(|d| d.reason.contains("no valid bullets")));
-    }
+            .any(|item| item.reason.contains("New line 45 is not in that hunk")));
 
-    #[test]
-    fn focused_diff_hunks_rechecked_by_reference() {
-        let facts = abc_facts().with_hunk("main.go", 0).with_hunk("main.go", 2);
-        let hunk = |i: u32| {
-            EntityRef::for_symbol(FileId::new_unchecked("main.go"), format!("hunk:{i}"), None)
-        };
-        let mut plan = plan_with(vec![form(
-            FormKind::FocusedDiff,
-            vec![
-                node("n1", Some(hunk(0)), &[]),
-                node("n2", Some(hunk(1)), &[]), // does not exist
-                node("n3", Some(hunk(2)), &[]),
-                node("n4", Some(sym_entity("main.go", "A")), &[]), // not a hunk ref
-            ],
+        let mut cross_file_node = node("n1", Some(sym_entity("main.go", "A")), &[]);
+        cross_file_node.code_refs.push(PlanCodeRef::new(
+            FileId::new_unchecked("other.go"),
+            0,
+            DiffSide::New,
+            42,
+            42,
+        ));
+        let mut cross_file = plan_with(vec![form(
+            FormKind::ChangedSymbolTree,
+            vec![cross_file_node],
             vec![],
         )]);
-        let report = validate(&mut plan, &facts, Epoch(1));
-        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
-        let ids: Vec<&str> = plan.forms[0].nodes.iter().map(|n| n.id.as_str()).collect();
-        assert_eq!(ids, ["n1", "n3"]);
-        assert!(report.dropped.iter().any(|d| d.subject.contains("n2")));
+        let report = validate(&mut cross_file, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
         assert!(report
             .dropped
             .iter()
-            .any(|d| d.subject.contains("n4") && d.reason.contains("hunk:<index>")));
+            .any(|item| item.reason.contains("outside the focused diff")));
+
+        let mut wrong_side = make_plan(DiffSide::Old, 42, 42);
+        let report = validate(&mut wrong_side, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|item| item.reason.contains("Old line 42 is not in that hunk")));
     }
 
     #[test]
     fn caps_forms_nodes_depth_summary_with_notes() {
-        let bullet = |i: usize| node(&format!("n{i}"), Some(sym_entity("main.go", "A")), &[]);
-        // Form 0: 10 bullets → capped at 8. Form 1: fine. Form 2: dropped (max 2 forms).
-        let mut many_bullets: Vec<PlanNode> = (0..10).map(bullet).collect();
-        for (i, n) in many_bullets.iter_mut().enumerate() {
+        let item = |i: usize| node(&format!("n{i}"), Some(sym_entity("main.go", "A")), &[]);
+        // Form 0: 14 nodes → capped at 12. Form 2 is dropped (max 2 forms).
+        let mut many_nodes: Vec<PlanNode> = (0..14).map(item).collect();
+        for (i, n) in many_nodes.iter_mut().enumerate() {
             n.id = format!("n{i}");
         }
-        let mut f0 = form(FormKind::ImpactSummary, many_bullets, vec![]);
+        let mut f0 = form(FormKind::ChangedSymbolTree, many_nodes, vec![]);
         f0.summary = "l1\nl2\nl3\nl4\nl5".into();
         let f1 = form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![node("m1", Some(sym_entity("main.go", "B")), &[])],
             vec![],
         );
         let f2 = form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![node("k1", Some(sym_entity("main.go", "C")), &[])],
             vec![],
         );
@@ -1246,7 +1772,7 @@ mod tests {
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
         assert_eq!(plan.forms.len(), MAX_FORMS_PER_PLAN);
-        assert_eq!(plan.forms[0].nodes.len(), IMPACT_SUMMARY_MAX_BULLETS);
+        assert_eq!(plan.forms[0].nodes.len(), MAX_FORM_NODES);
         assert_eq!(plan.forms[0].summary.lines().count(), MAX_SUMMARY_LINES);
         assert!(report.notes.iter().any(|n| n.contains("summary truncated")));
         assert!(report
@@ -1256,7 +1782,7 @@ mod tests {
         assert!(report
             .dropped
             .iter()
-            .any(|d| d.reason.contains("bullet cap")));
+            .any(|d| d.reason.contains("MAX_FORM_NODES")));
     }
 
     #[test]
@@ -1294,8 +1820,10 @@ mod tests {
     #[test]
     fn tree_depth_pruned_beyond_cap() {
         // Chain n1 -> n2 -> n3 -> n4: depth 4 exceeds MAX_FORM_DEPTH=3 → n4 pruned.
+        // (A true tree form: before_after is strictly two flat nodes since the shape
+        // contract was added.)
         let mut plan = plan_with(vec![form(
-            FormKind::BeforeAfter,
+            FormKind::CallTree,
             vec![
                 node("n1", Some(sym_entity("main.go", "A")), &["n2"]),
                 node("n2", Some(sym_entity("main.go", "B")), &["n3"]),
@@ -1316,7 +1844,7 @@ mod tests {
     #[test]
     fn duplicate_ids_and_dangling_children_are_cleaned() {
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![
                 node("n1", Some(sym_entity("main.go", "A")), &["nowhere"]),
                 node("n1", Some(sym_entity("main.go", "B")), &[]), // duplicate id
@@ -1327,13 +1855,11 @@ mod tests {
             vec![],
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
-        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
-        assert_eq!(plan.forms[0].nodes.len(), 4);
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
         assert!(report
             .dropped
             .iter()
             .any(|d| d.reason.contains("duplicate node id")));
-        assert!(plan.forms[0].nodes[0].children.is_empty());
     }
 
     #[test]
@@ -1355,7 +1881,7 @@ mod tests {
         let mut entity = sym_entity("main.go", "A"); // extent 0..5
         entity.range = Some(LineRange::new(100, 0, 120, 0));
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![
                 node("n1", Some(entity), &[]),
                 node("n2", Some(sym_entity("main.go", "B")), &[]),
@@ -1363,16 +1889,16 @@ mod tests {
             vec![],
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
-        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
         assert!(report
             .dropped
             .iter()
-            .any(|d| d.subject.contains("n1") && d.reason.contains("outside symbol extent")));
+            .any(|d| d.reason.contains("outside symbol extent")));
         // In-extent range is fine.
         let mut ok = sym_entity("main.go", "A");
         ok.range = Some(LineRange::new(1, 0, 4, 0));
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![node("n1", Some(ok), &[])],
             vec![],
         )]);
@@ -1390,7 +1916,7 @@ mod tests {
             vec![],
         );
         let good = form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![node("n1", Some(sym_entity("main.go", "A")), &[])],
             vec![],
         );
@@ -1398,7 +1924,7 @@ mod tests {
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
         assert_eq!(plan.forms.len(), 1);
-        assert_eq!(plan.forms[0].kind, FormKind::ImpactSummary);
+        assert_eq!(plan.forms[0].kind, FormKind::ChangedSymbolTree);
     }
 
     #[test]
@@ -1407,7 +1933,7 @@ mod tests {
         let b = sym_entity("main.go", "B");
         let facts = abc_facts().with_edge(&a, &b, PlanEdgeKind::Calls);
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![node("n1", Some(a), &[]), node("n2", Some(b), &[])],
             vec![
                 edge("n1", "n2", PlanEdgeKind::Calls),    // exists → kept
@@ -1432,7 +1958,7 @@ mod tests {
     fn file_level_entities_resolve_by_file_existence() {
         let facts = StubFacts::default().with_file("docs/readme.md");
         let mut plan = plan_with(vec![form(
-            FormKind::ImpactSummary,
+            FormKind::ChangedSymbolTree,
             vec![
                 node(
                     "n1",
@@ -1448,12 +1974,11 @@ mod tests {
             vec![],
         )]);
         let report = validate(&mut plan, &facts, Epoch(1));
-        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
-        assert_eq!(plan.forms[0].nodes.len(), 1);
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
         assert!(report
             .dropped
             .iter()
-            .any(|d| d.subject.contains("n2") && d.reason.contains("does not exist")));
+            .any(|d| d.reason.contains("does not exist")));
     }
 
     #[test]
@@ -1464,5 +1989,584 @@ mod tests {
         let mut plan = plan_with(vec![form(FormKind::ImpactSummary, nodes, vec![])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
+    }
+
+    /// A five-node sequence with the four required consecutive edges plus an extra
+    /// back-edge (the round-4 live shape: `n5 -> n2`). The back-edge would break the
+    /// renderer's linear-chain detection and imply a cycle the source does not show; it
+    /// must be dropped and recorded, leaving exactly nodes-1 ordered edges.
+    #[test]
+    fn sequence_back_edge_is_dropped_keeping_linear_chain() {
+        let nodes: Vec<PlanNode> = ["A", "B", "C", "D", "E"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut edges: Vec<PlanEdge> = (1..5)
+            .map(|i| {
+                let mut e = edge(
+                    &format!("n{i}"),
+                    &format!("n{}", i + 1),
+                    PlanEdgeKind::Writes,
+                );
+                e.label = Some(format!("step {i} behavior"));
+                e
+            })
+            .collect();
+        let mut back = edge("n5", "n2", PlanEdgeKind::Writes);
+        back.label = Some("readiness listener closes last".into());
+        edges.push(back);
+        let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        let f = &plan.forms[0];
+        assert_eq!(f.nodes.len(), 5);
+        assert_eq!(
+            f.edges.len(),
+            f.nodes.len() - 1,
+            "exactly one ordered edge per consecutive pair: {:?}",
+            f.edges
+        );
+        // The kept edges are the consecutive pairs in document order.
+        for (i, edge) in f.edges.iter().enumerate() {
+            assert_eq!(edge.from, format!("n{}", i + 1));
+            assert_eq!(edge.to, format!("n{}", i + 2));
+            assert_eq!(
+                edge.label.as_deref(),
+                Some(format!("step {} behavior", i + 1).as_str()),
+                "first required edge/label preserved"
+            );
+        }
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.subject.contains("n5 -> n2") && d.reason.contains("document order")));
+    }
+
+    /// A duplicate consecutive edge is a drop, not a rejection: the first edge and its
+    /// label win, and the form stays linear and renderable.
+    #[test]
+    fn sequence_duplicate_consecutive_edge_is_dropped() {
+        let nodes: Vec<PlanNode> = ["A", "B", "C"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut first = edge("n1", "n2", PlanEdgeKind::Writes);
+        first.label = Some("flips the health flag".into());
+        let mut dup = edge("n1", "n2", PlanEdgeKind::Writes);
+        dup.label = Some("redundant second label".into());
+        let mut third = edge("n2", "n3", PlanEdgeKind::Writes);
+        third.label = Some("probes return 503".into());
+        let mut plan = plan_with(vec![form(
+            FormKind::Sequence,
+            nodes,
+            vec![first, third, dup],
+        )]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        let f = &plan.forms[0];
+        assert_eq!(f.edges.len(), 2, "nodes-1 edges: {:?}", f.edges);
+        assert_eq!(f.edges[0].label.as_deref(), Some("flips the health flag"));
+        assert_eq!(f.edges[1].label.as_deref(), Some("probes return 503"));
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.subject.contains("n1 -> n2") && d.reason.contains("duplicate")));
+    }
+
+    /// A missing consecutive pair still rejects the form (no synthesis): the repair loop,
+    /// not the validator, must supply the edge.
+    #[test]
+    fn sequence_missing_ordered_edge_still_rejects() {
+        let nodes: Vec<PlanNode> = ["A", "B", "C"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut only = edge("n1", "n2", PlanEdgeKind::Writes);
+        only.label = Some("one edge is not enough for three nodes".into());
+        let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, vec![only])]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        // The sanitizer runs before connectivity, so the missing pair is named directly
+        // instead of the indirect "disconnected" reason.
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("sequence has no ordered edge n2 -> n3")));
+        let nodes: Vec<PlanNode> = ["A", "B", "C", "D"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        // Connected chain n1->n2->n3->n4 minus the interior n2->n3 edge: the missing-pair
+        // reason is the rejection cause, and no edge is synthesized.
+        let mut edges: Vec<PlanEdge> = (1..=3)
+            .filter(|i| *i != 2)
+            .map(|i| {
+                let mut e = edge(
+                    &format!("n{i}"),
+                    &format!("n{}", i + 1),
+                    PlanEdgeKind::Writes,
+                );
+                e.label = Some("step behavior".into());
+                e
+            })
+            .collect();
+        let mut cross = edge("n1", "n4", PlanEdgeKind::Writes);
+        cross.label = Some("keeps the form connected".into());
+        edges.push(cross);
+        let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("sequence has no ordered edge n2 -> n3")));
+    }
+
+    /// Sanitization runs before fact validation: an extra back-edge whose typed kind is
+    /// not in the impact graph must not reject the form — the back-edge is simply dropped.
+    #[test]
+    fn sequence_extra_typed_back_edge_cannot_reject_the_form() {
+        let a = sym_entity("main.go", "A");
+        let b = sym_entity("main.go", "B");
+        let nodes: Vec<PlanNode> = ["A", "B"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut required = edge("n1", "n2", PlanEdgeKind::Writes);
+        required.label = Some("state write drives handler response".into());
+        // A Calls back-edge the complete universe proves absent: would reject if validated.
+        let mut back = edge("n2", "n1", PlanEdgeKind::Calls);
+        back.label = Some("misleading cycle".into());
+        let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, vec![required, back])]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(
+            report.verdict,
+            ValidationVerdict::ValidWithDrops,
+            "the dropped back-edge must not be fact-checked: {:?}",
+            report.dropped
+        );
+        assert_eq!(plan.forms[0].edges.len(), 1);
+        assert!(plan.forms[0].edges[0].from == "n1" && plan.forms[0].edges[0].to == "n2");
+        // Prove the Calls edge really is absent in this universe (so the test is honest).
+        assert_eq!(
+            abc_facts().edge(&a, &b, PlanEdgeKind::Calls),
+            Lookup::Absent
+        );
+        assert_eq!(
+            abc_facts().edge(&b, &a, PlanEdgeKind::Calls),
+            Lookup::Absent
+        );
+    }
+
+    /// A valid consecutive chain plus an irrelevant back-edge with a BLANK label: the
+    /// extra edge must be sanitized away, not reject the form.
+    #[test]
+    fn sequence_blank_back_edge_is_sanitized_not_rejected() {
+        let nodes: Vec<PlanNode> = ["A", "B", "C"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut edges: Vec<PlanEdge> = (1..3)
+            .map(|i| {
+                let mut e = edge(
+                    &format!("n{i}"),
+                    &format!("n{}", i + 1),
+                    PlanEdgeKind::Writes,
+                );
+                e.label = Some(format!("step {i} behavior"));
+                e
+            })
+            .collect();
+        let mut blank_back = edge("n3", "n1", PlanEdgeKind::Writes);
+        blank_back.label = Some("   ".into()); // blank label on an irrelevant extra
+        edges.push(blank_back);
+        let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(
+            report.verdict,
+            ValidationVerdict::ValidWithDrops,
+            "extras dropped, form kept: {:?}",
+            report.dropped
+        );
+        assert_eq!(plan.forms[0].edges.len(), 2, "nodes-1 retained edges");
+    }
+
+    /// A valid consecutive chain plus a cross-edge pointing at an UNKNOWN node: sanitized
+    /// away, not a rejection.
+    #[test]
+    fn sequence_unknown_endpoint_cross_edge_is_sanitized_not_rejected() {
+        let nodes: Vec<PlanNode> = ["A", "B", "C"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut edges: Vec<PlanEdge> = (1..3)
+            .map(|i| {
+                let mut e = edge(
+                    &format!("n{i}"),
+                    &format!("n{}", i + 1),
+                    PlanEdgeKind::Writes,
+                );
+                e.label = Some(format!("step {i} behavior"));
+                e
+            })
+            .collect();
+        let mut cross = edge("n1", "ghost", PlanEdgeKind::Writes);
+        cross.label = Some("points nowhere".into());
+        edges.push(cross);
+        let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        assert_eq!(plan.forms[0].edges.len(), 2);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.subject.contains("n1 -> ghost")));
+    }
+
+    /// A duplicate required pair where the first duplicate is blank and a later labeled
+    /// edge exists: the valid labeled edge is preferred for the chain; the blank duplicate
+    /// is dropped as an extra.
+    #[test]
+    fn sequence_duplicate_pair_prefers_the_valid_labeled_edge() {
+        let nodes: Vec<PlanNode> = ["A", "B"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut blank = edge("n1", "n2", PlanEdgeKind::Writes);
+        blank.label = Some("   ".into());
+        let mut labeled = edge("n1", "n2", PlanEdgeKind::Writes);
+        labeled.label = Some("flips the health flag".into());
+        let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, vec![blank, labeled])]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        assert_eq!(plan.forms[0].edges.len(), 1);
+        assert_eq!(
+            plan.forms[0].edges[0].label.as_deref(),
+            Some("flips the health flag")
+        );
+    }
+
+    /// A required consecutive edge whose ONLY match is blank still rejects with the label
+    /// defect named — the sanitizer never rescues a genuinely malformed required edge.
+    #[test]
+    fn sequence_required_blank_edge_still_rejects_with_label_reason() {
+        let nodes: Vec<PlanNode> = ["A", "B"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut blank = edge("n1", "n2", PlanEdgeKind::Writes);
+        blank.label = Some("   ".into());
+        let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, vec![blank])]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("has no explanatory label")));
+    }
+
+    /// A sole evidence item that is invalid (nonexistent hunk) rejects the plan; the
+    /// concrete dropped reason stays in the report for repair feedback.
+    #[test]
+    fn sole_invalid_evidence_rejects_with_dropped_reason() {
+        let facts = abc_facts().with_hunk("main.go", 0);
+        let mut plan = plan_with(vec![form(
+            FormKind::Sequence,
+            vec![
+                node("n1", Some(sym_entity("main.go", "A")), &[]),
+                node("n2", Some(sym_entity("main.go", "B")), &[]),
+            ],
+            vec![edge("n1", "n2", PlanEdgeKind::Writes)],
+        )]);
+        plan.evidence.push(PlanEvidence {
+            file: FileId::new_unchecked("main.go"),
+            hunk: Some(9), // only hunk 0 exists
+            symbol: None,
+            range: None,
+            reason: "cites a hunk that does not exist".into(),
+        });
+        let report = validate(&mut plan, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        // The concrete dropped reason is preserved (not flattened into the terminal note).
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.subject.contains("evidence") && d.reason.contains("#h9")));
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n.contains("no valid evidence remains")));
+        assert!(plan.evidence.is_empty());
+    }
+
+    /// Mixed valid + invalid evidence stays ValidWithDrops: the invalid item is dropped,
+    /// the valid one grounds the plan.
+    #[test]
+    fn mixed_evidence_stays_valid_with_drops() {
+        let facts = abc_facts().with_hunk("main.go", 0);
+        let mut plan = plan_with(vec![form(
+            FormKind::Sequence,
+            vec![
+                node("n1", Some(sym_entity("main.go", "A")), &[]),
+                node("n2", Some(sym_entity("main.go", "B")), &[]),
+            ],
+            vec![edge("n1", "n2", PlanEdgeKind::Writes)],
+        )]);
+        plan.evidence.push(PlanEvidence {
+            file: FileId::new_unchecked("main.go"),
+            hunk: Some(0),
+            symbol: None,
+            range: None,
+            reason: "valid citation of the changed hunk".into(),
+        });
+        plan.evidence.push(PlanEvidence {
+            file: FileId::new_unchecked("main.go"),
+            hunk: Some(9),
+            symbol: None,
+            range: None,
+            reason: "invalid hunk citation".into(),
+        });
+        let report = validate(&mut plan, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        assert_eq!(plan.evidence.len(), 1);
+        assert!(plan.evidence[0].hunk == Some(0));
+        assert!(report.dropped.iter().any(|d| d.reason.contains("#h9")));
+    }
+
+    /// Non-semantic files still have exact diff facts. An invented symbol decoration on
+    /// a valid YAML hunk must not discard the whole explanation: strip the unavailable
+    /// symbol/range and retain the file+hunk citation.
+    #[test]
+    fn unqueried_symbol_on_exact_yaml_hunk_downgrades_to_diff_evidence() {
+        let path = ".github/workflows/vm-sandbox-deploy.yaml";
+        let facts = StubFacts::default()
+            .incomplete()
+            .with_file(path)
+            .with_hunk(path, 0);
+        let mut plan = plan_with(vec![form(
+            FormKind::Sequence,
+            vec![node("n1", None, &[]), node("n2", None, &[])],
+            vec![edge("n1", "n2", PlanEdgeKind::Writes)],
+        )]);
+        plan.evidence.push(PlanEvidence {
+            file: FileId::new_unchecked(path),
+            hunk: Some(0),
+            symbol: Some("changes".to_string()),
+            range: Some(LineRange::new(1, 0, 2, 0)),
+            reason: "the workflow changes its deployment behavior".to_string(),
+        });
+
+        let report = validate(&mut plan, &facts, Epoch(1));
+
+        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        assert_eq!(plan.evidence.len(), 1);
+        assert_eq!(plan.evidence[0].hunk, Some(0));
+        assert_eq!(plan.evidence[0].symbol, None);
+        assert_eq!(plan.evidence[0].range, None);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|item| { item.reason.contains("retained exact hunk evidence") }));
+    }
+
+    /// BeforeAfter contract: three nodes reject with the exact-two-nodes reason.
+    #[test]
+    fn before_after_rejects_three_nodes() {
+        let nodes: Vec<PlanNode> = ["A", "B", "C"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                node(
+                    &format!("n{}", i + 1),
+                    Some(sym_entity("main.go", name)),
+                    &[],
+                )
+            })
+            .collect();
+        let mut plan = plan_with(vec![form(FormKind::BeforeAfter, nodes, vec![])]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("before_after needs exactly two nodes")));
+    }
+
+    /// BeforeAfter contract: children on a node reject with the flat-nodes reason.
+    #[test]
+    fn before_after_rejects_children() {
+        let mut plan = plan_with(vec![form(
+            FormKind::BeforeAfter,
+            vec![
+                node("n1", Some(sym_entity("main.go", "A")), &["n2"]),
+                node("n2", Some(sym_entity("main.go", "B")), &[]),
+                node("n3", Some(sym_entity("main.go", "C")), &[]),
+            ],
+            vec![],
+        )]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        // Three nodes also present; the two-node reason fires first by construction.
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("before_after needs exactly two nodes")));
+        // The flat case in isolation: exactly two nodes, one carries a child.
+        let mut flat_violation = plan_with(vec![form(
+            FormKind::BeforeAfter,
+            vec![
+                node("n1", Some(sym_entity("main.go", "A")), &["n2"]),
+                node("n2", Some(sym_entity("main.go", "B")), &[]),
+            ],
+            vec![],
+        )]);
+        let report = validate(&mut flat_violation, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("before_after nodes must be flat")));
+    }
+
+    /// BeforeAfter contract: two edges reject; a single reversed edge rejects; the valid
+    /// no-edge and one-edge shapes pass.
+    #[test]
+    fn before_after_edge_direction_and_count() {
+        let two_nodes = || {
+            vec![
+                node("n1", Some(sym_entity("main.go", "A")), &[]),
+                node("n2", Some(sym_entity("main.go", "B")), &[]),
+            ]
+        };
+        // No edge: valid.
+        let mut plan = plan_with(vec![form(FormKind::BeforeAfter, two_nodes(), vec![])]);
+        assert_eq!(
+            validate(&mut plan, &abc_facts(), Epoch(1)).verdict,
+            ValidationVerdict::Valid
+        );
+        // One correctly directed edge: valid (writes is unverifiable-kind, noted only).
+        let mut ok_edge = edge("n1", "n2", PlanEdgeKind::Writes);
+        ok_edge.label = Some("becomes".into());
+        let mut plan = plan_with(vec![form(
+            FormKind::BeforeAfter,
+            two_nodes(),
+            vec![ok_edge],
+        )]);
+        assert_eq!(
+            validate(&mut plan, &abc_facts(), Epoch(1)).verdict,
+            ValidationVerdict::Valid
+        );
+        // Reversed direction: rejected.
+        let mut reversed = edge("n2", "n1", PlanEdgeKind::Writes);
+        reversed.label = Some("wrong direction".into());
+        let mut plan = plan_with(vec![form(
+            FormKind::BeforeAfter,
+            two_nodes(),
+            vec![reversed],
+        )]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("before_after edge must run n1 -> n2")));
+        // Two edges: rejected.
+        let mut e1 = edge("n1", "n2", PlanEdgeKind::Writes);
+        e1.label = Some("first".into());
+        let mut e2 = edge("n1", "n2", PlanEdgeKind::Writes);
+        e2.label = Some("second".into());
+        let mut plan = plan_with(vec![form(FormKind::BeforeAfter, two_nodes(), vec![e1, e2])]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("at most one transition edge")));
+        // A missing label on the transition edge: rejected with the before_after reason
+        // (the tree path never reaches the flow label check).
+        let mut unlabeled = edge("n1", "n2", PlanEdgeKind::Writes);
+        unlabeled.label = None;
+        let mut plan = plan_with(vec![form(
+            FormKind::BeforeAfter,
+            two_nodes(),
+            vec![unlabeled],
+        )]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report.dropped.iter().any(|d| d
+            .reason
+            .contains("before_after transition edge needs an explanatory label")));
+        // A blank (whitespace-only) label is equally missing.
+        let mut blank = edge("n1", "n2", PlanEdgeKind::Writes);
+        blank.label = Some("   ".into());
+        let mut plan = plan_with(vec![form(FormKind::BeforeAfter, two_nodes(), vec![blank])]);
+        let report = validate(&mut plan, &abc_facts(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|d| d.reason.contains("explanatory label")));
     }
 }

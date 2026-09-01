@@ -22,7 +22,8 @@
 
 use crate::error::{Result, TestutilError};
 use codescope_core::{
-    EntityRef, Epoch, FileId, FormKind, PlanNode, PlanNodeChange, VisualizationPlan, VizForm,
+    DiffSide, EntityRef, Epoch, FileId, FormKind, PlanCodeRef, PlanNode, PlanNodeChange,
+    VisualizationPlan, VizForm,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
@@ -119,51 +120,117 @@ impl AiScriptStep {
     }
 }
 
-/// A well-formed sample [`VisualizationPlan`] whose entities are real files/symbols of the
-/// [`go_fixture`](crate::go_fixture) (the feature-branch changes), echoing `epoch`.
+/// A well-formed sample [`VisualizationPlan`] whose entities and `code_refs` are real
+/// files/symbols/diff hunks of the [`go_fixture`](crate::go_fixture) (the feature-branch
+/// changes), echoing `epoch`.
+///
+/// The refs copy the fixture's real branch-vs-`main` hunks: `middleware.go` is a new file
+/// (`@@ -0,0 +1,15 @@`, new side only), and `postgres.go` modifies `Get`
+/// (`@@ -15,6 +15,9 @@`: old side 15-20, new side 15-23).
 #[must_use]
 pub fn sample_plan(epoch: Epoch) -> VisualizationPlan {
     let mut plan = VisualizationPlan::new(epoch, "What changed on feature/api-changes?");
-    let middleware = PlanNode::new("n1", "LoggingMiddleware", PlanNodeChange::Added).with_entity(
-        EntityRef::for_symbol(
+    plan.title = "Request handling gains logging and safer database errors".to_string();
+    plan.intent =
+        "LoggingMiddleware records request metadata before PostgresRepo.Get returns failures."
+            .to_string();
+    plan.review_focus = Some(
+        "Confirm PostgresRepo.Get still returns typed errors after the middleware wraps it."
+            .to_string(),
+    );
+    let mut middleware = PlanNode::new("n1", "LoggingMiddleware", PlanNodeChange::Added)
+        .with_detail("records request metadata before calling the next handler")
+        .with_expanded_detail(
+            "wraps any handler of shape func(int) (string, error); the wrapper logs entry and failure, then returns the wrapped result unchanged",
+        )
+        .with_entity(EntityRef::for_symbol(
             FileId::new_unchecked(crate::go_fixture::MIDDLEWARE_FILE),
             "LoggingMiddleware",
             None,
-        ),
-    );
+        ))
+        .with_code_ref(PlanCodeRef::new(
+            FileId::new_unchecked(crate::go_fixture::MIDDLEWARE_FILE),
+            0,
+            DiffSide::New,
+            5,
+            8,
+        ));
+    middleware.children.push("n2".to_string());
     let postgres_get = PlanNode::new("n2", "(PostgresRepo).Get", PlanNodeChange::Modified)
+        .with_detail("returns database lookup failures to the caller")
         .with_entity(EntityRef::for_symbol(
             FileId::new_unchecked(crate::go_fixture::POSTGRES_FILE),
             "(PostgresRepo).Get",
             None,
+        ))
+        .with_code_ref(PlanCodeRef::new(
+            FileId::new_unchecked(crate::go_fixture::POSTGRES_FILE),
+            0,
+            DiffSide::New,
+            17,
+            21,
+        ))
+        .with_code_ref(PlanCodeRef::new(
+            FileId::new_unchecked(crate::go_fixture::POSTGRES_FILE),
+            0,
+            DiffSide::Old,
+            17,
+            18,
         ));
     plan.forms.push(VizForm {
-        kind: FormKind::ImpactSummary,
-        title: "Feature branch impact".to_string(),
-        summary: "Adds request logging middleware; hardens PostgresRepo.Get.".to_string(),
+        kind: FormKind::ChangedSymbolTree,
+        title: "Request path ownership".to_string(),
+        summary: String::new(),
         nodes: vec![middleware, postgres_get],
         edges: Vec::new(),
+    });
+    plan.evidence.push(codescope_core::PlanEvidence {
+        file: FileId::new_unchecked(crate::go_fixture::MIDDLEWARE_FILE),
+        hunk: Some(0),
+        symbol: None,
+        range: None,
+        reason: "defines the logging middleware wrapping the request path".to_string(),
     });
     plan
 }
 
-/// Like [`sample_plan`] but with entities that resolve to nothing anywhere in the fixture.
+/// Like [`sample_plan`] but with entities and code refs that resolve to nothing anywhere
+/// in the fixture. The node still carries schema-valid `code_refs` (1-2 per node is a
+/// parse-time requirement), pointing at a nonexistent file/hunk so the validation
+/// boundary — not the parser — rejects it.
 #[must_use]
 pub fn hallucinated_sample_plan(epoch: Epoch) -> VisualizationPlan {
     let mut plan = VisualizationPlan::new(epoch, "What changed on feature/api-changes?");
-    let ghost = PlanNode::new("n1", "QuantumFluxHandler", PlanNodeChange::Modified).with_entity(
-        EntityRef::for_symbol(
+    plan.title = "Imaginary impact".to_string();
+    plan.intent = "An invented handler appears to own an imaginary request path.".to_string();
+    plan.review_focus = Some("Nothing to verify: the entities are invented.".to_string());
+    let ghost = PlanNode::new("n1", "QuantumFluxHandler", PlanNodeChange::Modified)
+        .with_detail("handles an imaginary quantum flux request")
+        .with_entity(EntityRef::for_symbol(
             FileId::new_unchecked("internal/api/quantum_flux.go"),
             "QuantumFluxHandler",
             None,
-        ),
-    );
+        ))
+        .with_code_ref(PlanCodeRef::new(
+            FileId::new_unchecked("internal/api/quantum_flux.go"),
+            0,
+            DiffSide::New,
+            1,
+            3,
+        ));
     plan.forms.push(VizForm {
-        kind: FormKind::ImpactSummary,
+        kind: FormKind::ChangedSymbolTree,
         title: "Imaginary impact".to_string(),
-        summary: "References entities that do not exist.".to_string(),
+        summary: String::new(),
         nodes: vec![ghost],
         edges: Vec::new(),
+    });
+    plan.evidence.push(codescope_core::PlanEvidence {
+        file: FileId::new_unchecked("internal/api/quantum_flux.go"),
+        hunk: Some(0),
+        symbol: None,
+        range: None,
+        reason: "the imaginary handler this plan hallucinates".to_string(),
     });
     plan
 }
@@ -561,7 +628,9 @@ fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codescope_core::{MAX_FORMS_PER_PLAN, MAX_FORM_NODES, PLAN_VERSION};
+    use codescope_core::{
+        DiffSide, PlanCodeRef, MAX_FORMS_PER_PLAN, MAX_FORM_NODES, MAX_NODE_CODE_REFS, PLAN_VERSION,
+    };
 
     #[test]
     fn sample_plan_is_schema_valid_and_echoes_epoch() {
@@ -570,10 +639,57 @@ mod tests {
         assert_eq!(plan.epoch, Epoch(42));
         assert!(plan.forms.len() <= MAX_FORMS_PER_PLAN);
         assert!(plan.forms.iter().all(|f| f.nodes.len() <= MAX_FORM_NODES));
+        // v4: every node carries 1..=MAX_NODE_CODE_REFS exact diff refs, and at least one
+        // node exercises both the optional expanded_detail and a two-ref node with both
+        // diff sides.
+        for form in &plan.forms {
+            for node in &form.nodes {
+                assert!(
+                    (1..=MAX_NODE_CODE_REFS).contains(&node.code_refs.len()),
+                    "node {} carries 1..={MAX_NODE_CODE_REFS} code_refs",
+                    node.id
+                );
+            }
+        }
+        assert!(plan.forms[0].nodes[0].expanded_detail.is_some());
+        assert_eq!(plan.forms[0].nodes[1].code_refs.len(), 2);
+        assert!(plan.forms[0].nodes[1]
+            .code_refs
+            .iter()
+            .any(|r| r.side == DiffSide::Old));
+        assert!(plan.forms[0].nodes[1]
+            .code_refs
+            .iter()
+            .any(|r| r.side == DiffSide::New));
         // Round-trips through the exact wire shape the AI layer parses.
         let value = serde_json::to_value(&plan).unwrap();
+        assert!(
+            value["forms"][0]["nodes"][0]["code_refs"].is_array(),
+            "code_refs serialize on the wire"
+        );
         let back: VisualizationPlan = serde_json::from_value(value).unwrap();
         assert_eq!(back, plan);
+    }
+
+    #[test]
+    fn hallucinated_plan_keeps_schema_valid_code_refs() {
+        // The ghost plan must still pass the parse-time 1-2-refs-per-node contract so the
+        // hallucination is caught by validation, not by the parser.
+        let plan = hallucinated_sample_plan(Epoch(1));
+        assert!(plan.forms[0]
+            .nodes
+            .iter()
+            .all(|node| (1..=MAX_NODE_CODE_REFS).contains(&node.code_refs.len())));
+        assert_eq!(
+            plan.forms[0].nodes[0].code_refs,
+            vec![PlanCodeRef::new(
+                FileId::new_unchecked("internal/api/quantum_flux.go"),
+                0,
+                DiffSide::New,
+                1,
+                3,
+            )]
+        );
     }
 
     #[test]

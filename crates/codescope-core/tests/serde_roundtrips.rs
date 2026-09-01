@@ -286,6 +286,17 @@ fn sample_plan() -> VisualizationPlan {
                     Some(LineRange::new(121, 4, 140, 5)),
                 )),
                 label: "load".to_string(),
+                detail: Some("loads a session after a cache miss".to_string()),
+                expanded_detail: Some(
+                    "Reads the cache before falling through to persistent storage.".to_string(),
+                ),
+                code_refs: vec![PlanCodeRef::new(
+                    FileId::new("src/session/store.rs").unwrap(),
+                    0,
+                    DiffSide::New,
+                    122,
+                    124,
+                )],
                 change: PlanNodeChange::Modified,
                 severity: Some(DiagnosticSeverity::Error),
                 children: vec!["n2".to_string()],
@@ -381,7 +392,7 @@ fn viz_domain_roundtrips() {
 #[test]
 fn research_05_schema_example_deserializes() {
     let json = serde_json::json!({
-        "plan_version": 1,
+        "plan_version": PLAN_VERSION,
         "epoch": 42,
         "focus": "What breaks if I rename SessionStore.load?",
         "forms": [{
@@ -396,6 +407,7 @@ fn research_05_schema_example_deserializes() {
                     "range": {"start_line": 121, "start_col": 4, "end_line": 140, "end_col": 5}
                 },
                 "label": "load",
+                "detail": "loads a session after a cache miss",
                 "change": "modified",
                 "severity": "error",
                 "children": ["n2"],
@@ -424,11 +436,52 @@ fn research_05_schema_example_deserializes() {
     assert_eq!(plan.forms[0].edges[0].kind, PlanEdgeKind::Calls);
 }
 
+/// Serialized plans omit exactly the default fields (`summary: ""`,
+/// `change: "unchanged"`, default `hint`) while keeping nondefault values; deserialization
+/// restores the omitted defaults, so the shape stays backward compatible.
+#[test]
+fn plan_serialization_omits_only_default_fields() {
+    let mut plan = VisualizationPlan::new(Epoch(5), "shape of the change");
+    plan.forms.push(VizForm {
+        kind: FormKind::ChangedSymbolTree,
+        title: "Changed files".to_string(),
+        summary: String::new(),
+        nodes: vec![PlanNode::new("n1", "store", PlanNodeChange::Unchanged)],
+        edges: Vec::new(),
+    });
+
+    let json = serde_json::to_value(&plan).expect("serialize");
+    let form = &json["forms"][0];
+    assert!(form.get("summary").is_none(), "empty summary omitted");
+    let node = &form["nodes"][0];
+    assert!(node.get("change").is_none(), "unchanged badge omitted");
+    assert!(node.get("hint").is_none(), "default hint omitted");
+
+    // A form carrying nondefault values keeps every one of them.
+    plan.forms[0].summary = "2 symbols changed".to_string();
+    plan.forms[0].nodes[0].change = PlanNodeChange::Added;
+    plan.forms[0].nodes[0].hint = NodeHint {
+        highlight: true,
+        collapsed: false,
+    };
+    let json = serde_json::to_value(&plan).expect("serialize");
+    let form = &json["forms"][0];
+    assert_eq!(form["summary"], "2 symbols changed");
+    let node = &form["nodes"][0];
+    assert_eq!(node["change"], "added");
+    assert_eq!(
+        node["hint"],
+        serde_json::json!({"highlight": true, "collapsed": false})
+    );
+
+    roundtrip(&plan);
+}
+
 /// AI output often omits optional fields entirely; defaults must fill them in.
 #[test]
 fn minimal_plan_json_uses_defaults() {
     let json = serde_json::json!({
-        "plan_version": 1,
+        "plan_version": PLAN_VERSION,
         "epoch": 0,
         "focus": "shape of the change",
         "forms": [{
@@ -440,6 +493,7 @@ fn minimal_plan_json_uses_defaults() {
     let plan: VisualizationPlan = serde_json::from_value(json).expect("minimal plan parses");
     let node = &plan.forms[0].nodes[0];
     assert!(node.entity.is_none());
+    assert!(node.detail.is_none());
     assert!(node.severity.is_none());
     assert!(node.children.is_empty());
     assert_eq!(

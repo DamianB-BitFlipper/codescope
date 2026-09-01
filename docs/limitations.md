@@ -25,8 +25,9 @@ claiming a complete project graph. There is no runtime data-flow analysis in v0.
 - **gopls document sync** uses close+reopen with full text (correct, simple; not incremental).
 - **AI plan entities** for implementation/reference results carry range-derived placeholder
   names (e.g. `42:8`) until hover-based name enrichment lands; the *positions* are exact.
-- **Focused-diff hunks** are referenced by index (`hunk:<n>`) — a stopgap until `PlanNode`
-  carries a real `HunkId`.
+- **Hunk citations are index-based** — plan evidence references hunks by zero-based diff
+  index (rendered one-based) rather than a stable `HunkId`; the legacy `focused_diff` form
+  that used index addressing is no longer accepted at the AI plan boundary.
 - **Submodules, symlinked roots, and `.gitignore`-driven AI exclusions** are handled
   conservatively; edge cases (linked worktrees with unusual layouts) are untested.
 - **The TUI renders the first changed file's diff and the full impact graph**; per-selection
@@ -39,8 +40,6 @@ claiming a complete project graph. There is no runtime data-flow analysis in v0.
 1. **Hover/signature enrichment** for graph node labels (real names for implementation refs).
 2. **Incremental LSP sync** (gopls supports it) to cut churn on rapid edits.
 3. **Per-selection semantic views** — re-center the impact/call tree on the focused symbol.
-4. **Before/after structural diff** rendering (the base-revision overlay already produces the
-   data; the TUI form is not wired).
-5. **rust-analyzer adapter** to prove the multi-language boundary.
-6. **A plan-validation debug pane** to tune prompts against the drop/reject report.
-7. **Deeper privacy filters** — content sniffing for secrets in outgoing digests.
+4. **rust-analyzer adapter** to prove the multi-language boundary.
+5. **A plan-validation debug pane** to tune prompts against the drop/reject report.
+6. **Deeper privacy filters** — content sniffing for secrets in outgoing digests.

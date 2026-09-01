@@ -5,10 +5,12 @@
 //! ```
 //!
 //! Uses [`AiConfig::from_env`]: set `CODESCOPE_AI_API_KEY` / `PRIME_API_KEY` /
-//! `OPENAI_API_KEY` (and optionally `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_MODEL`).
+//! `OPENAI_API_KEY` (and optionally `CODESCOPE_AI_BASE_URL`).
 
 use codescope_ai::{AiConfig, AiOutcome, AiService, FactView, Lookup, NoToolExecutor};
-use codescope_core::{EntityRef, Epoch, FileId, LineRange, PlanEdgeKind};
+use codescope_core::{
+    DiffSide, EntityRef, Epoch, FileId, LineRange, PlanEdgeKind, MAX_NODE_CODE_REFS,
+};
 
 /// Accept-everything facts: the live smoke exercises the wire + plan contract, not the
 /// fact store (offline tests cover validation strictness).
@@ -27,6 +29,9 @@ impl FactView for AcceptAll {
     fn hunk(&self, _file: &FileId, _index: u32) -> Lookup<()> {
         Lookup::Present(())
     }
+    fn diff_line(&self, _file: &FileId, _index: u32, _side: DiffSide, _line: u32) -> Lookup<()> {
+        Lookup::Present(())
+    }
 }
 
 const DIGEST: &str = "\
@@ -36,10 +41,23 @@ const DIGEST: &str = "\
 # diagnostics (0)
 
 # hunks (1)
-- internal/api/server.go hunk 0: +6 -1 in HandleRequest
+- internal/api/server.go hunk 0: +5 -2 in HandleRequest
 
 # 1-hop relationships
 - HandleRequest is called by main (cmd/server/main.go: main)
+
+## focused source evidence (exact selected hunks; hunk ids are zero-based; body annotations use one-based old/new lines)
+hunk_id: 0  file: internal/api/server.go  @@ -40,5 +40,8 @@ func HandleRequest
+[old:40 new:40]  func HandleRequest(req *Request) (*Response, error) {
+[old:41 new:-] -	if req == nil {
+[old:42 new:-] -		return nil, ErrBadRequest
+[old:- new:41] +	req = normalize(req)
+[old:- new:42] +	if req == nil {
+[old:- new:43] +		return nil, ErrBadRequest
+[old:- new:44] +	}
+[old:- new:45] +	log.Printf(\"request id=%s\", req.ID)
+[old:43 new:46] 	return handle(req)
+[old:44 new:47] }
 ";
 
 #[tokio::test]
@@ -64,6 +82,17 @@ async fn live_plan_smoke() {
             assert!(report.is_renderable());
             assert!(!plan.forms.is_empty());
             assert_eq!(plan.epoch, Epoch(1), "model must echo the prompt epoch");
+            // v4 strict rule: every validated node carries 1-2 exact code refs (a plan
+            // without them is a parse error the repair loop must have fixed).
+            for form in &plan.forms {
+                for node in &form.nodes {
+                    assert!(
+                        (1..=MAX_NODE_CODE_REFS).contains(&node.code_refs.len()),
+                        "live node {} lacks exact code_refs",
+                        node.id
+                    );
+                }
+            }
         }
         AiOutcome::Stale => panic!("model echoed a wrong epoch"),
         AiOutcome::Failed(reason) => panic!("live request failed: {reason}"),

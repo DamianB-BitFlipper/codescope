@@ -383,7 +383,7 @@ fn merge_conflict() -> Scenario {
 
 fn branch_fully_pushed() -> Scenario {
     // merge-base(upstream, HEAD) == HEAD: the branch is at its upstream tip, nothing committed.
-    // The branch scope must fall back to the dirty worktree (review 11 F1).
+    // This is not a meaningful comparison base; other worktree scopes remain available.
     let mut steps = base_commit();
     steps.push(Step::Branch { name: "feature" }); // feature == HEAD == main tip
     steps.push(Step::SetUpstream { to: "main" });
@@ -396,8 +396,8 @@ fn branch_fully_pushed() -> Scenario {
         steps,
         expect: Expect {
             branch: Some("feature"),
-            // branch scope: util.go via the fallback (fallback==true); unstaged+working see it too.
-            scope_counts: Some((1, 0, 1, 1)),
+            has_base: Some(false),
+            scope_counts: Some((0, 0, 1, 1)),
             ..Default::default()
         },
     }

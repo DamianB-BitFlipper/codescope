@@ -175,10 +175,10 @@ per_scenario!(
     non_git_dir
 );
 
-/// Review 11 F1: the fully-pushed shape must actually exercise the branch fallback — the
-/// branch changeset is marked `fallback` and carries the dirty worktree file.
+/// Review 26: a same-tip upstream is discarded instead of manufacturing an empty branch
+/// comparison. The explicit working scope still carries the dirty file.
 #[tokio::test(flavor = "multi_thread")]
-async fn branch_fully_pushed_sets_fallback_marker() {
+async fn branch_fully_pushed_has_no_base_but_working_remains_available() {
     let s = scenarios::all()
         .into_iter()
         .find(|s| s.name == "branch_fully_pushed")
@@ -187,17 +187,17 @@ async fn branch_fully_pushed_sets_fallback_marker() {
     let repo = GitRepo::discover(built.root_utf8())
         .await
         .expect("discover");
+    let ctx = repo.repo_context().await.expect("context");
+    assert!(ctx.base.is_none(), "same-tip upstream is not a base");
+    let err = repo.changeset(ChangeScope::Branch).await.unwrap_err();
+    assert!(err.is_no_base(), "branch scope reports no base: {err}");
     let cs = repo
-        .changeset(ChangeScope::Branch)
+        .changeset(ChangeScope::Working)
         .await
-        .expect("branch changeset");
-    assert!(
-        cs.fallback,
-        "a fully-pushed branch with a dirty tree must set the fallback marker"
-    );
+        .expect("working changeset");
     assert!(
         cs.files.iter().any(|f| f.path.as_str() == "util.go"),
-        "the dirty worktree file surfaces in branch scope: {:?}",
+        "the dirty worktree file remains available explicitly: {:?}",
         cs.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>()
     );
 }

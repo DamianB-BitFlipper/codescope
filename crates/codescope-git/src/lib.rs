@@ -16,4 +16,7 @@ mod runner;
 mod status;
 
 pub use error::{GitError, Result};
-pub use repo::{CommitSummary, GitRepo};
+pub use repo::{
+    BaseCandidates, CommitSummary, GitRepo, MAX_ANCESTOR_PICKER_ENTRIES, MAX_BRANCH_COMMITS,
+    MAX_RANK_COMMITS_AFTER_FIRST,
+};

@@ -27,12 +27,14 @@
 
 pub mod capabilities;
 pub mod client;
+mod content_cache;
 pub mod detect;
 pub mod encoding;
 pub mod error;
 pub mod framing;
 pub mod gopls;
 pub mod jsonrpc;
+pub mod options;
 pub mod rust_analyzer;
 pub mod service;
 pub mod uri;
@@ -42,5 +44,6 @@ pub use detect::{detect_languages, Language};
 pub use encoding::PositionEncoding;
 pub use error::{LspError, SemanticError};
 pub use gopls::GoplsService;
+pub use options::LanguageServiceOptions;
 pub use rust_analyzer::RustAnalyzerService;
 pub use service::LanguageService;

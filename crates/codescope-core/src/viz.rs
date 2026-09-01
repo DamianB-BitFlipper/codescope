@@ -13,7 +13,7 @@ use crate::relation::DiagnosticSeverity;
 use crate::semantic::EntityRef;
 
 /// Current [`VisualizationPlan::plan_version`]. Bump on any schema change.
-pub const PLAN_VERSION: u32 = 1;
+pub const PLAN_VERSION: u32 = 4;
 
 /// Hard cap on nodes per form (Show Me rule S4; enforced at validation).
 pub const MAX_FORM_NODES: usize = 12;
@@ -27,6 +27,15 @@ pub const MAX_FORMS_PER_PLAN: usize = 2;
 /// Maximum summary length in rendered lines (Show Me rule S5).
 pub const MAX_SUMMARY_LINES: usize = 3;
 
+/// Maximum source references attached to a plan.
+pub const MAX_PLAN_EVIDENCE: usize = 6;
+
+/// Maximum exact diff ranges attached to one visual node.
+pub const MAX_NODE_CODE_REFS: usize = 2;
+
+/// Maximum inclusive source lines covered by one node code range.
+pub const MAX_CODE_REF_LINES: u32 = 12;
+
 /// A visualization plan: the AI's answer to one focus question, as renderable forms.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VisualizationPlan {
@@ -36,20 +45,37 @@ pub struct VisualizationPlan {
     pub epoch: Epoch,
     /// The single question this plan answers (one sentence, required).
     pub focus: String,
+    /// Reviewer-facing name for the behavioral change.
+    #[serde(default)]
+    pub title: String,
+    /// One concise sentence explaining the change's intent or resulting behavior.
+    #[serde(default)]
+    pub intent: String,
+    /// The highest-value invariant, risk, or question for the reviewer to check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_focus: Option<String>,
     /// One or two forms ([`MAX_FORMS_PER_PLAN`]).
     #[serde(default)]
     pub forms: Vec<VizForm>,
+    /// Typed source references supporting the visual, never the visual itself.
+    #[serde(default)]
+    pub evidence: Vec<PlanEvidence>,
 }
 
 impl VisualizationPlan {
     /// A new empty plan at the current schema version.
     #[must_use]
     pub fn new(epoch: Epoch, focus: impl Into<String>) -> Self {
+        let focus = focus.into();
         VisualizationPlan {
             plan_version: PLAN_VERSION,
             epoch,
-            focus: focus.into(),
+            title: focus.clone(),
+            intent: focus.clone(),
+            focus,
+            review_focus: None,
             forms: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 
@@ -66,7 +92,27 @@ impl VisualizationPlan {
     }
 }
 
-/// The 8 fixed visualization forms (Show Me decision table adapted to code change impact).
+/// One validated source reference explaining where a visual claim comes from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanEvidence {
+    /// Repo-relative source path.
+    pub file: crate::FileId,
+    /// Zero-based diff hunk index. The UI presents this as one-based.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunk: Option<u32>,
+    /// Fully-qualified symbol name, when the evidence is symbol-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// Exact source range, when supplied by the fact digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<crate::LineRange>,
+    /// Why this source supports the visual or review focus.
+    pub reason: String,
+}
+
+/// Visualization forms understood by core. Plan schema v3 accepts only the six structural
+/// forms; `ImpactSummary` and `FocusedDiff` remain deserializable for stored/internal data
+/// but are rejected at the AI validation boundary.
 ///
 /// Serializes as `snake_case` (`"call_tree"`, `changed_symbol_tree`, …), matching the plan
 /// JSON schema.
@@ -121,7 +167,8 @@ pub struct VizForm {
     /// Short title.
     pub title: String,
     /// Prose summary, ≤ [`MAX_SUMMARY_LINES`] lines, rendered next to the visual.
-    #[serde(default)]
+    /// Empty summaries are omitted from serialized output (defaults restore them).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub summary: String,
     /// Plan nodes, keyed by [`PlanNode::id`] (≤ [`MAX_FORM_NODES`]).
     #[serde(default)]
@@ -145,6 +192,55 @@ impl VizForm {
     }
 }
 
+/// Which side of a unified diff an exact code range refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffSide {
+    /// The pre-change (`-`) side. Use this for removed lines.
+    Old,
+    /// The post-change (`+`) side. Use this for added lines and post-change context.
+    New,
+}
+
+/// An exact, hoverable range of lines in one diff hunk.
+///
+/// Line numbers are git-native (one-based) and both endpoints are inclusive. The hunk id is
+/// zero-based, matching [`PlanEvidence::hunk`]. Validation confirms every line exists on the
+/// selected side of that hunk before the range can drive UI highlighting.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct PlanCodeRef {
+    /// Repo-relative changed file.
+    pub file: crate::FileId,
+    /// Zero-based hunk index in diff order.
+    pub hunk: u32,
+    /// Old or new side of the diff.
+    pub side: DiffSide,
+    /// First one-based source line, inclusive.
+    pub start_line: u32,
+    /// Last one-based source line, inclusive.
+    pub end_line: u32,
+}
+
+impl PlanCodeRef {
+    /// Build an exact inclusive line range on one side of a hunk.
+    #[must_use]
+    pub fn new(
+        file: crate::FileId,
+        hunk: u32,
+        side: DiffSide,
+        start_line: u32,
+        end_line: u32,
+    ) -> Self {
+        Self {
+            file,
+            hunk,
+            side,
+            start_line,
+            end_line,
+        }
+    }
+}
+
 /// One node in a form. Ids are plan-local strings (`"n1"`, …) referenced by
 /// [`PlanEdge`]s and [`PlanNode::children`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -157,7 +253,17 @@ pub struct PlanNode {
     pub entity: Option<EntityRef>,
     /// Short display label (the TUI may re-derive it from the entity).
     pub label: String,
-    /// Change badge.
+    /// Concise, always-visible explanation of this node's role or effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Optional deeper explanation shown on explicit expansion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_detail: Option<String>,
+    /// Exact diff ranges highlighted while this visual node is hovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_refs: Vec<PlanCodeRef>,
+    /// Change badge. The default `unchanged` badge is omitted from serialized output.
+    #[serde(default, skip_serializing_if = "PlanNodeChange::is_unchanged")]
     pub change: PlanNodeChange,
     /// Optional diagnostic badge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,8 +271,9 @@ pub struct PlanNode {
     /// Child node ids for tree forms.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<String>,
-    /// Render hints only; never semantic.
-    #[serde(default)]
+    /// Render hints only; never semantic. Default hints are omitted from serialized
+    /// output.
+    #[serde(default, skip_serializing_if = "NodeHint::is_default")]
     pub hint: NodeHint,
 }
 
@@ -178,6 +285,9 @@ impl PlanNode {
             id: id.into(),
             entity: None,
             label: label.into(),
+            detail: None,
+            expanded_detail: None,
+            code_refs: Vec::new(),
             change,
             severity: None,
             children: Vec::new(),
@@ -191,10 +301,33 @@ impl PlanNode {
         self.entity = Some(entity);
         self
     }
+
+    /// Attach a concise reviewer-facing explanation.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Attach optional detail for the node's expanded inspector.
+    #[must_use]
+    pub fn with_expanded_detail(mut self, detail: impl Into<String>) -> Self {
+        self.expanded_detail = Some(detail.into());
+        self
+    }
+
+    /// Attach one exact hover-highlight range.
+    #[must_use]
+    pub fn with_code_ref(mut self, code_ref: PlanCodeRef) -> Self {
+        self.code_refs.push(code_ref);
+        self
+    }
 }
 
 /// Change badge on a [`PlanNode`] (research 05 §2: `added|modified|removed|unchanged|diagnostic`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanNodeChange {
     /// Added by the change-set.
@@ -204,9 +337,19 @@ pub enum PlanNodeChange {
     /// Removed by the change-set.
     Removed,
     /// Present for context, unchanged.
+    #[default]
     Unchanged,
     /// Flagged because a diagnostic touches it.
     Diagnostic,
+}
+
+impl PlanNodeChange {
+    /// `true` for the default [`PlanNodeChange::Unchanged`] badge; serialized plans omit
+    /// the `change` field when this holds.
+    #[must_use]
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, PlanNodeChange::Unchanged)
+    }
 }
 
 /// Render hints for a [`PlanNode`] — presentation only, never semantic.
@@ -220,6 +363,15 @@ pub struct NodeHint {
     /// Render the node collapsed.
     #[serde(default)]
     pub collapsed: bool,
+}
+
+impl NodeHint {
+    /// `true` when no hints are set; serialized plans omit the `hint` field when this
+    /// holds.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Kind of edge the AI may draw between plan nodes (research 05 §2).
@@ -355,6 +507,23 @@ pub enum AiStatus {
     Disabled,
     /// Enabled, no plan requested or in flight.
     Idle,
+    /// The selected file's asynchronous symbol inventory is not ready yet.
+    WaitingForSymbols {
+        /// Repo-state epoch whose symbols are being analyzed.
+        epoch: Epoch,
+    },
+    /// The selected symbol's callers/downstream context is still being resolved.
+    WaitingForRelations {
+        /// Repo-state epoch whose relationships are being resolved.
+        epoch: Epoch,
+    },
+    /// The selected plan is eligible but waiting for coordinator capacity.
+    Queued {
+        /// Repo-state epoch the queued plan will explain.
+        epoch: Epoch,
+        /// One-based priority order among pending plans (`1` is the first waiter).
+        position: u32,
+    },
     /// A plan request is in flight (started at `since_epoch`).
     Loading {
         /// Epoch the in-flight request was started against.
@@ -429,15 +598,20 @@ mod tests {
 
     #[test]
     fn plan_node_builder() {
-        let n = PlanNode::new("n1", "load", PlanNodeChange::Modified).with_entity(
-            EntityRef::for_symbol(
-                FileId::new("src/session/store.rs").unwrap(),
+        let file = FileId::new("src/session/store.rs").unwrap();
+        let n = PlanNode::new("n1", "load", PlanNodeChange::Modified)
+            .with_entity(EntityRef::for_symbol(
+                file.clone(),
                 "session::store::SessionStore::load",
                 Some(LineRange::new(121, 4, 140, 5)),
-            ),
-        );
+            ))
+            .with_detail("loads a session")
+            .with_expanded_detail("Falls through to storage after a cache miss.")
+            .with_code_ref(PlanCodeRef::new(file, 0, DiffSide::New, 122, 124));
         assert!(n.entity.is_some());
         assert_eq!(n.children.len(), 0);
+        assert_eq!(n.code_refs[0].start_line, 122);
+        assert!(n.expanded_detail.is_some());
         assert!(!n.hint.highlight);
     }
 
@@ -484,5 +658,61 @@ mod tests {
         assert_eq!(form.node_count(), 1);
         assert!(form.node("n1").is_some());
         assert!(form.node("n9").is_none());
+    }
+
+    /// Default fields (`summary: ""`, `change: "unchanged"`, default `hint`) are omitted
+    /// from serialized plans; deserialization restores them, so the round-trip is exact.
+    #[test]
+    fn default_fields_are_omitted_from_serialized_forms() {
+        let form = VizForm {
+            kind: FormKind::ChangedSymbolTree,
+            title: "Request path".into(),
+            summary: String::new(),
+            nodes: vec![PlanNode::new("n1", "load", PlanNodeChange::Unchanged)],
+            edges: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&form).expect("serialize");
+        assert!(json.get("summary").is_none(), "empty summary omitted");
+        let node = &json["nodes"][0];
+        assert!(node.get("change").is_none(), "unchanged badge omitted");
+        assert!(node.get("hint").is_none(), "default hint omitted");
+        assert_eq!(node["label"], "load", "required fields stay");
+
+        let back: VizForm = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, form, "defaults restore exactly");
+        assert_eq!(back.summary, "");
+        assert_eq!(back.nodes[0].change, PlanNodeChange::Unchanged);
+        assert_eq!(back.nodes[0].hint, NodeHint::default());
+    }
+
+    /// Nonempty summary, non-`unchanged` badge, and nondefault hints keep serializing.
+    #[test]
+    fn nondefault_fields_are_preserved_in_serialized_forms() {
+        let form = VizForm {
+            kind: FormKind::ChangedSymbolTree,
+            title: "Request path".into(),
+            summary: "load has 3 callers".into(),
+            nodes: vec![PlanNode {
+                hint: NodeHint {
+                    highlight: true,
+                    collapsed: true,
+                },
+                ..PlanNode::new("n1", "load", PlanNodeChange::Modified)
+            }],
+            edges: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&form).expect("serialize");
+        assert_eq!(json["summary"], "load has 3 callers");
+        let node = &json["nodes"][0];
+        assert_eq!(node["change"], "modified");
+        assert_eq!(
+            node["hint"],
+            serde_json::json!({"highlight": true, "collapsed": true})
+        );
+
+        let back: VizForm = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, form, "preserved fields round-trip exactly");
     }
 }

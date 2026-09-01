@@ -9,6 +9,8 @@
 
 pub mod action;
 pub mod app;
+pub mod diagram;
+pub mod divider;
 pub mod elide;
 pub mod file_rows;
 pub mod geometry;
@@ -17,9 +19,11 @@ pub mod layout;
 pub mod mouse;
 pub mod render;
 pub mod run;
+pub mod scroll;
 pub mod snapshot;
 
-pub use action::{map_key, Action};
-pub use app::{App, Pane};
+pub use action::{map_key, Action, PlanNodeTarget};
+pub use app::{App, Pane, UiPreferences};
+pub use divider::{DividerId, DividerSizes};
 pub use render::render;
 pub use snapshot::UiSnapshot;

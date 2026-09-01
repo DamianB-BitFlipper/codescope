@@ -5,19 +5,16 @@
 //! in App or recompute it in input handling.
 
 use ratatui::layout::Rect;
+use unicode_width::UnicodeWidthStr;
 
+use crate::action::PlanNodeTarget;
 use crate::app::{App, Pane};
-use crate::layout::{choose_tier, files_width, Tier, MIN_DIFF_WIDTH};
+use crate::divider::{DividerAxis, DividerHandle, DividerId};
+use crate::layout::{
+    choose_tier, files_width, impact_left_width, impact_section_heights, Tier, MIN_DIFF_WIDTH,
+};
+use crate::scroll::{ScrollRegion, ScrollRegionId};
 use crate::snapshot::UiSnapshot;
-
-/// The bottom-pane tab label rectangles (clickable).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BottomTabRects {
-    /// The `Impact` label.
-    pub impact: Option<Rect>,
-    /// The `AI Plan` label.
-    pub ai_plan: Option<Rect>,
-}
 
 /// The computed frame plan. `None` fields mean that region is not present/clickable in the
 /// current tier (e.g. a hidden pane in FocusOnly, or everything in TooSmall).
@@ -33,19 +30,22 @@ pub struct UiGeometry {
     pub files_inner: Option<Rect>,
     /// Diff pane outer rect.
     pub diff: Option<Rect>,
-    /// Bottom (Impact/AI) pane outer rect.
+    /// Bottom combined Impact pane outer rect.
     pub impact: Option<Rect>,
-    /// Bottom tab labels.
-    pub tabs: BottomTabRects,
-    /// The vertical files|diff drag handle (the shared border column).
-    pub files_diff_handle: Option<Rect>,
-    /// The horizontal work|impact drag handle (the shared border row).
-    pub work_impact_handle: Option<Rect>,
+    /// Clickable left portion of the bottom bar when it contains a status message.
+    pub status: Option<Rect>,
+    /// Every structural divider actually visible and draggable in this frame.
+    pub(crate) dividers: Vec<DividerHandle>,
     /// The visible files rows: (screen rect, physical row index). Physical indices index
     /// into the shared projection.
     pub file_row_rects: Vec<(Rect, usize)>,
     /// Physical index of the first visible file row (the scroll offset).
     pub files_first_visible: usize,
+    /// Independently scrollable rectangles in the frame the user actually saw.
+    pub(crate) scroll_regions: Vec<ScrollRegion>,
+    /// Visible generated-plan node spans. Several rects may share one target when a box
+    /// occupies multiple rows or a compact node has separate label/detail spans.
+    pub(crate) plan_node_rects: Vec<(Rect, PlanNodeTarget)>,
 }
 
 impl UiGeometry {
@@ -61,27 +61,19 @@ impl UiGeometry {
             return geo;
         }
         if tier == Tier::FocusOnly {
-            // The focused pane occupies the BODY between the chrome rows (top bar,
-            // summary, status, help) — not the whole terminal (review 24 M1). The help
-            // row is dropped below height 12, matching the renderer.
-            let body = if area.height >= 12 {
-                ratatui::layout::Layout::vertical([
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Min(3),
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Length(1),
-                ])
-                .split(area)[2]
-            } else {
-                ratatui::layout::Layout::vertical([
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Min(3),
-                    ratatui::layout::Constraint::Length(1),
-                ])
-                .split(area)[2]
-            };
+            // Match the renderer exactly: top context, focused pane, then the combined
+            // commands/usage/path footer. Geometry is the mouse contract, so it cannot
+            // retain rows that the renderer no longer draws.
+            let rows = ratatui::layout::Layout::vertical([
+                ratatui::layout::Constraint::Length(1),
+                ratatui::layout::Constraint::Min(3),
+                ratatui::layout::Constraint::Length(1),
+            ])
+            .split(area);
+            let body = rows[1];
+            if !snap.status.text.is_empty() {
+                geo.status = Some(crate::render::bottom_bar_chunks(rows[2], app, snap)[0]);
+            }
             match app.focused {
                 Pane::Files => {
                     geo.files = Some(body);
@@ -89,7 +81,7 @@ impl UiGeometry {
                     // The files viewport is usable in focus mode too.
                     let rows_proj = crate::file_rows::project(&snap.files);
                     let cap = inner(body).height as usize;
-                    let first = crate::file_rows::first_visible(&snap.files, app.file_sel, cap);
+                    let first = app.files_first_visible(cap);
                     geo.files_first_visible = first;
                     let fi = inner(body);
                     let mut rects = Vec::new();
@@ -97,33 +89,46 @@ impl UiGeometry {
                         rects.push((Rect::new(fi.x, fi.y + slot as u16, fi.width, 1), phys));
                     }
                     geo.file_row_rects = rects;
+                    geo.register_scroll_region(
+                        ScrollRegionId::Files,
+                        body,
+                        first,
+                        rows_proj.len().saturating_sub(cap),
+                    );
                 }
                 Pane::Diff => {
                     geo.diff = Some(body);
+                    geo.register_scroll_region(
+                        ScrollRegionId::Diff,
+                        body,
+                        usize::from(app.diff_scroll),
+                        snap.diff.rows.len().saturating_sub(1),
+                    );
                 }
                 Pane::Impact => {
                     geo.impact = Some(body);
-                    geo.tabs = bottom_tab_rects(body, app);
+                    geo.add_impact_regions(body, app, snap);
                 }
             }
             return geo;
         }
-        // Normal: the six-row stack. Rows: top, summary, work, impact, status, help.
+        // Normal: the renderer's four-row stack. Rows: top, work, impact, bottom.
         let rows = ratatui::layout::Layout::vertical([
-            ratatui::layout::Constraint::Length(1),
             ratatui::layout::Constraint::Length(1),
             ratatui::layout::Constraint::Min(7),
             ratatui::layout::Constraint::Length(crate::layout::impact_height(
-                app.impact_height,
+                app.dividers.get(DividerId::WorkReview),
                 area.height,
             )),
             ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Length(1),
         ])
         .split(area);
-        let work = rows[2];
-        let impact = rows[3];
-        let fw = files_width(app.files_width, work.width);
+        if !snap.status.text.is_empty() {
+            geo.status = Some(crate::render::bottom_bar_chunks(rows[3], app, snap)[0]);
+        }
+        let work = rows[1];
+        let impact = rows[2];
+        let fw = files_width(app.dividers.get(DividerId::FilesDiff), work.width);
         let work_split = ratatui::layout::Layout::horizontal([
             ratatui::layout::Constraint::Length(fw),
             ratatui::layout::Constraint::Min(MIN_DIFF_WIDTH),
@@ -133,33 +138,50 @@ impl UiGeometry {
         geo.files_inner = Some(inner(work_split[0]));
         geo.diff = Some(work_split[1]);
         geo.impact = Some(impact);
+        geo.add_impact_regions(impact, app, snap);
+        geo.register_scroll_region(
+            ScrollRegionId::Diff,
+            work_split[1],
+            usize::from(app.diff_scroll),
+            snap.diff.rows.len().saturating_sub(1),
+        );
 
         // Drag handles cover BOTH adjacent border cells (the two visible border columns/
         // rows of the shared boundary), so a press on either pane's border arms the drag.
         // The vertical handle stops before the work row's bottom border to avoid the
         // T-junction with the horizontal handle (review 24 M2).
         let vx = work_split[1].x.saturating_sub(1);
-        geo.files_diff_handle = Some(Rect::new(vx, work.y, 2, work.height.saturating_sub(1)));
+        geo.dividers.push(DividerHandle::new(
+            DividerId::FilesDiff,
+            Rect::new(vx, work.y, 2, work.height.saturating_sub(1)),
+            work_split[0].width,
+        ));
         let hy = impact.y.saturating_sub(1);
-        geo.work_impact_handle = Some(Rect::new(area.x, hy, area.width, 2));
+        geo.dividers.push(DividerHandle::new(
+            DividerId::WorkReview,
+            Rect::new(area.x, hy, area.width, 2),
+            impact.height,
+        ));
 
         // Files viewport: project the rows, compute the visible slice.
         if let Some(fi) = geo.files_inner {
             let rows_proj = crate::file_rows::project(&snap.files);
             let cap = fi.height as usize;
-            let first = crate::file_rows::first_visible(&snap.files, app.file_sel, cap);
+            let first = app.files_first_visible(cap);
             geo.files_first_visible = first;
             let mut rects = Vec::new();
             for (slot, phys) in (first..rows_proj.len()).take(cap).enumerate() {
                 rects.push((Rect::new(fi.x, fi.y + slot as u16, fi.width, 1), phys));
             }
             geo.file_row_rects = rects;
+            geo.register_scroll_region(
+                ScrollRegionId::Files,
+                work_split[0],
+                first,
+                rows_proj.len().saturating_sub(cap),
+            );
         }
 
-        // Bottom tab labels: they live in the impact pane's top border title.
-        // The title is ` Impact | AI Plan ` starting after the border corner. Compute the
-        // two label rects by display width.
-        geo.tabs = bottom_tab_rects(impact, app);
         geo
     }
 
@@ -175,6 +197,189 @@ impl UiGeometry {
             return Some(Pane::Impact);
         }
         None
+    }
+
+    /// Whether a point is over the visible status-message portion of the bottom bar.
+    pub(crate) fn status_at(&self, x: u16, y: u16) -> bool {
+        self.status.is_some_and(|rect| hit(rect, x, y))
+    }
+
+    /// The visible handle for one stable divider identity.
+    pub(crate) fn divider(&self, id: DividerId) -> Option<DividerHandle> {
+        self.dividers.iter().copied().find(|handle| handle.id == id)
+    }
+
+    /// Highest-precedence divider under a point. Horizontal boundaries win at their
+    /// intersections with vertical ones, matching the visible row-wide sectional.
+    pub(crate) fn divider_at(&self, x: u16, y: u16) -> Option<DividerHandle> {
+        self.dividers
+            .iter()
+            .copied()
+            .filter(|handle| hit(handle.rect, x, y))
+            .min_by_key(|handle| match handle.id.axis() {
+                DividerAxis::Horizontal => 0,
+                DividerAxis::Vertical => 1,
+            })
+    }
+
+    /// Scrollable region under a point, resolved from retained frame geometry.
+    pub(crate) fn scroll_region_at(&self, x: u16, y: u16) -> Option<ScrollRegion> {
+        self.scroll_regions
+            .iter()
+            .copied()
+            .find(|region| hit(region.rect, x, y))
+    }
+
+    /// Generated-plan node under a point, resolved from the exact rendered span layout.
+    pub(crate) fn plan_node_at(&self, x: u16, y: u16) -> Option<PlanNodeTarget> {
+        self.plan_node_rects
+            .iter()
+            .find_map(|(rect, target)| hit(*rect, x, y).then(|| target.clone()))
+    }
+
+    fn register_scroll_region(
+        &mut self,
+        id: ScrollRegionId,
+        rect: Rect,
+        offset: usize,
+        max_offset: usize,
+    ) {
+        if rect.width > 0 && rect.height > 0 {
+            self.scroll_regions
+                .push(ScrollRegion::new(id, rect, offset, max_offset));
+        }
+    }
+
+    /// Register the generated split and the two sectionals within the deterministic
+    /// relationship stack. The same helper serves normal and focus-only layouts.
+    fn add_impact_regions(&mut self, impact: Rect, app: &App, snap: &UiSnapshot) {
+        let content = inner(impact);
+        if content.width < 2 || content.height == 0 {
+            return;
+        }
+        let left_width = impact_left_width(
+            app.dividers.get(DividerId::RelationshipsGenerated),
+            content.width,
+        );
+        let divider_x = content.x.saturating_add(left_width);
+        self.dividers.push(DividerHandle::new(
+            DividerId::RelationshipsGenerated,
+            Rect::new(
+                divider_x.saturating_sub(1),
+                content.y,
+                2.min(content.width),
+                content.height,
+            ),
+            left_width,
+        ));
+
+        let [selected, callers, downstream] = impact_section_heights(
+            app.dividers.get(DividerId::SelectedCallers),
+            app.dividers.get(DividerId::CallersDownstream),
+            content.height,
+        );
+        let left = Rect::new(content.x, content.y, left_width, content.height);
+        let rows = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Length(selected),
+            ratatui::layout::Constraint::Length(callers),
+            ratatui::layout::Constraint::Length(downstream),
+        ])
+        .split(left);
+        let callers_capacity = impact_list_capacity(rows[1].height, true);
+        let downstream_capacity = impact_list_capacity(rows[2].height, false);
+        self.register_scroll_region(
+            ScrollRegionId::Callers,
+            rows[1],
+            app.callers_scroll,
+            scroll_max(snap.impact.callers.rows.len(), callers_capacity),
+        );
+        self.register_scroll_region(
+            ScrollRegionId::Downstream,
+            rows[2],
+            app.downstream_scroll,
+            scroll_max(snap.impact.downstream.rows.len(), downstream_capacity),
+        );
+
+        let generated = Rect::new(
+            divider_x,
+            content.y,
+            content.width.saturating_sub(left_width),
+            content.height,
+        );
+        // The generated Block owns a left border and one cell of left padding.
+        let generated_inner = Rect::new(
+            generated.x.saturating_add(2),
+            generated.y,
+            generated.width.saturating_sub(2),
+            generated.height,
+        );
+        let generated_lines =
+            crate::render::generated_impact_content(app, snap, generated_inner.width);
+        let viewport = usize::from(generated_inner.height);
+        let max_scroll = scroll_max(generated_lines.len(), viewport);
+        let first = app.ai_plan_scroll.min(max_scroll);
+        for (screen_row, line) in generated_lines
+            .iter()
+            .skip(first)
+            .take(viewport)
+            .enumerate()
+        {
+            let mut x = generated_inner.x;
+            let right = generated_inner.x.saturating_add(generated_inner.width);
+            for span in &line.spans {
+                let requested = u16::try_from(span.text.width()).unwrap_or(u16::MAX);
+                let width = requested.min(right.saturating_sub(x));
+                if width > 0 {
+                    if let Some(target) = &span.target {
+                        self.plan_node_rects.push((
+                            Rect::new(
+                                x,
+                                generated_inner.y.saturating_add(screen_row as u16),
+                                width,
+                                1,
+                            ),
+                            target.clone(),
+                        ));
+                    }
+                    x = x.saturating_add(width);
+                }
+                if x >= right {
+                    break;
+                }
+            }
+        }
+        self.register_scroll_region(
+            ScrollRegionId::GeneratedImpact,
+            generated,
+            app.ai_plan_scroll,
+            max_scroll,
+        );
+        register_horizontal_sectional(
+            &mut self.dividers,
+            DividerId::SelectedCallers,
+            rows[0],
+            rows[1],
+        );
+        register_horizontal_sectional(
+            &mut self.dividers,
+            DividerId::CallersDownstream,
+            rows[1],
+            rows[2],
+        );
+    }
+}
+
+fn impact_list_capacity(section_height: u16, bottom_divider: bool) -> usize {
+    usize::from(section_height)
+        .saturating_sub(usize::from(bottom_divider))
+        .saturating_sub(1) // header
+}
+
+fn scroll_max(content_len: usize, viewport_len: usize) -> usize {
+    if viewport_len == 0 {
+        0
+    } else {
+        content_len.saturating_sub(viewport_len)
     }
 }
 
@@ -193,26 +398,68 @@ fn hit(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
-/// The ` Impact | AI Plan ` title label rects on the bottom pane's top border row.
-fn bottom_tab_rects(impact: Rect, app: &App) -> BottomTabRects {
-    use unicode_width::UnicodeWidthStr;
-    // The title starts one cell after the left border corner, with a leading space.
-    let mut x = impact.x + 2;
-    let y = impact.y;
-    let impact_label = "Impact";
-    let ai_label = if matches!(app.snapshot.ai, codescope_core::AiStatus::Loading { .. }) {
-        "AI Plan …"
-    } else {
-        "AI Plan"
-    };
-    let iw = UnicodeWidthStr::width(impact_label) as u16;
-    let impact_rect = Rect::new(x, y, iw, 1);
-    // " | " separator (3 cells) between the labels.
-    x += iw + 3;
-    let aw = UnicodeWidthStr::width(ai_label) as u16;
-    let ai_rect = Rect::new(x, y, aw, 1);
-    BottomTabRects {
-        impact: Some(impact_rect),
-        ai_plan: Some(ai_rect),
+/// Add a two-cell hit target around one visible horizontal section boundary.
+fn register_horizontal_sectional(
+    handles: &mut Vec<DividerHandle>,
+    id: DividerId,
+    before: Rect,
+    after: Rect,
+) {
+    if before.height == 0 || after.height == 0 || before.width == 0 {
+        return;
+    }
+    handles.push(DividerHandle::new(
+        id,
+        Rect::new(before.x, after.y.saturating_sub(1), before.width, 2),
+        before.height,
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_geometry_matches_the_four_rendered_rows() {
+        let app = App::new();
+        let geometry = UiGeometry::build(Rect::new(0, 0, 140, 40), &app, &UiSnapshot::default());
+        assert_eq!(geometry.files, Some(Rect::new(0, 1, 42, 22)));
+        assert_eq!(geometry.diff, Some(Rect::new(42, 1, 98, 22)));
+        assert_eq!(geometry.impact, Some(Rect::new(0, 23, 140, 16)));
+        assert_eq!(geometry.pane_at(2, 0), None, "top bar is not a pane");
+        assert_eq!(geometry.pane_at(2, 39), None, "bottom bar is not a pane");
+    }
+
+    #[test]
+    fn focus_only_geometry_reserves_only_top_and_bottom_bars() {
+        let app = App::new();
+        let geometry = UiGeometry::build(Rect::new(0, 0, 79, 40), &app, &UiSnapshot::default());
+        assert_eq!(geometry.files, Some(Rect::new(0, 1, 79, 38)));
+        assert_eq!(geometry.pane_at(2, 0), None, "top bar is not clickable");
+        assert_eq!(geometry.pane_at(2, 39), None, "bottom bar is not clickable");
+    }
+
+    #[test]
+    fn status_geometry_covers_only_the_message_side_of_the_bottom_bar() {
+        let mut snap = UiSnapshot::default();
+        snap.status.text = "provider error".to_string();
+        snap.files.push(crate::snapshot::FileRow {
+            path: "src/main.rs".to_string(),
+            status: "M",
+            changed_symbol_count: 0,
+            added_lines: 0,
+            removed_lines: 0,
+            symbols: Vec::new(),
+            expanded: false,
+            semantic: crate::snapshot::FileSemanticLoad::Unsupported,
+        });
+        let app = App::new();
+        let geometry = UiGeometry::build(Rect::new(0, 0, 140, 40), &app, &snap);
+        let status = geometry.status.expect("status hit target");
+        assert!(geometry.status_at(status.x, status.y));
+        assert!(
+            !geometry.status_at(139, 39),
+            "right-side usage/path is inert"
+        );
     }
 }

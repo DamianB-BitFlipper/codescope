@@ -3,22 +3,28 @@
 //! Pure with respect to I/O — `render` only touches the frame buffer, so it is fully
 //! testable with ratatui's `TestBackend`. Layout is recomputed from the frame area every
 //! pass (resize needs no stored state). The pane arrangement is the reference
-//! master-detail layout of docs/review/15 §1: one normal tier (top, summary, files+diff,
-//! full-width Impact, status, help) and a focus-only fallback below 80x20 or when
+//! master-detail layout of docs/review/15 §1: one normal tier (top, files+diff,
+//! full-width Impact, bottom) and a focus-only fallback below 80x20 or when
 //! zoomed. All colors come from the §2 palette below — never a bare `Color::Green`.
 
-use codescope_core::{AiStatus, ChangeScope, LsStatus};
-use ratatui::layout::{Constraint, Layout, Rect};
+use codescope_core::{AiStatus, ChangeScope, DiffSide, LsStatus, ValidationVerdict};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{filter_candidates, App, BottomView, Pane};
+use crate::app::{filter_candidates, App, Pane};
+use crate::diagram::{fallback_lines, DiagramRole};
+use crate::divider::DividerId;
 use crate::elide;
 use crate::intraline;
-use crate::layout::{choose_tier, files_width, Tier, MIN_DIFF_WIDTH};
+use crate::layout::{
+    choose_tier, files_width, impact_left_width, impact_section_heights, Tier, MIN_DIFF_WIDTH,
+};
 use crate::snapshot::{DiffRow, ImpactList, ImpactLoadState, StatusLevel, UiSnapshot};
 
 // -- palette (docs/review/15 §2) ----------------------------------------------
@@ -27,9 +33,9 @@ use crate::snapshot::{DiffRow, ImpactList, ImpactLoadState, StatusLevel, UiSnaps
 // selected/basename labels, column headings, and intraline changed spans. `REVERSED`
 // is never used: it would destroy the deliberate red/green diff palette.
 
-/// Top, status, and help bar background.
+/// Top context and combined bottom bar background.
 pub(crate) const SURFACE: Color = Color::Rgb(24, 27, 32);
-/// Summary bar and hunk-header band background.
+/// Hunk-header band background.
 pub(crate) const SURFACE_ALT: Color = Color::Rgb(31, 35, 41);
 /// Normal label / source text.
 pub(crate) const TEXT: Color = Color::Rgb(210, 214, 220);
@@ -63,6 +69,10 @@ pub(crate) const DEL_HI_BG: Color = Color::Rgb(101, 45, 53);
 pub(crate) const WARN: Color = Color::Rgb(218, 174, 86);
 /// Hunk-header band text.
 pub(crate) const HUNK_FG: Color = Color::Rgb(132, 190, 229);
+/// Background for source rows linked to the generated node under the pointer. A dark
+/// amber overlay plus underline remains distinct from both add/delete colors and does not
+/// rely on hue alone.
+pub(crate) const CODE_LINK_BG: Color = Color::Rgb(64, 55, 34);
 /// Failures / diagnostics.
 pub(crate) const ERROR: Color = Color::Rgb(238, 95, 101);
 
@@ -79,58 +89,37 @@ pub fn render(frame: &mut Frame, app: &App, snap: &UiSnapshot) {
     match tier {
         Tier::TooSmall => unreachable!("handled above"),
         Tier::Normal => {
-            // docs/review/15 §1.1: top, summary, work (surplus), Impact, status, help.
+            // Dense chrome: repository context on top; commands, usage, and path below.
             let rows = Layout::vertical([
                 Constraint::Length(1),
-                Constraint::Length(1),
                 Constraint::Min(7),
-                Constraint::Length(crate::layout::impact_height(app.impact_height, area.height)),
-                Constraint::Length(1),
+                Constraint::Length(crate::layout::impact_height(
+                    app.dividers.get(DividerId::WorkReview),
+                    area.height,
+                )),
                 Constraint::Length(1),
             ])
             .split(area);
             render_top_bar(frame, rows[0], snap);
-            render_summary_bar(frame, rows[1], app, snap);
-            let fw = files_width(app.files_width, rows[2].width);
+            let fw = files_width(app.dividers.get(DividerId::FilesDiff), rows[1].width);
             let work =
                 Layout::horizontal([Constraint::Length(fw), Constraint::Min(MIN_DIFF_WIDTH)])
-                    .split(rows[2]);
+                    .split(rows[1]);
             render_files(frame, work[0], app, snap);
             render_diff(frame, work[1], app, snap);
-            render_impact(frame, rows[3], app, snap);
-            render_status_bar(frame, rows[4], app, snap);
-            render_help_bar(frame, rows[5]);
+            render_impact(frame, rows[2], app, snap);
+            render_bottom_bar(frame, rows[3], app, snap);
         }
         Tier::FocusOnly => {
-            // docs/review/15 §1.2: keep the chrome, render only the focused pane. The
-            // help row is the first luxury dropped (heights 8..=11).
-            if area.height >= 12 {
-                let rows = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Min(3),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-                render_top_bar(frame, rows[0], snap);
-                render_summary_bar(frame, rows[1], app, snap);
-                render_focused(frame, rows[2], app, snap);
-                render_status_bar(frame, rows[3], app, snap);
-                render_help_bar(frame, rows[4]);
-            } else {
-                let rows = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Min(3),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-                render_top_bar(frame, rows[0], snap);
-                render_summary_bar(frame, rows[1], app, snap);
-                render_focused(frame, rows[2], app, snap);
-                render_status_bar(frame, rows[3], app, snap);
-            }
+            let rows = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+            render_top_bar(frame, rows[0], snap);
+            render_focused(frame, rows[1], app, snap);
+            render_bottom_bar(frame, rows[2], app, snap);
         }
     }
 
@@ -142,6 +131,9 @@ pub fn render(frame: &mut Frame, app: &App, snap: &UiSnapshot) {
     }
     if app.show_base_picker {
         render_base_picker(frame, area, app, snap);
+    }
+    if let Some(status) = &app.status_detail {
+        render_status_detail(frame, area, status);
     }
 }
 
@@ -191,88 +183,91 @@ fn zoom_tag(app: &App, pane: Pane) -> &'static str {
 
 // -- top bar (docs/review/15 §3.1) ---------------------------------------------
 
-/// The top repository/service bar: `codescope  {repo}  {branch} ◂ {base}` on the left,
-/// `{scope}  LSP {glyph}  AI {glyph}[ {provider}]` reserved on the right (plus `  ⟳`
-/// while refreshing). The right group is measured and reserved FIRST; the left group is
-/// then elided into what remains, dropping base, branch, repo, and product in that
-/// order. Service failures and the refresh state are never clipped.
+/// The top repository/service bar: `codescope  {repo}  {base} ← {branch}  {N} files`
+/// on the left, and `{scope}  LSP {status}  {provider} {model} {status}` on the right.
+/// The comparison direction and current change-set size replace the retired summary row.
 fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     let r = &snap.repo;
     // The comparison base: `base_ref` is authoritative (dispatcher-owned; reflects a
     // picker override); fall back to the repo-bar base for snapshots that never set it.
     let base = if snap.base_ref.is_empty() {
-        r.base.as_deref().unwrap_or("?")
+        r.base.as_deref().unwrap_or("none")
     } else {
         snap.base_ref.as_str()
     };
 
-    // -- right group: scope + service glyphs (+ provider) + spinner -----------------
+    // Service/model state owns a bounded right-hand region. Model ids can be arbitrarily
+    // long, so cap only that field; provider and status remain visible.
     let (ls_g, ls_style) = ls_status_glyph(snap.ls);
     let (ai_g, ai_style) = ai_status_glyph(&snap.ai);
     let provider = if snap.ai_provider.is_empty() {
-        String::new()
+        "AI"
     } else {
-        format!(" {}", snap.ai_provider)
+        snap.ai_provider.as_str()
     };
+    let model_budget = ((area.width as usize) / 5).clamp(8, 28);
+    let model = truncate_cells(&snap.ai_model, model_budget);
     let mut right: Vec<Span> = vec![
         Span::styled(scope_label(snap.scope), Style::new().fg(MUTED)),
         Span::raw("  "),
         Span::styled("LSP ", Style::new().fg(MUTED)),
         Span::styled(ls_g, ls_style),
         Span::raw("  "),
-        Span::styled("AI ", Style::new().fg(MUTED)),
-        Span::styled(ai_g, ai_style),
-        Span::styled(provider, Style::new().fg(MUTED)),
+        Span::styled(provider.to_string(), Style::new().fg(MUTED)),
     ];
+    if !model.is_empty() {
+        right.push(Span::raw(" "));
+        right.push(Span::styled(model, Style::new().fg(TEXT)));
+    }
+    right.push(Span::raw(" "));
+    right.push(Span::styled(ai_g, ai_style));
     if snap.refreshing {
         right.push(Span::styled("  ⟳", Style::new().fg(WARN)));
     }
     right.push(Span::raw(" "));
     let right_w: usize = right.iter().map(Span::width).sum();
 
-    // -- left group: drop base, then branch, then repo, then product -----------------
+    // Keep the count and comparison direction at every usable width. Product/repository
+    // context is progressively dropped before either of those facts.
     let product = Span::styled(
         " codescope ",
         Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
     );
     let repo = Span::styled(format!(" {} ", r.repo_name), Style::new().fg(ACCENT));
-    let branch = Span::styled(format!(" {} ", r.branch), Style::new().fg(TEXT));
-    let base_span = Span::styled(format!("◂ {} ", base), Style::new().fg(MUTED));
 
     let reserved = right_w.min(area.width as usize) as u16;
     let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(reserved)]).split(area);
     let budget = chunks[0].width as usize;
-
-    let mut left: Vec<Span> = Vec::new();
-    for candidate in [
-        vec![
-            product.clone(),
-            repo.clone(),
-            branch.clone(),
-            base_span.clone(),
-        ],
-        vec![product.clone(), repo.clone(), branch.clone()],
-        vec![product.clone(), repo.clone()],
-        vec![product.clone()],
-    ] {
-        let w: usize = candidate.iter().map(Span::width).sum();
-        if w <= budget {
-            left = candidate;
-            break;
-        }
-    }
-    if left.is_empty() {
-        // Even the product alone is too wide: truncate the plain text grapheme-safely.
-        frame.render_widget(
-            Paragraph::new(truncate_cells(" codescope", budget)).style(Style::new().bg(SURFACE)),
-            chunks[0],
-        );
+    let file_word = if snap.files.len() == 1 {
+        "file"
     } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(left)).style(Style::new().bg(SURFACE)),
-            chunks[0],
-        );
+        "files"
+    };
+    let count = format!(" {} {file_word} ", snap.files.len());
+    let count_w = count.width();
+    let full_comparison = format!(" {base} ← {} ", r.branch);
+    let min_comparison = 8usize;
+    let prefix = if product.width() + repo.width() + count_w + min_comparison <= budget {
+        vec![product, repo]
+    } else if product.width() + count_w + min_comparison <= budget {
+        vec![product]
+    } else {
+        Vec::new()
+    };
+    let prefix_w: usize = prefix.iter().map(Span::width).sum();
+    let comparison_budget = budget.saturating_sub(prefix_w + count_w);
+    let mut left = prefix;
+    left.push(Span::styled(
+        truncate_cells(&full_comparison, comparison_budget),
+        Style::new().fg(TEXT),
+    ));
+    if count_w <= budget.saturating_sub(prefix_w) {
+        left.push(Span::styled(count, Style::new().fg(MUTED)));
     }
+    frame.render_widget(
+        Paragraph::new(Line::from(left)).style(Style::new().bg(SURFACE)),
+        chunks[0],
+    );
     frame.render_widget(
         Paragraph::new(Line::from(right)).style(Style::new().bg(SURFACE)),
         chunks[1],
@@ -297,6 +292,9 @@ fn ai_status_glyph(ai: &AiStatus) -> (&'static str, Style) {
     match ai {
         AiStatus::Ready { .. } => ("✓", Style::new().fg(ADD_FG)),
         AiStatus::Loading { .. } => ("…", Style::new().fg(WARN)),
+        AiStatus::WaitingForSymbols { .. }
+        | AiStatus::WaitingForRelations { .. }
+        | AiStatus::Queued { .. } => ("·", Style::new().fg(WARN)),
         AiStatus::Stale { .. } => ("~", Style::new().fg(WARN)),
         AiStatus::Disabled => ("×", Style::new().fg(MUTED)),
         AiStatus::Idle => ("·", Style::new().fg(MUTED)),
@@ -337,99 +335,6 @@ fn truncate_cells(s: &str, budget: usize) -> String {
     out
 }
 
-// -- summary bar (docs/review/15 §3.2) ------------------------------------------
-
-/// The one-line summary: `{N} changed files · {M} symbols in {basename} · hunk {c} / {t}`.
-/// The symbol count belongs to the file shown in the diff (matched by path, never by a
-/// transient list index); the hunk phrase uses the same App-owned `current_hunk` as the
-/// diff title. At constrained widths the file phrase is elided first; the count and
-/// hunk phrases survive.
-fn render_summary_bar(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
-    let text = summary_text(app, snap, area.width as usize);
-    frame.render_widget(
-        Paragraph::new(text).style(Style::new().fg(TEXT).bg(SURFACE_ALT)),
-        area,
-    );
-}
-
-/// The summary text, budgeted (pure; tested directly). Always one leading space.
-fn summary_text(app: &App, snap: &UiSnapshot, width: usize) -> String {
-    let n = snap.files.len();
-    let files = if n == 1 {
-        "1 changed file".to_string()
-    } else {
-        format!("{n} changed files")
-    };
-    if n == 0 {
-        return truncate_cells(&format!(" {files} · no selection"), width.saturating_sub(1));
-    }
-
-    // The file shown in the diff: match the snapshot's diff path against the file rows.
-    // (`DiffPane::title` is the full path today; MERGE: the dispatcher half renames it
-    // to `file_path` — same comparison.)
-    let diff_path = snap.diff.title.as_str();
-    let diff_file = snap.files.iter().find(|f| f.path == diff_path);
-
-    let file_phrase = diff_file.map(|f| {
-        // The symbol count is real only once the file's lazy analysis landed; an
-        // unanalyzed file must not claim `0 symbols`.
-        let sym = match f.semantic {
-            crate::snapshot::FileSemanticLoad::Ready => {
-                let count = f.changed_symbol_count;
-                if count == 1 {
-                    "1 symbol".to_string()
-                } else {
-                    format!("{count} symbols")
-                }
-            }
-            crate::snapshot::FileSemanticLoad::Loading => "analyzing…".to_string(),
-            crate::snapshot::FileSemanticLoad::Unsupported => "semantics unavailable".to_string(),
-            crate::snapshot::FileSemanticLoad::Failed => "analysis failed".to_string(),
-            crate::snapshot::FileSemanticLoad::Unloaded => "not analyzed".to_string(),
-        };
-        format!("{sym} in {}", basename(&f.path))
-    });
-
-    let hunk_phrase = if snap.diff.total_hunks > 0 {
-        Some(format!(
-            "hunk {} / {}",
-            app.current_hunk, snap.diff.total_hunks
-        ))
-    } else {
-        None
-    };
-
-    // Budget: keep `N changed files` and the hunk phrase; elide the middle file phrase.
-    let mut parts = vec![files.clone()];
-    if let Some(fp) = file_phrase {
-        parts.push(fp);
-    }
-    if let Some(hp) = hunk_phrase {
-        parts.push(hp);
-    }
-    let full = format!(" {}", parts.join(" · "));
-    if full.width() <= width {
-        return full;
-    }
-    // Drop the middle phrase first (never the count or the hunk).
-    let short = if parts.len() > 2 {
-        format!(" {} · {}", parts[0], parts.last().unwrap())
-    } else {
-        format!(" {}", parts.join(" · "))
-    };
-    if short.width() <= width {
-        return short;
-    }
-    // Still too wide (a long basename in the middle): truncate the middle, keep the ends.
-    if parts.len() > 2 {
-        let fixed = parts[0].width() + parts[2].width() + 2 * " · ".width() + 1 + 1; // space + …
-        let mid_budget = width.saturating_sub(fixed);
-        let mid = truncate_cells(&parts[1], mid_budget.max(1));
-        return format!(" {} · {mid} · {}", parts[0], parts[2]);
-    }
-    truncate_cells(&short, width.saturating_sub(1))
-}
-
 /// The basename of a repo-relative path (the last component).
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -438,18 +343,29 @@ fn basename(path: &str) -> &str {
 // -- files pane (docs/review/15 §3.3) -------------------------------------------
 
 /// The changed-files pane: outer title `Changed files` (left) + the active file count
-/// (right). Rows are `{status} {disclosure} {display_path}{pad}{count}` with the count
-/// right-aligned to the widest visible count; directory components are MUTED, the
+/// (right). Rows are `{status} {disclosure} {display_path}{pad}+A -D`; line counts are
+/// right-aligned and disappear as one unit when the pane cannot preserve a useful path.
+/// Directory components are MUTED, the
 /// basename TEXT (bold on the active file). The active row gets SELECTED_BG; the file
 /// owning an active symbol child gets OWNER_BG.
 fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let focused = app.focused == Pane::Files;
     let inner_w = (area.width as usize).saturating_sub(2);
 
-    let counts: Vec<usize> = snap.files.iter().map(|f| f.changed_symbol_count).collect();
-    let count_width = counts.iter().map(|c| digits(*c)).max().unwrap_or(1).max(1);
-    // status + space + disclosure + space + at-least-one gap = 5 fixed cells.
-    let path_budget = inner_w.saturating_sub(5 + count_width);
+    let loc_width = snap
+        .files
+        .iter()
+        .filter(|f| f.added_lines > 0 || f.removed_lines > 0)
+        .map(|f| format!("+{} -{}", f.added_lines, f.removed_lines).width())
+        .max()
+        .unwrap_or(0);
+    // Four prefix cells, one separating gap, and at least ten useful path cells.
+    let show_loc = loc_width > 0 && inner_w >= 4 + 1 + 10 + loc_width;
+    let path_budget = if show_loc {
+        inner_w.saturating_sub(5 + loc_width)
+    } else {
+        inner_w.saturating_sub(4)
+    };
 
     // Display-only shortening; the snapshot keeps full paths as identity.
     let paths: Vec<&str> = snap.files.iter().map(|f| f.path.as_str()).collect();
@@ -487,14 +403,10 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
         } else {
             Color::Reset
         };
-        // A zero count on a file that HAS no symbols yet would still draw a "0"; show
-        // the count only when there is anything to count.
-        let count = counts[fi];
         items.push(ListItem::new(file_row_line(
             f,
             &display[fi],
-            count,
-            count_width,
+            if show_loc { loc_width } else { 0 },
             path_budget,
             inner_w,
             active,
@@ -521,7 +433,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                 }
                 crate::snapshot::FileSemanticLoad::Failed => {
                     items.push(ListItem::new(semantic_note_line(
-                        "analysis failed — Tab to retry",
+                        "analysis failed — retries after file change",
                         inner_w,
                     )));
                 }
@@ -531,8 +443,8 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                         inner_w,
                     )));
                 }
-                // An expanded Unloaded row (optimistic frame before the dispatcher's
-                // Loading publish) shows the pending marker, not a blank body.
+                // An expanded Unloaded row (the brief frame before background scheduling)
+                // shows the pending marker, not a blank body.
                 crate::snapshot::FileSemanticLoad::Unloaded => {
                     items.push(ListItem::new(semantic_note_line(
                         "… analyzing symbols",
@@ -560,7 +472,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     // selection, so mouse hit-testing maps screen rows to the same slice the user sees
     // (review 23: no hidden ListState offset).
     let capacity = area.height.saturating_sub(2) as usize; // inside the border
-    let first_visible = crate::file_rows::first_visible(&snap.files, app.file_sel, capacity);
+    let first_visible = app.files_first_visible(capacity);
     let visible: Vec<ListItem> = items
         .into_iter()
         .skip(first_visible)
@@ -570,24 +482,12 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     frame.render_widget(list, area);
 }
 
-/// The decimal digit count of `n` (for right-aligning counts).
-fn digits(mut n: usize) -> usize {
-    let mut d = 1;
-    while n >= 10 {
-        n /= 10;
-        d += 1;
-    }
-    d
-}
-
 /// One file row: status + disclosure + path (dirs MUTED, basename TEXT, bold when
-/// active) padded to `path_budget`, then the right-aligned count.
-#[allow(clippy::too_many_arguments)]
+/// active) padded to `path_budget`, then optional right-aligned green/red line counts.
 fn file_row_line(
     f: &crate::snapshot::FileRow,
     display: &str,
-    count: usize,
-    count_width: usize,
+    loc_width: usize,
     path_budget: usize,
     inner_w: usize,
     active: bool,
@@ -601,10 +501,18 @@ fn file_row_line(
         base_style
     };
     let (dirs, base) = split_dir_basename(display);
-    let pad = path_budget.saturating_sub(display.width()) + 1;
-    let content_w = 4 + display.width() + pad + count_width;
+    let loc = if loc_width > 0 && (f.added_lines > 0 || f.removed_lines > 0) {
+        Some((
+            format!("+{}", f.added_lines),
+            format!("-{}", f.removed_lines),
+        ))
+    } else {
+        None
+    };
+    let pad = path_budget.saturating_sub(display.width());
+    let content_w = 4 + display.width() + pad + usize::from(loc_width > 0) + loc_width;
     let trailing = inner_w.saturating_sub(content_w);
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(f.status.to_string(), status_style(f.status).bg(bg)),
         Span::styled(" ", base_style),
         Span::styled(marker, Style::new().fg(MUTED).bg(bg)),
@@ -612,22 +520,32 @@ fn file_row_line(
         Span::styled(dirs, Style::new().fg(MUTED).bg(bg)),
         Span::styled(base, basename_style),
         Span::styled(" ".repeat(pad), base_style),
-        // The count is only meaningful once analysis landed: Unloaded shows `…`
-        // (unknown, not zero), Loading shows the pending marker.
-        Span::styled(
-            match f.semantic {
-                crate::snapshot::FileSemanticLoad::Ready => {
-                    format!("{count:>count_width$}")
-                }
-                crate::snapshot::FileSemanticLoad::Loading => {
-                    format!("{:>count_width$}", "…")
-                }
-                _ => " ".repeat(count_width),
-            },
-            Style::new().fg(MUTED).bg(bg),
-        ),
-        Span::styled(" ".repeat(trailing), base_style),
-    ])
+    ];
+    if loc_width > 0 {
+        spans.push(Span::styled(" ", base_style));
+        match loc {
+            Some((added, removed)) => {
+                let loc_pad = loc_width.saturating_sub(added.width() + 1 + removed.width());
+                spans.push(Span::styled(" ".repeat(loc_pad), base_style));
+                spans.push(Span::styled(added, Style::new().fg(ADD_FG).bg(bg)));
+                spans.push(Span::styled(" ", base_style));
+                spans.push(Span::styled(removed, Style::new().fg(DEL_FG).bg(bg)));
+            }
+            None => spans.push(Span::styled(" ".repeat(loc_width), base_style)),
+        }
+    }
+    spans.push(Span::styled(" ".repeat(trailing), base_style));
+    Line::from(spans)
+}
+
+/// Number of decimal cells needed to render an integer.
+fn digits(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 /// An indented muted note row under an expanded file (loading / unsupported / failed /
@@ -789,7 +707,8 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
 
     // Pre-wrap (smart mode) or body-slice (raw mode) into display lines. The gutter is
     // fixed: ratatui's own x-scroll is never used (it would carry the numbers offscreen).
-    let built = if app.diff_wrap {
+    let linked_rows = linked_diff_rows(d, app.active_code_node());
+    let mut built = if app.diff_wrap {
         build_wrapped(&d.rows, &spans, ln_w, body_w)
     } else {
         build_raw(
@@ -801,6 +720,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
             inner_w,
         )
     };
+    apply_linked_diff_style(&mut built, &linked_rows);
     // `diff_scroll` is a logical-row anchor (resize-stable); map it to the first visual
     // line of that row. Raw mode is 1:1, so the map is the identity there.
     let scroll_y = built
@@ -820,6 +740,10 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
         .or_else(|| app.selected_symbol_name());
     if let Some(sym) = focused_symbol {
         right_parts.push(sym.to_string());
+    }
+    let linked_count = linked_rows.iter().filter(|linked| **linked).count();
+    if linked_count > 0 {
+        right_parts.push(format!("↔ {linked_count} code lines"));
     }
     if d.total_hunks > 0 {
         right_parts.push(format!("hunk {}/{}", app.current_hunk, d.total_hunks));
@@ -876,6 +800,80 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
         .block(block)
         .scroll((scroll_y, 0));
     frame.render_widget(paragraph, area);
+}
+
+fn linked_diff_rows(
+    diff: &crate::snapshot::DiffPane,
+    node: Option<&codescope_core::PlanNode>,
+) -> Vec<bool> {
+    let mut linked = vec![false; diff.rows.len()];
+    let Some(node) = node else {
+        return linked;
+    };
+    let refs = node
+        .code_refs
+        .iter()
+        .filter(|code_ref| code_ref.file.to_string() == diff.title)
+        .collect::<Vec<_>>();
+    if refs.is_empty() {
+        return linked;
+    }
+    let mut hunk = None;
+    for (index, row) in diff.rows.iter().enumerate() {
+        if matches!(row, DiffRow::HunkHeader(_)) {
+            hunk = Some(hunk.map_or(0, |current: u32| current.saturating_add(1)));
+            continue;
+        }
+        linked[index] = refs.iter().any(|code_ref| {
+            if hunk != Some(code_ref.hunk) {
+                return false;
+            }
+            let line = match (code_ref.side, row) {
+                (DiffSide::Old, DiffRow::Del { old_ln, .. })
+                | (DiffSide::Old, DiffRow::Context { old_ln, .. }) => Some(*old_ln),
+                (DiffSide::New, DiffRow::Add { new_ln, .. })
+                | (DiffSide::New, DiffRow::Context { new_ln, .. }) => Some(*new_ln),
+                _ => None,
+            };
+            line.is_some_and(|line| line >= code_ref.start_line && line <= code_ref.end_line)
+        });
+    }
+    linked
+}
+
+fn apply_linked_diff_style(built: &mut BuiltDiff, linked: &[bool]) {
+    for (logical, is_linked) in linked.iter().copied().enumerate() {
+        if !is_linked {
+            continue;
+        }
+        let Some(&start) = built.first_visual.get(logical) else {
+            continue;
+        };
+        let end = built
+            .first_visual
+            .get(logical + 1)
+            .copied()
+            .unwrap_or_else(|| u16::try_from(built.lines.len()).unwrap_or(u16::MAX));
+        for line in built
+            .lines
+            .iter_mut()
+            .take(usize::from(end))
+            .skip(usize::from(start))
+        {
+            for span in &mut line.spans {
+                let mut style = span
+                    .style
+                    .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+                // Keep the existing green/red backgrounds on added/deleted bodies and
+                // intraline spans. The gutter and context text receive the linked-code
+                // background, while underline/bold is the non-colour cue across the row.
+                if style.bg.is_none() {
+                    style = style.bg(CODE_LINK_BG);
+                }
+                span.style = style;
+            }
+        }
+    }
 }
 
 /// The diff rows rendered into display lines, plus the logical→visual anchor map.
@@ -1154,12 +1152,23 @@ fn changed_flags(gs: &[&str], spans: &[(usize, usize)]) -> Vec<bool> {
 fn styled_graphemes(gs: &[&str], flags: &[bool], base: Style, hi: Style) -> Vec<Span<'static>> {
     debug_assert_eq!(gs.len(), flags.len());
     let mut out: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
     for (g, &changed) in gs.iter().zip(flags) {
         let style = if changed { hi } else { base };
+        let width = grapheme_cells(g, col);
+        // Ratatui stores cells in an intermediate buffer and drops control characters;
+        // a literal tab therefore never reaches a terminal for expansion. Materialize it
+        // here using the same four-cell stops used by wrapping and horizontal slicing.
+        let displayed = if *g == "\t" {
+            " ".repeat(width)
+        } else {
+            (*g).to_string()
+        };
         match out.last_mut() {
-            Some(last) if last.style == style => last.content.to_mut().push_str(g),
-            _ => out.push(Span::styled(g.to_string(), style)),
+            Some(last) if last.style == style => last.content.to_mut().push_str(&displayed),
+            _ => out.push(Span::styled(displayed, style)),
         }
+        col += width;
     }
     out
 }
@@ -1191,9 +1200,14 @@ fn slice_styled(
             break;
         }
         let style = if changed { hi } else { base };
+        let displayed = if *g == "\t" {
+            " ".repeat(w)
+        } else {
+            (*g).to_string()
+        };
         match out.last_mut() {
-            Some(last) if last.style == style => last.content.to_mut().push_str(g),
-            _ => out.push(Span::styled(g.to_string(), style)),
+            Some(last) if last.style == style => last.content.to_mut().push_str(&displayed),
+            _ => out.push(Span::styled(displayed, style)),
         }
         taken += w;
         col = next;
@@ -1233,14 +1247,30 @@ fn measured_cells(s: &str) -> usize {
 /// Wrap `text` into segments of at most `budget` display cells. Prefers a whitespace or
 /// punctuation break in the segment's second half (the break character is preserved, not
 /// trimmed); an overlong token is hard-broken by display width. Original graphemes are
-/// kept: tabs are measured as four-cell stops but passed through for display, because
-/// ratatui (and real terminals) render the tab character themselves.
+/// kept. Tabs are materialized as spaces at four-cell stops because ratatui's cell buffer
+/// drops the literal control character before a real terminal can expand it.
 fn wrap_body(text: &str, budget: usize) -> Vec<String> {
     let gs: Vec<&str> = unicode_segmentation::UnicodeSegmentation::graphemes(text, true).collect();
     wrap_ranges(&gs, budget)
         .iter()
-        .map(|&(s, e)| gs[s..e].concat())
+        .map(|&(s, e)| expand_tabs(&gs[s..e]))
         .collect()
+}
+
+/// Render a grapheme slice with tabs expanded at four-cell stops local to the visual line.
+fn expand_tabs(gs: &[&str]) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    for g in gs {
+        let width = grapheme_cells(g, col);
+        if *g == "\t" {
+            out.push_str(&" ".repeat(width));
+        } else {
+            out.push_str(g);
+        }
+        col += width;
+    }
+    out
 }
 
 /// The [`wrap_body`] break policy as grapheme-index ranges into `gs`, so callers can map
@@ -1278,188 +1308,235 @@ fn is_soft_break(g: &str) -> bool {
         .any(|c| c.is_whitespace() || c.is_ascii_punctuation())
 }
 
-// -- bottom pane: Impact | AI Plan (docs/review/15 §3.5, docs/review/16) -------------
+// -- combined Impact pane ------------------------------------------------------------
 //
-// The bottom pane is tabbed (`v`): the deterministic Impact view reads `snap.impact`
-// (spec §4), the AI plan view reads the validated plan the dispatcher publishes in
-// `snap.semantic` (only ever rendered when `ai_generated`).
+// Deterministic relationships and the generated breakdown describe the same selection,
+// so they stay visible together instead of competing for a tabbed bottom pane.
 
-/// The full-width bottom pane: one bordered block whose title is the `Impact | AI Plan`
-/// tab strip (the active tab is ACCENT+BOLD, the inactive MUTED; `AI Plan …` while a
-/// request is in flight). The body is the active tab's view.
+/// The full-width Impact pane. The left column stacks the deterministic selected change,
+/// callers, and downstream relationships; a vertical divider separates the generated,
+/// selection-scoped breakdown on the right.
 fn render_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let focused = app.focused == Pane::Impact;
-    let block = pane_block(bottom_tab_title(app, snap), None, focused);
+    // The contents already identify the selected change and generated explanation. A
+    // permanent "Impact" title only repeated that context and consumed visual attention.
+    // Keep the zoom state discoverable without naming the section.
+    let zoom_title = (app.zoomed && focused).then(|| {
+        Line::from(Span::styled(
+            " ZOOM ",
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+        ))
+    });
+    let block = pane_block(Line::from(""), zoom_title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 6 || inner.height == 0 {
         return;
     }
-    match app.bottom_view {
-        BottomView::Impact => render_impact_body(frame, inner, snap),
-        BottomView::AiPlan => render_ai_plan(frame, inner, app, snap),
+
+    let left_width = impact_left_width(
+        app.dividers.get(DividerId::RelationshipsGenerated),
+        inner.width,
+    );
+    let columns =
+        Layout::horizontal([Constraint::Length(left_width), Constraint::Min(0)]).split(inner);
+    render_impact_body(frame, columns[0], app, snap);
+
+    let generated = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::new().fg(BORDER))
+        .border_type(BorderType::Plain)
+        .padding(Padding::left(1));
+    let generated_inner = generated.inner(columns[1]);
+    frame.render_widget(generated, columns[1]);
+    if generated_inner.width > 0 && generated_inner.height > 0 {
+        render_generated_impact(frame, generated_inner, app, snap);
     }
 }
 
-/// The ` Impact | AI Plan ` tab strip: the active tab is ACCENT+BOLD, the inactive
-/// MUTED, separated by a MUTED ` | `. While `snap.ai` is Loading the AI tab gains a
-/// WARN `…` suffix — the label itself keeps its active/inactive style, so the active
-/// tab never loses its cue. The zoom tag trails, as before.
-fn bottom_tab_title(app: &App, snap: &UiSnapshot) -> Line<'static> {
-    let loading = matches!(snap.ai, AiStatus::Loading { .. });
-    let active = Style::new().fg(ACCENT).add_modifier(Modifier::BOLD);
-    let inactive = Style::new().fg(MUTED);
-    let (impact_style, ai_style) = match app.bottom_view {
-        BottomView::Impact => (active, inactive),
-        BottomView::AiPlan => (inactive, active),
-    };
-    let mut spans = vec![
-        Span::styled(" Impact", impact_style),
-        Span::styled(" | ", Style::new().fg(MUTED)),
-        Span::styled("AI Plan", ai_style),
-    ];
-    if loading {
-        spans.push(Span::styled(" …", Style::new().fg(WARN)));
-    }
-    spans.push(Span::styled(
-        format!("{} ", zoom_tag(app, Pane::Impact)),
-        Style::new().fg(TEXT),
-    ));
-    Line::from(spans)
-}
-
-/// The Impact body: three inner columns (40/30/30) with right-border dividers on the
-/// first two. Headers are the first interior row of each column: `SELECTED CHANGE`,
-/// `CALLERS · {N|…}`, `DOWNSTREAM · {N|…}`.
-fn render_impact_body(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
+/// The deterministic half of Impact: selected change above callers above downstream.
+fn render_impact_body(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let impact = &snap.impact;
-    let cols = Layout::horizontal([
-        Constraint::Percentage(40),
-        Constraint::Percentage(30),
-        Constraint::Percentage(30),
+    let [selected_height, callers_height, downstream_height] = impact_section_heights(
+        app.dividers.get(DividerId::SelectedCallers),
+        app.dividers.get(DividerId::CallersDownstream),
+        area.height,
+    );
+    let rows = Layout::vertical([
+        Constraint::Length(selected_height),
+        Constraint::Length(callers_height),
+        Constraint::Length(downstream_height),
     ])
     .split(area);
 
-    render_selected_change(frame, cols[0], impact);
-    render_impact_list(frame, cols[1], "CALLERS", &impact.callers, true);
-    render_impact_list(frame, cols[2], "DOWNSTREAM", &impact.downstream, false);
+    render_selected_change(frame, rows[0], impact, true);
+    render_impact_list(
+        frame,
+        rows[1],
+        "CALLERS",
+        &impact.callers,
+        app.callers_scroll,
+        true,
+    );
+    render_impact_list(
+        frame,
+        rows[2],
+        "DOWNSTREAM",
+        &impact.downstream,
+        app.downstream_scroll,
+        false,
+    );
 }
 
-/// The AI plan body: the semantic pane's title row (MUTED+BOLD header + a MUTED ` AI`
-/// badge, with the pane note appended when present), then one indented row per
-/// [`crate::snapshot::SemRow`], scrolled by `app.ai_plan_scroll`. A validated plan with
-/// no rows — or a stale/unavailable one — renders a single MUTED explanation instead,
-/// chosen by AI state so a deterministic pane's note never poses as an AI message.
-fn render_ai_plan(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
+/// The generated explanation is laid out from validated structure at the current width.
+/// If AI is unavailable, the same visual grammar renders a deterministic relationship
+/// fallback from the selected change, callers, and downstream facts.
+fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
+    let lines = generated_impact_content(app, snap, area.width);
+    let height = usize::from(area.height);
+    let max_scroll = lines.len().saturating_sub(height);
+    let start = app.ai_plan_scroll.min(max_scroll);
+    let end = (start + height).min(lines.len());
+    let rendered = lines[start..end]
+        .iter()
+        .cloned()
+        .map(render_diagram_line)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(rendered), area);
+}
+
+/// The generated pane's semantic line layout, shared by rendering and retained mouse
+/// geometry. Node-bearing spans keep their plan-local targets until the final Ratatui
+/// conversion, so hover hitboxes cannot drift from the cells a user sees.
+pub(crate) fn generated_impact_content(
+    app: &App,
+    snap: &UiSnapshot,
+    width: u16,
+) -> Vec<crate::diagram::DiagramLine> {
     let sem = &snap.semantic;
-    // No renderable plan: a validated plan that came back empty, or no current plan at
-    // all. Order by AI state; the pane note is only trusted for Failed/stale plans (a
-    // non-AI pane's note never speaks for the AI tab).
-    if !sem.ai_generated || sem.rows.is_empty() {
-        let msg = if sem.ai_generated {
-            // (rows.is_empty(), per the guard above): the plan validated but had nothing
-            // renderable.
-            "AI returned no renderable rows".to_string()
-        } else if matches!(snap.ai, AiStatus::Loading { .. }) {
-            "generating AI plan…".to_string()
-        } else if matches!(snap.ai, AiStatus::Disabled | AiStatus::Idle) {
-            "AI plan unavailable".to_string()
-        } else if matches!(snap.ai, AiStatus::Failed { .. }) {
-            if sem.note.is_empty() {
-                "AI request failed — see status bar".to_string()
-            } else {
-                sem.note.clone()
-            }
-        } else if !sem.note.is_empty() {
-            // Stale plan (Stale status, or a Ready/Loading tagged with an old epoch).
-            sem.note.clone()
-        } else {
-            "AI plan unavailable".to_string()
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg, Style::new().fg(MUTED)))),
-            area,
-        );
-        return;
-    }
-
-    // Width budget: the ` AI` badge always survives; the title takes what remains, and
-    // the note what is left after that.
-    let width = usize::from(area.width);
-    let title = truncate_cells(&sem.title, width.saturating_sub(3));
-    let mut header = header_line(&title);
-    header.push_span(Span::styled(" AI", Style::new().fg(MUTED)));
-    if !sem.note.is_empty() {
-        let note_budget = width.saturating_sub(header.width() + 2);
-        if note_budget > 0 {
-            header.push_span(Span::styled(
-                format!("  {}", truncate_cells(&sem.note, note_budget)),
-                Style::new().fg(MUTED),
-            ));
-        }
-    }
-    let mut lines: Vec<Line> = vec![header];
-
-    // Rows under the header, windowed by the scroll offset; the last visible row is a
-    // `… +N more` marker when the window does not reach the end.
-    let avail = (area.height as usize).saturating_sub(1);
-    let total = sem.rows.len();
-    let start = app.ai_plan_scroll.min(total);
-    let end = if total - start > avail && avail > 0 {
-        start + avail - 1
+    // Node highlighting follows the actual selection, not the dispatcher's data-quality
+    // note: the selected change label is what node labels and entity symbols must match.
+    let selected_label = snap
+        .impact
+        .selected_change
+        .as_ref()
+        .map(|selected| selected.label.as_str())
+        .unwrap_or("");
+    let diagram = if sem.ai_generated {
+        sem.plan.as_ref().map(|plan| {
+            let active = app
+                .hovered_plan_node
+                .as_ref()
+                .or(app.expanded_plan_node.as_ref());
+            crate::diagram::interactive_plan_lines(
+                plan,
+                width,
+                selected_label,
+                active,
+                app.expanded_plan_node.as_ref(),
+            )
+        })
     } else {
-        (start + avail).min(total)
-    };
-    for r in &sem.rows[start..end] {
-        let label_style = if r.changed {
-            Style::new().fg(WARN)
-        } else {
-            Style::new().fg(TEXT)
+        None
+    }
+    .unwrap_or_else(|| fallback_lines(&snap.impact, width));
+
+    let mut lines = Vec::new();
+    if !sem.ai_generated {
+        let status: Option<(String, DiagramRole)> = match snap.ai {
+            AiStatus::WaitingForSymbols { .. } => Some((
+                "Waiting for symbol analysis…".to_string(),
+                DiagramRole::Review,
+            )),
+            AiStatus::WaitingForRelations { .. } => Some((
+                "Waiting for symbol relationships…".to_string(),
+                DiagramRole::Review,
+            )),
+            AiStatus::Queued { position: 1, .. } => Some((
+                "Waiting for AI capacity · priority #1".to_string(),
+                DiagramRole::Review,
+            )),
+            AiStatus::Queued { position, .. } => Some((
+                format!("Waiting for AI capacity · priority #{position}"),
+                DiagramRole::Review,
+            )),
+            AiStatus::Loading { .. } => Some((
+                "Generating a deeper explanation…".to_string(),
+                DiagramRole::Review,
+            )),
+            AiStatus::Failed { .. } => Some((
+                "AI failed; showing known relationships".to_string(),
+                DiagramRole::Review,
+            )),
+            AiStatus::Stale { .. } => Some((
+                "Repository changed; showing known relationships".to_string(),
+                DiagramRole::Review,
+            )),
+            AiStatus::Disabled => Some((
+                "Known relationships · AI not configured".to_string(),
+                DiagramRole::Muted,
+            )),
+            AiStatus::Idle => Some((
+                "Known relationships · AI generation is automatic".to_string(),
+                DiagramRole::Muted,
+            )),
+            AiStatus::Ready { .. } => None,
         };
-        // Budget the row: indentation is capped, the relation suffix and the
-        // diagnostic ` !` are reserved, and the label is truncated into what remains —
-        // a model-controlled label can never push the suffixes off the row.
-        let indent = (usize::from(r.depth) * 2).min(8);
-        let suffix = match (r.relation.is_empty(), r.has_diagnostic) {
-            (false, false) => UnicodeWidthStr::width(r.relation) + 1,
-            (false, true) => UnicodeWidthStr::width(r.relation) + 1 + 2,
-            (true, true) => 2,
-            (true, false) => 0,
-        };
-        let label = truncate_cells(&r.label, width.saturating_sub(indent + suffix));
-        let mut spans = vec![
-            Span::raw(" ".repeat(indent)),
-            Span::styled(label, label_style),
-        ];
-        if !r.relation.is_empty() {
-            spans.push(Span::styled(
-                format!(" {}", r.relation),
-                Style::new().fg(MUTED),
+        if let Some((text, role)) = status {
+            lines.push(crate::diagram::DiagramLine::plain(text, role));
+        }
+    } else if let Some(report) = &sem.report {
+        // A sanitized plan (the validator dropped content) gets one concise WARN line
+        // before the visual; the full reasons stay in the debug-ai JSON, not this pane.
+        if report.verdict == ValidationVerdict::ValidWithDrops || !report.dropped.is_empty() {
+            let removed = report.dropped.len();
+            let items = if removed == 1 { "item" } else { "items" };
+            lines.push(crate::diagram::DiagramLine::plain(
+                truncate_cells(
+                    &format!("⚠ sanitized AI plan · {removed} {items} removed"),
+                    width.into(),
+                ),
+                DiagramRole::Review,
             ));
         }
-        if r.has_diagnostic {
-            spans.push(Span::styled(" !", Style::new().fg(ERROR)));
-        }
-        lines.push(Line::from(spans));
     }
-    if end < total {
-        lines.push(Line::from(Span::styled(
-            format!("… +{} more", total - end),
-            Style::new().fg(MUTED),
-        )));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
+    lines.extend(diagram);
+    lines
+}
+
+fn render_diagram_line(line: crate::diagram::DiagramLine) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| {
+                let style = match span.role {
+                    DiagramRole::Title => Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+                    DiagramRole::Text => Style::new().fg(TEXT),
+                    DiagramRole::Border | DiagramRole::Muted => Style::new().fg(MUTED),
+                    DiagramRole::Selected => Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    DiagramRole::Hovered => Style::new()
+                        .fg(TEXT)
+                        .bg(SELECTED_BG)
+                        .add_modifier(Modifier::BOLD),
+                    DiagramRole::Arrow | DiagramRole::Evidence => Style::new().fg(HUNK_FG),
+                    DiagramRole::Review => Style::new().fg(WARN),
+                };
+                Span::styled(span.text, style)
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// The SELECTED CHANGE column: header, then the symbol label (ACCENT+BOLD) + badge, one
 /// deterministic interpretation line, and the pane note when space remains. A file-row
 /// selection shows the basename and the "select one to inspect impact" guidance.
-fn render_selected_change(frame: &mut Frame, area: Rect, impact: &crate::snapshot::ImpactPane) {
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::new().fg(BORDER))
-        .border_type(BorderType::Plain)
-        .padding(Padding::horizontal(1));
+fn render_selected_change(
+    frame: &mut Frame,
+    area: Rect,
+    impact: &crate::snapshot::ImpactPane,
+    divider: bool,
+) {
+    let block = impact_section_block(divider);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let mut lines: Vec<Line> = vec![header_line("SELECTED CHANGE")];
@@ -1501,32 +1578,44 @@ fn render_selected_change(frame: &mut Frame, area: Rect, impact: &crate::snapsho
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// A CALLERS / DOWNSTREAM column: header with a live count (`· …` while loading, never
+/// A CALLERS / DOWNSTREAM section: header with a live count (`· …` while loading, never
 /// a false zero), then rows; when rows remain past the visible space the final visible
 /// row is `… +N more` in MUTED.
-fn render_impact_list(frame: &mut Frame, area: Rect, name: &str, list: &ImpactList, divider: bool) {
-    let block = if divider {
-        Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(Style::new().fg(BORDER))
-            .padding(Padding::horizontal(1))
-    } else {
-        Block::default().padding(Padding::horizontal(1))
-    };
+fn render_impact_list(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    list: &ImpactList,
+    requested_offset: usize,
+    divider: bool,
+) {
+    let block = impact_section_block(divider);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let header = match list.state {
+    let base_header = match list.state {
         ImpactLoadState::Loading => format!("{name} · …"),
         _ => format!("{name} · {}", list.rows.len()),
     };
-    let mut lines: Vec<Line> = vec![header_line(&header)];
 
     // Interior rows available below the header.
     let avail = (inner.height as usize).saturating_sub(1);
     let rows = &list.rows;
-    let show = rows.len().min(avail);
-    for r in &rows[..show] {
+    let max_offset = if avail == 0 {
+        0
+    } else {
+        rows.len().saturating_sub(avail)
+    };
+    let offset = requested_offset.min(max_offset);
+    let header = if offset > 0 {
+        format!("{base_header} · ↑{offset}")
+    } else {
+        base_header
+    };
+    let mut lines: Vec<Line> = vec![header_line(&header)];
+    let visible = &rows[offset..];
+    let show = visible.len().min(avail);
+    for r in &visible[..show] {
         let style = if r.changed {
             Style::new().fg(WARN)
         } else {
@@ -1545,8 +1634,8 @@ fn render_impact_list(frame: &mut Frame, area: Rect, name: &str, list: &ImpactLi
         lines.push(Line::from(spans));
     }
     // Truncation marker: replace the last visible row when more remain.
-    if rows.len() > avail && avail > 0 {
-        let more = rows.len() - (avail - 1);
+    if visible.len() > avail && avail > 0 {
+        let more = visible.len() - (avail - 1);
         lines.truncate(1 + avail - 1);
         lines.push(Line::from(Span::styled(
             format!("… +{more} more"),
@@ -1565,6 +1654,19 @@ fn render_impact_list(frame: &mut Frame, area: Rect, name: &str, list: &ImpactLi
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Shared styling for the vertically stacked deterministic Impact sections.
+fn impact_section_block(divider: bool) -> Block<'static> {
+    let block = Block::default().padding(Padding::horizontal(1));
+    if divider {
+        block
+            .borders(Borders::BOTTOM)
+            .border_style(Style::new().fg(BORDER))
+            .border_type(BorderType::Plain)
+    } else {
+        block
+    }
+}
+
 /// A column header: MUTED + BOLD (docs/review/15 §2).
 fn header_line(text: &str) -> Line<'static> {
     Line::from(Span::styled(
@@ -1573,63 +1675,86 @@ fn header_line(text: &str) -> Line<'static> {
     ))
 }
 
-// -- status + help bars (docs/review/15 §3.6, §3.7) --------------------------------
+// -- combined bottom bar ----------------------------------------------------------
 
-/// The status message row (always reserved): the typed `snap.status` (spec §3.6), or
-/// the selected file's full repo-relative path in MUTED when there is no message.
-fn render_status_bar(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
-    let (text, style) = if snap.status.text.is_empty() {
-        (
-            format!(" {}", app.selected_file_path().unwrap_or("")),
-            Style::new().fg(MUTED),
-        )
+/// Commands/status on the left; process token usage and the selected file on the right.
+/// The filename is always the final field, so it remains visually right-justified.
+fn render_bottom_bar(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
+    let chunks = bottom_bar_chunks(area, app, snap);
+    let path = app.selected_file_path().unwrap_or("");
+    let right_width = chunks[1].width as usize;
+
+    if snap.status.text.is_empty() {
+        frame.render_widget(
+            Paragraph::new(help_line(chunks[0].width as usize)).style(Style::new().bg(SURFACE)),
+            chunks[0],
+        );
     } else {
         let fg = match snap.status.level {
             StatusLevel::Error => ERROR,
             StatusLevel::Warning => WARN,
             StatusLevel::Info => MUTED,
         };
-        (format!(" {}", snap.status.text), Style::new().fg(fg))
-    };
+        let text = truncate_cells(&format!(" {}", snap.status.text), chunks[0].width as usize);
+        frame.render_widget(
+            Paragraph::new(text).style(Style::new().fg(fg).bg(SURFACE)),
+            chunks[0],
+        );
+    }
+
+    let right = bottom_right_text(path, snap, right_width);
     frame.render_widget(
-        Paragraph::new(truncate_cells(&text, area.width as usize)).style(style.bg(SURFACE)),
-        area,
+        Paragraph::new(right)
+            .alignment(Alignment::Right)
+            .style(Style::new().fg(MUTED).bg(SURFACE)),
+        chunks[1],
     );
 }
 
-/// The compact help row: styled spans (keys TEXT, separators/explanations MUTED). The
-/// full layout at width >= 96; resize and the impact/AI toggle are dropped first at
-/// 64..=95; the minimal set at 30..=63. The help modal holds the rest.
-fn render_help_bar(frame: &mut Frame, area: Rect) {
-    let groups: &[(&str, &str)] = if area.width >= 96 {
+/// Split the bottom bar once for both rendering and mouse hit-testing. The left rectangle
+/// is the clickable status/help segment; the right rectangle owns token usage and path.
+pub(crate) fn bottom_bar_chunks(area: Rect, app: &App, snap: &UiSnapshot) -> [Rect; 2] {
+    let width = area.width as usize;
+    let path = app.selected_file_path().unwrap_or("");
+    let desired_right = bottom_right_text(path, snap, usize::MAX)
+        .width()
+        .saturating_add(1);
+    let min_left = if width >= 96 {
+        48
+    } else if width >= 64 {
+        28
+    } else {
+        12
+    };
+    let right_width = desired_right.min(width.saturating_sub(min_left));
+    let chunks = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(u16::try_from(right_width).unwrap_or(u16::MAX)),
+    ])
+    .split(area);
+    [chunks[0], chunks[1]]
+}
+
+fn help_line(width: usize) -> Line<'static> {
+    let groups: &[(&str, &str)] = if width >= 83 {
         &[
-            ("Tab", "analyze"),
+            ("R", "refresh"),
+            ("Tab", "expand"),
             ("1-3", "pane"),
-            ("z", "zoom"),
-            ("W", "wrap"),
             ("n/N", "hunk"),
-            ("[/]", "resize"),
-            ("v", "impact/AI"),
+            ("wheel", "scroll"),
+            ("drag", "resize"),
             ("?", "help"),
         ]
-    } else if area.width >= 64 {
+    } else if width >= 48 {
         &[
-            ("Tab", "analyze"),
+            ("R", "refresh"),
+            ("Tab", "expand"),
             ("1-3", "pane"),
-            ("z", "zoom"),
-            ("W", "wrap"),
-            ("n/N", "hunk"),
             ("?", "help"),
         ]
     } else {
-        &[
-            ("Tab", ""),
-            ("1-3", ""),
-            ("z", ""),
-            ("W", ""),
-            ("n/N", ""),
-            ("?", ""),
-        ]
+        &[("R", ""), ("Tab", ""), ("1-3", ""), ("?", "")]
     };
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (key, label)) in groups.iter().enumerate() {
@@ -1641,10 +1766,117 @@ fn render_help_bar(frame: &mut Frame, area: Rect) {
             spans.push(Span::styled(format!(" {label}"), Style::new().fg(MUTED)));
         }
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::new().bg(SURFACE)),
-        area,
-    );
+    Line::from(spans)
+}
+
+fn bottom_right_text(path: &str, snap: &UiSnapshot, budget: usize) -> String {
+    let input = compact_count(snap.ai_tokens.input);
+    let output = compact_count(snap.ai_tokens.output);
+    let full_usage = format!("tokens in {input} out {output}");
+    let compact_usage = format!("in {input} out {output}");
+    if path.is_empty() {
+        return truncate_cells(&format!("{full_usage} "), budget);
+    }
+
+    for usage in [&full_usage, &compact_usage] {
+        for shown_path in [path, basename(path)] {
+            let candidate = format!("{usage} · {shown_path} ");
+            if candidate.width() <= budget {
+                return candidate;
+            }
+        }
+    }
+
+    let fixed = compact_usage.width() + " ·  ".width();
+    if budget > fixed {
+        let shown_path = truncate_cells(basename(path), budget - fixed);
+        return format!("{compact_usage} · {shown_path} ");
+    }
+    truncate_cells(&compact_usage, budget)
+}
+
+fn compact_count(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=9_999 => format!("{:.1}k", value as f64 / 1_000.0),
+        10_000..=999_999 => format!("{}k", value / 1_000),
+        1_000_000..=9_999_999 => format!("{:.1}m", value as f64 / 1_000_000.0),
+        _ => format!("{}m", value / 1_000_000),
+    }
+}
+
+// -- status detail overlay -------------------------------------------------------
+
+/// Full, wrapped rendering of the exact status the user clicked. The dialog is content
+/// sized and width-capped; it grows only when the provider response actually needs room.
+fn render_status_detail(frame: &mut Frame, area: Rect, status: &crate::snapshot::StatusMessage) {
+    let border = match status.level {
+        StatusLevel::Error => ERROR,
+        StatusLevel::Warning => WARN,
+        StatusLevel::Info => ACCENT,
+    };
+    let popup = status_detail_rect(area, &status.text);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(border))
+        .title(" status details · click or Esc to close ");
+    let paragraph = Paragraph::new(status.text.clone())
+        .style(Style::new().fg(TEXT))
+        .wrap(Wrap { trim: false })
+        .block(block);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+/// A comfortable status-dialog rectangle: at most 120 columns / 80% of the terminal,
+/// with height derived from word-wrapped display cells and a two-row border allowance.
+fn status_detail_rect(area: Rect, text: &str) -> Rect {
+    let available_width = area.width.saturating_sub(4).max(1);
+    let preferred_width = area.width.saturating_mul(4) / 5;
+    let width = preferred_width.clamp(1, 120).max(40).min(available_width);
+    let content_width = width.saturating_sub(2).max(1);
+    let wrapped = u16::try_from(wrapped_line_count(text, content_width)).unwrap_or(u16::MAX);
+    let available_height = area.height.saturating_sub(4).max(1);
+    let height = wrapped.saturating_add(2).max(5).min(available_height);
+    centered_rect(area, width, height)
+}
+
+/// Estimate Ratatui's word wrapping in terminal display cells, including hard wrapping
+/// for individual JSON/token fragments wider than the dialog.
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    text.split('\n')
+        .map(|line| {
+            let mut rows = 1usize;
+            let mut used = 0usize;
+            for token in unicode_segmentation::UnicodeSegmentation::split_word_bounds(line) {
+                let token_width = token.width();
+                if token_width == 0 {
+                    continue;
+                }
+                if used > 0 && used.saturating_add(token_width) > width {
+                    rows = rows.saturating_add(1);
+                    used = 0;
+                }
+                if token_width <= width {
+                    used = used.saturating_add(token_width);
+                    continue;
+                }
+
+                let full_rows = token_width / width;
+                let remainder = token_width % width;
+                if remainder == 0 {
+                    rows = rows.saturating_add(full_rows.saturating_sub(1));
+                    used = width;
+                } else {
+                    rows = rows.saturating_add(full_rows);
+                    used = remainder;
+                }
+            }
+            rows
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 // -- help modal -------------------------------------------------------------------
@@ -1654,13 +1886,14 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(ratatui::widgets::Clear, popup);
     let lines = vec![
         Line::from(Span::styled(
-            "codescope — keyboard controls",
+            "codescope — controls",
             Style::new().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from("  q / Ctrl-C      quit"),
         Line::from("  ? / Esc         this help / close"),
-        Line::from("  Tab             expand file + analyze symbols / collapse"),
+        Line::from("  R               refresh repository state"),
+        Line::from("  Tab             expand / collapse file (symbols load automatically)"),
         Line::from("  1 / 2 / 3       focus files / diff / impact"),
         Line::from("  j/k · ↑/↓       move selection · scroll"),
         Line::from("  Ctrl-d/u · Pg   half / full page in diff"),
@@ -1669,13 +1902,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  b               pick comparison base (default: nearest ancestor)"),
         Line::from("  Enter           jump to symbol / re-center view"),
         Line::from("  Space h l       expand / collapse"),
-        Line::from("  [ / ]           resize the files pane"),
+        Line::from("  mouse hover     impact node highlights its linked diff code"),
+        Line::from("  click / Space   expand hovered impact-node details"),
+        Line::from("  mouse wheel     scroll the section under the pointer"),
+        Line::from("  mouse drag      resize any pane divider"),
         Line::from("  n / N           next / previous diff hunk"),
         Line::from("  z               zoom the focused pane (Tab still switches)"),
-        Line::from("  v               toggle impact / AI plan"),
         Line::from("  W / 0           diff: toggle wrap / reset horizontal scroll"),
-        Line::from("  R               rescan git"),
-        Line::from("  a / A           AI toggle / refresh"),
         Line::from("  g / G           top / bottom"),
     ];
     frame.render_widget(
@@ -1706,6 +1939,16 @@ fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
     .split(v[1])[1]
 }
 
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width.min(area.width),
+        height.min(area.height),
+    )
+}
+
 // -- model picker modal -------------------------------------------------------
 
 fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
@@ -1727,14 +1970,28 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
         .title(title);
     let models = filter_candidates(&snap.available_models, &app.model_query);
     let mut items: Vec<ListItem> = if snap.available_models.is_empty() {
+        let message = if snap.ai_model.is_empty() && snap.ai_provider.is_empty() {
+            "  AI is not configured; set a provider API key".to_string()
+        } else if snap.model_list_loading {
+            "  fetching models from the configured provider…".to_string()
+        } else {
+            "  provider returned no discoverable models; type an exact model id".to_string()
+        };
         vec![ListItem::new(Line::from(Span::styled(
-            "  no models loaded (is AI configured?)",
+            message,
             Style::new().fg(MUTED),
         )))]
     } else if models.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
-            "  no matches",
-            Style::new().fg(MUTED),
+            if app.model_query.trim().is_empty() {
+                "  no matches".to_string()
+            } else {
+                format!(
+                    "  Enter to use {:?} as an exact model id",
+                    app.model_query.trim()
+                )
+            },
+            Style::new().fg(WARN),
         )))]
     } else {
         models
@@ -1748,12 +2005,28 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
             })
             .collect()
     };
+    if snap.model_list_loading && !snap.available_models.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  fetching additional models…",
+            Style::new().fg(MUTED),
+        ))));
+    }
+    if let Some(error) = &snap.model_list_error {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("  discovery failed: {error}"),
+            Style::new().fg(WARN),
+        ))));
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  current model remains selectable; type an exact model id to switch",
+            Style::new().fg(MUTED),
+        ))));
+    }
     items.push(ListItem::new(Line::from(Span::styled(
         format!("  filter: {}", app.model_query),
         Style::new().fg(WARN),
     ))));
     items.push(ListItem::new(Line::from(Span::styled(
-        "  type to filter · ↑/↓ move · Enter select · Esc close",
+        "  type to filter or enter exact id · ↑/↓ move · Enter select · Esc close",
         Style::new().fg(MUTED),
     ))));
     let mut state = ListState::default();
@@ -1771,11 +2044,17 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
 fn render_base_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let popup = centered(area, 50, 50);
     frame.render_widget(ratatui::widgets::Clear, popup);
-    let title = if snap.base_ref.is_empty() {
-        " comparison base ".to_string()
+    let selected = if snap.base_ref.is_empty() {
+        "none"
     } else {
-        format!(" comparison base (current: {}) ", snap.base_ref)
+        snap.base_ref.as_str()
     };
+    let bounded = if snap.base_candidates_truncated {
+        " · bounded list"
+    } else {
+        ""
+    };
+    let title = format!(" comparison base (selected: {selected}{bounded}) ");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(ACCENT))
@@ -1803,6 +2082,12 @@ fn render_base_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsho
             })
             .collect()
     };
+    if snap.base_candidates_truncated {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  more ancestors omitted by the scan bound",
+            Style::new().fg(WARN),
+        ))));
+    }
     items.push(ListItem::new(Line::from(Span::styled(
         format!("  filter: {}", app.base_query),
         Style::new().fg(WARN),
@@ -1869,6 +2154,7 @@ mod tests {
         snap.ls = LsStatus::Ready;
         snap.ai = AiStatus::Disabled;
         snap.ai_provider = "prime".to_string();
+        snap.ai_model = "z-ai/glm-5.3".to_string();
         snap.available_bases = vec![
             "release/2.0".to_string(),
             "main".to_string(),
@@ -1885,6 +2171,8 @@ mod tests {
             status: "M",
             expanded: true,
             changed_symbol_count: 1,
+            added_lines: 1,
+            removed_lines: 1,
             semantic: crate::snapshot::FileSemanticLoad::Ready,
             symbols: vec![SymbolRow {
                 name: "GetDisplayName".to_string(),
@@ -1926,39 +2214,28 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let app = app_with(&sample());
         t.draw(|f| render(f, &app, &sample())).unwrap();
-        // §1.1: top y=0, summary y=1, work y=2..28 (h 27), Impact y=29..37 (h 9),
-        // status y=38, help y=39.
+        // Dense layout: top y=0, work y=1..22, Impact y=23..38, bottom y=39.
         assert!(
             row_text(&t, 0).contains("codescope"),
             "top bar: {}",
             row_text(&t, 0)
         );
+        assert!(row_text(&t, 0).contains("1 file"), "count moved to top");
         assert!(
-            row_text(&t, 1).contains("1 changed file"),
-            "summary: {}",
+            row_text(&t, 1).contains("Changed files"),
+            "files block top: {}",
             row_text(&t, 1)
         );
-        assert!(
-            row_text(&t, 2).contains("Changed files"),
-            "files block top: {}",
-            row_text(&t, 2)
-        );
         // Work row split: files width 42 → its right border is x=41, diff starts x=42.
-        assert_eq!(cell(&t, 41, 2).0, "┐", "files right border at x=41");
-        assert_eq!(cell(&t, 42, 2).0, "┌", "diff left border at x=42");
-        // Impact block: full width, y=29..37.
+        assert_eq!(cell(&t, 41, 1).0, "┐", "files right border at x=41");
+        assert_eq!(cell(&t, 42, 1).0, "┌", "diff left border at x=42");
+        assert!(!row_text(&t, 23).contains("Impact"));
+        assert!(row_text(&t, 23).starts_with('┌'), "impact top border");
+        assert!(row_text(&t, 38).starts_with('└'), "impact bottom border");
         assert!(
-            row_text(&t, 29).contains("Impact"),
-            "impact top: {}",
-            row_text(&t, 29)
+            row_text(&t, 22).starts_with('└'),
+            "files/diff bottom at y=22"
         );
-        assert!(row_text(&t, 29).starts_with('┌'), "impact top border");
-        assert!(row_text(&t, 37).starts_with('└'), "impact bottom border");
-        assert!(
-            row_text(&t, 28).starts_with('└'),
-            "files/diff bottom at y=28"
-        );
-        // Status y=38, help y=39.
         assert!(
             row_text(&t, 39).contains("? help"),
             "help: {}",
@@ -1972,16 +2249,17 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(80, 20)).unwrap();
         let app = app_with(&sample());
         t.draw(|f| render(f, &app, &sample())).unwrap();
-        // §7.2: files width 32, diff width 48, work height 7 (y=2..8), impact y=9..17.
-        assert_eq!(cell(&t, 31, 2).0, "┐", "files right border x=31");
-        assert_eq!(cell(&t, 32, 2).0, "┌", "diff left border x=32");
+        // At the minimum size the work area keeps its seven-row floor: work y=1..7,
+        // Impact y=8..18, combined bottom y=19.
+        assert_eq!(cell(&t, 31, 1).0, "┐", "files right border x=31");
+        assert_eq!(cell(&t, 32, 1).0, "┌", "diff left border x=32");
         assert!(
-            row_text(&t, 8).starts_with('└'),
-            "work bottom y=8: {}",
-            row_text(&t, 8)
+            row_text(&t, 7).starts_with('└'),
+            "work bottom y=7: {}",
+            row_text(&t, 7)
         );
-        assert!(row_text(&t, 9).starts_with('┌'), "impact top y=9");
-        assert!(row_text(&t, 17).starts_with('└'), "impact bottom y=17");
+        assert!(row_text(&t, 8).starts_with('┌'), "impact top y=8");
+        assert!(row_text(&t, 18).starts_with('└'), "impact bottom y=18");
     }
 
     #[test]
@@ -2041,15 +2319,31 @@ mod tests {
         assert!(top.contains("codescope"), "{top}");
         assert!(top.contains("demo"), "repo: {top}");
         assert!(
-            top.contains("feature/x ◂ release/2.0"),
-            "branch ◂ base: {top}"
+            top.contains("release/2.0 ← feature/x"),
+            "explicit branch/base labels: {top}"
         );
         assert!(
-            top.contains("branch  LSP ✓  AI × prime"),
+            top.contains("branch  LSP ✓  prime z-ai/glm-5.3 ×"),
             "right group: {top}"
         );
         // The right group is reserved flush against the terminal's right edge.
-        assert!(top.ends_with("prime "), "right-aligned: {top:?}");
+        assert!(top.ends_with("× "), "right-aligned: {top:?}");
+    }
+
+    #[test]
+    fn top_bar_puts_provider_and_selected_model_before_ai_status() {
+        let mut snap = sample();
+        snap.ai = AiStatus::Ready {
+            epoch: codescope_core::Epoch(1),
+        };
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &App::new(), &snap)).unwrap();
+        let top = row_text(&t, 0);
+        assert!(
+            top.contains("prime z-ai/glm-5.3 ✓"),
+            "provider/model/status order: {top}"
+        );
+        assert!(!top.contains("AI ✓ prime"), "retired order: {top}");
     }
 
     #[test]
@@ -2061,7 +2355,10 @@ mod tests {
             t.draw(|f| render(f, &App::new(), &snap)).unwrap();
             let top = row_text(&t, 0);
             assert!(top.contains("LSP ✓"), "{w}: lsp survives: {top}");
-            assert!(top.contains("AI × prime"), "{w}: ai survives: {top}");
+            assert!(
+                top.contains("prime") && top.contains('×'),
+                "{w}: ai survives: {top}"
+            );
         }
     }
 
@@ -2070,11 +2367,21 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let app = App::new();
         t.draw(|f| render(f, &app, &snap_with_base())).unwrap();
-        assert!(row_text(&t, 0).contains("feature/x ◂ release/2.0"));
+        assert!(row_text(&t, 0).contains("release/2.0 ← feature/x"));
         let mut snap = snap_with_base();
         snap.base_ref.clear();
         t.draw(|f| render(f, &app, &snap)).unwrap();
-        assert!(row_text(&t, 0).contains("feature/x ◂ origin/main"));
+        assert!(row_text(&t, 0).contains("origin/main ← feature/x"));
+    }
+
+    #[test]
+    fn top_bar_labels_missing_base_explicitly() {
+        let mut snap = snap_with_base();
+        snap.base_ref.clear();
+        snap.repo.base = None;
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &App::new(), &snap)).unwrap();
+        assert!(row_text(&t, 0).contains("none ← feature/x"));
     }
 
     #[test]
@@ -2086,44 +2393,33 @@ mod tests {
         assert!(row_text(&t, 0).contains('⟳'), "spinner");
     }
 
-    // -- §3.2 / §7.5: summary bar ------------------------------------------------------
+    // -- retired summary row ----------------------------------------------------------
 
     #[test]
-    fn summary_counts_symbols_of_the_diff_file() {
+    fn changed_file_count_lives_in_top_bar_and_summary_row_is_gone() {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        let mut app = app_with(&sample());
         let snap = sample();
-        t.draw(|f| render(f, &app, &snap)).unwrap();
-        let s = row_text(&t, 1);
-        assert!(s.contains("1 changed file"), "{s}");
-        assert!(s.contains("1 symbol in service.go"), "{s}");
-        assert!(s.contains("hunk 1 / 1"), "{s}");
-        // Selection on the nested symbol keeps the same file's count.
-        app.apply(crate::action::Action::Down);
-        t.draw(|f| render(f, &app, &snap)).unwrap();
-        assert!(row_text(&t, 1).contains("1 symbol in service.go"));
+        t.draw(|f| render(f, &app_with(&snap), &snap)).unwrap();
+        assert!(row_text(&t, 0).contains("1 file"));
+        assert!(row_text(&t, 1).contains("Changed files"));
+        let text = buffer_text(&t);
+        assert!(!text.contains("1 symbol in service.go"));
+        assert!(!text.contains("semantics unavailable"));
     }
 
     #[test]
-    fn summary_empty_and_singular() {
+    fn top_bar_file_count_handles_empty_and_plural() {
         let mut snap = snap_with_base();
-        snap.files.clear();
-        snap.diff = DiffPane::default();
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
-        assert!(row_text(&t, 1).contains("0 changed files · no selection"));
-
-        // A selected file with no mapped symbols.
-        let mut snap = sample();
-        snap.files[0].symbols.clear();
-        snap.files[0].changed_symbol_count = 0;
+        assert!(row_text(&t, 0).contains("0 files"));
+        snap.files = vec![sample().files[0].clone(), sample().files[0].clone()];
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
-        assert!(row_text(&t, 1).contains("0 symbols in service.go"));
+        assert!(row_text(&t, 0).contains("2 files"));
     }
 
     #[test]
-    fn summary_and_title_hunk_values_match() {
-        // current_hunk is App-owned: n/N moves it and summary + diff title agree.
+    fn hunk_navigation_remains_in_diff_title() {
         let mut snap = sample();
         snap.diff
             .rows
@@ -2138,12 +2434,7 @@ mod tests {
         let mut app = app_with(&snap);
         app.apply(crate::action::Action::NextHunk);
         t.draw(|f| render(f, &app, &snap)).unwrap();
-        assert!(
-            row_text(&t, 1).contains("hunk 2 / 2"),
-            "summary: {}",
-            row_text(&t, 1)
-        );
-        let diff_title_row = row_text(&t, 2);
+        let diff_title_row = row_text(&t, 1);
         assert!(
             diff_title_row.contains("hunk 2/2"),
             "diff title: {diff_title_row}"
@@ -2160,40 +2451,50 @@ mod tests {
             status: "A",
             expanded: false,
             changed_symbol_count: 0,
+            added_lines: 1,
+            removed_lines: 0,
             semantic: crate::snapshot::FileSemanticLoad::Ready,
             symbols: vec![],
         });
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app_with(&snap), &snap)).unwrap();
-        let files_top = row_text(&t, 2);
+        let files_top = row_text(&t, 1);
         assert!(
             files_top.contains("Changed files"),
             "left title: {files_top}"
         );
         // Right title is the active count, right-aligned against the right border (x=41).
-        let files_top: String = (0..42u16).map(|x| cell(&t, x, 2).0).collect();
+        let files_top: String = (0..42u16).map(|x| cell(&t, x, 1).0).collect();
         assert!(
             files_top.contains("Changed files"),
             "left title: {files_top:?}"
         );
         assert_eq!(
-            cell(&t, 39, 2).0,
+            cell(&t, 39, 1).0,
             "2",
             "count right-aligned before the border: {files_top:?}"
         );
         // Status colors: M is WARN, A is ADD_FG.
-        assert_eq!(cell(&t, 1, 3).0, "M");
-        assert_eq!(cell(&t, 1, 3).1, WARN);
-        // The file row is at y=3 (block top border y=2). Find the `A` row.
-        let y_a = (3..28u16)
+        assert_eq!(cell(&t, 1, 2).0, "M");
+        assert_eq!(cell(&t, 1, 2).1, WARN);
+        let plus_x = (0..41u16)
+            .find(|&x| cell(&t, x, 2).0 == "+" && cell(&t, x + 1, 2).0 == "1")
+            .expect("added LoC");
+        let minus_x = (0..41u16)
+            .find(|&x| cell(&t, x, 2).0 == "-" && cell(&t, x + 1, 2).0 == "1")
+            .expect("removed LoC");
+        assert_eq!(cell(&t, plus_x, 2).1, ADD_FG, "added LoC is green");
+        assert_eq!(cell(&t, minus_x, 2).1, DEL_FG, "removed LoC is red");
+        // The file row is at y=2 (block top border y=1). Find the `A` row.
+        let y_a = (2..28u16)
             .find(|&y| cell(&t, 1, y).0 == "A")
             .expect("added file row");
         assert_eq!(cell(&t, 1, y_a).1, ADD_FG);
         // Selected row background on the first file row (active file is file_sel=0);
         // the SELECTED_BG fills the whole inner row.
-        assert_eq!(cell(&t, 10, 3).2, SELECTED_BG, "selected row bg");
+        assert_eq!(cell(&t, 10, 2).2, SELECTED_BG, "selected row bg");
         assert_eq!(
-            cell(&t, 39, 3).2,
+            cell(&t, 39, 2).2,
             SELECTED_BG,
             "selected row bg to the row end"
         );
@@ -2204,12 +2505,12 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app_with(&sample()), &sample()))
             .unwrap();
-        // The file row (y=3) shows `M ▾ internal/service/service.go`: the directory
+        // The file row (y=2) shows `M ▾ internal/service/service.go`: the directory
         // components and separators are MUTED; the basename is TEXT + BOLD (active).
         let buf = t.backend().buffer();
         let cells: Vec<(String, Color, Modifier)> = (0..42u16)
             .map(|x| {
-                let c = buf.cell((x, 3)).unwrap();
+                let c = buf.cell((x, 2)).unwrap();
                 (c.symbol().to_string(), c.fg, c.modifier)
             })
             .collect();
@@ -2236,16 +2537,18 @@ mod tests {
                 assert_eq!(*fg, MUTED, "dir char {sym:?} at x{x} muted");
             }
         }
-        // The basename chars sit strictly between the last '/' and the count padding.
-        let count_x = cells.iter().position(|(s, _, _)| s == "1").unwrap();
+        // The basename chars sit strictly between the last '/' and the LoC suffix.
+        let count_x = cells.iter().position(|(s, _, _)| s == "+").unwrap();
         for (x, (sym, fg, mods)) in cells.iter().enumerate() {
             if x > slash && x < count_x && !sym.trim().is_empty() {
                 assert_eq!(*fg, TEXT, "basename char {sym:?} at x{x} text");
                 assert!(mods.contains(Modifier::BOLD), "basename char {sym:?} bold");
             }
         }
-        // The right-aligned count sits at the row's end (before the border at x=41).
-        assert_eq!(cells[40].0, "1", "count right-aligned");
+        let plus = cells.iter().position(|(s, _, _)| s == "+").unwrap();
+        let minus = cells.iter().position(|(s, _, _)| s == "-").unwrap();
+        assert_eq!(cells[plus].1, ADD_FG, "added LoC is green");
+        assert_eq!(cells[minus].1, DEL_FG, "removed LoC is red");
     }
 
     #[test]
@@ -2257,13 +2560,13 @@ mod tests {
         app.apply(crate::action::Action::Down);
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert_eq!(
-            cell(&t, 5, 4).0,
+            cell(&t, 5, 3).0,
             "~",
             "change glyph after the 4-cell indent"
         );
-        assert_eq!(cell(&t, 5, 4).2, SELECTED_BG, "active symbol row bg");
+        assert_eq!(cell(&t, 5, 3).2, SELECTED_BG, "active symbol row bg");
         assert_eq!(
-            cell(&t, 10, 3).2,
+            cell(&t, 10, 2).2,
             OWNER_BG,
             "owning file row keeps OWNER_BG"
         );
@@ -2272,28 +2575,150 @@ mod tests {
     // -- §3.4 / §7.8/§7.9/§7.10: diff pane --------------------------------------------
 
     #[test]
+    fn hovered_node_links_exact_old_and_new_hunk_rows() {
+        let diff = crate::snapshot::DiffPane {
+            title: "src/main.rs".to_string(),
+            focused_symbol: None,
+            rows: vec![
+                DiffRow::HunkHeader("@@ -10,2 +10,2 @@".to_string()),
+                DiffRow::Del {
+                    old_ln: 10,
+                    text: "old value".to_string(),
+                },
+                DiffRow::Add {
+                    new_ln: 10,
+                    text: "new value".to_string(),
+                },
+                DiffRow::Context {
+                    old_ln: 11,
+                    new_ln: 11,
+                    text: "context".to_string(),
+                },
+                DiffRow::HunkHeader("@@ -30,0 +30,1 @@".to_string()),
+                DiffRow::Add {
+                    new_ln: 30,
+                    text: "finish".to_string(),
+                },
+            ],
+            current_hunk: 1,
+            total_hunks: 2,
+        };
+        let node =
+            codescope_core::PlanNode::new("n1", "update", codescope_core::PlanNodeChange::Modified)
+                .with_code_ref(codescope_core::PlanCodeRef::new(
+                    codescope_core::FileId::new("src/main.rs").unwrap(),
+                    0,
+                    DiffSide::Old,
+                    10,
+                    11,
+                ))
+                .with_code_ref(codescope_core::PlanCodeRef::new(
+                    codescope_core::FileId::new("src/main.rs").unwrap(),
+                    1,
+                    DiffSide::New,
+                    30,
+                    30,
+                ));
+        let linked = linked_diff_rows(&diff, Some(&node));
+        assert_eq!(linked, vec![false, true, false, true, false, true]);
+
+        let spans = intraline::row_spans(&diff.rows);
+        let mut built = build_raw(&diff.rows, &spans, 2, 0, 40, 48);
+        apply_linked_diff_style(&mut built, &linked);
+        for index in [1usize, 3, 5] {
+            assert!(built.lines[index]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::UNDERLINED)));
+            assert!(built.lines[index]
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(CODE_LINK_BG)));
+        }
+        assert!(
+            built.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(DEL_BG)),
+            "deleted body retains its semantic background"
+        );
+        assert!(
+            built.lines[5]
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(ADD_BG)),
+            "added body retains its semantic background"
+        );
+        assert!(built.lines[2]
+            .spans
+            .iter()
+            .all(|span| span.style.bg != Some(CODE_LINK_BG)));
+    }
+
+    #[test]
     fn diff_dual_gutter_blanks_on_the_absent_side() {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app_with(&sample()), &sample()))
             .unwrap();
         // Diff pane x starts at 43 (border at 42); ln_width = 4 (max ln 11 → 2 digits,
-        // clamped to 4). Rows: header y=3, context y=4, del y=5, add y=6.
-        // Context row y=4: both numbers present. The gutter starts at x=43 (block inner).
-        let ctx: String = (43..54u16).map(|x| cell(&t, x, 4).0).collect();
+        // clamped to 4). Rows: header y=2, context y=3, del y=4, add y=5.
+        // Context row y=3: both numbers present. The gutter starts at x=43 (block inner).
+        let ctx: String = (43..54u16).map(|x| cell(&t, x, 3).0).collect();
         assert_eq!(ctx, "  10 │   10", "dual gutter: {ctx:?}");
-        // Del row y=5: old number present, new side exactly ln_width blanks.
-        let del_old: String = (43..47u16).map(|x| cell(&t, x, 5).0).collect();
+        // Del row y=4: old number present, new side exactly ln_width blanks.
+        let del_old: String = (43..47u16).map(|x| cell(&t, x, 4).0).collect();
         assert_eq!(del_old, "  11", "del old number: {del_old:?}");
-        let del_new: String = (50..54u16).map(|x| cell(&t, x, 5).0).collect();
+        let del_new: String = (50..54u16).map(|x| cell(&t, x, 4).0).collect();
         assert_eq!(del_new, "    ", "del new side blank: {del_new:?}");
-        assert_eq!(cell(&t, 48, 5).0, "│");
-        assert_eq!(cell(&t, 55, 5).0, "-", "sign cell");
-        // Add row y=6: old side blank, new number present.
-        let add_old: String = (43..47u16).map(|x| cell(&t, x, 6).0).collect();
+        assert_eq!(cell(&t, 48, 4).0, "│");
+        assert_eq!(cell(&t, 55, 4).0, "-", "sign cell");
+        // Add row y=5: old side blank, new number present.
+        let add_old: String = (43..47u16).map(|x| cell(&t, x, 5).0).collect();
         assert_eq!(add_old, "    ", "add old side blank");
-        let add_new: String = (50..54u16).map(|x| cell(&t, x, 6).0).collect();
+        let add_new: String = (50..54u16).map(|x| cell(&t, x, 5).0).collect();
         assert_eq!(add_new, "  11", "add new number");
-        assert_eq!(cell(&t, 55, 6).0, "+");
+        assert_eq!(cell(&t, 55, 5).0, "+");
+    }
+
+    #[test]
+    fn diff_expands_source_tabs_in_raw_and_wrapped_modes() {
+        for wrapped in [false, true] {
+            let mut snap = sample();
+            snap.diff.rows = vec![
+                DiffRow::HunkHeader("@@ -1,0 +1,2 @@ func handler()".to_string()),
+                DiffRow::Add {
+                    new_ln: 1,
+                    text: "\tif ready {".to_string(),
+                },
+                DiffRow::Add {
+                    new_ln: 2,
+                    text: "\t\treturn".to_string(),
+                },
+            ];
+            let mut app = app_with(&snap);
+            app.diff_wrap = wrapped;
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+
+            // Diff inner x=43, 4-cell dual gutter + sign ends at x=55, body starts x=56.
+            assert_eq!(cell(&terminal, 55, 3).0, "+");
+            assert_eq!(
+                (56..60)
+                    .map(|x| cell(&terminal, x, 3).0)
+                    .collect::<String>(),
+                "    ",
+                "first tab indentation, wrapped={wrapped}"
+            );
+            assert_eq!(cell(&terminal, 60, 3).0, "i");
+            assert_eq!(
+                (56..64)
+                    .map(|x| cell(&terminal, x, 4).0)
+                    .collect::<String>(),
+                "        ",
+                "nested tab indentation, wrapped={wrapped}"
+            );
+            assert_eq!(cell(&terminal, 64, 4).0, "r");
+        }
     }
 
     #[test]
@@ -2311,15 +2736,15 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &snap)).unwrap();
         // The gutter columns are unchanged at hscroll x+08.
-        let del_old: String = (43..47u16).map(|x| cell(&t, x, 5).0).collect();
+        let del_old: String = (43..47u16).map(|x| cell(&t, x, 4).0).collect();
         assert_eq!(del_old, "  11", "gutter fixed under hscroll");
-        assert_eq!(cell(&t, 48, 5).0, "│");
-        assert_eq!(cell(&t, 55, 5).0, "-", "sign fixed under hscroll");
+        assert_eq!(cell(&t, 48, 4).0, "│");
+        assert_eq!(cell(&t, 55, 4).0, "-", "sign fixed under hscroll");
         // The title shows the raw offset.
         assert!(
-            row_text(&t, 2).contains("x+08"),
+            row_text(&t, 1).contains("x+08"),
             "title: {}",
-            row_text(&t, 2)
+            row_text(&t, 1)
         );
     }
 
@@ -2328,13 +2753,13 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app_with(&sample()), &sample()))
             .unwrap();
-        // The header band is row y=3; the diff block spans x 42..139, so the inner is
+        // The header band is row y=2; the diff block spans x 42..139, so the inner is
         // x 43..=138. EVERY interior cell carries the band style (padded to the right).
         for x in [43u16, 60, 100, 138] {
-            let (_, _, bg, _) = cell(&t, x, 3);
+            let (_, _, bg, _) = cell(&t, x, 2);
             assert_eq!(bg, SURFACE_ALT, "x={x} band bg");
         }
-        let (_, fg, _, mods) = cell(&t, 43, 3);
+        let (_, fg, _, mods) = cell(&t, 43, 2);
         assert_eq!(fg, HUNK_FG);
         assert!(mods.contains(Modifier::BOLD));
     }
@@ -2346,16 +2771,16 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app_with(&sample()), &sample()))
             .unwrap();
-        // Del row y=5: nothing changes on the old side (pure deletion of nothing) —
+        // Del row y=4: nothing changes on the old side (pure deletion of nothing) —
         // `return` is equal, `name` moves; the del side has no inserted span.
-        // Add row y=6: body starts at x=57 (gutter x=43, 14 cells: 2*4+5+1 → 43+14).
+        // Add row y=5: body starts at x=57 (gutter x=43, 14 cells: 2*4+5+1 → 43+14).
         let body_x = 57u16;
         // `    return ` is equal → restrained ADD body (fg TEXT, bg ADD_BG).
-        let (_, fg, bg, mods) = cell(&t, body_x + 5, 6); // 'e' in "return"
+        let (_, fg, bg, mods) = cell(&t, body_x + 5, 5); // 'e' in "return"
         assert_eq!((fg, bg), (TEXT, ADD_BG), "equal words restrained");
         assert!(!mods.contains(Modifier::BOLD));
         // `prefix + ` was inserted → bright.
-        let (_, fg, bg, mods) = cell(&t, body_x + 12, 6); // inside "prefix"
+        let (_, fg, bg, mods) = cell(&t, body_x + 12, 5); // inside "prefix"
         assert_eq!((fg, bg), (ADD_HI, ADD_HI_BG), "changed words bright");
         assert!(mods.contains(Modifier::BOLD));
     }
@@ -2365,7 +2790,7 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let app = app_with(&sample());
         t.draw(|f| render(f, &app, &sample())).unwrap();
-        let title = row_text(&t, 2);
+        let title = row_text(&t, 1);
         // Basename only (not the full path) on the left; hunk + wrap on the right.
         assert!(title.contains("service.go"), "{title}");
         assert!(
@@ -2384,17 +2809,17 @@ mod tests {
         let app = app_with(&snap);
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert!(
-            row_text(&t, 2).contains("GetDisplayName · hunk 1/1"),
+            row_text(&t, 1).contains("GetDisplayName · hunk 1/1"),
             "{}",
-            row_text(&t, 2)
+            row_text(&t, 1)
         );
         // File-row selection (no focused_symbol): no symbol in the title.
         snap.diff.focused_symbol = None;
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert!(
-            !row_text(&t, 2).contains("GetDisplayName ·"),
+            !row_text(&t, 1).contains("GetDisplayName ·"),
             "no symbol: {}",
-            row_text(&t, 2)
+            row_text(&t, 1)
         );
     }
 
@@ -2405,10 +2830,10 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app_with(&sample()), &sample()))
             .unwrap();
-        let header_row = row_text(&t, 30); // first interior row of the Impact block
-        assert!(header_row.contains("SELECTED CHANGE"), "{header_row}");
-        assert!(header_row.contains("CALLERS ·"), "{header_row}");
-        assert!(header_row.contains("DOWNSTREAM ·"), "{header_row}");
+        let text = buffer_text(&t);
+        assert!(text.contains("SELECTED CHANGE"), "{text}");
+        assert!(text.contains("CALLERS ·"), "{text}");
+        assert!(text.contains("DOWNSTREAM ·"), "{text}");
     }
 
     /// An impact pane for a selected symbol with callers/downstream.
@@ -2458,8 +2883,10 @@ mod tests {
     fn impact_shows_selected_change_and_counts() {
         let mut snap = sample();
         snap.impact = impact_sample();
+        let mut app = App::new();
+        app.dividers.set(DividerId::WorkReview, 16);
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        t.draw(|f| render(f, &App::new(), &snap)).unwrap();
+        t.draw(|f| render(f, &app, &snap)).unwrap();
         let text = buffer_text(&t);
         assert!(text.contains("GetDisplayName"), "symbol label: {text}");
         assert!(text.contains("modified"), "badge: {text}");
@@ -2487,6 +2914,39 @@ mod tests {
     }
 
     #[test]
+    fn impact_relationship_lists_render_their_independent_scroll_offsets() {
+        let mut snap = sample();
+        let mut impact = impact_sample();
+        impact.callers.rows = (0..10)
+            .map(|index| crate::snapshot::ImpactRow {
+                label: format!("caller-{index}"),
+                relation: "calls",
+                changed: false,
+                has_diagnostic: false,
+            })
+            .collect();
+        snap.impact = impact;
+        let mut app = App::new();
+        app.callers_scroll = 3;
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        let text = buffer_text(&t);
+        let relationship_stack = (0..40)
+            .map(|y| row_text(&t, y).chars().take(54).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("CALLERS · 10 · ↑3"), "scroll marker: {text}");
+        assert!(
+            relationship_stack.contains("caller-3"),
+            "scrolled first row: {text}"
+        );
+        assert!(
+            !relationship_stack.contains("caller-0"),
+            "earlier row stays above viewport: {text}"
+        );
+    }
+
+    #[test]
     fn impact_empty_selection_is_graceful() {
         let mut snap = sample();
         snap.impact = crate::snapshot::ImpactPane::default();
@@ -2500,33 +2960,67 @@ mod tests {
         );
     }
 
-    // -- bottom pane: AI Plan tab (docs/review/16) ----------------------------------------
+    // -- generated half of the combined Impact pane --------------------------------------
 
     /// A snapshot whose semantic pane carries a validated, epoch-matched AI plan.
+    /// `report` defaults to a clean `Valid`; tests swap in drops to exercise the
+    /// sanitizer-warning line.
     fn ai_plan_snap(rows: usize) -> UiSnapshot {
+        ai_plan_snap_with_report(rows, codescope_core::ValidationReport::valid())
+    }
+
+    fn ai_plan_snap_with_report(
+        rows: usize,
+        report: codescope_core::ValidationReport,
+    ) -> UiSnapshot {
+        use codescope_core::{FormKind, PlanEdge, PlanEdgeKind, PlanNode, PlanNodeChange, VizForm};
+
         let mut snap = sample();
         snap.epoch = codescope_core::Epoch(3);
         snap.ai = AiStatus::Ready {
             epoch: codescope_core::Epoch(3),
         };
         snap.semantic = crate::snapshot::SemanticPane {
-            title: "plan: auth refactor".to_string(),
-            rows: (0..rows)
-                .map(|i| crate::snapshot::SemRow {
-                    depth: (i % 3) as u16,
-                    label: format!("PlanStep{i}"),
-                    relation: "calls",
-                    changed: i % 2 == 0,
-                    has_diagnostic: i == 1,
-                })
-                .collect(),
+            report: Some(report),
+            plan: (rows > 0).then(|| {
+                let mut plan = codescope_core::VisualizationPlan::new(
+                    codescope_core::Epoch(3),
+                    "How does authentication flow?",
+                );
+                plan.title = "Authentication request flow".into();
+                plan.intent = "Each request moves through the changed authentication path.".into();
+                plan.forms.push(VizForm {
+                    kind: FormKind::RelationshipFlow,
+                    title: "runtime".into(),
+                    summary: String::new(),
+                    nodes: (0..rows)
+                        .map(|i| {
+                            PlanNode::new(
+                                format!("n{i}"),
+                                format!("PlanStep{i}"),
+                                PlanNodeChange::Modified,
+                            )
+                            .with_detail(format!("explains effect {i}"))
+                        })
+                        .collect(),
+                    edges: (1..rows)
+                        .map(|i| PlanEdge {
+                            from: format!("n{}", i - 1),
+                            to: format!("n{i}"),
+                            kind: PlanEdgeKind::Calls,
+                            label: Some(format!("passes step {i}")),
+                        })
+                        .collect(),
+                });
+                plan
+            }),
             note: String::new(),
             ai_generated: true,
         };
         snap
     }
 
-    /// Drive the Loading → Ready edge so the app auto-switches to the AI plan.
+    /// Drive the Loading → Ready edge so the generated half is populated.
     fn app_after_ai_landed(plan: &UiSnapshot) -> App {
         let mut app = App::new();
         let mut loading = sample();
@@ -2540,63 +3034,86 @@ mod tests {
     }
 
     #[test]
-    fn ai_plan_renders_rows_badge_and_title_after_loading_to_ready() {
+    fn ai_plan_renders_explained_annotations_and_title_after_loading_to_ready() {
         let plan = ai_plan_snap(3);
         let app = app_after_ai_landed(&plan);
-        assert_eq!(app.bottom_view, crate::app::BottomView::AiPlan);
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
-        // Tab strip on the block's top border.
+        // The outer border has no redundant section or retired tab title.
         assert!(
-            row_text(&t, 29).contains("Impact | AI Plan"),
-            "tab strip: {}",
-            row_text(&t, 29)
+            !row_text(&t, 23).contains("Impact") && !row_text(&t, 23).contains("AI Plan"),
+            "title-free border: {}",
+            row_text(&t, 23)
         );
-        // Header row: semantic title + the MUTED AI badge.
-        let header = row_text(&t, 30);
+        // The claim and the diagram grammar/context occupy separate readable lines.
+        let header = row_text(&t, 24);
         assert!(
-            header.contains("plan: auth refactor"),
+            header.contains("Authentication request flow"),
             "plan title: {header}"
         );
         assert!(
-            header.contains("plan: auth refactor AI"),
-            "AI badge: {header}"
+            !header.contains("call tree"),
+            "title stays concise: {header}"
         );
-        // Rows: depth-indented labels with relations; the diagnostic row shows ` !`.
-        let (r0, r1, r2) = (row_text(&t, 31), row_text(&t, 32), row_text(&t, 33));
-        assert!(r0.contains("PlanStep0 calls"), "row 0: {r0}");
-        assert!(r1.contains("  PlanStep1 calls !"), "row 1: {r1}");
-        assert!(r2.contains("    PlanStep2 calls"), "row 2: {r2}");
-        // The deterministic columns are NOT drawn in the AI plan view.
-        let body: String = (30..37).map(|y| row_text(&t, y)).collect();
-        assert!(!body.contains("SELECTED CHANGE"), "impact replaced: {body}");
+        let context = row_text(&t, 25);
+        assert!(
+            context.contains("Each request moves through"),
+            "intent is explicit: {context}"
+        );
+        assert!(
+            !header.contains("AI-selected"),
+            "opaque provenance: {header}"
+        );
+        assert_eq!(
+            (24..38)
+                .map(|y| row_text(&t, y))
+                .collect::<String>()
+                .matches("Authentication request flow")
+                .count(),
+            1,
+            "the first form title renders once"
+        );
+        // Rows carry explanation and visual grammar, never a metadata badge inventory.
+        let generated: String = (24..38).map(|y| row_text(&t, y)).collect();
+        assert!(generated.contains('┌'), "node box: {generated}");
+        assert!(
+            generated.contains("PlanStep0"),
+            "selected node: {generated}"
+        );
+        assert!(
+            generated.contains("explains effect"),
+            "node detail: {generated}"
+        );
+        assert!(
+            !generated.contains("diff modified"),
+            "old badge: {generated}"
+        );
+        assert!(!generated.contains("LSP info"), "old badge: {generated}");
+        assert!(
+            !generated.contains("AI-selected"),
+            "old legend: {generated}"
+        );
+        // The deterministic context stays visible beside generated Impact.
+        let body: String = (24..38).map(|y| row_text(&t, y)).collect();
+        assert!(body.contains("SELECTED CHANGE"), "impact context: {body}");
     }
 
     #[test]
-    fn tab_strip_marks_the_active_tab() {
+    fn combined_impact_has_no_section_title_and_keeps_both_halves() {
         let plan = ai_plan_snap(2);
         let mut app = App::new();
-        app.update(plan.clone()); // no Loading edge: stays on Impact
+        app.update(plan.clone());
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
-        let row = row_text(&t, 29);
-        let xi = row.find("Impact").unwrap() as u16;
-        let xa = row.find("AI Plan").unwrap() as u16;
-        assert_eq!(cell(&t, xi, 29).1, ACCENT, "Impact active");
-        assert!(cell(&t, xi, 29).3.contains(Modifier::BOLD));
-        assert_eq!(cell(&t, xa, 29).1, MUTED, "AI Plan inactive");
-        app.apply(crate::action::Action::ToggleBottomView);
-        t.draw(|f| render(f, &app, &plan)).unwrap();
-        let row = row_text(&t, 29);
-        let xi = row.find("Impact").unwrap() as u16;
-        let xa = row.find("AI Plan").unwrap() as u16;
-        assert_eq!(cell(&t, xi, 29).1, MUTED, "Impact inactive");
-        assert_eq!(cell(&t, xa, 29).1, ACCENT, "AI Plan active");
-        assert!(cell(&t, xa, 29).3.contains(Modifier::BOLD));
+        assert!(!row_text(&t, 22).contains("Impact"));
+        let text = buffer_text(&t);
+        assert!(!text.contains("AI Plan"), "retired tab name: {text}");
+        assert!(text.contains("SELECTED CHANGE"), "left half: {text}");
+        assert!(text.contains("PlanStep0"), "right half: {text}");
     }
 
     #[test]
-    fn ai_tab_shows_ellipsis_while_loading() {
+    fn generated_impact_shows_progress_while_loading() {
         let mut snap = sample();
         snap.ai = AiStatus::Loading {
             since_epoch: codescope_core::Epoch(3),
@@ -2604,36 +3121,70 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
         assert!(
-            row_text(&t, 29).contains("AI Plan …"),
-            "loading tab: {}",
-            row_text(&t, 29)
+            buffer_text(&t).contains("Generating a deeper explanation…"),
+            "loading state: {}",
+            buffer_text(&t)
         );
+    }
+
+    #[test]
+    fn generated_impact_distinguishes_prerequisites_and_queue_position() {
+        let cases = [
+            (
+                AiStatus::WaitingForSymbols {
+                    epoch: codescope_core::Epoch(3),
+                },
+                "Waiting for symbol analysis…",
+            ),
+            (
+                AiStatus::WaitingForRelations {
+                    epoch: codescope_core::Epoch(3),
+                },
+                "Waiting for symbol relationships…",
+            ),
+            (
+                AiStatus::Queued {
+                    epoch: codescope_core::Epoch(3),
+                    position: 4,
+                },
+                "Waiting for AI capacity · priority #4",
+            ),
+        ];
+        for (status, expected) in cases {
+            let mut snap = sample();
+            snap.ai = status;
+            let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            t.draw(|f| render(f, &App::new(), &snap)).unwrap();
+            assert!(
+                buffer_text(&t).contains(expected),
+                "missing {expected:?}: {}",
+                buffer_text(&t)
+            );
+        }
     }
 
     #[test]
     fn ai_plan_view_explains_empty_or_unavailable_states() {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        // A validated-but-empty plan: nothing to scroll, say so.
+        // A validated-but-empty plan falls back to deterministic selection guidance.
         let mut app = App::new();
         let empty = ai_plan_snap(0);
         app.update(empty.clone());
-        app.apply(crate::action::Action::ToggleBottomView);
         t.draw(|f| render(f, &app, &empty)).unwrap();
         assert!(
-            row_text(&t, 30).contains("AI returned no renderable rows"),
-            "empty plan: {}",
-            row_text(&t, 30)
+            buffer_text(&t).contains("Select a changed file or symbol"),
+            "empty generated impact: {}",
+            buffer_text(&t)
         );
         // AI off: unavailable. (update() flips the view back; toggle after it.)
         let mut snap = sample(); // ai: Disabled, semantic: default
         let mut app = App::new();
         app.update(snap.clone());
-        app.apply(crate::action::Action::ToggleBottomView);
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert!(
-            row_text(&t, 30).contains("AI plan unavailable"),
+            buffer_text(&t).contains("Known relationships · AI not configured"),
             "disabled: {}",
-            row_text(&t, 30)
+            buffer_text(&t)
         );
         // A stale publish carries the dispatcher's note.
         snap.ai = AiStatus::Stale {
@@ -2642,37 +3193,361 @@ mod tests {
         snap.semantic.note = "AI view stale (repo changed); regenerating…".to_string();
         let mut app = App::new();
         app.update(snap.clone());
-        app.apply(crate::action::Action::ToggleBottomView);
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert!(
-            row_text(&t, 30).contains("AI view stale (repo changed)"),
+            buffer_text(&t).contains("Repository changed; showing known relationships"),
             "stale note: {}",
-            row_text(&t, 30)
+            buffer_text(&t)
         );
     }
 
+    /// A sanitized plan (ValidWithDrops) gets exactly one WARN line before the diagram;
+    /// the drop reasons stay out of the small pane (full detail lives in debug-ai JSON).
     #[test]
-    fn ai_plan_scrolls_with_a_truncation_marker() {
+    fn sanitized_plan_warns_once_before_the_diagram() {
+        let report = codescope_core::ValidationReport::with_drops(vec![
+            codescope_core::DroppedItem {
+                subject: "edge n3 -> n1 in form 0".to_string(),
+                reason: "nonconsecutive or duplicate sequence edge".to_string(),
+            },
+            codescope_core::DroppedItem {
+                subject: "node n9 in form 0".to_string(),
+                reason: "entity does not resolve".to_string(),
+            },
+        ]);
+        let plan = ai_plan_snap_with_report(3, report);
+        let app = app_after_ai_landed(&plan);
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let text = buffer_text(&t);
+        assert_eq!(
+            text.matches("sanitized AI plan").count(),
+            1,
+            "exactly one warning line: {text}"
+        );
+        assert!(
+            text.contains("sanitized AI plan · 2 items removed"),
+            "concise count line (plural): {text}"
+        );
+        assert!(
+            !text.contains("entity does not resolve")
+                && !text.contains("nonconsecutive or duplicate sequence edge"),
+            "drop reasons stay out of the small pane: {text}"
+        );
+        // The warning precedes the plan's own title, and uses WARN styling.
+        let warn_row = (24..38u16)
+            .find(|y| row_text(&t, *y).contains("sanitized AI plan"))
+            .expect("warning visible in the default viewport");
+        let title_row = (24..38u16)
+            .find(|y| row_text(&t, *y).contains("Authentication request flow"))
+            .expect("plan title visible");
+        assert!(warn_row < title_row, "warning precedes the plan: {text}");
+        let mut styled = false;
+        for x in 0..140u16 {
+            let (symbol, fg, _, _) = cell(&t, x, warn_row);
+            if symbol == "⚠" && fg == WARN {
+                styled = true;
+            }
+        }
+        assert!(styled, "the warning uses WARN styling");
+    }
+
+    /// A clean report (Valid, zero drops) adds no warning line; neither does a fallback
+    /// pane (no AI plan) nor a report-less semantic pane.
+    #[test]
+    fn clean_report_adds_no_warning_line() {
+        // Valid with zero drops: no line anywhere.
+        let plan = ai_plan_snap(3);
+        let app = app_after_ai_landed(&plan);
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        assert!(
+            !buffer_text(&t).contains("sanitized AI plan"),
+            "a clean report must not warn: {}",
+            buffer_text(&t)
+        );
+        // Fallback pane (deterministic relationships): the slot stays warning-free even
+        // if a stale report were left behind.
+        let mut snap = sample();
+        snap.semantic.report = Some(codescope_core::ValidationReport::with_drops(vec![
+            codescope_core::DroppedItem {
+                subject: "node n1 in form 0".to_string(),
+                reason: "entity does not resolve".to_string(),
+            },
+        ]));
+        let app = App::new();
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        assert!(
+            !buffer_text(&t).contains("sanitized AI plan"),
+            "fallback panes never carry the AI sanitizer warning: {}",
+            buffer_text(&t)
+        );
+    }
+
+    /// The real failure shape: a validated 7-step sequence must show its first steps in
+    /// the default Impact pane. The old five-row boxes showed no diagram at all.
+    #[test]
+    fn default_impact_pane_shows_ladder_steps() {
+        let mut plan = ai_plan_snap(7);
+        {
+            let viz = plan.semantic.plan.as_mut().unwrap();
+            viz.title = "API graceful drain".into();
+            viz.intent = "Stop new traffic before waiting for in-flight requests.".into();
+            let form = &mut viz.forms[0];
+            form.kind = codescope_core::FormKind::Sequence;
+            for (index, node) in form.nodes.iter_mut().enumerate() {
+                node.label = format!("Step{index}");
+                node.detail = Some(format!("explains effect {index}"));
+            }
+            form.edges[0].label = Some("SIGTERM/SIGINT triggers shutdown, unblocks waiters".into());
+            for (index, edge) in form.edges.iter_mut().enumerate().skip(1) {
+                edge.label = Some(format!("passes step {index}"));
+            }
+        }
+        let mut app = App::new();
+        app.update(plan.clone());
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let pane: String = (24..38).map(|y| format!("{}\n", row_text(&t, y))).collect();
+        assert!(pane.contains("API graceful drain"), "title: {pane}");
+        // The trust note precedes the ladder, so the default viewport shows it.
+        assert!(
+            pane.contains("≈ ┊ = inferred from cited diff"),
+            "basis note above the ladder: {pane}"
+        );
+        let note = pane.find("inferred from cited diff").expect("note");
+        let first_step = pane.find(" 1  Step0").expect("first step");
+        assert!(
+            note < first_step,
+            "the note precedes the first step: {pane}"
+        );
+        assert!(
+            pane.contains(" 1  Step0"),
+            "the first step is visible without scrolling: {pane}"
+        );
+        assert!(
+            pane.contains(" 2  Step1"),
+            "the second step is visible without scrolling: {pane}"
+        );
+        assert!(
+            pane.contains("SIGTERM/SIGINT triggers shutdown, unblocks waiters"),
+            "the causal label keeps the full pane width: {pane}"
+        );
+        // Terra P1 fix: the raised default height (12) gives the generated half ten
+        // inner rows, so after the header block the viewport reaches materially into
+        // the ladder — at least through step 3.
+        assert!(
+            pane.contains(" 3  Step2"),
+            "the default viewport reaches at least step 3: {pane}"
+        );
+
+        // With the retired summary/status rows gone, 80x20 gives Impact 11 rows while
+        // still preserving the seven-row work minimum.
+        let mut t80 = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        t80.draw(|f| render(f, &App::new(), &plan)).unwrap();
+        assert!(
+            crate::layout::impact_height(
+                crate::divider::DividerSizes::default().get(DividerId::WorkReview),
+                20
+            ) == 11,
+            "80x20 gives Impact the reclaimed chrome rows"
+        );
+    }
+
+    /// The precise external-assumption warning renders inside the default Impact pane,
+    /// above the inference basis and the first visual, with Review (WARN) styling.
+    /// The full Review block stays below the diagram.
+    #[test]
+    fn external_assumption_warning_visible_in_default_pane() {
+        let mut plan = ai_plan_snap(7);
+        {
+            let viz = plan.semantic.plan.as_mut().unwrap();
+            viz.title = "API graceful drain".into();
+            viz.intent = "Stop new traffic before waiting for in-flight requests.".into();
+            viz.review_focus = Some(
+                "External assumption: the 10s drain delay matches the load balancer probe interval."
+                    .into(),
+            );
+            let form = &mut viz.forms[0];
+            form.kind = codescope_core::FormKind::Sequence;
+            for (index, node) in form.nodes.iter_mut().enumerate() {
+                node.label = format!("Step{index}");
+                node.detail = Some(format!("explains effect {index}"));
+            }
+            form.edges[0].label = Some("SIGTERM/SIGINT triggers shutdown, unblocks waiters".into());
+            for (index, edge) in form.edges.iter_mut().enumerate().skip(1) {
+                edge.label = Some(format!("passes step {index}"));
+            }
+        }
+        let mut app = App::new();
+        app.update(plan.clone());
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let pane: String = (24..38).map(|y| format!("{}\n", row_text(&t, y))).collect();
+        // The warning sits above the basis note and the first step in the viewport.
+        let warning = pane.find("External assumption").expect("warning visible");
+        let basis = pane
+            .find("inferred from cited diff")
+            .expect("basis note visible");
+        let first_step = pane.find(" 1  Step0").expect("first step visible");
+        assert!(
+            warning < basis && basis < first_step,
+            "warning < basis < step: {pane}"
+        );
+        // Review styling (WARN) on the warning glyphs.
+        let warning_row = (24..38u16)
+            .find(|y| row_text(&t, *y).contains("External assumption"))
+            .expect("warning row");
+        let mut styled = false;
+        for x in 0..140u16 {
+            let (symbol, fg, _, _) = cell(&t, x, warning_row);
+            if (symbol == "⚠" || symbol == "e") && fg == WARN {
+                styled = true;
+            }
+        }
+        assert!(styled, "warning uses WARN styling: {pane}");
+        // The actual caveat, not a generic "see below" marker, is readable up front.
+        assert!(
+            pane.contains("load balancer probe interval"),
+            "precise caveat visible in the viewport: {pane}"
+        );
+    }
+
+    /// Node highlighting is wired to the actual selected change: a plan node whose label
+    /// matches `impact.selected_change.label` renders with the selection style. The old
+    /// wiring passed the dispatcher's data-quality note, which could never match.
+    #[test]
+    fn selected_node_label_is_highlighted() {
+        let mut plan = ai_plan_snap(5);
+        plan.semantic.plan.as_mut().unwrap().forms[0].nodes[2].label = "WiredTarget".into();
+        plan.impact.selected_change = Some(crate::snapshot::SelectedChange {
+            file: "internal/service/service.go".to_string(),
+            label: "WiredTarget".to_string(),
+            change: "modified",
+            interpretation: "Signature changed.".to_string(),
+            interpretation_source: Default::default(),
+        });
+        let mut app = App::new();
+        app.update(plan.clone());
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        // Five steps cannot fit side by side: the ladder renders, step 3 at the last row
+        // of the default pane.
+        let mut highlighted = false;
+        for y in 24..38u16 {
+            let row = row_text(&t, y);
+            if !row.contains("WiredTarget") {
+                continue;
+            }
+            for x in 0..140u16 {
+                let (symbol, fg, _, modifier) = cell(&t, x, y);
+                if symbol == "W" && fg == ACCENT && modifier.contains(Modifier::BOLD) {
+                    highlighted = true;
+                }
+            }
+        }
+        assert!(
+            highlighted,
+            "the matching node uses the selection style: {}",
+            (24..38).map(|y| row_text(&t, y)).collect::<String>()
+        );
+    }
+
+    /// At a 40-column focus-only size no box border is ever clipped: every top border
+    /// that opens also closes within the pane (the old clamp forced 18-cell boxes into a
+    /// 17-cell half).
+    #[test]
+    fn narrow_focus_renders_without_clipped_borders() {
+        let plan = ai_plan_snap(3);
+        let mut app = App::new();
+        app.update(plan.clone());
+        app.apply(crate::action::Action::Focus(Pane::Impact));
+        let mut t = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let buf = t.backend().buffer();
+        for y in 0..24u16 {
+            let mut opens = 0usize;
+            let mut closes = 0usize;
+            let mut bottom_opens = 0usize;
+            let mut bottom_closes = 0usize;
+            for x in 0..40u16 {
+                match buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ") {
+                    "┌" => opens += 1,
+                    "┐" => closes += 1,
+                    "└" => bottom_opens += 1,
+                    "┘" => bottom_closes += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                opens,
+                closes,
+                "clipped top border at row {y}: {}",
+                row_text(&t, y)
+            );
+            assert_eq!(
+                bottom_opens,
+                bottom_closes,
+                "clipped bottom border at row {y}: {}",
+                row_text(&t, y)
+            );
+        }
+        let text = buffer_text(&t);
+        assert!(text.contains("PlanStep0"), "steps survive at 40x24: {text}");
+    }
+
+    #[test]
+    fn ai_plan_scrolls_over_physical_diagram_lines() {
         let plan = ai_plan_snap(8);
         let app = app_after_ai_landed(&plan);
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
-        // Inner height 7: header + 5 rows + the marker (8 rows total).
-        let (r5, r6) = (row_text(&t, 35), row_text(&t, 36));
-        assert!(r5.contains("PlanStep4"), "fifth row: {r5}");
-        assert!(r6.contains("… +3 more"), "truncation marker: {r6}");
-        // Scrolling down moves the window; the end needs no marker.
+        let initial: String = (24..38).map(|y| row_text(&t, y)).collect();
+        assert!(
+            initial.contains("Authentication request flow"),
+            "title: {initial}"
+        );
+        assert!(initial.contains("PlanStep0"), "first step: {initial}");
+        // The trust note precedes the ladder, so the default viewport shows it above
+        // the first step.
+        assert!(
+            initial.contains("≈ ┊ = inferred from cited diff"),
+            "basis note above the ladder: {initial}"
+        );
+        // Scrolling moves over physical ladder lines computed for this width: one line
+        // per step, one per edge rail.
         let mut app = app_after_ai_landed(&plan);
         app.apply(crate::action::Action::Focus(Pane::Impact));
-        for _ in 0..3 {
+        for _ in 0..6 {
             app.apply(crate::action::Action::Down);
         }
         t.draw(|f| render(f, &app, &plan)).unwrap();
-        let (r0, r4) = (row_text(&t, 31), row_text(&t, 35));
-        assert!(r0.contains("PlanStep3"), "scrolled: {r0}");
-        assert!(r4.contains("PlanStep7"), "last row: {r4}");
-        let body: String = (31..37).map(|y| row_text(&t, y)).collect();
-        assert!(!body.contains("more"), "no marker at the end: {body}");
+        let moved: String = (24..38).map(|y| row_text(&t, y)).collect();
+        assert!(
+            !moved.contains("Authentication request flow"),
+            "title scrolled: {moved}"
+        );
+        assert!(
+            !moved.contains("PlanStep0"),
+            "the first step scrolled out: {moved}"
+        );
+        assert!(
+            moved.contains("PlanStep4"),
+            "later steps enter view: {moved}"
+        );
+        app.apply(crate::action::Action::Bottom);
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let bottom: String = (24..38).map(|y| row_text(&t, y)).collect();
+        assert!(bottom.contains("PlanStep7"), "last step: {bottom}");
+        assert!(
+            bottom.contains(" 1  PlanStep") || bottom.contains("PlanStep6"),
+            "the taller default pane reaches deep into the ladder: {bottom}"
+        );
+        assert!(
+            !bottom.contains("cited diff"),
+            "the note stays pinned to the top of the ladder: {bottom}"
+        );
     }
 
     #[test]
@@ -2684,8 +3559,9 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
         let text = buffer_text(&t);
-        assert!(text.contains("Impact | AI Plan"), "tabs in zoom: {text}");
-        assert!(text.contains("· ZOOM"), "zoom tag: {text}");
+        assert!(!text.contains("Impact"), "section title removed: {text}");
+        assert!(!text.contains("AI Plan"), "retired tab absent: {text}");
+        assert!(text.contains("ZOOM"), "zoom tag: {text}");
         assert!(text.contains("PlanStep0"), "rows in zoom: {text}");
     }
 
@@ -2702,65 +3578,96 @@ mod tests {
         app.apply(crate::action::Action::Focus(Pane::Impact));
         let mut t = Terminal::new(TestBackend::new(30, 8)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
-        // 79x40: focus-only fallback also goes through the tabbed dispatcher.
+        // 79x40: focus-only fallback keeps the same combined layout.
         let mut app = app_after_ai_landed(&plan);
         app.apply(crate::action::Action::Focus(Pane::Impact));
         let mut t = Terminal::new(TestBackend::new(79, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
         let text = buffer_text(&t);
-        assert!(text.contains("Impact | AI Plan"), "79x40 tabs: {text}");
+        assert!(!text.contains("Impact"), "79x40 title removed: {text}");
+        assert!(!text.contains("AI Plan"), "79x40 retired tab: {text}");
         assert!(text.contains("PlanStep0"), "79x40 rows: {text}");
     }
 
     #[test]
-    fn impact_view_still_renders_the_three_columns() {
+    fn generated_impact_wraps_long_explanations_instead_of_truncating_them() {
+        // The intent is capped at two lines: a length that wraps into exactly two lines
+        // must be shown complete, not clipped or elided.
+        let mut plan = ai_plan_snap(1);
+        plan.semantic.plan.as_mut().unwrap().intent =
+            "The readiness endpoint returns unavailable before shutdown so new traffic stops"
+                .to_string();
+        let app = app_after_ai_landed(&plan);
+        let mut t = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        t.draw(|f| render(f, &app, &plan)).unwrap();
+        let body: String = (24..38).map(|y| format!("{}\n", row_text(&t, y))).collect();
+        assert!(
+            body.contains("The readiness endpoint"),
+            "first line: {body}"
+        );
+        assert!(body.contains("before shutdown"), "wrapped line: {body}");
+        assert!(
+            body.contains("new traffic stops"),
+            "untruncated ending: {body}"
+        );
+        assert!(!body.contains('…'), "long content was not elided: {body}");
+    }
+
+    #[test]
+    fn combined_impact_renders_relationship_stack_and_generated_breakdown() {
         let mut snap = sample();
         snap.impact = impact_sample();
         snap.ai = AiStatus::Ready {
             epoch: codescope_core::Epoch(3),
         };
-        snap.semantic = ai_plan_snap(3).semantic; // a plan exists but Impact is the view
+        snap.semantic = ai_plan_snap(3).semantic;
+        let mut app = App::new();
+        app.dividers.set(DividerId::WorkReview, 16);
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        t.draw(|f| render(f, &App::new(), &snap)).unwrap();
-        let header_row = row_text(&t, 30);
-        assert!(header_row.contains("SELECTED CHANGE"), "{header_row}");
-        assert!(header_row.contains("CALLERS ·"), "{header_row}");
-        assert!(header_row.contains("DOWNSTREAM ·"), "{header_row}");
-        let tabs = row_text(&t, 29);
-        assert!(tabs.contains("Impact | AI Plan"), "tabs: {tabs}");
-        assert!(
-            !row_text(&t, 31).contains("PlanStep0"),
-            "plan hidden in Impact view"
-        );
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("SELECTED CHANGE"), "{text}");
+        assert!(text.contains("CALLERS ·"), "{text}");
+        assert!(text.contains("DOWNSTREAM ·"), "{text}");
+        assert!(text.contains("PlanStep0"), "generated half: {text}");
+        assert!(!text.contains("AI Plan"), "retired tab: {text}");
     }
 
     // -- §3.6 / §3.7: status + help bars ------------------------------------------------
 
     #[test]
-    fn status_bar_shows_path_when_no_message() {
+    fn bottom_bar_right_justifies_tokens_and_path() {
+        let mut snap = sample();
+        snap.ai_tokens.input = 1_250;
+        snap.ai_tokens.output = 42;
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        t.draw(|f| render(f, &app_with(&sample()), &sample()))
-            .unwrap();
-        let status = row_text(&t, 38);
+        t.draw(|f| render(f, &app_with(&snap), &snap)).unwrap();
+        let status = row_text(&t, 39);
         assert!(
             status.contains("internal/service/service.go"),
             "full path: {status}"
         );
-        assert_eq!(cell(&t, 2, 38).1, MUTED, "path muted");
+        assert!(status.contains("tokens in 1.2k out 42"), "usage: {status}");
+        assert!(
+            status.trim_end().ends_with("internal/service/service.go"),
+            "path is final and right-aligned: {status:?}"
+        );
+        let path_x = status.find("internal/service/service.go").unwrap() as u16;
+        assert_eq!(cell(&t, path_x, 39).1, MUTED, "path muted");
     }
 
     #[test]
     fn status_bar_colors_messages_by_severity() {
         let mut snap = sample();
         snap.status = crate::snapshot::StatusMessage {
-            text: "AI timed out after 20s · A retry · m change model".to_string(),
+            text: "AI timed out after 20s · m change model · retries automatically".to_string(),
             level: crate::snapshot::StatusLevel::Error,
         };
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
-        assert_eq!(cell(&t, 2, 38).1, ERROR, "AI failure is an error");
+        assert_eq!(cell(&t, 2, 39).1, ERROR, "AI failure is an error");
         assert!(
-            row_text(&t, 38).contains("AI timed out after 20s"),
+            row_text(&t, 39).contains("AI timed out after 20s"),
             "actionable text"
         );
         snap.status = crate::snapshot::StatusMessage {
@@ -2768,7 +3675,7 @@ mod tests {
             level: crate::snapshot::StatusLevel::Info,
         };
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
-        assert_eq!(cell(&t, 2, 38).1, MUTED, "info is muted");
+        assert_eq!(cell(&t, 2, 39).1, MUTED, "info is muted");
     }
 
     #[test]
@@ -2780,7 +3687,55 @@ mod tests {
         };
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
-        assert_eq!(cell(&t, 2, 38).1, WARN, "warning");
+        assert_eq!(cell(&t, 2, 39).1, WARN, "warning");
+    }
+
+    #[test]
+    fn clicked_status_detail_wraps_and_shows_the_untruncated_tail() {
+        let mut snap = sample();
+        let tail = "TAIL_OF_PROVIDER_RESPONSE";
+        snap.status = crate::snapshot::StatusMessage {
+            text: format!(
+                "AI provider returned HTTP 400: {{\"error\":{{\"message\":\"{} {tail}\"}}}}",
+                "unsupported provider parameter ".repeat(8)
+            ),
+            level: crate::snapshot::StatusLevel::Warning,
+        };
+        let mut app = App::new();
+        app.update(snap.clone());
+        app.apply(crate::action::Action::ToggleStatusDetail);
+
+        let mut t = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        let text = buffer_text(&t);
+
+        assert!(text.contains("status details"), "overlay title: {text}");
+        assert!(
+            text.contains("AI provider returned HTTP 400"),
+            "message prefix: {text}"
+        );
+        assert!(text.contains(tail), "untruncated tail: {text}");
+        assert!(text.contains("click or Esc to close"), "close hint: {text}");
+    }
+
+    #[test]
+    fn status_detail_dialog_is_content_sized_and_width_capped() {
+        let area = Rect::new(0, 0, 200, 40);
+        let short = status_detail_rect(area, "brief provider error");
+        assert_eq!(
+            short.width, 120,
+            "wide terminals keep a readable line length"
+        );
+        assert_eq!(
+            short.height, 5,
+            "short errors use the minimum dialog height"
+        );
+        assert!(short.width < area.width && short.height < area.height);
+
+        let long = status_detail_rect(area, &"provider response detail ".repeat(40));
+        assert!(long.height > short.height, "content grows the dialog");
+        assert!(long.height < area.height.saturating_sub(4));
+        assert_eq!(wrapped_line_count("abcdefghij", 4), 3);
     }
 
     #[test]
@@ -2789,15 +3744,18 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
         assert!(
-            row_text(&t, 39).contains("[/] resize"),
+            row_text(&t, 39).contains("drag resize"),
             "full: {}",
             row_text(&t, 39)
         );
-        // Focus-only at 79 wide: help at y=39, resize dropped at 64..95.
+        // Focus-only at 79 wide: manual refresh remains visible while mouse guidance drops.
         let mut t = Terminal::new(TestBackend::new(79, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
         let help = row_text(&t, 39);
-        assert!(help.contains("n/N hunk"), "{help}");
+        assert!(
+            help.contains("R refresh"),
+            "manual mode is discoverable: {help}"
+        );
         assert!(!help.contains("resize"), "resize dropped: {help}");
     }
 
@@ -2809,8 +3767,8 @@ mod tests {
         t.draw(|f| render(f, &app, &sample())).unwrap();
         assert!(row_text(&t, 0).contains("codescope"), "top survives zoom");
         assert!(
-            row_text(&t, 1).contains("1 changed file"),
-            "summary survives zoom"
+            row_text(&t, 0).contains("1 file"),
+            "file count survives zoom"
         );
         assert!(row_text(&t, 39).contains("? help"), "help survives zoom");
         assert!(buffer_text(&t).contains("· ZOOM"), "zoom tag visible");
@@ -2837,7 +3795,7 @@ mod tests {
         app.show_help = true;
         let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
         t.draw(|f| render(f, &app, &sample())).unwrap();
-        assert!(buffer_text(&t).contains("keyboard controls"));
+        assert!(buffer_text(&t).contains("codescope — controls"));
     }
 
     #[test]
@@ -2859,6 +3817,10 @@ mod tests {
         t.draw(|f| render(f, &app, &snap_with_base())).unwrap();
         let text = buffer_text(&t);
         assert!(text.contains("comparison base"), "picker title: {text}");
+        assert!(
+            text.contains("selected: release/2.0"),
+            "picker names the selected base explicitly: {text}"
+        );
         assert!(text.contains("release/2.0"), "current base listed");
         assert!(text.contains("origin/main"), "a candidate listed");
         assert!(text.contains("●"), "current-base marker");
@@ -2887,7 +3849,35 @@ mod tests {
         );
     }
 
-    /// The files pane renders each semantic load state distinctly (lazy per-file
+    #[test]
+    fn base_picker_labels_no_selection_explicitly() {
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = App::new();
+        app.show_base_picker = true;
+        let mut snap = snap_with_base();
+        snap.base_ref.clear();
+        snap.repo.base = None;
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        assert!(buffer_text(&t).contains("selected: none"));
+    }
+
+    #[test]
+    fn base_picker_marks_a_bounded_candidate_scan() {
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = App::new();
+        app.show_base_picker = true;
+        let mut snap = snap_with_base();
+        snap.base_candidates_truncated = true;
+        t.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("bounded list"), "picker title: {text}");
+        assert!(
+            text.contains("more ancestors omitted"),
+            "picker note: {text}"
+        );
+    }
+
+    /// The files pane renders each semantic load state distinctly (asynchronous per-file
     /// analysis): Unloaded shows no fake zero, Loading shows the analyzing marker,
     /// Unsupported/Failed explain themselves, Ready-with-zero says so explicitly.
     #[test]
@@ -2898,6 +3888,8 @@ mod tests {
             path: path.to_string(),
             status: "M",
             changed_symbol_count: symbols.len(),
+            added_lines: 0,
+            removed_lines: 0,
             symbols,
             expanded,
             semantic,
@@ -2930,7 +3922,7 @@ mod tests {
             "unsupported: {text:?}"
         );
         assert!(
-            text.contains("analysis failed — Tab to retry"),
+            text.contains("analysis failed — retries after"),
             "failed: {text:?}"
         );
         assert!(

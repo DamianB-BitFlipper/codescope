@@ -17,6 +17,7 @@ use codescope_core::{
 use crate::detect::{detect_languages, Language};
 use crate::error::SemanticError;
 use crate::gopls::GoplsService;
+use crate::options::LanguageServiceOptions;
 use crate::rust_analyzer::RustAnalyzerService;
 
 /// One running language-server session behind the common semantic surface.
@@ -38,13 +39,23 @@ impl LanguageService {
     /// [`SemanticError::NoSupportedLanguage`] error is returned so the binary can
     /// distinguish "no language" from a real language-server failure.
     pub async fn start(root: &Utf8Path) -> Result<Self, SemanticError> {
+        Self::start_with_options(root, LanguageServiceOptions::default()).await
+    }
+
+    /// Start the detected language service with an explicit resource policy.
+    pub async fn start_with_options(
+        root: &Utf8Path,
+        options: LanguageServiceOptions,
+    ) -> Result<Self, SemanticError> {
         let languages = detect_languages(root);
         if languages.contains(&Language::Go) {
-            return Ok(LanguageService::Gopls(GoplsService::start(root).await?));
+            return Ok(LanguageService::Gopls(
+                GoplsService::start_with_options(root, options).await?,
+            ));
         }
         if languages.contains(&Language::Rust) {
             return Ok(LanguageService::RustAnalyzer(
-                RustAnalyzerService::start(root).await?,
+                RustAnalyzerService::start_with_options(root, options).await?,
             ));
         }
         Err(SemanticError::NoSupportedLanguage(languages))

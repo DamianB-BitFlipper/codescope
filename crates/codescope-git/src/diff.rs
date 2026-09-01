@@ -524,6 +524,25 @@ index 1234567..89abcde 100644
     }
 
     #[test]
+    fn hunk_body_preserves_leading_source_tabs() {
+        let text = concat!(
+            "diff --git a/main.go b/main.go\n",
+            "index 1234567..89abcde 100644\n",
+            "--- a/main.go\n",
+            "+++ b/main.go\n",
+            "@@ -1,2 +1,2 @@\n",
+            "-\told()\n",
+            "+\tif ready {\n",
+            " \t\twork()\n",
+        );
+        let file = &parse_unified_diff(text).unwrap()[0];
+        let lines = &file.hunks[0].lines;
+        assert_eq!(lines[0].text, "\told()");
+        assert_eq!(lines[1].text, "\tif ready {");
+        assert_eq!(lines[2].text, "\t\twork()");
+    }
+
+    #[test]
     fn comma_one_omitted_in_header() {
         let text = "\
 diff --git a/one.txt b/one.txt

@@ -9,6 +9,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::app::{App, Pane};
 
+/// Stable identity of one AI-plan node inside the current plan.
+///
+/// Node ids are local to a form, so the form index is part of every mouse/keyboard target.
+/// The app clears these targets whenever the generated plan changes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlanNodeTarget {
+    /// Zero-based form index inside [`codescope_core::VisualizationPlan::forms`].
+    pub form: usize,
+    /// Plan-local [`codescope_core::PlanNode::id`].
+    pub id: String,
+}
+
 /// A user intent. The dispatcher turns these into work; [`crate::app::App::apply`] turns
 /// them into view state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,14 +29,17 @@ pub enum Action {
     Quit,
     /// Toggle the help modal.
     ToggleHelp,
+    /// Open/close the full status-message detail overlay. Mouse clicks produce this;
+    /// `Esc` closes the overlay once open.
+    ToggleStatusDetail,
     /// Focus a pane directly (`1`/`2`/`3`; Tab no longer cycles panes).
     Focus(Pane),
     /// Tab on the files pane: set the expansion of the file the selection is on RIGHT
     /// NOW. The path is resolved by the app at keypress time and carried with the
     /// command, so a coalesced/out-of-order SelectionChanged can never make the
     /// dispatcher toggle a different file than the one the user pressed Tab on
-    /// (review 18 M4). Idempotent; expanding an Unloaded file dispatches its lazy
-    /// analysis.
+    /// (review 18 M4). Idempotent; this changes visibility only because analysis is
+    /// scheduled independently.
     SetFileExpanded {
         /// Repo-relative path of the file row.
         path: String,
@@ -77,10 +92,6 @@ pub enum Action {
     Collapse,
     /// Expand the selected node.
     Expand,
-    /// Narrow the files pane by two cells (`[`), clamped to 28..=56 (docs/review/15 §1.1).
-    ResizeFilesNarrower,
-    /// Widen the files pane by two cells (`]`), clamped to 28..=56.
-    ResizeFilesWider,
     /// Show the staged scope.
     ScopeStaged,
     /// Show the unstaged scope.
@@ -91,12 +102,8 @@ pub enum Action {
     ScopeWorking,
     /// Cycle scope (branch → staged → unstaged → working).
     ScopeCycle,
-    /// Re-scan git data.
+    /// Refresh repository state from Git and the working tree.
     RefreshGit,
-    /// Toggle AI on/off (inert when AI is not configured).
-    AiToggle,
-    /// Force an AI refresh for the current view.
-    AiRefresh,
     /// Open/close the AI model picker modal.
     ModelPicker,
     /// The user picked a model in the picker (the dispatcher applies it).
@@ -115,24 +122,39 @@ pub enum Action {
     PrevHunk,
     /// Toggle zoom of the focused pane into the whole main area (`z`).
     ToggleZoom,
-    /// Toggle the bottom pane between the deterministic Impact view and the AI plan (`v`).
-    ToggleBottomView,
     /// Toggle smart wrap in the diff pane (`W`); raw mode clips + h-scrolls.
     ToggleWrap,
     /// Reset the diff pane's horizontal scroll to zero (`0`).
     ResetHScroll,
+    /// Mouse motion: set the generated-plan node currently under the pointer. `None`
+    /// clears transient hover and its linked diff highlighting.
+    HoverPlanNode(Option<PlanNodeTarget>),
+    /// Mouse click: expand or collapse one generated-plan node's detail inspector.
+    TogglePlanNode(PlanNodeTarget),
     /// Mouse: select the file/symbol row at this logical index (and focus Files).
     /// The selection tracker emits the same SelectionChanged a keyboard move would.
     SelectFileRow {
         /// The logical (selectable) row index.
         logical_index: usize,
     },
-    /// Mouse: directly select the bottom pane's view (idempotent; `v` toggles).
-    SetBottomView(crate::app::BottomView),
-    /// Mouse drag: set the files-pane width to an absolute value (clamped).
-    SetFilesWidth(u16),
-    /// Mouse drag: set the Impact-pane height to an absolute value (clamped).
-    SetImpactHeight(u16),
+    /// Mouse wheel: set the independently scrollable region under the pointer. This is
+    /// absolute because the retained frame geometry owns the displayed/clamped origin.
+    ScrollRegion {
+        /// Stable region identity.
+        region: crate::scroll::ScrollRegionId,
+        /// New absolute row offset, already clamped to the rendered content.
+        offset: usize,
+    },
+    /// Mouse drag: set any registered divider's leading/trailing extent (clamped).
+    ResizeDivider {
+        /// Stable structural divider identity.
+        divider: crate::divider::DividerId,
+        /// Absolute requested extent in terminal cells.
+        extent: u16,
+    },
+    /// Persist the stable global view preferences. Produced by the run loop after an
+    /// explicit preference change; never produced directly by a key mapping.
+    PersistUiPreferences(crate::app::UiPreferences),
     /// The key did not map to an action.
     None,
 }
@@ -145,6 +167,12 @@ pub enum Action {
 pub fn map_key(key: KeyEvent, app: &App) -> Action {
     if key.kind != KeyEventKind::Press {
         return Action::None;
+    }
+    if app.status_detail.is_some() {
+        return match key.code {
+            KeyCode::Esc => Action::ToggleStatusDetail,
+            _ => Action::None,
+        };
     }
     if app.show_help {
         return match key.code {
@@ -177,8 +205,8 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         // their own Esc above).
         KeyCode::Esc if app.zoomed => Action::ToggleZoom,
         KeyCode::Esc => Action::None,
-        // Tab is lazy file expansion, not focus cycling: on the files pane it expands
-        // (analyzing on first expand) or collapses the selected file. Elsewhere inert.
+        // Tab controls file expansion, not focus cycling. Symbol analysis runs
+        // asynchronously regardless of expansion.
         KeyCode::Tab if app.focused == Pane::Files => match app.file_toggle_target() {
             Some((path, expanded)) => Action::SetFileExpanded { path, expanded },
             None => Action::None,
@@ -193,8 +221,6 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('w') => Action::ScopeWorking,
         KeyCode::Char('S') => Action::ScopeCycle,
         KeyCode::Char('R') => Action::RefreshGit,
-        KeyCode::Char('a') => Action::AiToggle,
-        KeyCode::Char('A') => Action::AiRefresh,
         KeyCode::Char('m') => Action::ModelPicker,
         KeyCode::Char('b') => Action::BasePicker,
         KeyCode::Char('j') | KeyCode::Down => Action::Down,
@@ -203,14 +229,12 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char(' ') => Action::ToggleExpand,
         KeyCode::Char('h') | KeyCode::Left => Action::Collapse,
         KeyCode::Char('l') | KeyCode::Right => Action::Expand,
-        KeyCode::Char('[') => Action::ResizeFilesNarrower,
-        KeyCode::Char(']') => Action::ResizeFilesWider,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::Char('n') => Action::NextHunk,
         KeyCode::Char('N') => Action::PrevHunk,
         KeyCode::Char('z') => Action::ToggleZoom,
-        KeyCode::Char('v') => Action::ToggleBottomView,
+        KeyCode::Char('v') => Action::None,
         KeyCode::Char('W') => Action::ToggleWrap,
         KeyCode::Char('0') => Action::ResetHScroll,
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
@@ -314,6 +338,12 @@ mod tests {
     }
 
     #[test]
+    fn manual_refresh_key() {
+        assert_eq!(map_key(key(KeyCode::Char('R')), &app()), Action::RefreshGit);
+        assert_eq!(map_key(key(KeyCode::Char('r')), &app()), Action::None);
+    }
+
+    #[test]
     fn focus_keys() {
         // Tab is lazy file expansion on the files pane, inert elsewhere; Shift-Tab is
         // inert everywhere. 1/2/3 focus panes directly.
@@ -324,6 +354,8 @@ mod tests {
                 path: "a.go".to_string(),
                 status: "M",
                 changed_symbol_count: 0,
+                added_lines: 0,
+                removed_lines: 0,
                 symbols: Vec::new(),
                 expanded: false,
                 semantic: crate::snapshot::FileSemanticLoad::Unloaded,
@@ -358,15 +390,10 @@ mod tests {
     }
 
     #[test]
-    fn files_resize_keys() {
-        assert_eq!(
-            map_key(key(KeyCode::Char('[')), &app()),
-            Action::ResizeFilesNarrower
-        );
-        assert_eq!(
-            map_key(key(KeyCode::Char(']')), &app()),
-            Action::ResizeFilesWider
-        );
+    fn resize_keys_are_unbound() {
+        assert_eq!(map_key(key(KeyCode::Char('[')), &app()), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char(']')), &app()), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('/')), &app()), Action::None);
     }
 
     #[test]
@@ -386,6 +413,19 @@ mod tests {
     }
 
     #[test]
+    fn status_detail_swallows_keys_and_esc_closes_it() {
+        let mut a = app();
+        a.snapshot.status = crate::snapshot::StatusMessage {
+            text: "provider returned HTTP 400".to_string(),
+            level: crate::snapshot::StatusLevel::Warning,
+        };
+        a.apply(Action::ToggleStatusDetail);
+        assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('?')), &a), Action::None);
+        assert_eq!(map_key(key(KeyCode::Esc), &a), Action::ToggleStatusDetail);
+    }
+
+    #[test]
     fn unmapped_is_none() {
         assert_eq!(map_key(key(KeyCode::Char('x')), &app()), Action::None);
     }
@@ -401,13 +441,10 @@ mod tests {
     }
 
     #[test]
-    fn v_toggles_bottom_view_and_ai_keys_are_unchanged() {
-        assert_eq!(
-            map_key(key(KeyCode::Char('v')), &app()),
-            Action::ToggleBottomView
-        );
-        assert_eq!(map_key(key(KeyCode::Char('a')), &app()), Action::AiToggle);
-        assert_eq!(map_key(key(KeyCode::Char('A')), &app()), Action::AiRefresh);
+    fn retired_view_and_ai_keys_are_unmapped() {
+        assert_eq!(map_key(key(KeyCode::Char('v')), &app()), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('a')), &app()), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('A')), &app()), Action::None);
     }
 
     #[test]

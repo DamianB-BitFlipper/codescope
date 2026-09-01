@@ -1,8 +1,5 @@
-//! The tokio run loop: terminal events + snapshot updates, with a biased select so keys
-//! always beat ticks. Terminal init/restore is the CALLER's responsibility
+//! The tokio run loop: terminal events + snapshot updates. Terminal init/restore is the CALLER's responsibility
 //! (`ratatui::init()` / `ratatui::restore()`); this only drives the loop.
-
-use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
@@ -20,7 +17,7 @@ use crate::snapshot::UiSnapshot;
 ///
 /// - `rx` carries new snapshots from the dispatcher (watch = latest-wins).
 /// - `tx` receives Actions that require work the TUI cannot do itself
-///   (RefreshGit, AiToggle, AiRefresh, scope changes); view-only actions are applied
+///   (RefreshGit, model/base selection, scope changes); view-only actions are applied
 ///   locally.
 pub async fn run(
     terminal: &mut DefaultTerminal,
@@ -32,7 +29,6 @@ pub async fn run(
     // ratatui::init already does this, but a missed enable leaves the app unresponsive.
     let _ = crossterm::terminal::enable_raw_mode();
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(33));
     let mut pending_scope = PendingScope::default();
     let mut selection = SelectionTracker::default();
 
@@ -40,14 +36,17 @@ pub async fn run(
     // recomputed). Rebuilt on every draw.
     let mut last_geometry = crate::geometry::UiGeometry::default();
     let mut drag = crate::mouse::DragState::Idle;
+    // Drag setters are previews: coalesce any number of motion samples into one write on
+    // mouse-up (or flush when the interaction is cancelled/exits).
+    let mut preferences_dirty = false;
     // Draw only when state changed. Mouse `Moved`/no-op events do not force a redraw, and a
-    // steady mouse stream cannot starve the snapshot/tick arms (review 24 B2).
+    // steady mouse stream cannot starve snapshot delivery (review 24 B2).
     let mut dirty = true; // first frame draws
     loop {
         if dirty {
             terminal.draw(|frame| {
                 let geo = crate::geometry::UiGeometry::build(frame.area(), &app, &app.snapshot);
-                render(frame, &app, &app.snapshot.clone());
+                render(frame, &app, &app.snapshot);
                 last_geometry = geo;
             })?;
             dirty = false;
@@ -62,14 +61,25 @@ pub async fn run(
                 match maybe {
                     Some(Ok(Event::Key(key))) => {
                         let action = map_key(key, &app);
-                        dispatch(&mut app, action, &tx, &mut pending_scope, &mut selection)
-                            .await;
+                        preferences_dirty |= dispatch(
+                            &mut app,
+                            action,
+                            &tx,
+                            &mut pending_scope,
+                            &mut selection,
+                        )
+                        .await;
+                        if app.should_quit && preferences_dirty {
+                            persist_preferences(&app, &tx).await;
+                            preferences_dirty = false;
+                        }
                         dirty = true;
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
                         // Route against the retained frame plan. Row clicks reuse the
                         // existing SelectionTracker: the returned action is dispatched
                         // through the same path as a keypress.
+                        let previous_drag = drag;
                         let outcome = crate::mouse::map_mouse(
                             mouse,
                             &app,
@@ -80,25 +90,51 @@ pub async fn run(
                         drag = outcome.drag;
                         dirty |= outcome.dirty;
                         if let Some(action) = outcome.action {
-                            dispatch(&mut app, action, &tx, &mut pending_scope, &mut selection)
-                                .await;
+                            preferences_dirty |= dispatch(
+                                &mut app,
+                                action,
+                                &tx,
+                                &mut pending_scope,
+                                &mut selection,
+                            )
+                            .await;
+                        }
+                        if !matches!(previous_drag, crate::mouse::DragState::Idle)
+                            && matches!(drag, crate::mouse::DragState::Idle)
+                            && preferences_dirty
+                        {
+                            persist_preferences(&app, &tx).await;
+                            preferences_dirty = false;
                         }
                     }
                     Some(Ok(Event::Resize(_, _))) => {
-                        // A resize invalidates the retained geometry and any drag anchored
-                        // to it: cancel the drag; the next draw rebuilds the plan.
+                        // A resize invalidates the retained geometry, hover target, and any
+                        // drag anchored to it. The next draw rebuilds the whole frame plan.
                         drag = crate::mouse::DragState::Idle;
+                        app.apply(Action::HoverPlanNode(None));
+                        if preferences_dirty {
+                            persist_preferences(&app, &tx).await;
+                            preferences_dirty = false;
+                        }
                         dirty = true;
                     }
                     // Event stream ended or errored: the loop cannot stay interactive; exit
                     // cleanly rather than hot-loop on a permanently-ready source.
-                    Some(Ok(_)) | Some(Err(_)) | None => return Ok(()),
+                    Some(Ok(_)) | Some(Err(_)) | None => {
+                        if preferences_dirty {
+                            persist_preferences(&app, &tx).await;
+                        }
+                        return Ok(());
+                    },
                 }
             }
             // A new repository/analysis state arrived.
             changed = rx.changed() => {
                 if changed.is_err() {
                     // Dispatcher dropped the sender: nothing more will arrive; stop.
+                    if preferences_dirty {
+                        persist_preferences(&app, &tx).await;
+                    }
                     return Ok(());
                 }
                 let mut snapshot = rx.borrow_and_update().clone();
@@ -109,8 +145,6 @@ pub async fn run(
                 selection.sync(&app, &tx).await;
                 dirty = true;
             }
-            // Spinner/redraw heartbeat.
-            _ = tick.tick() => {}
         }
     }
 }
@@ -209,7 +243,9 @@ async fn dispatch(
     tx: &mpsc::Sender<Action>,
     pending_scope: &mut PendingScope,
     selection: &mut SelectionTracker,
-) {
+) -> bool {
+    let before = app.preferences();
+    let drag_preview = matches!(&action, Action::ResizeDivider { .. });
     match action {
         Action::Activate => {
             // If the files-pane selection is a symbol row with a position, forward a
@@ -226,6 +262,10 @@ async fn dispatch(
                 app.filtered_models()
                     .get(app.model_sel)
                     .map(|s| (*s).to_string())
+                    .or_else(|| {
+                        let typed = app.model_query.trim();
+                        (!typed.is_empty()).then(|| typed.to_string())
+                    })
                     .unwrap_or_default()
             } else {
                 name
@@ -236,19 +276,17 @@ async fn dispatch(
             app.show_model_picker = false;
             app.model_query.clear();
         }
-        Action::RefreshGit | Action::AiToggle | Action::AiRefresh => {
+        Action::RefreshGit => {
             let _ = tx.send(action).await;
         }
         Action::SetFileExpanded { .. } => {
             // Optimistic local apply (responsive expand/collapse), then the dispatcher
-            // reconciles: it owns expansion + the lazy analysis job. The path is part of
+            // reconciles: it owns expansion state. The path is part of
             // the command, so a coalesced SelectionChanged cannot retarget it.
             app.apply(action.clone());
             let _ = tx.send(action).await;
         }
-        // Space/h/l are expansion aliases that must not bypass the lazy analysis path:
-        // an Unloaded row cannot be expanded without the dispatcher dispatching the job,
-        // so they resolve the same targeted command (which forwards to the dispatcher).
+        // Space/h/l are expansion aliases and resolve the same targeted command.
         Action::ToggleExpand | Action::Collapse | Action::Expand if app.focused == Pane::Files => {
             if let Some((path, expanded)) = app.file_toggle_target() {
                 let cmd = Action::SetFileExpanded { path, expanded };
@@ -301,9 +339,21 @@ async fn dispatch(
         }
         other => app.apply(other),
     }
+    let preferences_changed = app.preferences() != before;
+    if preferences_changed && !drag_preview {
+        persist_preferences(app, tx).await;
+    }
     // Navigation-driven panes: whatever the action did, tell the dispatcher where the
     // files-pane selection landed (sends only on change).
     selection.sync(app, tx).await;
+    preferences_changed && drag_preview
+}
+
+/// Forward one coalesced global-preference snapshot to the dispatcher/config writer.
+async fn persist_preferences(app: &App, tx: &mpsc::Sender<Action>) {
+    let _ = tx
+        .send(Action::PersistUiPreferences(app.preferences()))
+        .await;
 }
 
 /// Resolve the currently selected symbol row to a [`Action::SelectSymbol`], if the files-pane
@@ -424,6 +474,91 @@ mod tests {
         assert!(app.model_query.is_empty(), "Enter clears the query");
     }
 
+    #[tokio::test]
+    async fn enter_uses_typed_model_when_discovery_has_no_match() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = App::new();
+        let mut pending = PendingScope::default();
+        app.update(UiSnapshot {
+            ai_model: "current/model".to_string(),
+            ai_provider: "custom".to_string(),
+            available_models: vec!["current/model".to_string()],
+            model_list_error: Some("provider has no models endpoint".to_string()),
+            ..UiSnapshot::default()
+        });
+        app.apply(Action::ModelPicker);
+        for character in "new/model-id".chars() {
+            app.apply(Action::PickerInput(character));
+        }
+
+        dispatch(
+            &mut app,
+            Action::ModelSelected(String::new()),
+            &tx,
+            &mut pending,
+            &mut SelectionTracker::default(),
+        )
+        .await;
+        assert_eq!(
+            rx.recv().await,
+            Some(Action::ModelSelected("new/model-id".to_string()))
+        );
+        assert!(!app.show_model_picker);
+        assert!(app.model_query.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drag_previews_coalesce_until_one_explicit_persist() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = App::new();
+        let mut pending = PendingScope::default();
+        let mut selection = SelectionTracker::default();
+
+        let dirty = dispatch(
+            &mut app,
+            Action::ResizeDivider {
+                divider: crate::divider::DividerId::FilesDiff,
+                extent: 47,
+            },
+            &tx,
+            &mut pending,
+            &mut selection,
+        )
+        .await;
+        assert!(dirty, "drag preview changed a stable preference");
+        assert!(rx.try_recv().is_err(), "preview must not write config");
+
+        let dirty_again = dispatch(
+            &mut app,
+            Action::ResizeDivider {
+                divider: crate::divider::DividerId::FilesDiff,
+                extent: 51,
+            },
+            &tx,
+            &mut pending,
+            &mut selection,
+        )
+        .await;
+        assert!(dirty_again);
+        assert!(rx.try_recv().is_err(), "many samples still write nothing");
+
+        persist_preferences(&app, &tx).await;
+        let persisted = rx.recv().await;
+        let Some(Action::PersistUiPreferences(preferences)) = persisted else {
+            panic!("expected one preferences update, got {persisted:?}");
+        };
+        assert_eq!(
+            preferences
+                .dividers
+                .get(crate::divider::DividerId::FilesDiff),
+            51
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "release flush is exactly one action"
+        );
+    }
+
     /// Navigation moves within the filtered list: j/k indices address filtered entries.
     #[tokio::test]
     async fn base_picker_selection_indexes_the_filtered_list() {
@@ -477,6 +612,8 @@ mod tests {
                     path: "a.go".to_string(),
                     status: "M",
                     changed_symbol_count: 2,
+                    added_lines: 0,
+                    removed_lines: 0,
                     symbols: vec![symbol("sym0", Some((10, 4))), symbol("sym1", Some((20, 4)))],
                     expanded: true,
                     semantic: Default::default(),
@@ -485,6 +622,8 @@ mod tests {
                     path: "b.go".to_string(),
                     status: "M",
                     changed_symbol_count: 0,
+                    added_lines: 0,
+                    removed_lines: 0,
                     symbols: Vec::new(),
                     expanded: false,
                     semantic: Default::default(),
@@ -595,6 +734,8 @@ mod tests {
                 path: "a.go".to_string(),
                 status: "M",
                 changed_symbol_count: 2,
+                added_lines: 0,
+                removed_lines: 0,
                 semantic: crate::snapshot::FileSemanticLoad::Ready,
                 symbols: vec![
                     SymbolRow {

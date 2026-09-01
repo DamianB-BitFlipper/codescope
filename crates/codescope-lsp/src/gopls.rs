@@ -25,15 +25,26 @@ use tokio::sync::Mutex;
 
 use crate::capabilities::{parse_text_document_sync, require, resolve_features};
 use crate::client::{LspClient, ShutdownOutcome};
+use crate::content_cache::{DocumentSnapshot, OpenDocumentState, SymbolTreeCache};
 use crate::detect::go_module_folders;
 use crate::encoding::{line_at, position_from_wire, position_to_wire, PositionEncoding};
 use crate::error::{LspError, SemanticError};
+use crate::options::LanguageServiceOptions;
 use crate::uri::{path_from_uri, uri_from_path};
 
 /// Deadline for the very first request (gopls loads the workspace lazily).
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Steady-state request deadline.
 const STEADY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn gopls_command(program: &str, repo_root: &Utf8Path, options: LanguageServiceOptions) -> Command {
+    let mut command = Command::new(program);
+    command
+        .arg("serve")
+        .env("GOMAXPROCS", options.max_threads.to_string())
+        .current_dir(repo_root.as_std_path());
+    command
+}
 
 /// gopls session state.
 #[derive(Debug)]
@@ -45,8 +56,10 @@ pub struct GoplsService {
     go_roots: Vec<Utf8PathBuf>,
     features: FeatureSet,
     encoding: PositionEncoding,
-    /// Open document versions by absolute path (for didChange versioning).
-    versions: Mutex<HashMap<Utf8PathBuf, i32>>,
+    /// Open document versions and content identities by absolute path.
+    documents: Mutex<HashMap<Utf8PathBuf, OpenDocumentState>>,
+    /// Content-addressed symbol trees survive repository epochs without becoming stale.
+    symbol_cache: Mutex<SymbolTreeCache>,
     /// Monotonic request counter to distinguish the slow first request.
     request_count: AtomicU64,
 }
@@ -56,6 +69,16 @@ impl GoplsService {
     /// and `go.work` under it as a workspace folder.
     #[tracing::instrument(err)]
     pub async fn start(repo_root: &Utf8Path) -> Result<Self, SemanticError> {
+        Self::start_with_options(repo_root, LanguageServiceOptions::default()).await
+    }
+
+    /// Spawn gopls with an explicit worker-thread limit.
+    #[tracing::instrument(err)]
+    pub async fn start_with_options(
+        repo_root: &Utf8Path,
+        options: LanguageServiceOptions,
+    ) -> Result<Self, SemanticError> {
+        let options = options.normalized();
         let mut go_roots = go_module_folders(repo_root);
         if go_roots.is_empty() {
             // This should normally be caught by LanguageService::start, but keep the
@@ -69,8 +92,7 @@ impl GoplsService {
         }
 
         let program = std::env::var("CODESCOPE_GOPLS").unwrap_or_else(|_| "gopls".to_string());
-        let mut command = Command::new(&program);
-        command.arg("serve").current_dir(repo_root.as_std_path());
+        let command = gopls_command(&program, repo_root, options);
         let client = LspClient::spawn(command, "gopls")?;
 
         let root_uri = uri_from_path(repo_root)?;
@@ -120,7 +142,8 @@ impl GoplsService {
             go_roots,
             features,
             encoding,
-            versions: Mutex::new(HashMap::new()),
+            documents: Mutex::new(HashMap::new()),
+            symbol_cache: Mutex::new(SymbolTreeCache::default()),
             request_count: AtomicU64::new(0),
         })
     }
@@ -170,23 +193,23 @@ impl GoplsService {
         }
     }
 
-    /// Ensure gopls has the current disk content of `file` as an open document.
-    /// gopls advertises incremental sync only; the simplest correct overlay update is
-    /// close + reopen with the full text (research 01: documented choice).
-    async fn sync_worktree(&self, file: &FileId) -> Result<Utf8PathBuf, SemanticError> {
+    /// Read the file once and ensure gopls has that exact content as an open document.
+    async fn sync_worktree(&self, file: &FileId) -> Result<DocumentSnapshot, SemanticError> {
         let abs = self.abs_path(file);
         let text = std::fs::read_to_string(&abs).map_err(|source| SemanticError::FileRead {
             path: abs.clone(),
             source,
         })?;
-        self.reopen(&abs, &text).await?;
-        Ok(abs)
+        let snapshot = DocumentSnapshot::new(abs, text);
+        self.sync_content(&snapshot.abs, &snapshot.text, snapshot.hash)
+            .await?;
+        Ok(snapshot)
     }
 
     /// Close the overlay for `abs` if one is open.
     async fn close(&self, abs: &Utf8Path) -> Result<(), SemanticError> {
-        let mut versions = self.versions.lock().await;
-        if versions.remove(abs).is_some() {
+        let mut documents = self.documents.lock().await;
+        if documents.remove(abs).is_some() {
             let uri = uri_from_path(abs)?;
             self.client
                 .notify(
@@ -198,18 +221,35 @@ impl GoplsService {
         Ok(())
     }
 
-    /// Close (if open) then didOpen with `text`.
-    async fn reopen(&self, abs: &Utf8Path, text: &str) -> Result<(), SemanticError> {
+    /// Synchronize a full-text overlay. Unchanged content emits no notification; changed
+    /// content advances the LSP version with didChange instead of close/open churn.
+    async fn sync_content(
+        &self,
+        abs: &Utf8Path,
+        text: &str,
+        hash: u64,
+    ) -> Result<bool, SemanticError> {
         let uri = uri_from_path(abs)?;
-        let mut versions = self.versions.lock().await;
-        if versions.contains_key(abs) {
+        let mut documents = self.documents.lock().await;
+        if let Some(state) = documents.get_mut(abs) {
+            if state.hash == hash {
+                return Ok(false);
+            }
+            state.version = state.version.saturating_add(1);
+            state.hash = hash;
             self.client
                 .notify(
-                    "textDocument/didClose",
-                    json!({ "textDocument": { "uri": uri.as_str() } }),
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {
+                            "uri": uri.as_str(),
+                            "version": state.version,
+                        },
+                        "contentChanges": [{ "text": text }]
+                    }),
                 )
                 .await?;
-            versions.remove(abs);
+            return Ok(true);
         }
         self.client
             .notify(
@@ -224,8 +264,8 @@ impl GoplsService {
                 }),
             )
             .await?;
-        versions.insert(abs.to_path_buf(), 1);
-        Ok(())
+        documents.insert(abs.to_path_buf(), OpenDocumentState { version: 1, hash });
+        Ok(true)
     }
 
     /// Current push-diagnostics for `file`, converted to utf-8 positions.
@@ -279,9 +319,16 @@ impl GoplsService {
         file: &FileId,
     ) -> Result<Evidence<SymbolTree>, SemanticError> {
         require(&self.features, codescope_core::Feature::DocumentSymbols)?;
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
+        let snapshot = self.sync_worktree(file).await?;
+        if let Some(tree) =
+            self.symbol_cache
+                .lock()
+                .await
+                .get(&snapshot.abs, Revision::Worktree, snapshot.hash)
+        {
+            return Ok(tree);
+        }
+        let uri = uri_from_path(&snapshot.abs)?;
         let result = self
             .client
             .request(
@@ -290,7 +337,20 @@ impl GoplsService {
                 self.timeout(),
             )
             .await?;
-        self.symbol_tree(file.clone(), Revision::Worktree, result, &text, &abs)
+        let tree = self.symbol_tree(
+            file.clone(),
+            Revision::Worktree,
+            result,
+            &snapshot.text,
+            &snapshot.abs,
+        )?;
+        self.symbol_cache.lock().await.insert(
+            snapshot.abs,
+            Revision::Worktree,
+            snapshot.hash,
+            tree.clone(),
+        );
+        Ok(tree)
     }
 
     /// Symbol tree of `content` as a temporary overlay (base-revision analysis).
@@ -302,9 +362,25 @@ impl GoplsService {
     ) -> Result<Evidence<SymbolTree>, SemanticError> {
         require(&self.features, codescope_core::Feature::DocumentSymbols)?;
         let abs = self.abs_path(file);
-        let disk = std::fs::read_to_string(&abs).ok();
+        let base_hash = xxhash_rust::xxh3::xxh3_64(content.as_bytes());
+        if let Some(tree) = self
+            .symbol_cache
+            .lock()
+            .await
+            .get(&abs, Revision::Base, base_hash)
+        {
+            return Ok(tree);
+        }
+        let was_open = self.documents.lock().await.contains_key(&abs);
+        let disk = if was_open {
+            std::fs::read_to_string(&abs)
+                .ok()
+                .map(|text| DocumentSnapshot::new(abs.clone(), text))
+        } else {
+            None
+        };
         // Overlay with the base content, query, then restore the worktree view.
-        self.reopen(&abs, content).await?;
+        self.sync_content(&abs, content, base_hash).await?;
         let uri = uri_from_path(&abs)?;
         let result = self
             .client
@@ -316,14 +392,22 @@ impl GoplsService {
             .await;
         // Restore the worktree view. For a deleted file, close the overlay instead of
         // reopening an empty document (F2: an empty overlay produces phantom diagnostics).
-        let restore = match &disk {
-            Some(text) => self.reopen(&abs, text).await,
-            None => self.close(&abs).await,
+        let restore = match (was_open, &disk) {
+            (true, Some(snapshot)) => self
+                .sync_content(&abs, &snapshot.text, snapshot.hash)
+                .await
+                .map(|_| ()),
+            _ => self.close(&abs).await,
         };
         let result = result?;
         restore?;
         // Wire positions refer to the overlay `content`, not the disk text.
-        self.symbol_tree(file.clone(), Revision::Base, result, content, &abs)
+        let tree = self.symbol_tree(file.clone(), Revision::Base, result, content, &abs)?;
+        self.symbol_cache
+            .lock()
+            .await
+            .insert(abs, Revision::Base, base_hash, tree.clone());
+        Ok(tree)
     }
 
     fn symbol_tree(
@@ -420,10 +504,9 @@ impl GoplsService {
         pos: Position,
     ) -> Result<Evidence<Vec<Location>>, SemanticError> {
         require(&self.features, codescope_core::Feature::References)?;
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
         let result = self
             .client
             .request(
@@ -527,10 +610,9 @@ impl GoplsService {
         pos: Position,
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
         require(&self.features, codescope_core::Feature::Implementation)?;
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
         let result = self
             .client
             .request(
@@ -584,10 +666,9 @@ impl GoplsService {
         file: &FileId,
         pos: Position,
     ) -> Result<Option<lsp_types::CallHierarchyItem>, SemanticError> {
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
         let result = self
             .client
             .request(
@@ -611,10 +692,9 @@ impl GoplsService {
         file: &FileId,
         pos: Position,
     ) -> Result<Option<lsp_types::TypeHierarchyItem>, SemanticError> {
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
         let result = self
             .client
             .request(
@@ -726,5 +806,26 @@ impl GoplsService {
     /// Graceful teardown.
     pub async fn shutdown(self) {
         let _outcome: ShutdownOutcome = self.client.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gopls_command_limits_go_workers() {
+        let command = gopls_command(
+            "gopls",
+            Utf8Path::new("."),
+            LanguageServiceOptions { max_threads: 2 },
+        );
+        let gomaxprocs = command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == "GOMAXPROCS")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str());
+        assert_eq!(gomaxprocs, Some("2"));
     }
 }

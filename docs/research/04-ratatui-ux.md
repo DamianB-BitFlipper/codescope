@@ -114,7 +114,6 @@ whole keymap is unit-testable without a terminal.
 | `Tab` / `Shift-Tab`, `1` `2` `3` | cycle / directly focus files, diff, semantic pane |
 | `s` / `u` / `B` | scope: staged / unstaged / branch-vs-base (`S` cycles) |
 | `R` | re-scan git data |
-| `a` / `A` | toggle AI on-off / force AI refresh for current view (inert without AI config) |
 | `j`/`k`, `↓`/`↑` | move selection / scroll focused pane |
 | `Enter` | files: jump diff+semantic to symbol; semantic: re-center impact graph on symbol |
 | `Space`, `h`/`l`, `←`/`→` | collapse/expand tree node (files, impact) |

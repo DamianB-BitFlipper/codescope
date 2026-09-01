@@ -26,15 +26,24 @@ use tokio::sync::Mutex;
 
 use crate::capabilities::{parse_text_document_sync, require, resolve_features};
 use crate::client::{LspClient, ShutdownOutcome};
+use crate::content_cache::{DocumentSnapshot, OpenDocumentState, SymbolTreeCache};
 use crate::detect::rust_project_root;
 use crate::encoding::{line_at, position_from_wire, position_to_wire, PositionEncoding};
 use crate::error::{LspError, SemanticError};
+use crate::options::LanguageServiceOptions;
 use crate::uri::{path_from_uri, uri_from_path};
 
 /// Deadline for the very first request (rust-analyzer loads the workspace eagerly).
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Steady-state request deadline.
 const STEADY_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn initialization_options(options: LanguageServiceOptions) -> Value {
+    json!({
+        "numThreads": options.max_threads,
+        "cachePriming": { "numThreads": options.max_threads }
+    })
+}
 
 /// rust-analyzer session state.
 #[derive(Debug)]
@@ -47,8 +56,10 @@ pub struct RustAnalyzerService {
     cargo_root: Utf8PathBuf,
     features: FeatureSet,
     encoding: PositionEncoding,
-    /// Open document versions by absolute path (for didChange versioning).
-    versions: Mutex<HashMap<Utf8PathBuf, i32>>,
+    /// Open document versions and content identities by absolute path.
+    documents: Mutex<HashMap<Utf8PathBuf, OpenDocumentState>>,
+    /// Content-addressed symbol trees survive repository epochs without becoming stale.
+    symbol_cache: Mutex<SymbolTreeCache>,
     /// Monotonic request counter to distinguish the slow first request.
     request_count: AtomicU64,
 }
@@ -60,6 +71,16 @@ impl RustAnalyzerService {
     /// `repo_root`, walking up to a `[workspace]` root if one exists.
     #[tracing::instrument(err)]
     pub async fn start(repo_root: &Utf8Path) -> Result<Self, SemanticError> {
+        Self::start_with_options(repo_root, LanguageServiceOptions::default()).await
+    }
+
+    /// Spawn rust-analyzer with an explicit worker-thread limit.
+    #[tracing::instrument(err)]
+    pub async fn start_with_options(
+        repo_root: &Utf8Path,
+        options: LanguageServiceOptions,
+    ) -> Result<Self, SemanticError> {
+        let options = options.normalized();
         let cargo_root = rust_project_root(repo_root).ok_or_else(|| {
             SemanticError::Client(LspError::Protocol(format!(
                 "no Cargo.toml found under {repo_root}"
@@ -87,7 +108,7 @@ impl RustAnalyzerService {
                 },
                 "workspace": { "workspaceFolders": true, "symbol": {} }
             },
-            "initializationOptions": {}
+            "initializationOptions": initialization_options(options)
         });
         let init = client
             .request("initialize", params, FIRST_REQUEST_TIMEOUT)
@@ -109,7 +130,8 @@ impl RustAnalyzerService {
             cargo_root,
             features,
             encoding,
-            versions: Mutex::new(HashMap::new()),
+            documents: Mutex::new(HashMap::new()),
+            symbol_cache: Mutex::new(SymbolTreeCache::default()),
             request_count: AtomicU64::new(0),
         })
     }
@@ -161,20 +183,22 @@ impl RustAnalyzerService {
     }
 
     /// Ensure rust-analyzer has the current disk content of `file` as an open document.
-    async fn sync_worktree(&self, file: &FileId) -> Result<Utf8PathBuf, SemanticError> {
+    async fn sync_worktree(&self, file: &FileId) -> Result<DocumentSnapshot, SemanticError> {
         let abs = self.abs_path(file);
         let text = std::fs::read_to_string(&abs).map_err(|source| SemanticError::FileRead {
             path: abs.clone(),
             source,
         })?;
-        self.reopen(&abs, &text).await?;
-        Ok(abs)
+        let snapshot = DocumentSnapshot::new(abs, text);
+        self.sync_content(&snapshot.abs, &snapshot.text, snapshot.hash)
+            .await?;
+        Ok(snapshot)
     }
 
     /// Close the overlay for `abs` if one is open.
     async fn close(&self, abs: &Utf8Path) -> Result<(), SemanticError> {
-        let mut versions = self.versions.lock().await;
-        if versions.remove(abs).is_some() {
+        let mut documents = self.documents.lock().await;
+        if documents.remove(abs).is_some() {
             let uri = uri_from_path(abs)?;
             self.client
                 .notify(
@@ -186,18 +210,34 @@ impl RustAnalyzerService {
         Ok(())
     }
 
-    /// Close (if open) then didOpen with `text`.
-    async fn reopen(&self, abs: &Utf8Path, text: &str) -> Result<(), SemanticError> {
+    /// Synchronize a full-text overlay without close/open churn.
+    async fn sync_content(
+        &self,
+        abs: &Utf8Path,
+        text: &str,
+        hash: u64,
+    ) -> Result<bool, SemanticError> {
         let uri = uri_from_path(abs)?;
-        let mut versions = self.versions.lock().await;
-        if versions.contains_key(abs) {
+        let mut documents = self.documents.lock().await;
+        if let Some(state) = documents.get_mut(abs) {
+            if state.hash == hash {
+                return Ok(false);
+            }
+            state.version = state.version.saturating_add(1);
+            state.hash = hash;
             self.client
                 .notify(
-                    "textDocument/didClose",
-                    json!({ "textDocument": { "uri": uri.as_str() } }),
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {
+                            "uri": uri.as_str(),
+                            "version": state.version,
+                        },
+                        "contentChanges": [{ "text": text }]
+                    }),
                 )
                 .await?;
-            versions.remove(abs);
+            return Ok(true);
         }
         self.client
             .notify(
@@ -212,8 +252,8 @@ impl RustAnalyzerService {
                 }),
             )
             .await?;
-        versions.insert(abs.to_path_buf(), 1);
-        Ok(())
+        documents.insert(abs.to_path_buf(), OpenDocumentState { version: 1, hash });
+        Ok(true)
     }
 
     /// Current push-diagnostics for `file`, converted to utf-8 positions.
@@ -267,9 +307,16 @@ impl RustAnalyzerService {
         file: &FileId,
     ) -> Result<Evidence<SymbolTree>, SemanticError> {
         require(&self.features, codescope_core::Feature::DocumentSymbols)?;
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
+        let snapshot = self.sync_worktree(file).await?;
+        if let Some(tree) =
+            self.symbol_cache
+                .lock()
+                .await
+                .get(&snapshot.abs, Revision::Worktree, snapshot.hash)
+        {
+            return Ok(tree);
+        }
+        let uri = uri_from_path(&snapshot.abs)?;
         let result = self
             .client
             .request(
@@ -278,7 +325,20 @@ impl RustAnalyzerService {
                 self.timeout(),
             )
             .await?;
-        self.symbol_tree(file.clone(), Revision::Worktree, result, &text, &abs)
+        let tree = self.symbol_tree(
+            file.clone(),
+            Revision::Worktree,
+            result,
+            &snapshot.text,
+            &snapshot.abs,
+        )?;
+        self.symbol_cache.lock().await.insert(
+            snapshot.abs,
+            Revision::Worktree,
+            snapshot.hash,
+            tree.clone(),
+        );
+        Ok(tree)
     }
 
     /// Symbol tree of `content` as a temporary overlay (base-revision analysis).
@@ -290,8 +350,24 @@ impl RustAnalyzerService {
     ) -> Result<Evidence<SymbolTree>, SemanticError> {
         require(&self.features, codescope_core::Feature::DocumentSymbols)?;
         let abs = self.abs_path(file);
-        let disk = std::fs::read_to_string(&abs).ok();
-        self.reopen(&abs, content).await?;
+        let base_hash = xxhash_rust::xxh3::xxh3_64(content.as_bytes());
+        if let Some(tree) = self
+            .symbol_cache
+            .lock()
+            .await
+            .get(&abs, Revision::Base, base_hash)
+        {
+            return Ok(tree);
+        }
+        let was_open = self.documents.lock().await.contains_key(&abs);
+        let disk = if was_open {
+            std::fs::read_to_string(&abs)
+                .ok()
+                .map(|text| DocumentSnapshot::new(abs.clone(), text))
+        } else {
+            None
+        };
+        self.sync_content(&abs, content, base_hash).await?;
         let uri = uri_from_path(&abs)?;
         let result = self
             .client
@@ -301,13 +377,21 @@ impl RustAnalyzerService {
                 self.timeout(),
             )
             .await;
-        let restore = match &disk {
-            Some(text) => self.reopen(&abs, text).await,
-            None => self.close(&abs).await,
+        let restore = match (was_open, &disk) {
+            (true, Some(snapshot)) => self
+                .sync_content(&abs, &snapshot.text, snapshot.hash)
+                .await
+                .map(|_| ()),
+            _ => self.close(&abs).await,
         };
         let result = result?;
         restore?;
-        self.symbol_tree(file.clone(), Revision::Base, result, content, &abs)
+        let tree = self.symbol_tree(file.clone(), Revision::Base, result, content, &abs)?;
+        self.symbol_cache
+            .lock()
+            .await
+            .insert(abs, Revision::Base, base_hash, tree.clone());
+        Ok(tree)
     }
 
     fn symbol_tree(
@@ -401,10 +485,9 @@ impl RustAnalyzerService {
         pos: Position,
     ) -> Result<Evidence<Vec<Location>>, SemanticError> {
         require(&self.features, codescope_core::Feature::References)?;
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
         let result = self
             .client
             .request(
@@ -508,10 +591,9 @@ impl RustAnalyzerService {
         pos: Position,
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
         require(&self.features, codescope_core::Feature::Implementation)?;
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
         let result = self
             .client
             .request(
@@ -550,10 +632,9 @@ impl RustAnalyzerService {
         pos: Position,
     ) -> Result<Option<String>, SemanticError> {
         require(&self.features, codescope_core::Feature::Hover)?;
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
         let result = self
             .client
             .request(
@@ -577,10 +658,9 @@ impl RustAnalyzerService {
         file: &FileId,
         pos: Position,
     ) -> Result<Option<lsp_types::CallHierarchyItem>, SemanticError> {
-        let abs = self.sync_worktree(file).await?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-        let uri = uri_from_path(&abs)?;
-        let wire = self.pos_to_wire(&text, pos);
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
         let result = self
             .client
             .request(
@@ -694,5 +774,17 @@ fn hover_text(contents: &lsp_types::HoverContents) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialization_limits_workers_and_cache_priming() {
+        let options = initialization_options(LanguageServiceOptions { max_threads: 2 });
+        assert_eq!(options["numThreads"], 2);
+        assert_eq!(options["cachePriming"]["numThreads"], 2);
     }
 }

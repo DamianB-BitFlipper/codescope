@@ -1,4 +1,5 @@
-//! The non-interactive JSON backend: `codescope <scan|changeset|analyze|digest|bases>`.
+//! The non-interactive JSON backend:
+//! `codescope <scan|changeset|analyze|digest|bases|debug-ai>`.
 //!
 //! This module is wiring, not new analysis: every subcommand reuses the existing
 //! [`GitRepo`] / [`AnalysisEngine`] / [`codescope_analysis::ChangeDigest`] APIs and
@@ -13,20 +14,29 @@
 //!   stripped from [`RepoContext`]), no timestamps.
 
 use std::io::Write as _;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Subcommand, ValueEnum};
+use codescope_ai::AiService;
 use codescope_analysis::{
     AnalysisEngine, AnalysisSnapshot, ChangedSymbolInfo, FileAnalysis, MappedHunk, SemanticSource,
 };
 use codescope_core::{
-    BaseInfo, ChangeScope, Diagnostic, Epoch, Evidence, FeatureSet, FileId, FileStatus, HeadState,
-    HunkMapping, ImpactGraph, Location, Position, RepoContext, SymbolRef, SymbolTree, Upstream,
+    AiStatus, BaseInfo, ChangeScope, Diagnostic, Epoch, Evidence, FeatureSet, FileId, FileStatus,
+    HeadState, HunkMapping, ImpactGraph, Location, Position, RepoContext, SymbolRef, SymbolTree,
+    Upstream, ValidationReport, VisualizationPlan,
 };
 use codescope_git::GitRepo;
 use codescope_lsp::{detect_languages, Language, LanguageService, LspError, SemanticError};
+use codescope_tui::snapshot::FileSemanticLoad;
+use codescope_tui::{Action, UiSnapshot};
 use serde::Serialize;
+use tokio::sync::mpsc;
+
+use crate::config::ConfigStore;
+use crate::dispatcher::{self, AiPrefetchPolicy, DispatchEvent, Dispatcher};
 
 /// Non-interactive backend subcommands. With none given, the TUI starts instead.
 #[derive(Subcommand, Debug)]
@@ -42,6 +52,8 @@ pub enum BackendCommand {
     Digest(DigestArgs),
     /// Base-ref candidates for the branch scope, as JSON (for pickers / LLM base selection).
     Bases(BackendArgs),
+    /// Run the interactive backend headlessly and print its validated AI plan as JSON.
+    DebugAi(DebugAiArgs),
 }
 
 /// Shared arguments for subcommands that only read git state.
@@ -84,6 +96,36 @@ pub struct DigestArgs {
     /// Render the digest as prompt text instead of JSON.
     #[arg(long)]
     pub text: bool,
+}
+
+/// Arguments for the headless AI debugger.
+#[derive(Args, Debug)]
+pub struct DebugAiArgs {
+    /// Repository path (any directory inside the worktree).
+    #[arg(default_value = ".")]
+    pub path: Utf8PathBuf,
+    /// Which change-set to inspect.
+    #[arg(long, value_enum, default_value = "branch")]
+    pub scope: Scope,
+    /// Repo-relative changed file to explain; defaults to the first changed file.
+    #[arg(long)]
+    pub file: Option<String>,
+    /// Changed symbol to explain. The command waits for the file's asynchronous symbol
+    /// analysis and requires `--file`.
+    #[arg(long, requires = "file")]
+    pub symbol: Option<String>,
+    /// AI model for this run. Overrides the remembered/global model without persisting it.
+    #[arg(short = 'm', long, value_name = "MODEL_NAME")]
+    pub model: Option<String>,
+    /// Print only the generated one-sentence intent instead of the full debug envelope.
+    #[arg(long)]
+    pub intent_only: bool,
+    /// Single-line JSON instead of pretty-printed JSON.
+    #[arg(long)]
+    pub compact: bool,
+    /// Maximum time for repository analysis, asynchronous symbol loading, and the AI request.
+    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u64).range(1..=600))]
+    pub timeout_secs: u64,
 }
 
 /// CLI spelling of [`ChangeScope`].
@@ -143,6 +185,7 @@ async fn run_inner(cmd: &BackendCommand) -> Result<()> {
         BackendCommand::Analyze(args) => analyze(args).await,
         BackendCommand::Digest(args) => digest(args).await,
         BackendCommand::Bases(args) => bases(args).await,
+        BackendCommand::DebugAi(args) => debug_ai(args).await,
     }
 }
 
@@ -229,6 +272,313 @@ async fn bases(args: &BackendArgs) -> Result<()> {
         .await
         .context("cannot list base candidates")?;
     emit(&BasesOut { bases }, args.compact)
+}
+
+/// Exercise the real interactive dispatcher without starting a terminal and print the
+/// validated plan it publishes. This deliberately drives public [`Action`]s and consumes
+/// [`UiSnapshot`]s instead of rebuilding the prompt/validation path in the CLI.
+async fn debug_ai(args: &DebugAiArgs) -> Result<()> {
+    let started = Instant::now();
+    tracing::info!(
+        path = %args.path,
+        scope = args.scope.as_str(),
+        file = ?args.file,
+        symbol = ?args.symbol,
+        timeout_secs = args.timeout_secs,
+        "debug-ai session started"
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(args.timeout_secs),
+        debug_ai_session(args),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "headless AI generation timed out after {} seconds",
+            args.timeout_secs
+        )
+    })??;
+    tracing::info!(elapsed = ?started.elapsed(), "debug-ai plan ready");
+
+    if args.intent_only {
+        println!("{}", result.plan.intent);
+        return Ok(());
+    }
+    emit(&result, args.compact)
+}
+
+async fn debug_ai_session(args: &DebugAiArgs) -> Result<DebugAiOut> {
+    let phase = Instant::now();
+    let repo = discover(&args.path).await?;
+    let root = repo.toplevel().to_path_buf();
+    tracing::info!(elapsed = ?phase.elapsed(), root = %root, "repository discovered");
+
+    let phase = Instant::now();
+    let config = ConfigStore::load();
+    let mut notes: Vec<String> = config.warning().map(str::to_owned).into_iter().collect();
+    let ai_config = config
+        .resolve_ai_config(args.model.as_deref())
+        .context("cannot resolve AI configuration")?;
+    anyhow::ensure!(
+        ai_config.enabled,
+        "AI is not configured; set PRIME_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY"
+    );
+    tracing::info!(
+        elapsed = ?phase.elapsed(),
+        base_url = %ai_config.base_url,
+        model = %ai_config.model,
+        request_timeout = ?ai_config.timeout,
+        tool_choice = ai_config.tool_choice.as_str(),
+        max_tool_calls = ai_config.max_tool_calls,
+        "AI configuration resolved"
+    );
+    let ai = AiService::new(ai_config, root.clone()).context("cannot initialize AI service")?;
+
+    // Starting the LSP up front makes symbol-targeted debugging deterministic. The TUI
+    // starts it concurrently, but both feed the identical AnalysisEngine into Dispatcher.
+    let phase = Instant::now();
+    let (engine, engine_unavailable) = match LanguageService::start(root.as_path()).await {
+        Ok(service) => {
+            tracing::info!(elapsed = ?phase.elapsed(), "language server ready");
+            (Some(AnalysisEngine::new(service, repo.clone())), None)
+        }
+        Err(error) => {
+            tracing::warn!(elapsed = ?phase.elapsed(), %error, "language server unavailable");
+            let reason = error.to_string();
+            notes.push(format!(
+                "language server unavailable; git-only backend ({reason})"
+            ));
+            (None, Some(reason))
+        }
+    };
+
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<UiSnapshot>();
+    let (action_tx, action_rx) = mpsc::channel::<Action>(32);
+    let (event_tx, event_rx) = mpsc::channel::<DispatchEvent>(64);
+    let mut dispatcher = Dispatcher::new(repo, engine, Some(ai), output_tx, event_tx.clone())
+        .with_ai_prefetch_policy(AiPrefetchPolicy::FocusedOnly);
+    if let Some(reason) = engine_unavailable {
+        dispatcher = dispatcher.with_engine_unavailable(reason);
+    }
+    let dispatcher_task = tokio::spawn(dispatcher::run(dispatcher, event_rx, action_rx));
+    tracing::debug!("dispatcher started; driving requested selection");
+
+    let drive_result = drive_debug_ai(args, &action_tx, &mut output_rx, notes).await;
+
+    // Closing the action input is the dispatcher's normal shutdown signal. It performs the
+    // same graceful language-server teardown as an interactive exit.
+    let phase = Instant::now();
+    drop(action_tx);
+    drop(event_tx);
+    let shutdown = tokio::time::timeout(Duration::from_secs(8), dispatcher_task).await;
+    tracing::info!(
+        elapsed = ?phase.elapsed(),
+        completed = shutdown.is_ok(),
+        "dispatcher shutdown finished"
+    );
+    drive_result
+}
+
+async fn drive_debug_ai(
+    args: &DebugAiArgs,
+    actions: &mpsc::Sender<Action>,
+    snapshots: &mut mpsc::UnboundedReceiver<UiSnapshot>,
+    notes: Vec<String>,
+) -> Result<DebugAiOut> {
+    let started = Instant::now();
+    if !matches!(args.scope, Scope::Branch) {
+        actions
+            .send(scope_action(args.scope))
+            .await
+            .context("dispatcher stopped before accepting the requested scope")?;
+    }
+
+    // Wait until the chosen scope has completed its git phase. `refreshing == false` is
+    // important for an honestly empty change-set: `files.is_empty()` alone cannot tell an
+    // empty result from the boot placeholder.
+    let mut snapshot_count = 0_u64;
+    let initial = loop {
+        let snapshot = next_snapshot(snapshots).await?;
+        snapshot_count += 1;
+        tracing::debug!(
+            snapshot_count,
+            epoch = %snapshot.epoch,
+            scope = ?snapshot.scope,
+            refreshing = snapshot.refreshing,
+            files = snapshot.files.len(),
+            ai = ?snapshot.ai,
+            "waiting for initial change-set"
+        );
+        if snapshot.scope == args.scope.into()
+            && snapshot.epoch != Epoch::ZERO
+            && !snapshot.refreshing
+        {
+            break snapshot;
+        }
+    };
+    tracing::info!(
+        elapsed = ?started.elapsed(),
+        snapshot_count,
+        epoch = %initial.epoch,
+        files = initial.files.len(),
+        "initial change-set ready"
+    );
+    anyhow::ensure!(
+        !initial.files.is_empty(),
+        "the {} scope has no changed files to explain{}",
+        args.scope.as_str(),
+        status_suffix(&initial)
+    );
+
+    let requested_file = args
+        .file
+        .as_deref()
+        .map(|file| file.strip_prefix("./").unwrap_or(file));
+    let file = match requested_file {
+        Some(file) => {
+            anyhow::ensure!(
+                initial.files.iter().any(|row| row.path == file),
+                "--file {file:?} is not present in the {} change-set",
+                args.scope.as_str()
+            );
+            file.to_string()
+        }
+        None => initial.files[0].path.clone(),
+    };
+
+    let symbol = if let Some(symbol_name) = args.symbol.as_deref() {
+        let file_row = loop {
+            let snapshot = next_snapshot(snapshots).await?;
+            let Some(row) = snapshot.files.iter().find(|row| row.path == file) else {
+                anyhow::bail!("selected file {file:?} disappeared while it was analyzed");
+            };
+            match row.semantic {
+                FileSemanticLoad::Ready => break row.clone(),
+                FileSemanticLoad::Failed => {
+                    anyhow::bail!(
+                        "semantic analysis failed for {file:?}{}",
+                        status_suffix(&snapshot)
+                    )
+                }
+                FileSemanticLoad::Unsupported => {
+                    anyhow::bail!("semantic analysis is unsupported for {file:?}")
+                }
+                FileSemanticLoad::Unloaded | FileSemanticLoad::Loading => {}
+            }
+        };
+        let matching: Vec<_> = file_row
+            .symbols
+            .iter()
+            .filter(|row| row.name == symbol_name)
+            .collect();
+        anyhow::ensure!(
+            matching.len() == 1,
+            "--symbol {symbol_name:?} matched {} changed symbols in {file:?}",
+            matching.len()
+        );
+        let position = matching[0].position.with_context(|| {
+            format!("changed symbol {symbol_name:?} has no selectable source position")
+        })?;
+        Some((symbol_name.to_string(), position.0, position.1))
+    } else {
+        None
+    };
+
+    actions
+        .send(Action::SelectionChanged {
+            file: Some(file.clone()),
+            symbol: symbol.clone(),
+        })
+        .await
+        .context("dispatcher stopped before accepting the debug selection")?;
+    tracing::info!(
+        elapsed = ?started.elapsed(),
+        file = %file,
+        symbol = ?symbol.as_ref().map(|(name, _, _)| name),
+        "selection submitted; waiting for AI plan"
+    );
+
+    loop {
+        let snapshot = next_snapshot(snapshots).await?;
+        snapshot_count += 1;
+        tracing::debug!(
+            elapsed = ?started.elapsed(),
+            snapshot_count,
+            epoch = %snapshot.epoch,
+            ai = ?snapshot.ai,
+            plan_present = snapshot.semantic.plan.is_some(),
+            plan_label = %snapshot.semantic.note,
+            "AI snapshot received"
+        );
+        if let Some(plan) = snapshot.semantic.plan {
+            let expected_label = symbol
+                .as_ref()
+                .map(|(name, _, _)| name.as_str())
+                .unwrap_or(file.as_str());
+            if snapshot.semantic.note == expected_label {
+                tracing::info!(
+                    elapsed = ?started.elapsed(),
+                    snapshot_count,
+                    "matching validated plan published"
+                );
+                // The dispatcher publishes plan and report together; a matching plan
+                // without its report is an internal error, never a silent omission
+                // (Terra: sanitized content must stay labeled).
+                let Some(report) = snapshot.semantic.report.clone() else {
+                    anyhow::bail!(
+                        "internal error: the dispatcher published a plan without its \
+                         validation report (epoch {}, selection {expected_label:?})",
+                        snapshot.epoch
+                    );
+                };
+                return Ok(DebugAiOut {
+                    epoch: snapshot.epoch,
+                    scope: args.scope.as_str(),
+                    selection: DebugAiSelection {
+                        file,
+                        symbol: symbol.map(|(name, _, _)| name),
+                    },
+                    provider: snapshot.ai_provider,
+                    model: snapshot.ai_model,
+                    plan,
+                    report,
+                    notes,
+                });
+            }
+        }
+        match &snapshot.ai {
+            AiStatus::Failed { reason } => anyhow::bail!("AI generation failed: {reason}"),
+            AiStatus::Stale { epoch } => anyhow::bail!(
+                "AI returned a stale plan for epoch {epoch}; current backend epoch is {}",
+                snapshot.epoch
+            ),
+            _ => {}
+        }
+    }
+}
+
+async fn next_snapshot(snapshots: &mut mpsc::UnboundedReceiver<UiSnapshot>) -> Result<UiSnapshot> {
+    snapshots
+        .recv()
+        .await
+        .context("backend output closed before the requested state was published")
+}
+
+fn scope_action(scope: Scope) -> Action {
+    match scope {
+        Scope::Branch => Action::ScopeBranch,
+        Scope::Staged => Action::ScopeStaged,
+        Scope::Unstaged => Action::ScopeUnstaged,
+        Scope::Working => Action::ScopeWorking,
+    }
+}
+
+fn status_suffix(snapshot: &UiSnapshot) -> String {
+    if snapshot.status.text.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", snapshot.status.text)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +784,29 @@ struct SnapshotView<'a> {
 #[derive(Serialize)]
 struct BasesOut {
     bases: Vec<BaseInfo>,
+}
+
+/// Stable headless result from the same dispatcher snapshot the TUI consumes.
+#[derive(Serialize)]
+struct DebugAiOut {
+    epoch: Epoch,
+    scope: &'static str,
+    selection: DebugAiSelection,
+    provider: String,
+    model: String,
+    plan: VisualizationPlan,
+    /// The validation report behind `plan` (verdict, dropped items, notes): the same
+    /// transparency the TUI renders, in full detail.
+    report: ValidationReport,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DebugAiSelection {
+    file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,10 @@
 //! AI opt-in configuration (research 05 §5, research 07 §2).
 //!
-//! Env-first: [`AiConfig::from_env`] reads `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`,
-//! `CODESCOPE_AI_MODEL`, `CODESCOPE_AI_TIMEOUT_MS`, and the API key from the first of
+//! Environment-over-file resolution: [`AiConfig::from_env`] reads environment only, while
+//! [`AiConfig::from_env_with_file`] accepts the binary's global `[ai]` configuration and then
+//! applies the same environment variables as higher-precedence overrides. The supported vars are
+//! `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_TIMEOUT_MS`,
+//! `CODESCOPE_AI_TOOL_CHOICE`, and the API key from the first of
 //! `PRIME_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` that is set. **AI is disabled by
 //! default**: with no explicit `CODESCOPE_AI=on|off` the subsystem enables itself only when
 //! an API key is found (auto mode). The default `base_url` follows the key's provider
@@ -47,6 +50,49 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-latest";
 /// Default per-request timeout (research 07 §4: 20 s budget).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(20_000);
 
+/// How the provider should decide whether to call one of Codescope's tools.
+///
+/// [`ToolChoice::Required`] preserves Codescope's strict default. Some OpenAI-compatible
+/// providers only accept [`ToolChoice::Auto`], which can be selected with
+/// `CODESCOPE_AI_TOOL_CHOICE=auto`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// Require the model to call a tool (`required` for OpenAI-compatible providers,
+    /// `any` for Anthropic).
+    #[default]
+    Required,
+    /// Let the model decide whether to call a tool.
+    Auto,
+}
+
+impl ToolChoice {
+    fn parse(value: &str) -> Result<Self, AiError> {
+        match value.to_ascii_lowercase().as_str() {
+            "required" => Ok(Self::Required),
+            "auto" => Ok(Self::Auto),
+            other => Err(AiError::Config(format!(
+                "CODESCOPE_AI_TOOL_CHOICE must be required|auto, got {other:?}"
+            ))),
+        }
+    }
+
+    /// OpenAI-compatible wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub(crate) const fn anthropic_type(self) -> &'static str {
+        match self {
+            Self::Required => "any",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 /// Resolved AI configuration.
 ///
 /// Construct via [`AiConfig::from_env`] / [`AiConfig::resolve`]; the `api_key` is `None`
@@ -63,6 +109,8 @@ pub struct AiConfig {
     pub api_key: Option<SecretString>,
     /// Per-request timeout.
     pub timeout: Duration,
+    /// Provider tool-selection policy. Defaults to [`ToolChoice::Required`].
+    pub tool_choice: ToolChoice,
     /// Read-only tool-call budget per plan (≤ [`MAX_TOOL_CALLS`]).
     pub max_tool_calls: u32,
     /// Prime Inference team id, sent as `X-Prime-Team-ID` so requests bill the team balance
@@ -81,12 +129,14 @@ impl AiConfig {
             model: DEFAULT_MODEL.to_string(),
             api_key: None,
             timeout: DEFAULT_TIMEOUT,
+            tool_choice: ToolChoice::Required,
             max_tool_calls: MAX_TOOL_CALLS,
             prime_team_id: None,
         }
     }
 
-    /// Resolve from process environment variables only (no config file).
+    /// Resolve from process environment variables only (no config file). The Codescope binary
+    /// uses [`AiConfig::from_env_with_file`] after loading its global user configuration.
     ///
     /// See [`AiConfig::resolve`] for the full resolution rules.
     pub fn from_env() -> Result<Self, AiError> {
@@ -109,12 +159,15 @@ impl AiConfig {
     /// - Key resolution order: [`AiFileConfig::api_key_env`]-named var, then
     ///   `PRIME_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. A named `api_key_env` var
     ///   that is unset is a hard [`AiError::Config`] (silent misconfiguration is worse than
-    ///   an error).
+    ///   an error). The three built-in names retain their provider identity; an arbitrary
+    ///   name requires an explicit base URL so its credential is never sent to a guessed
+    ///   endpoint.
     /// - Default `base_url` follows the key's provider: [`PRIME_BASE_URL`] from
     ///   `PRIME_API_KEY`, [`ANTHROPIC_BASE_URL`] from `ANTHROPIC_API_KEY`, otherwise
     ///   [`OPENAI_BASE_URL`]. `CODESCOPE_AI_BASE_URL` overrides.
     /// - A literal [`AiFileConfig::api_key`] in the file layer is
     ///   [`AiError::LiteralApiKeyInConfig`], even when AI ends up disabled.
+    /// - `CODESCOPE_AI_TOOL_CHOICE` accepts `required` (default) or `auto`.
     ///
     /// Empty / whitespace-only env values are treated as unset.
     pub fn resolve(
@@ -160,14 +213,20 @@ impl AiConfig {
             return Ok(AiConfig::disabled());
         }
 
+        let configured_base =
+            env("CODESCOPE_AI_BASE_URL").or_else(|| file.and_then(|f| f.base_url.clone()));
+        if matches!(key_source, Some(KeySource::FileNamedEnv)) && configured_base.is_none() {
+            return Err(AiError::Config(
+                "an arbitrary api_key_env requires an explicit base_url so its credential is not sent to an inferred provider"
+                    .into(),
+            ));
+        }
         let default_base = match key_source {
             Some(KeySource::PrimeApiKey) => PRIME_BASE_URL,
             Some(KeySource::AnthropicApiKey) => ANTHROPIC_BASE_URL,
             _ => OPENAI_BASE_URL,
         };
-        let base_url = env("CODESCOPE_AI_BASE_URL")
-            .or_else(|| file.and_then(|f| f.base_url.clone()))
-            .unwrap_or_else(|| default_base.to_string());
+        let base_url = configured_base.unwrap_or_else(|| default_base.to_string());
         if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
             return Err(AiError::Config(format!(
                 "base_url must start with http:// or https://, got {base_url:?}"
@@ -177,10 +236,20 @@ impl AiConfig {
         let default_model = match key_source {
             Some(KeySource::OpenaiApiKey) => DEFAULT_OPENAI_MODEL,
             Some(KeySource::AnthropicApiKey) => DEFAULT_ANTHROPIC_MODEL,
+            Some(KeySource::FileNamedEnv)
+                if base_url.trim_end_matches('/') == OPENAI_BASE_URL.trim_end_matches('/') =>
+            {
+                DEFAULT_OPENAI_MODEL
+            }
+            Some(KeySource::FileNamedEnv)
+                if base_url.trim_end_matches('/') == ANTHROPIC_BASE_URL.trim_end_matches('/') =>
+            {
+                DEFAULT_ANTHROPIC_MODEL
+            }
             _ => DEFAULT_MODEL, // Prime, file-named, or keyless local
         };
-        let model = env("CODESCOPE_AI_MODEL")
-            .or_else(|| file.and_then(|f| f.model.clone()))
+        let model = file
+            .and_then(|f| f.model.clone())
             .unwrap_or_else(|| default_model.to_string());
 
         let timeout_ms = match env("CODESCOPE_AI_TIMEOUT_MS") {
@@ -192,6 +261,11 @@ impl AiConfig {
         if timeout_ms == 0 {
             return Err(AiError::Config("timeout must be greater than zero".into()));
         }
+
+        let tool_choice = env("CODESCOPE_AI_TOOL_CHOICE")
+            .map(|value| ToolChoice::parse(&value))
+            .transpose()?
+            .unwrap_or_default();
 
         let max_tool_calls = file
             .and_then(|f| f.max_tool_calls)
@@ -213,6 +287,7 @@ impl AiConfig {
             base_url = %base_url,
             model = %model,
             timeout_ms,
+            tool_choice = tool_choice.as_str(),
             max_tool_calls,
             keyed = key.is_some(),
             "ai enabled"
@@ -223,6 +298,7 @@ impl AiConfig {
             model,
             api_key: key.map(SecretString::from),
             timeout: Duration::from_millis(timeout_ms),
+            tool_choice,
             max_tool_calls,
             prime_team_id,
         })
@@ -284,6 +360,7 @@ impl fmt::Debug for AiConfig {
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "«redacted»"))
             .field("timeout", &self.timeout)
+            .field("tool_choice", &self.tool_choice)
             .field("max_tool_calls", &self.max_tool_calls)
             .finish()
     }
@@ -356,8 +433,14 @@ fn resolve_key(
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<(Option<String>, Option<KeySource>), AiError> {
     if let Some(name) = file.and_then(|f| f.api_key_env.as_deref()) {
+        let source = match name {
+            "PRIME_API_KEY" => KeySource::PrimeApiKey,
+            "OPENAI_API_KEY" => KeySource::OpenaiApiKey,
+            "ANTHROPIC_API_KEY" => KeySource::AnthropicApiKey,
+            _ => KeySource::FileNamedEnv,
+        };
         return match env(name) {
-            Some(v) => Ok((Some(v), Some(KeySource::FileNamedEnv))),
+            Some(v) => Ok((Some(v), Some(source))),
             None => Err(AiError::Config(format!(
                 "api_key_env names env var {name:?}, which is unset or empty"
             ))),
@@ -490,16 +573,16 @@ mod tests {
     }
 
     #[test]
-    fn explicit_model_override_wins() {
+    fn model_is_not_selected_from_the_environment() {
         let cfg = AiConfig::resolve(
             None,
             env_of(&[
-                ("ANTHROPIC_API_KEY", "sk-a"),
-                ("CODESCOPE_AI_MODEL", "claude-opus-4-6"),
+                ("OPENAI_API_KEY", "sk-o"),
+                ("CODESCOPE_AI_MODEL", "ignored/model"),
             ]),
         )
         .unwrap();
-        assert_eq!(cfg.model, "claude-opus-4-6");
+        assert_eq!(cfg.model, DEFAULT_OPENAI_MODEL);
     }
 
     #[test]
@@ -546,15 +629,22 @@ mod tests {
             env_of(&[
                 ("CODESCOPE_AI", "on"),
                 ("CODESCOPE_AI_BASE_URL", "https://example.test/v1"),
-                ("CODESCOPE_AI_MODEL", "test/model-x"),
                 ("CODESCOPE_AI_TIMEOUT_MS", "1500"),
+                ("CODESCOPE_AI_TOOL_CHOICE", "auto"),
                 ("OPENAI_API_KEY", "sk-x"),
             ]),
         )
         .unwrap();
         assert_eq!(cfg.base_url, "https://example.test/v1");
-        assert_eq!(cfg.model, "test/model-x");
+        assert_eq!(cfg.model, DEFAULT_OPENAI_MODEL);
         assert_eq!(cfg.timeout, Duration::from_millis(1500));
+        assert_eq!(cfg.tool_choice, ToolChoice::Auto);
+    }
+
+    #[test]
+    fn tool_choice_defaults_to_required() {
+        let cfg = AiConfig::resolve(None, env_of(&[("OPENAI_API_KEY", "sk-x")])).unwrap();
+        assert_eq!(cfg.tool_choice, ToolChoice::Required);
     }
 
     #[test]
@@ -574,6 +664,16 @@ mod tests {
             AiConfig::resolve(
                 None,
                 env_of(&[("CODESCOPE_AI", "on"), ("CODESCOPE_AI_TIMEOUT_MS", "0")]),
+            ),
+            Err(AiError::Config(_))
+        ));
+        assert!(matches!(
+            AiConfig::resolve(
+                None,
+                env_of(&[
+                    ("CODESCOPE_AI", "on"),
+                    ("CODESCOPE_AI_TOOL_CHOICE", "sometimes"),
+                ]),
             ),
             Err(AiError::Config(_))
         ));
@@ -617,6 +717,7 @@ mod tests {
     fn api_key_env_names_the_var() {
         let file = AiFileConfig {
             api_key_env: Some("MY_CUSTOM_KEY".into()),
+            base_url: Some("http://127.0.0.1:11434/v1".into()),
             ..AiFileConfig::default()
         };
         let cfg =
@@ -628,6 +729,46 @@ mod tests {
             AiConfig::resolve(Some(&file), env_of(&[])),
             Err(AiError::Config(_))
         ));
+
+        let missing_endpoint = AiFileConfig {
+            api_key_env: Some("MY_CUSTOM_KEY".into()),
+            ..AiFileConfig::default()
+        };
+        assert!(matches!(
+            AiConfig::resolve(
+                Some(&missing_endpoint),
+                env_of(&[("MY_CUSTOM_KEY", "sk-custom")])
+            ),
+            Err(AiError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn built_in_api_key_env_names_keep_provider_identity() {
+        for (name, base, model, provider) in [
+            ("PRIME_API_KEY", PRIME_BASE_URL, DEFAULT_MODEL, "prime"),
+            (
+                "OPENAI_API_KEY",
+                OPENAI_BASE_URL,
+                DEFAULT_OPENAI_MODEL,
+                "openai",
+            ),
+            (
+                "ANTHROPIC_API_KEY",
+                ANTHROPIC_BASE_URL,
+                DEFAULT_ANTHROPIC_MODEL,
+                "anthropic",
+            ),
+        ] {
+            let file = AiFileConfig {
+                api_key_env: Some(name.into()),
+                ..AiFileConfig::default()
+            };
+            let cfg = AiConfig::resolve(Some(&file), env_of(&[(name, "secret")])).unwrap();
+            assert_eq!(cfg.base_url, base, "{name}");
+            assert_eq!(cfg.model, model, "{name}");
+            assert_eq!(cfg.provider_label(), provider, "{name}");
+        }
     }
 
     #[test]
@@ -640,17 +781,10 @@ mod tests {
             max_tool_calls: Some(4),
             ..AiFileConfig::default()
         };
-        let cfg = AiConfig::resolve(
-            Some(&file),
-            env_of(&[
-                ("CODESCOPE_AI_MODEL", "env/model"),
-                ("OPENAI_API_KEY", "sk-x"),
-            ]),
-        )
-        .unwrap();
+        let cfg = AiConfig::resolve(Some(&file), env_of(&[("OPENAI_API_KEY", "sk-x")])).unwrap();
         assert!(cfg.enabled);
         assert_eq!(cfg.base_url, "https://file.example/v1"); // no env override
-        assert_eq!(cfg.model, "env/model"); // env wins
+        assert_eq!(cfg.model, "file/model");
         assert_eq!(cfg.timeout, Duration::from_millis(9000));
         assert_eq!(cfg.max_tool_calls, 4);
     }

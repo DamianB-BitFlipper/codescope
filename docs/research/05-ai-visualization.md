@@ -37,42 +37,59 @@ JSON, produced via a tool call (§5). Serde-friendly; versioned.
 
 ```json
 {
-  "plan_version": 1,
-  "epoch": "b3f1c…",                    // repo-state epoch, echoed from prompt (§3)
-  "focus": "What breaks if I rename SessionStore.load?",
+  "plan_version": 4,
+  "epoch": 7,
+  "focus": "How does the changed request path load a session?",
+  "title": "Session loading now follows the guarded cache path",
+  "intent": "The handler checks cached state before falling through to persistent storage.",
+  "review_focus": "Confirm cache misses still preserve the typed storage error.",
   "forms": [{
-    "kind": "call_tree",                // enum below — exactly one per form block
-    "title": "Callers of load",
-    "summary": "load has 3 callers; 2 are in changed files.",
+    "kind": "relationship_flow",
+    "title": "Request path",
     "nodes": [{
-      "id": "n1",                       // plan-local id, referenced by edges/children
-      "entity": {                       // MUST resolve against the fact store
-        "file": "src/session/store.rs", // repo-relative path
-        "symbol": "session::store::SessionStore::load",  // fully-qualified, language-neutral
-        "range": {"start_line": 121, "start_col": 4, "end_line": 140, "end_col": 5}
+      "id": "n1",
+      "entity": {
+        "file": "src/session/store.rs",
+        "symbol": "session::store::SessionStore::load"
       },
-      "label": "load",                  // short display label (TUI may re-derive)
-      "change": "modified",             // added|modified|removed|unchanged|diagnostic
-      "severity": "error",              // optional: diagnostic badge
-      "children": ["n2"],               // tree forms
-      "hint": {"highlight": true, "collapsed": false}   // render hints only
+      "label": "SessionStore.load",
+      "detail": "checks cached state before reading storage",
+      "expanded_detail": "A cache miss continues through the existing typed storage result.",
+      "code_refs": [{
+        "file": "src/session/store.rs",
+        "hunk": 0,
+        "side": "new",
+        "start_line": 122,
+        "end_line": 126
+      }]
+    }, {
+      "id": "n2",
+      "label": "persistent lookup",
+      "detail": "returns the loaded session or typed failure",
+      "code_refs": [{
+        "file": "src/session/store.rs",
+        "hunk": 0,
+        "side": "new",
+        "start_line": 127,
+        "end_line": 130
+      }]
     }],
-    "edges": [{                         // flow/sequence/relationship forms
-      "from": "n1", "to": "n2",
-      "kind": "calls",                  // calls|imports|implements|contains|reads|writes
-      "label": "on cache miss"
+    "edges": [{
+      "from": "n1", "to": "n2", "kind": "reads", "label": "on cache miss"
     }]
+  }],
+  "evidence": [{
+    "file": "src/session/store.rs", "hunk": 0,
+    "reason": "contains the guarded cache and storage path"
   }]
 }
 ```
 
-Form enum (mirrors Show Me's table, adapted to code change impact):
-`changed_symbol_tree` (diff-shaped symbol tree), `call_tree`, `type_impl_tree`,
-`relationship_flow`, `impact_summary` (grouped counts + entry points, ≤8 bullets),
-`focused_diff` (subset of real hunks, ordered, with 1-line rationale each),
-`before_after` (two structural trees/diffs side by side), `sequence` (time-ordered edges;
-nodes are participants). Language-neutral: entities are `(file, symbol, range)`; the Go/gopls
-fact mapper produces the same ids.
+The AI-facing form enum is fixed: `changed_symbol_tree`, `call_tree`, `type_impl_tree`,
+`relationship_flow`, `before_after`, and `sequence`. Legacy stored/internal
+`impact_summary` and `focused_diff` values do not pass the AI validation boundary. Language-neutral
+entities remain `(file, symbol, range)`. A node's `code_refs` are separate hover anchors into the
+focused unified diff: file + zero-based hunk + explicit old/new side + inclusive one-based lines.
 
 Pitfalls: (a) do not let the AI emit Mermaid/text art — TUI can't validate it; (b) `range`
 must be optional for tree roots (file-level nodes: symbol omitted); (c) enforce caps at
@@ -93,8 +110,11 @@ Validation is local, deterministic, and has no AI in the loop. Pipeline:
 3. **Edge validation.** `calls/implements/imports` edges must exist in the impact graph.
    The AI may *select* edges, not assert new ones. (If we later want hypothesis edges, add
    `"inferred": true`, render dashed; still require resolvable endpoints.)
-4. **Hunk validation.** `focused_diff` hunks are referenced by `(file, hunk_index)` and
-   re-read from git — the AI orders/subsets/annotates, it never writes diff text.
+4. **Hunk and code-link validation.** Plan evidence references `(file, hunk_index)`. Every
+   AI node also carries one or two exact code ranges. The validator confirms the file/hunk and
+   each one-based line on the declared old/new side against parsed diff rows before the range can
+   drive hover highlighting. Reversed, oversized, missing, or wrong-side ranges trigger a bounded
+   repair; the model never emits screen coordinates.
 
 Hallucination policy (per form):
 - **Tree forms** (`changed_symbol_tree`, `call_tree`, `type_impl_tree`, `before_after`):
@@ -164,7 +184,7 @@ Config (env-first, all optional unless enabled; AI disabled = full functionality
 - `CODESCOPE_AI=off|on` (default: auto = on iff an API key is found)
 - `CODESCOPE_AI_BASE_URL` (default `https://api.pinference.ai/api/v1` if `PRIME_API_KEY` set,
   else `https://api.openai.com/v1`), `CODESCOPE_AI_API_KEY` (fallback: `PRIME_API_KEY`, then
-  `OPENAI_API_KEY`), `CODESCOPE_AI_MODEL` (default `openai/gpt-5-mini`-class; plans are
+  `OPENAI_API_KEY`), `--model` / `-m` (default `openai/gpt-5-mini`-class; plans are
   schema-constrained so a small model suffices), `CODESCOPE_AI_TIMEOUT_MS` (default 20000),
   `CODESCOPE_AI_STREAM=0|1`. Wrap the key in `secrecy` 0.10.3; never log it.
 

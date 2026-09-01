@@ -77,7 +77,7 @@ pub fn read_only_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "get_hunk",
-            description: "Read one diff hunk verbatim (capped at 200 lines), addressed by file and zero-based hunk index from the digest. For focused_diff plan nodes echo the entity as {\"file\": <file>, \"symbol\": \"hunk:<index>\"}.".into(),
+            description: "Read one diff hunk verbatim (capped at 200 lines), addressed by file and zero-based hunk index from the digest. Cite the same file and hunk index in plan evidence.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -200,6 +200,16 @@ impl ToolExecError {
 /// The trait returns a [`BoxFuture`] (instead of `async fn`) so it stays dyn-compatible
 /// for `&dyn ToolExecutor` wiring.
 pub trait ToolExecutor: Send + Sync {
+    /// Read-only tools this executor can actually serve.
+    ///
+    /// The service advertises only this set to the model. Implementations that use the
+    /// complete production surface may keep the default; executors without a fact-store
+    /// backend must return an empty list so automatic tool choice cannot create a futile
+    /// request/failed-tool/request loop.
+    fn available_tools(&self) -> Vec<ToolDef> {
+        read_only_tools()
+    }
+
     /// Execute one read-only tool call. `arguments` is the parsed JSON arguments object.
     fn execute<'a>(
         &'a self,
@@ -214,6 +224,10 @@ pub trait ToolExecutor: Send + Sync {
 pub struct NoToolExecutor;
 
 impl ToolExecutor for NoToolExecutor {
+    fn available_tools(&self) -> Vec<ToolDef> {
+        Vec::new()
+    }
+
     fn execute<'a>(
         &'a self,
         name: &'a str,
@@ -315,6 +329,7 @@ mod tests {
     #[tokio::test]
     async fn no_tool_executor_reports_unavailable() {
         let exec = NoToolExecutor;
+        assert!(exec.available_tools().is_empty());
         let err = exec
             .execute("get_symbol", &serde_json::json!({}))
             .await

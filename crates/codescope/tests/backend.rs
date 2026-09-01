@@ -1,5 +1,5 @@
 //! Integration tests for the JSON backend subcommands
-//! (`codescope scan|changeset|analyze|digest|bases`).
+//! (`codescope scan|changeset|analyze|digest|bases|debug-ai`).
 //!
 //! Each subcommand runs against a scratch git repo and the testutil Go fixture; the
 //! assertions cover JSON shape, exit codes, the non-repo error contract, and the
@@ -8,6 +8,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use codescope_core::{
+    Epoch, FormKind, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode, PlanNodeChange,
+    VisualizationPlan, VizForm,
+};
+use codescope_testutil::fake_ai::{AiScriptStep, ScriptedProvider};
 use codescope_testutil::scenarios;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -475,6 +480,290 @@ fn digest_scratch_repo_git_only_notes() {
 }
 
 // ---------------------------------------------------------------------------
+// debug-ai: the real dispatcher, no terminal frontend
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
+    // One initial repository refresh owns one epoch increment.
+    let mut plan = VisualizationPlan::new(Epoch(1), "What does the selected change do?");
+    plan.title = "Request handling becomes observable".to_string();
+    plan.intent = "Record request metadata before continuing the request path.".to_string();
+    plan.review_focus = Some(
+        "Confirm the recorded metadata reaches the log sink before errors are returned."
+            .to_string(),
+    );
+    plan.evidence.push(codescope_core::PlanEvidence {
+        file: codescope_core::FileId::new_unchecked("internal/api/middleware.go"),
+        hunk: Some(0),
+        symbol: None,
+        range: None,
+        reason: "defines the middleware that records the request metadata".to_string(),
+    });
+    let mut entry = PlanNode::new("entry", "request", PlanNodeChange::Modified)
+        .with_detail("enters the changed request path")
+        .with_code_ref(codescope_core::PlanCodeRef::new(
+            codescope_core::FileId::new_unchecked("internal/api/middleware.go"),
+            0,
+            codescope_core::DiffSide::New,
+            6,
+            7,
+        ));
+    entry.children.push("logging".to_string());
+    let logging = PlanNode::new("logging", "record metadata", PlanNodeChange::Added)
+        .with_detail("captures context before continuing")
+        .with_code_ref(codescope_core::PlanCodeRef::new(
+            codescope_core::FileId::new_unchecked("internal/api/middleware.go"),
+            0,
+            codescope_core::DiffSide::New,
+            8,
+            8,
+        ));
+    plan.forms.push(VizForm {
+        kind: FormKind::ChangedSymbolTree,
+        title: "Request path".to_string(),
+        summary: String::new(),
+        nodes: vec![entry, logging],
+        edges: Vec::new(),
+    });
+    // The AI input contract requires 1-4 evidence entries over real fixture files.
+    plan.evidence.push(PlanEvidence {
+        file: codescope_core::FileId::new("internal/api/middleware.go").unwrap(),
+        hunk: Some(0),
+        symbol: None,
+        range: None,
+        reason: "the middleware hunk that records request metadata".to_string(),
+    });
+    let provider = ScriptedProvider::start([AiScriptStep::from_plan(&plan).unwrap()])
+        .await
+        .unwrap();
+    let (_fixture, root) = go_fixture();
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("missing-config.toml");
+    let endpoint = format!("{}/v1", provider.base_url());
+    let root_string = root.to_string_lossy().to_string();
+
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(BIN)
+            .args([
+                "debug-ai",
+                &root_string,
+                "--scope",
+                "branch",
+                "--timeout-secs",
+                "20",
+                "--model",
+                "codescope-fake",
+            ])
+            .env("CODESCOPE_CONFIG", config_path)
+            .env("CODESCOPE_AI", "on")
+            .env("CODESCOPE_AI_BASE_URL", endpoint)
+            .env("CODESCOPE_AI_TIMEOUT_MS", "5000")
+            .env("OPENAI_API_KEY", "sk-test-only")
+            .env("CODESCOPE_GOPLS", "/nonexistent/codescope-test-gopls")
+            .env_remove("PRIME_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("spawn headless codescope")
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        out.status.success(),
+        "headless command failed: {}; requests: {:?}",
+        stderr(&out),
+        provider.requests()
+    );
+    let json = json_stdout(&out);
+    assert_eq!(json["scope"], "branch");
+    assert!(json["selection"]["file"].is_string());
+    assert_eq!(json["provider"], "custom");
+    assert_eq!(json["model"], "codescope-fake");
+    assert_eq!(
+        json["plan"]["intent"],
+        "Record request metadata before continuing the request path."
+    );
+    assert_eq!(
+        json["plan"]["forms"][0]["nodes"].as_array().unwrap().len(),
+        2
+    );
+    // The full validation report rides next to the plan (Terra: report preservation).
+    assert_eq!(json["report"]["verdict"], "valid");
+    assert!(
+        json["report"]["dropped"].is_null(),
+        "a clean plan serializes no dropped items: {json}"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "one backend AI request");
+    let body = requests[0].body_json().expect("debug-ai request JSON");
+    let tool_names: Vec<&str> = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tool_names,
+        ["submit_visualization_plan"],
+        "the production NoToolExecutor must not advertise unusable read tools"
+    );
+    assert!(
+        requests[0].body.contains("current impact selection"),
+        "headless path uses the dispatcher's focused prompt"
+    );
+}
+
+/// The sequence extra-edge sanitizer's `ValidWithDrops` report must survive the
+/// dispatcher/backend boundary: `debug-ai` JSON carries the full report (verdict,
+/// dropped items with reasons) next to the sanitized plan — never a silent omission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
+    // A three-step sequence with both required consecutive edges plus one extra
+    // back-edge (n3 -> n1): the validator keeps the chain, drops the back-edge, and
+    // records it — the plan is sanitized, not trusted.
+    // One initial repository refresh owns one epoch increment.
+    let mut plan = VisualizationPlan::new(Epoch(1), "How does the request flow change?");
+    plan.title = "Request logging wraps the handler".to_string();
+    plan.intent = "The middleware logs each request around the handled call.".to_string();
+    plan.review_focus = Some(
+        "Confirm the log line is written before the handler consumes the request.".to_string(),
+    );
+    plan.forms.push(VizForm {
+        kind: FormKind::Sequence,
+        title: "request path".to_string(),
+        summary: String::new(),
+        nodes: vec![
+            PlanNode::new("n1", "request", PlanNodeChange::Modified)
+                .with_detail("enters the changed request path")
+                .with_code_ref(codescope_core::PlanCodeRef::new(
+                    codescope_core::FileId::new_unchecked("internal/api/middleware.go"),
+                    0,
+                    codescope_core::DiffSide::New,
+                    6,
+                    7,
+                )),
+            PlanNode::new("n2", "logging", PlanNodeChange::Added)
+                .with_detail("records the request id before continuing")
+                .with_code_ref(codescope_core::PlanCodeRef::new(
+                    codescope_core::FileId::new_unchecked("internal/api/middleware.go"),
+                    0,
+                    codescope_core::DiffSide::New,
+                    8,
+                    8,
+                )),
+            PlanNode::new("n3", "handler", PlanNodeChange::Modified)
+                .with_detail("consumes the logged request")
+                .with_code_ref(codescope_core::PlanCodeRef::new(
+                    codescope_core::FileId::new_unchecked("internal/api/middleware.go"),
+                    0,
+                    codescope_core::DiffSide::New,
+                    9,
+                    13,
+                )),
+        ],
+        edges: vec![
+            PlanEdge {
+                from: "n1".into(),
+                to: "n2".into(),
+                kind: PlanEdgeKind::Writes,
+                label: Some("carries the request id".into()),
+            },
+            PlanEdge {
+                from: "n2".into(),
+                to: "n3".into(),
+                kind: PlanEdgeKind::Writes,
+                label: Some("passes the logged request".into()),
+            },
+            PlanEdge {
+                from: "n3".into(),
+                to: "n1".into(),
+                kind: PlanEdgeKind::Writes,
+                label: Some("returns the response".into()),
+            },
+        ],
+    });
+    plan.evidence.push(PlanEvidence {
+        file: codescope_core::FileId::new("internal/api/middleware.go").unwrap(),
+        hunk: Some(0),
+        symbol: None,
+        range: None,
+        reason: "the middleware hunk that wraps the handler".to_string(),
+    });
+    let provider = ScriptedProvider::start([AiScriptStep::from_plan(&plan).unwrap()])
+        .await
+        .unwrap();
+    let (_fixture, root) = go_fixture();
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("missing-config.toml");
+    let endpoint = format!("{}/v1", provider.base_url());
+    let root_string = root.to_string_lossy().to_string();
+
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(BIN)
+            .args([
+                "debug-ai",
+                &root_string,
+                "--scope",
+                "branch",
+                "--timeout-secs",
+                "20",
+                "--model",
+                "codescope-fake",
+            ])
+            .env("CODESCOPE_CONFIG", config_path)
+            .env("CODESCOPE_AI", "on")
+            .env("CODESCOPE_AI_BASE_URL", endpoint)
+            .env("CODESCOPE_AI_TIMEOUT_MS", "5000")
+            .env("OPENAI_API_KEY", "sk-test-only")
+            .env("CODESCOPE_GOPLS", "/nonexistent/codescope-test-gopls")
+            .env_remove("PRIME_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("spawn headless codescope")
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        out.status.success(),
+        "headless command failed: {}; requests: {:?}",
+        stderr(&out),
+        provider.requests()
+    );
+    let json = json_stdout(&out);
+    // The sanitizer's verdict and dropped items reach the JSON intact.
+    assert_eq!(
+        json["report"]["verdict"], "valid_with_drops",
+        "sanitized plan keeps its report: {json}"
+    );
+    let dropped = json["report"]["dropped"].as_array().expect("dropped items");
+    assert_eq!(dropped.len(), 1, "exactly the extra back-edge: {json}");
+    assert_eq!(
+        dropped[0]["subject"], "edge n3 -> n1 in form 0",
+        "drop subject: {json}"
+    );
+    let reason = dropped[0]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("nonconsecutive or duplicate sequence edge"),
+        "drop reason: {reason}"
+    );
+    // The published plan itself was sanitized to the consecutive chain.
+    let edges = json["plan"]["forms"][0]["edges"]
+        .as_array()
+        .expect("form edges");
+    assert_eq!(edges.len(), 2, "the back-edge no longer renders: {json}");
+    // One backend request: the sanitized plan needed no repair turn.
+    assert_eq!(provider.requests().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // bases
 // ---------------------------------------------------------------------------
 
@@ -516,7 +805,14 @@ fn bases_lists_candidates_for_fixture_and_scratch() {
 fn non_repo_path_errors_with_json_and_exit_1() {
     let tmp = TempDir::new().expect("tempdir"); // a plain directory, not a repo
     let path = tmp.path().to_string_lossy().to_string();
-    for sub in ["scan", "changeset", "analyze", "digest", "bases"] {
+    for sub in [
+        "scan",
+        "changeset",
+        "analyze",
+        "digest",
+        "bases",
+        "debug-ai",
+    ] {
         let out = codescope(&[sub, &path]);
         let err = json_stderr_error(&out);
         assert!(
@@ -821,11 +1117,11 @@ fn subcommand_matrix_all_repo_shapes() {
                 working: 3,
             },
         ),
-        // Fully pushed branch: the branch scope falls back to the dirty worktree.
+        // Same-tip upstream: no meaningful branch base; worktree scopes still work.
         (
             "branch_fully_pushed",
             ShapeExpect {
-                branch: Some(1),
+                branch: None,
                 staged: 0,
                 unstaged: 1,
                 working: 1,
@@ -903,115 +1199,33 @@ fn subcommand_matrix_all_repo_shapes() {
 }
 
 // ---------------------------------------------------------------------------
-// The branch-fallback contract (a fully pushed branch with a dirty worktree)
+// A same-tip upstream is not a comparison base
 // ---------------------------------------------------------------------------
 
 #[test]
-fn changeset_fallback_flag_true_only_on_fully_pushed_branch() {
+fn fully_pushed_branch_reports_no_base_and_keeps_working_scope() {
     let built = scenario_repo("branch_fully_pushed");
     let root = built.root.to_string_lossy().to_string();
 
-    // Branch scope: merge-base == HEAD, so the committed diff is empty and the dirty
-    // worktree file is surfaced under the fallback flag.
     let out = codescope(&["changeset", &root, "--scope", "branch"]);
-    let json = json_stdout(&out);
-    assert_eq!(
-        json["fallback"].as_bool(),
-        Some(true),
-        "fallback fires: {json}"
+    let err = json_stderr_error(&out);
+    assert!(
+        err["error"].as_str().unwrap().contains("no base"),
+        "branch scope reports an honest missing base: {err}"
     );
-    let files = json["files"].as_array().unwrap();
-    assert_eq!(
-        files.len(),
-        1,
-        "fallback fills the set from the worktree: {json}"
-    );
-    assert_eq!(files[0]["path"], "util.go");
-    assert_eq!(files[0]["status"], "modified");
 
-    // Every other scope reports fallback=false; the flag is always serialized.
     for scope in ["staged", "unstaged", "working"] {
         let out = codescope(&["changeset", &root, "--scope", scope]);
         let json = json_stdout(&out);
-        assert!(
-            json.get("fallback").is_some(),
-            "{scope}: fallback key present: {json}"
-        );
-        assert_eq!(
-            json["fallback"].as_bool(),
-            Some(false),
-            "{scope}: no fallback: {json}"
-        );
+        assert_eq!(json["fallback"].as_bool(), Some(false), "{scope}: {json}");
     }
-
-    // A normal diverged branch reports fallback=false on the branch scope too.
-    let (_tmp, fx) = go_fixture();
-    let out = codescope(&["changeset", &fx.to_string_lossy(), "--scope", "branch"]);
+    let out = codescope(&["changeset", &root, "--scope", "working"]);
     let json = json_stdout(&out);
-    assert_eq!(
-        json["fallback"].as_bool(),
-        Some(false),
-        "fixture branch has real commits: {json}"
-    );
+    assert_eq!(json["files"][0]["path"], "util.go");
 }
 
 #[test]
-fn analyze_fully_pushed_branch_marks_changeset_as_fallback() {
-    let built = scenario_repo("branch_fully_pushed");
-    let root = built.root.to_string_lossy().to_string();
-
-    let out = codescope(&["analyze", &root, "--scope", "branch"]);
-    let json = json_stdout(&out);
-    assert_analyze_keys(&json, "fully_pushed analyze");
-    assert_eq!(json["changeset"]["scope"], "branch");
-    assert_eq!(
-        json["changeset"]["fallback"].as_bool(),
-        Some(true),
-        "fallback rides the snapshot: {json}"
-    );
-    assert_eq!(json["changeset"]["files"][0]["path"], "util.go");
-    // The fallback hunk reaches tier 3 of the embedded digest.
-    assert!(
-        !json["digest"]["hunks"].as_array().unwrap().is_empty(),
-        "fallback hunks reach the digest: {json}"
-    );
-    assert_repo_relative(&stdout(&out), &built.root);
-}
-
-#[test]
-fn digest_fully_pushed_branch_scope_carries_fallback_content() {
-    let built = scenario_repo("branch_fully_pushed");
-    let root = built.root.to_string_lossy().to_string();
-
-    let out = codescope(&["digest", &root, "--scope", "branch"]);
-    let json = json_stdout(&out);
-    assert_digest_tiers(&json, "fully_pushed digest");
-    assert_eq!(json["scope"], "branch");
-    let hunks = json["hunks"].as_array().unwrap();
-    assert_eq!(hunks.len(), 1, "one fallback hunk: {json}");
-    assert_eq!(hunks[0]["file"], "util.go");
-    // The repo sketch names the upstream base.
-    assert_eq!(json["repo"]["head"], "feature");
-    assert_eq!(json["repo"]["base_ref"], "main");
-
-    // --text renders the same content.
-    let out = codescope(&["digest", &root, "--scope", "branch", "--text"]);
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-    let text = stdout(&out);
-    assert!(text.starts_with("# change digest\n"), "{text}");
-    assert!(
-        text.contains("## hunks (1)"),
-        "fallback hunk rendered: {text}"
-    );
-    assert!(
-        text.contains("util.go#h0"),
-        "hunk line names the file: {text}"
-    );
-    assert_repo_relative(&text, &built.root);
-}
-
-#[test]
-fn bases_fully_pushed_branch_lists_the_upstream_first() {
+fn bases_fully_pushed_branch_excludes_every_head_equivalent_ref() {
     let built = scenario_repo("branch_fully_pushed");
     let root = built.root.to_string_lossy().to_string();
 
@@ -1019,17 +1233,130 @@ fn bases_fully_pushed_branch_lists_the_upstream_first() {
     let json = json_stdout(&out);
     let bases = json["bases"].as_array().unwrap();
     assert!(
-        !bases.is_empty(),
-        "upstream configured → at least one candidate: {json}"
+        bases.is_empty(),
+        "all refs are at HEAD and must be excluded: {json}"
     );
-    assert_eq!(bases[0]["ref_name"], "main");
-    assert_eq!(bases[0]["source"], "upstream");
-    let merge_base = bases[0]["merge_base"].as_str().expect("merge_base string");
-    assert_eq!(merge_base.len(), 40, "full hex oid: {merge_base}");
+}
+
+// ---------------------------------------------------------------------------
+// Stacked branches with a remote-only parent (review 26)
+
+/// The ROOTFS shape: a local far ancestor (rootfs-1), a REMOTE-ONLY nearest ancestor
+/// (origin/rootfs-2, no local branch), and HEAD (rootfs-3) whose upstream is HEAD-equivalent.
+/// The inferred base must be the remote-only rootfs-2, and the picker must include it and
+/// exclude the empty origin/rootfs-3.
+#[test]
+fn stacked_branch_with_remote_only_parent_infers_it() {
+    let dir = std::env::temp_dir().join(format!(
+        "codescope-rootfs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@test.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@test.invalid")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    // rootfs-1: the far ancestor (local).
+    git(&["init", "-q", "-b", "rootfs-1"]);
+    std::fs::write(
+        dir.join("a.txt"),
+        "one
+",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "--no-verify", "-m", "r1"]);
+    // rootfs-2: one commit on top, pushed to a remote so it exists only as origin/rootfs-2.
+    git(&["checkout", "-q", "-b", "rootfs-2"]);
+    std::fs::write(
+        dir.join("a.txt"),
+        "one
+two
+",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "--no-verify", "-m", "r2"]);
+    // A bare remote to hold the remote-only ref. It must live OUTSIDE the repo dir, or its
+    // files would appear in the diff.
+    let bare = dir.parent().unwrap().join(format!(
+        "_origin-{}.git",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::create_dir_all(&bare).unwrap();
+    let bare_str = bare.to_string_lossy().to_string();
+    git(&["-C", &bare_str, "init", "-q", "--bare"]);
+    git(&["remote", "add", "origin", &bare_str]);
+    git(&["push", "-q", "-u", "origin", "rootfs-2"]);
+    // rootfs-3: HEAD, one commit on top of rootfs-2, upstream == HEAD (empty).
+    git(&["checkout", "-q", "-b", "rootfs-3"]);
+    std::fs::write(
+        dir.join("a.txt"),
+        "one
+two
+three
+",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "--no-verify", "-m", "r3"]);
+    git(&["push", "-q", "-u", "origin", "rootfs-3"]);
+    // Delete the local rootfs-2 branch so it exists ONLY as origin/rootfs-2.
+    git(&["branch", "-q", "-D", "rootfs-2"]);
+
+    let root = dir.to_string_lossy().to_string();
+    let out = codescope(&["scan", &root]);
+    let json = json_stdout(&out);
+    assert_eq!(json["repo"]["head"]["branch"], "rootfs-3");
+    assert_eq!(
+        json["repo"]["base"]["ref_name"], "origin/rootfs-2",
+        "the nearest strict ancestor is the remote-only rootfs-2: {}",
+        json["repo"]
+    );
+
+    let out = codescope(&["bases", &root]);
+    let json = json_stdout(&out);
+    let names: Vec<&str> = json["bases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["ref_name"].as_str().unwrap())
+        .collect();
     assert!(
-        merge_base.chars().all(|c| c.is_ascii_hexdigit()),
-        "hex oid: {merge_base}"
+        names.contains(&"origin/rootfs-2"),
+        "rootfs-2 in the picker: {names:?}"
     );
+    assert!(
+        !names.contains(&"origin/rootfs-3"),
+        "the HEAD-equivalent upstream is excluded: {names:?}"
+    );
+
+    // Branch scope shows only the rootfs-3 delta (1 file) vs rootfs-2.
+    let out = codescope(&["changeset", &root, "--scope", "branch"]);
+    let json = json_stdout(&out);
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "only the rootfs-3 change: {json}");
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,7 +2063,14 @@ fn nonexistent_path_errors_with_json_and_exit_1() {
         .join("does-not-exist")
         .to_string_lossy()
         .to_string();
-    for sub in ["scan", "changeset", "analyze", "digest", "bases"] {
+    for sub in [
+        "scan",
+        "changeset",
+        "analyze",
+        "digest",
+        "bases",
+        "debug-ai",
+    ] {
         let out = codescope(&[sub, &missing]);
         let err = json_stderr_error(&out);
         assert!(
@@ -1755,7 +2089,14 @@ fn file_path_is_not_a_repo() {
     let file = tmp.path().join("plain.txt");
     std::fs::write(&file, "hello\n").expect("write");
     let file = file.to_string_lossy().to_string();
-    for sub in ["scan", "changeset", "analyze", "digest", "bases"] {
+    for sub in [
+        "scan",
+        "changeset",
+        "analyze",
+        "digest",
+        "bases",
+        "debug-ai",
+    ] {
         let out = codescope(&[sub, &file]);
         let err = json_stderr_error(&out);
         assert!(
@@ -1773,7 +2114,14 @@ fn non_git_dir_scenario_errors_on_all_subcommands() {
     let built = scenario_repo("non_git_dir");
     assert!(!built.git, "the scenario builds a plain directory");
     let root = built.root.to_string_lossy().to_string();
-    for sub in ["scan", "changeset", "analyze", "digest", "bases"] {
+    for sub in [
+        "scan",
+        "changeset",
+        "analyze",
+        "digest",
+        "bases",
+        "debug-ai",
+    ] {
         let out = codescope(&[sub, &root]);
         let err = json_stderr_error(&out);
         assert!(
@@ -1960,16 +2308,12 @@ fn detached_head_scan_reports_the_detached_oid() {
         assert_eq!(json["scopes"][scope], 0, "{scope}: clean tree");
     }
 
-    // bases and tree scopes keep working while detached.
+    // The only named ref is HEAD-equivalent, so it is not offered as an empty base.
     let out = codescope(&["bases", &root]);
     let json = json_stdout(&out);
     assert!(
-        json["bases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|b| b["ref_name"] == "main"),
-        "main is still a base candidate: {json}"
+        json["bases"].as_array().unwrap().is_empty(),
+        "HEAD-equivalent main is excluded: {json}"
     );
     let out = codescope(&["changeset", &root, "--scope", "working"]);
     let json = json_stdout(&out);
