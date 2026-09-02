@@ -2,7 +2,8 @@
 
 Scope: how codescope uses an LLM to *choose and parameterize* visualizations of the current
 change. The app owns facts, validation, and rendering. The AI never invents entities and is
-never required: every AI view has a deterministic fallback built from the same fact store.
+never required. Deterministic impact remains available outside the generated result, but a failed
+AI view reports failure explicitly instead of impersonating a summary with fallback data.
 
 Sources verified locally: HumanLayer Show Me SKILL.md (fetched 2026-08), crates.io versions,
 `prime inference models` output, Prime Inference base URL from the prime-intellect skill docs.
@@ -122,7 +123,7 @@ Hallucination policy (per form):
   If >20% of nodes invalid or the root invalid → reject the form.
 - **Flow/sequence forms**: invalid endpoint breaks ordering semantics → reject the form.
 - **`impact_summary`**: drop invalid bullets; reject if empty.
-- Any rejection → deterministic fallback view of the same form + status-line notice.
+- Any terminal rejection → one clickable `AI failed` banner with retained diagnostic detail.
   Log all drops/rejects; a "plan validation" debug pane helps tune prompts.
 
 ## 4. Compact change description (prompt payload) + tool surface
@@ -176,8 +177,9 @@ the whole OpenAI API surface — churn without payoff for one endpoint. Pitfall:
 `reqwest-eventsource` 0.6.0 pins `reqwest ^0.12`, so on reqwest 0.13 use `eventsource-stream`
 0.2.3 directly over `response.bytes_stream()` and parse `data:` frames yourself ([DONE] sentinel).
 
-HTTP streaming remains off. Accepted draft edits can render immediately between ordinary tool
-turns, while publication is atomic after validation.
+HTTP streaming remains off. Accepted draft edits remain available through the shared draft API;
+between ordinary tool turns the TUI shows each research/edit call progressing through
+running/succeeded/failed. Diagram publication remains atomic after validation.
 
 Config (env-first, all optional unless enabled; AI disabled = full functionality):
 - `CODESCOPE_AI=off|on` (default: auto = on iff an API key is found)
@@ -194,7 +196,7 @@ paths and env values from the payload.
 ## Recommended decisions
 
 1. AI selects from the structural form enum and incrementally describes boxes and relationships;
-   the TUI owns all placement/rendering and every AI form has a deterministic fallback.
+   the TUI owns all placement/rendering and reports generation failure explicitly.
 2. Adopt Show Me's rules as plan constraints: one focus question, ≤12 nodes, depth ≤3, ≤3-line
    summary, structural diffs over text diffs.
 3. Validate everything: epoch gate, entity resolution, edge existence in the impact graph,

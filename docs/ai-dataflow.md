@@ -55,9 +55,11 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    selected changed files, and results are line/byte capped. Git status/diff results come from
    the immutable captured `ChangeSet`, so exact evidence cannot drift during the loop. Diff rows
    carry copyable one-based `[old:… new:…]` coordinates. A finish requested before one successful
-   research call is rejected and the model is sent back to research. Each accepted draft edit can
-   be published to the TUI immediately; only renderable projections are shown, and final publication
-   still requires full validation. No shell command is executed and no repository state is mutated.
+   research call is rejected and the model is sent back to research. Each accepted draft edit is
+   published into the shared snapshot/controller state, while the in-flight TUI view shows the
+   ordered tool-call lifecycle (`running`, `succeeded`, or `failed`) rather than unfinished boxes.
+   Final diagram publication still requires full validation. No shell command is executed and no
+   repository state is mutated.
    A completed,
    validated plan is cached by stable directory/file/symbol identity. After that selection changes, its
    old plan is sent as an explicitly untrusted design seed: incremental revisions preserve
@@ -80,7 +82,8 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    nodes per form (4 is the default; core keeps larger internal backstops), ≤8 edges per
    form, and 1–4 evidence entries. A rejected plan gets up to 3 bounded repair turns —
    schema, entity/fact, and structural errors each receive targeted guidance — before the
-   deterministic fallback. A sequence missing an ordered link is repaired; extra, back, or
+   generated pane reports `AI failed`. It never substitutes deterministic relationships for a
+   failed generated result. A sequence missing an ordered link is repaired; extra, back, or
    duplicate sequence edges are sanitized to one consecutive edge per step. An accepted
    validation report travels with its plan: `debug-ai` prints the full report (verdict,
    dropped items, notes), while the TUI shows one concise sanitized-plan warning above the
@@ -131,8 +134,8 @@ the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` re
 - **Timeout / rate limit** — configurable per-request timeout, `Retry-After` honored,
   exponential backoff, an 8-request in-flight cap, and the high 600 rpm local safety ceiling
   awaited asynchronously; a circuit breaker (3 transport failures in 60 s) cools down for 60 s.
-- **Malformed / hallucinated plan** — validation drops or rejects; deterministic fallback shows;
-  the status line notes it.
+- **Malformed / hallucinated plan** — validation drops invalid pieces or rejects the result after
+  bounded repair; a terminal rejection shows the clickable `AI failed` banner.
 - **Rapid edits** — changes are coalesced. The selected file's symbols are invalidated and
   reloaded first, then its plan regenerates; the AI is never asked on every keystroke.
 

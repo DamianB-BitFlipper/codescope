@@ -179,7 +179,11 @@ instead of repeatedly returning the whole plan. Each node also carries one or tw
 `code_refs` copied from annotated `git_diff_file` tool results plus optional
 `expanded_detail`. The model describes semantics, not coordinates: the renderer chooses a
 responsive horizontal or vertical arrangement, bounds every line to the pane width, and uses a
-single vertical scroll axis when the result is taller than the viewport. Hovering a rendered
+single vertical scroll axis when the result is taller than the viewport. While an internal request
+is running, the generated pane shows its research and diagram tool calls progressing from running
+to succeeded/failed instead of mixing unfinished boxes with fallback content. A terminal failure
+shows one clickable `AI failed` banner; it does not replace the unfinished draft with known
+relationships. Hovering a rendered
 node highlights those old/new rows in the main diff; clicking it (or pressing `Space` while it is
 hovered) pins its code highlight and opens its deeper explanation and source locators. Every cited file, hunk, source line,
 symbol, or typed graph edge must resolve against the fact store; conceptual entityless nodes and

@@ -8,7 +8,8 @@
 use std::collections::HashSet;
 
 use codescope_ai::{
-    parse_plan, validate, AiOutcome, AiService, DiagramObserver, FactView, ReasoningEffort,
+    parse_plan, validate, AiActivityObserver, AiActivityUpdate, AiOutcome, AiService,
+    AiToolActivityState, DiagramObserver, FactView, ReasoningEffort,
 };
 use codescope_analysis::{AnalysisEngine, AnalysisSnapshot};
 use codescope_core::{
@@ -18,9 +19,10 @@ use codescope_core::{
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
 use codescope_tui::snapshot::{
-    AiSummaryKey, AiSummaryState, AiTokenUsage, DiffPane, DiffRow, FileRow, ImpactList,
-    ImpactLoadState, ImpactPane, ImpactRow, InterpretationSource, RepoBar, ScopeCounts,
-    SelectedChange, SemanticPane, StatusLevel, StatusMessage, SymbolRow, UiSnapshot,
+    AiActivity, AiSummaryKey, AiSummaryState, AiTokenUsage, AiToolCallActivity,
+    AiToolCallActivityState, DiffPane, DiffRow, FileRow, ImpactList, ImpactLoadState, ImpactPane,
+    ImpactRow, InterpretationSource, RepoBar, ScopeCounts, SelectedChange, SemanticPane,
+    StatusLevel, StatusMessage, SymbolRow, UiSnapshot,
 };
 use codescope_tui::Action;
 use codescope_tui::UiPreferences;
@@ -162,6 +164,17 @@ pub enum DispatchEvent {
         generation: u64,
         /// Complete bounded draft after the accepted edit.
         draft: DiagramDraft,
+    },
+    /// One model/tool lifecycle update for an in-flight AI request.
+    AiActivity {
+        /// Repository epoch the request is researching.
+        epoch: Epoch,
+        /// Selection whose explanation is being generated.
+        selection: AiSelectionKey,
+        /// Request generation used to reject stale or evicted updates.
+        generation: u64,
+        /// Waiting/tool-call state emitted by the AI service.
+        update: AiActivityUpdate,
     },
     /// The selection stayed on one changed directory/file/symbol long enough to request its AI plan.
     /// Navigation increments `generation`, so earlier debounce events become inert before
@@ -475,6 +488,8 @@ pub struct Dispatcher {
     agent_guidance: std::collections::HashMap<AiSelectionKey, AgentGuidance>,
     /// Active AI requests, indexed by their unique generation.
     ai_running: std::collections::HashMap<u64, AiRunningJob>,
+    /// Bounded per-generation tool-call history used by the focused loading view.
+    ai_activity: std::collections::HashMap<u64, AiActivity>,
     /// FIFO window of active requests. Selection changes do not cancel work; starting a
     /// seventeenth request cancels the oldest active generation.
     ai_requests: RequestCoordinator,
@@ -584,6 +599,7 @@ impl Dispatcher {
             ai_revision_cache: std::collections::HashMap::new(),
             agent_guidance: std::collections::HashMap::new(),
             ai_running: std::collections::HashMap::new(),
+            ai_activity: std::collections::HashMap::new(),
             ai_requests: RequestCoordinator::default(),
             ai_failures: std::collections::HashMap::new(),
             ai_selection_seq: 0,
@@ -747,6 +763,12 @@ impl Dispatcher {
                 generation,
                 draft,
             } => self.on_ai_draft(epoch, selection, generation, draft),
+            DispatchEvent::AiActivity {
+                epoch,
+                selection,
+                generation,
+                update,
+            } => self.on_ai_activity(epoch, selection, generation, update),
             DispatchEvent::AiSelectionSettled { epoch, generation } => {
                 if epoch == self.epoch && generation == self.ai_selection_seq {
                     if let Some(selection) = self.current_ai_selection() {
@@ -1159,6 +1181,7 @@ impl Dispatcher {
         for generation in generations {
             self.ai_requests.abort(generation);
             self.ai_running.remove(&generation);
+            self.ai_activity.remove(&generation);
         }
         self.retarget_ai_to_current_selection(true);
         self.set_status(
@@ -1426,6 +1449,7 @@ impl Dispatcher {
     fn abort_all_ai_requests(&mut self) {
         self.ai_requests.abort_all();
         self.ai_running.clear();
+        self.ai_activity.clear();
     }
 
     fn refresh_current_ai_status(&mut self) {
@@ -1772,6 +1796,7 @@ impl Dispatcher {
                     "cancelled oldest AI request after active window reached 16"
                 );
             }
+            self.ai_activity.remove(&generation);
         }
         // A validated plan from an older epoch is not current UI state, but it is a useful
         // design draft for the same directory/file/symbol. The AI service labels it as untrusted
@@ -1796,6 +1821,7 @@ impl Dispatcher {
         let ai = self.ai.clone();
         let tx = self.job_tx.clone();
         let draft_tx = tx.clone();
+        let activity_tx = tx.clone();
         let draft_selection = selection.clone();
         let observer: DiagramObserver = std::sync::Arc::new(move |draft| {
             // Draft mutations are bounded and frequent. Never make the provider loop wait
@@ -1807,17 +1833,27 @@ impl Dispatcher {
                 draft,
             });
         });
+        let activity_selection = selection.clone();
+        let activity_observer: AiActivityObserver = std::sync::Arc::new(move |update| {
+            let _ = activity_tx.try_send(DispatchEvent::AiActivity {
+                epoch,
+                selection: activity_selection.clone(),
+                generation,
+                update,
+            });
+        });
         let running_selection = selection.clone();
         let task = tokio::spawn(async move {
             let outcome = match &ai {
                 Some(ai) => {
-                    ai.request_plan_with_previous_observer(
+                    ai.request_plan_with_observers(
                         &brief,
                         previous_plan.as_ref(),
                         &research_tools,
                         &facts,
                         epoch,
                         Some(observer),
+                        Some(activity_observer),
                     )
                     .await
                 }
@@ -1839,6 +1875,14 @@ impl Dispatcher {
                 selection: running_selection.clone(),
                 epoch,
                 generation,
+            },
+        );
+        self.ai_activity.insert(
+            generation,
+            AiActivity {
+                active: true,
+                waiting_for_model: true,
+                ..AiActivity::default()
             },
         );
         tracing::debug!(
@@ -2311,6 +2355,65 @@ impl Dispatcher {
         }
     }
 
+    fn on_ai_activity(
+        &mut self,
+        epoch: Epoch,
+        selection: AiSelectionKey,
+        generation: u64,
+        update: AiActivityUpdate,
+    ) {
+        let Some(running) = self.ai_running.get(&generation) else {
+            return;
+        };
+        if epoch != self.epoch
+            || running.epoch != epoch
+            || running.generation != generation
+            || running.selection != selection
+        {
+            return;
+        }
+
+        let activity = self.ai_activity.entry(generation).or_insert(AiActivity {
+            active: true,
+            ..AiActivity::default()
+        });
+        match update {
+            AiActivityUpdate::WaitingForModel => activity.waiting_for_model = true,
+            AiActivityUpdate::ToolCall {
+                id,
+                name,
+                detail,
+                state,
+            } => {
+                activity.waiting_for_model = false;
+                let state = match state {
+                    AiToolActivityState::Running => AiToolCallActivityState::Running,
+                    AiToolActivityState::Succeeded => AiToolCallActivityState::Succeeded,
+                    AiToolActivityState::Failed => AiToolCallActivityState::Failed,
+                };
+                if let Some(call) = activity.calls.iter_mut().find(|call| call.id == id) {
+                    call.name = name;
+                    call.detail = detail;
+                    call.state = state;
+                } else {
+                    activity.calls.push(AiToolCallActivity {
+                        id,
+                        name,
+                        detail,
+                        state,
+                    });
+                    if activity.calls.len() > codescope_ai::MAX_TOOL_CALLS as usize {
+                        activity.calls.remove(0);
+                    }
+                }
+            }
+        }
+        if self.current_ai_selection().as_ref() == Some(&selection) {
+            self.ai_status = AiStatus::Loading { since_epoch: epoch };
+            self.publish();
+        }
+    }
+
     fn on_ai_done(
         &mut self,
         epoch: Epoch,
@@ -2324,6 +2427,7 @@ impl Dispatcher {
             // generation. Its ledger entry is gone, so it cannot publish stale output.
             return;
         };
+        self.ai_activity.remove(&generation);
         if running.epoch != epoch
             || running.generation != generation
             || running.selection != selection
@@ -2426,6 +2530,19 @@ impl Dispatcher {
         let diagram_draft = self
             .current_ai_selection()
             .and_then(|selection| self.ai_drafts.get(&selection).cloned());
+        let ai_activity = self
+            .current_ai_selection()
+            .and_then(|selection| {
+                self.ai_running
+                    .iter()
+                    .filter_map(|(generation, running)| {
+                        (running.epoch == self.epoch && running.selection == selection)
+                            .then_some(*generation)
+                    })
+                    .max()
+            })
+            .and_then(|generation| self.ai_activity.get(&generation).cloned())
+            .unwrap_or_default();
         UiSnapshot {
             repo: repo_bar,
             scope: self.scope,
@@ -2454,6 +2571,7 @@ impl Dispatcher {
                 .map(|a| a.provider_label().to_string())
                 .unwrap_or_default(),
             ai_tokens,
+            ai_activity,
             available_models: self.available_models.clone(),
             model_list_loading: self.model_list_loading,
             model_list_error: self.model_list_error.clone(),
@@ -4769,6 +4887,58 @@ mod tests {
             interpret_change(&removed),
             "Removed function; callers may require updates."
         );
+    }
+
+    /// Activity events update one stable row and expose the next-model wait separately.
+    #[tokio::test]
+    async fn ai_activity_updates_one_tool_row_from_running_to_succeeded() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.selected_file = Some("a.txt".to_string());
+        let selection = disp.current_ai_selection().unwrap();
+        let generation = 41;
+        disp.ai_running.insert(
+            generation,
+            AiRunningJob {
+                selection: selection.clone(),
+                epoch: disp.epoch,
+                generation,
+            },
+        );
+
+        for state in [AiToolActivityState::Running, AiToolActivityState::Succeeded] {
+            disp.handle(DispatchEvent::AiActivity {
+                epoch: disp.epoch,
+                selection: selection.clone(),
+                generation,
+                update: AiActivityUpdate::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "git_diff_file".to_string(),
+                    detail: "a.txt · hunk 0".to_string(),
+                    state,
+                },
+            })
+            .await;
+        }
+        disp.handle(DispatchEvent::AiActivity {
+            epoch: disp.epoch,
+            selection,
+            generation,
+            update: AiActivityUpdate::WaitingForModel,
+        })
+        .await;
+
+        let snap = snapshot_rx.borrow().clone();
+        assert!(snap.ai_activity.active);
+        assert!(snap.ai_activity.waiting_for_model);
+        assert_eq!(snap.ai_activity.calls.len(), 1);
+        assert_eq!(
+            snap.ai_activity.calls[0].state,
+            AiToolCallActivityState::Succeeded
+        );
+        assert_eq!(snap.ai_activity.calls[0].name, "git_diff_file");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Every AI failure maps to a concise Warning footer plus a complete click-open

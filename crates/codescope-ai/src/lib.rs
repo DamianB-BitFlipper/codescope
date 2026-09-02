@@ -44,7 +44,10 @@ pub use config::{
 pub use error::AiError;
 pub use plan::parse_plan;
 pub use scrub::{scrub_secrets, REDACTED};
-pub use service::{redact_repo_root, AiOutcome, AiService, DiagramObserver, RetryPolicy};
+pub use service::{
+    redact_repo_root, AiActivityObserver, AiActivityUpdate, AiOutcome, AiService,
+    AiToolActivityState, DiagramObserver, RetryPolicy,
+};
 pub use tools::{
     diagram_tools, is_diagram_tool, is_read_only_tool, read_only_tools, research_tools,
     NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,

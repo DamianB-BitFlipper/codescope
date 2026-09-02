@@ -91,8 +91,10 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    requires every AI node to carry 1–2 exact old/new diff ranges and permits one optional expanded
    explanation. The fact-validation boundary checks epoch, entity resolution, typed-edge existence,
    hunks, and every referenced source line, with up to 3 bounded repair turns; accepted validation reports travel with
-   plans (debug-ai prints the full report; the TUI shows one sanitized-plan warning);
-   deterministic fallback always. The files pane projects changed paths as a directory → file →
+   plans (debug-ai prints the full report; the TUI shows one sanitized-plan warning). During
+   generation the TUI shows ordered tool-call progress, and a terminal generation failure shows
+   only `AI failed` in the generated half rather than a deterministic substitute. The files pane
+   projects changed paths as a directory → file →
    symbol tree and publishes per-row AI readiness. Only the debounced current directory, file,
    or symbol starts inference; directory facts are filtered to their subtree, and there
    is no AI prefetch or background prompt queue. Navigation cancels an unsent debounce but leaves

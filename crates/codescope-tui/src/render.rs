@@ -24,7 +24,9 @@ use crate::intraline;
 use crate::layout::{
     choose_tier, files_width, impact_left_width, impact_section_heights, Tier, MIN_DIFF_WIDTH,
 };
-use crate::snapshot::{DiffRow, ImpactList, ImpactLoadState, StatusLevel, UiSnapshot};
+use crate::snapshot::{
+    AiToolCallActivityState, DiffRow, ImpactList, ImpactLoadState, StatusLevel, UiSnapshot,
+};
 
 // -- palette (docs/review/15 §2) ----------------------------------------------
 //
@@ -1594,6 +1596,21 @@ pub(crate) fn generated_impact_content(
     snap: &UiSnapshot,
     width: u16,
 ) -> Vec<crate::diagram::DiagramLine> {
+    if matches!(snap.ai, AiStatus::Loading { .. }) && snap.ai_activity.active {
+        return ai_activity_lines(snap, width);
+    }
+    if matches!(snap.ai, AiStatus::Failed { .. }) {
+        return snap
+            .ai_failure_status()
+            .map(|status| {
+                vec![crate::diagram::DiagramLine::plain(
+                    truncate_cells(&status.text, width.into()),
+                    DiagramRole::Warning,
+                )]
+            })
+            .unwrap_or_default();
+    }
+
     let sem = &snap.semantic;
     // Node highlighting follows the actual selection, not the dispatcher's data-quality
     // note: the selected change label is what node labels and entity symbols must match.
@@ -1639,13 +1656,8 @@ pub(crate) fn generated_impact_content(
                 "Waiting for selection to settle…".to_string(),
                 DiagramRole::Warning,
             )),
-            AiStatus::Loading { .. } => Some((
-                "Generating a deeper explanation…".to_string(),
-                DiagramRole::Warning,
-            )),
-            AiStatus::Failed { .. } => snap
-                .ai_failure_status()
-                .map(|status| (status.text, DiagramRole::Warning)),
+            AiStatus::Loading { .. } => None,
+            AiStatus::Failed { .. } => None,
             AiStatus::Stale { .. } => Some((
                 "Repository changed; showing known relationships".to_string(),
                 DiagramRole::Warning,
@@ -1682,6 +1694,48 @@ pub(crate) fn generated_impact_content(
         }
     }
     lines.extend(diagram);
+    lines
+}
+
+fn ai_activity_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::DiagramLine> {
+    const MAX_VISIBLE_CALLS: usize = 9;
+    let mut lines = vec![crate::diagram::DiagramLine::plain(
+        truncate_cells("AI activity", width.into()),
+        DiagramRole::Title,
+    )];
+    let hidden = snap
+        .ai_activity
+        .calls
+        .len()
+        .saturating_sub(MAX_VISIBLE_CALLS);
+    if hidden > 0 {
+        lines.push(crate::diagram::DiagramLine::plain(
+            truncate_cells(&format!("… {hidden} earlier tool calls"), width.into()),
+            DiagramRole::Muted,
+        ));
+    }
+    for call in snap.ai_activity.calls.iter().skip(hidden) {
+        let (marker, role) = match call.state {
+            AiToolCallActivityState::Running => ("…", DiagramRole::Warning),
+            AiToolCallActivityState::Succeeded => ("✓", DiagramRole::Evidence),
+            AiToolCallActivityState::Failed => ("×", DiagramRole::Warning),
+        };
+        let detail = if call.detail.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", call.detail)
+        };
+        lines.push(crate::diagram::DiagramLine::plain(
+            truncate_cells(&format!("{marker} {}{detail}", call.name), width.into()),
+            role,
+        ));
+    }
+    if snap.ai_activity.waiting_for_model {
+        lines.push(crate::diagram::DiagramLine::plain(
+            truncate_cells("… waiting for model", width.into()),
+            DiagramRole::Muted,
+        ));
+    }
     lines
 }
 
@@ -3357,18 +3411,72 @@ mod tests {
     }
 
     #[test]
-    fn generated_impact_shows_progress_while_loading() {
+    fn generated_impact_shows_tool_progress_while_loading() {
         let mut snap = sample();
         snap.ai = AiStatus::Loading {
             since_epoch: codescope_core::Epoch(3),
         };
+        snap.ai_activity = crate::snapshot::AiActivity {
+            active: true,
+            waiting_for_model: false,
+            calls: vec![
+                crate::snapshot::AiToolCallActivity {
+                    id: "call-1".to_string(),
+                    name: "git_status_file".to_string(),
+                    detail: "service.go".to_string(),
+                    state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                },
+                crate::snapshot::AiToolCallActivity {
+                    id: "call-2".to_string(),
+                    name: "git_diff_file".to_string(),
+                    detail: "service.go · hunk 0".to_string(),
+                    state: crate::snapshot::AiToolCallActivityState::Running,
+                },
+            ],
+        };
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("AI activity"), "loading title: {text}");
         assert!(
-            buffer_text(&t).contains("Generating a deeper explanation…"),
-            "loading state: {}",
-            buffer_text(&t)
+            text.contains("✓ git_status_file · service.go"),
+            "done: {text}"
         );
+        assert!(
+            text.contains("… git_diff_file · service.go · hunk 0"),
+            "running: {text}"
+        );
+        assert!(
+            !text.contains("waiting for model"),
+            "tool is running: {text}"
+        );
+        assert!(
+            !text.contains("Generating a deeper explanation"),
+            "old noise: {text}"
+        );
+
+        snap.ai_activity.calls[1].state = crate::snapshot::AiToolCallActivityState::Succeeded;
+        snap.ai_activity.waiting_for_model = true;
+        t.draw(|f| render(f, &App::new(), &snap)).unwrap();
+        let text = buffer_text(&t);
+        assert!(
+            text.contains("✓ git_diff_file · service.go · hunk 0"),
+            "completed: {text}"
+        );
+        assert!(text.contains("… waiting for model"), "next turn: {text}");
+    }
+
+    #[test]
+    fn failed_ai_shows_only_the_failure_banner_in_the_generated_half() {
+        let mut snap = ai_plan_snap(2);
+        snap.ai = AiStatus::Failed {
+            reason: "tool budget exceeded".to_string(),
+        };
+        let lines = generated_impact_content(&App::new(), &snap, 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "AI failed · click for details");
+        assert!(!lines[0].text().contains("known relationships"));
+        assert!(!lines[0].text().contains("PlanStep"));
     }
 
     #[test]

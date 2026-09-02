@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_ai_failure_fallback_opens_the_retained_complete_reason() {
+    fn clicking_ai_failure_banner_opens_the_retained_complete_reason() {
         let reason = "provider HTTP 400\nfull validation response tail";
         let mut s = snap();
         s.ai = codescope_core::AiStatus::Failed {

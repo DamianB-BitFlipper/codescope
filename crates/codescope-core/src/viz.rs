@@ -400,7 +400,7 @@ pub enum ValidationVerdict {
     /// The plan's epoch no longer matches the repo state; show the last valid render with a
     /// "regenerating" badge and re-request.
     Stale,
-    /// The plan (or a form) is unusable; render the deterministic fallback.
+    /// The plan (or every remaining form) is unusable; do not publish it.
     Rejected,
 }
 

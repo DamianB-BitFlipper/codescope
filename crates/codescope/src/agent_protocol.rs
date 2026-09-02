@@ -16,7 +16,8 @@ use clap::{Args, Subcommand};
 use codescope_core::DiagramCommand;
 use codescope_git::GitRepo;
 use codescope_tui::snapshot::{
-    AiSummaryKey, AiSummaryState, DiffRow, FileSemanticLoad, ImpactLoadState, UiSnapshot,
+    AiSummaryKey, AiSummaryState, AiToolCallActivityState, DiffRow, FileSemanticLoad,
+    ImpactLoadState, UiSnapshot,
 };
 use codescope_tui::Action;
 use serde::{Deserialize, Serialize};
@@ -545,6 +546,19 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
             "status": snapshot.ai,
             "provider": snapshot.ai_provider,
             "model": snapshot.ai_model,
+            "activity": {
+                "active": snapshot.ai_activity.active,
+                "waiting_for_model": snapshot.ai_activity.waiting_for_model,
+                "calls": snapshot.ai_activity.calls.iter().map(|call| json!({
+                    "name": call.name,
+                    "detail": call.detail,
+                    "state": match call.state {
+                        AiToolCallActivityState::Running => "running",
+                        AiToolCallActivityState::Succeeded => "succeeded",
+                        AiToolCallActivityState::Failed => "failed",
+                    },
+                })).collect::<Vec<_>>(),
+            },
             "active_agent_guidance": snapshot.semantic.note.strip_prefix("Agent ").map(|_| snapshot.semantic.note.as_str()),
             "plan": snapshot.semantic.plan,
             "validation": snapshot.semantic.report,
@@ -843,6 +857,8 @@ mod tests {
         );
         assert_eq!(view["live"]["selection"]["kind"], "symbol");
         assert_eq!(view["focused_diff"]["rows"][0]["kind"], "add");
+        assert_eq!(view["ai"]["activity"]["active"], false);
+        assert!(view["ai"]["activity"]["calls"].is_array());
         assert!(view["capabilities"]["workflow"].as_array().unwrap().len() >= 4);
     }
 

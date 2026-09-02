@@ -51,7 +51,7 @@ pub enum Action {
     /// `Esc` closes the overlay once open.
     ToggleStatusDetail,
     /// Open a particular frozen diagnostic, such as the retained AI failure behind the
-    /// deterministic fallback banner. Unlike `ToggleStatusDetail`, this does not depend
+    /// generated-pane failure banner. Unlike `ToggleStatusDetail`, this does not depend
     /// on whichever transient message currently occupies the footer.
     OpenStatusDetail(crate::snapshot::StatusMessage),
     /// Focus a pane directly (`1`/`2`/`3`; Tab no longer cycles panes).

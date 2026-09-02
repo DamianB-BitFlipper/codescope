@@ -48,6 +48,8 @@ pub struct UiSnapshot {
     pub ai_provider: String,
     /// Provider-reported tokens consumed by this running process.
     pub ai_tokens: AiTokenUsage,
+    /// Live research and diagram-tool progression for the focused AI generation.
+    pub ai_activity: AiActivity,
     /// Models the provider advertises (for the picker modal; empty until fetched).
     pub available_models: Vec<String>,
     /// `true` while the user-triggered provider model-discovery request is in flight.
@@ -94,6 +96,7 @@ impl Default for UiSnapshot {
             available_reasoning_efforts: Vec::new(),
             ai_provider: String::new(),
             ai_tokens: AiTokenUsage::default(),
+            ai_activity: AiActivity::default(),
             available_models: Vec::new(),
             model_list_loading: false,
             model_list_error: None,
@@ -158,6 +161,41 @@ pub struct AiTokenUsage {
     pub output: u64,
 }
 
+/// Tool-call activity for the focused in-flight AI request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AiActivity {
+    /// `true` when the focused selection is owned by an internal provider request.
+    pub active: bool,
+    /// Calls in model order, updated in place as each one finishes.
+    pub calls: Vec<AiToolCallActivity>,
+    /// `true` while Codescope is waiting for the model's next response.
+    pub waiting_for_model: bool,
+}
+
+/// One bounded tool-call row shown while an AI explanation is generated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiToolCallActivity {
+    /// Provider call id used to join start and finish updates.
+    pub id: String,
+    /// Exact model-facing tool name.
+    pub name: String,
+    /// Short path, symbol, or diagram operation supplied to the call.
+    pub detail: String,
+    /// Current call lifecycle.
+    pub state: AiToolCallActivityState,
+}
+
+/// Display lifecycle for one AI tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiToolCallActivityState {
+    /// The tool is executing.
+    Running,
+    /// The tool returned a successful result.
+    Succeeded,
+    /// The call failed or was rejected and repair feedback was returned.
+    Failed,
+}
+
 impl UiSnapshot {
     /// A boot-time placeholder shown before the first analysis completes.
     #[must_use]
@@ -180,8 +218,8 @@ impl UiSnapshot {
         self.files.is_empty()
     }
 
-    /// Full click-open diagnostic for the deterministic fallback banner shown after an
-    /// AI request fails. The failure reason lives in `AiStatus`, independently of the
+    /// Full click-open diagnostic for the compact banner shown after an AI request fails.
+    /// The failure reason lives in `AiStatus`, independently of the
     /// transient footer, so later progress messages cannot erase the diagnostic before
     /// the user opens it.
     #[must_use]
@@ -190,7 +228,7 @@ impl UiSnapshot {
             return None;
         };
         Some(StatusMessage {
-            text: "AI failed; showing known relationships".to_string(),
+            text: "AI failed · click for details".to_string(),
             detail: Some(reason.clone()),
             level: StatusLevel::Warning,
         })
@@ -500,7 +538,7 @@ mod tests {
         };
 
         let failure = snap.ai_failure_status().expect("retained AI failure");
-        assert_eq!(failure.text, "AI failed; showing known relationships");
+        assert_eq!(failure.text, "AI failed · click for details");
         assert_eq!(failure.detail.as_deref(), Some(reason));
         assert_eq!(failure.level, StatusLevel::Warning);
     }

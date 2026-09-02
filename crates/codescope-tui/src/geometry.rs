@@ -211,7 +211,7 @@ impl UiGeometry {
         self.status.is_some_and(|rect| hit(rect, x, y))
     }
 
-    /// Whether a point is over the visible AI-failure fallback banner.
+    /// Whether a point is over the visible AI-failure banner.
     pub(crate) fn ai_failure_status_at(&self, x: u16, y: u16) -> bool {
         self.ai_failure_status.is_some_and(|rect| hit(rect, x, y))
     }

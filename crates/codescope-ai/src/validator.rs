@@ -180,7 +180,7 @@ pub fn validate(
         ValidationVerdict::ValidWithDrops
     };
     if verdict == ValidationVerdict::Rejected {
-        notes.push("no renderable forms remain; use the deterministic fallback".to_string());
+        notes.push("no renderable forms remain".to_string());
     }
     tracing::debug!(?verdict, dropped = dropped.len(), "plan validated");
     ValidationReport {

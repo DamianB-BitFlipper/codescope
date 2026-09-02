@@ -139,10 +139,13 @@ impl App {
         // (MERGE: the dispatcher half renames it to `file_path`; the comparison stays).
         let retargeted = self.snapshot.diff.title != snapshot.diff.title;
         let diff_content_changed = retargeted || self.snapshot.diff.rows != snapshot.diff.rows;
-        let generated_retargeted = self.snapshot.semantic.note != snapshot.semantic.note
-            || self.snapshot.semantic.plan != snapshot.semantic.plan;
         let impact_retargeted =
             self.snapshot.impact.selected_change != snapshot.impact.selected_change;
+        let activity_started = !self.snapshot.ai_activity.active && snapshot.ai_activity.active;
+        let generated_retargeted = self.snapshot.semantic.note != snapshot.semantic.note
+            || self.snapshot.semantic.plan != snapshot.semantic.plan
+            || impact_retargeted
+            || activity_started;
         if diff_content_changed {
             self.diff_selection = None;
         }

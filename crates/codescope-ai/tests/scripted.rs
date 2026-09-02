@@ -4,10 +4,10 @@
 //! local throttle) without any real network dependency.
 
 use codescope_ai::{
-    diagram_tools, research_tools, AiClient, AiClientOptions, AiConfig, AiError, AiOutcome,
-    AiService, ChatMessage, DiagramObserver, FactView, Lookup, NoToolExecutor, ReasoningEffort,
-    RetryPolicy, ToolChoice, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
-    DIAGRAM_FINISH_TOOL_NAME,
+    diagram_tools, research_tools, AiActivityObserver, AiActivityUpdate, AiClient, AiClientOptions,
+    AiConfig, AiError, AiOutcome, AiService, AiToolActivityState, ChatMessage, DiagramObserver,
+    FactView, Lookup, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolChoice, ToolDef,
+    ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_FINISH_TOOL_NAME,
 };
 use codescope_core::{
     DiagramCommand, DiagramDraft, DiffSide, EntityRef, Epoch, FileId, FormKind, LineRange,
@@ -921,15 +921,21 @@ async fn incremental_tools_build_and_publish_the_observed_live_draft() {
     let observer: DiagramObserver = Arc::new(move |draft| {
         observed_for_callback.lock().unwrap().push(draft);
     });
+    let activities = Arc::new(Mutex::new(Vec::<AiActivityUpdate>::new()));
+    let activities_for_callback = activities.clone();
+    let activity_observer: AiActivityObserver = Arc::new(move |activity| {
+        activities_for_callback.lock().unwrap().push(activity);
+    });
 
     let outcome = service
-        .request_plan_with_previous_observer(
+        .request_plan_with_observers(
             "small research brief",
             None,
             &IncrementalExecutor::default(),
             &FixtureFacts,
             Epoch(5),
             Some(observer),
+            Some(activity_observer),
         )
         .await;
     let AiOutcome::Plan(plan, report) = outcome else {
@@ -947,6 +953,21 @@ async fn incremental_tools_build_and_publish_the_observed_live_draft() {
             .first()
             .is_some_and(|form| form.nodes.len() == 2)
     }));
+    let activities = activities.lock().unwrap();
+    assert!(matches!(
+        activities.first(),
+        Some(AiActivityUpdate::WaitingForModel)
+    ));
+    assert!(activities.iter().any(|activity| matches!(
+        activity,
+        AiActivityUpdate::ToolCall { name, state: AiToolActivityState::Running, .. }
+            if name == "git_diff_file"
+    )));
+    assert!(activities.iter().any(|activity| matches!(
+        activity,
+        AiActivityUpdate::ToolCall { name, state: AiToolActivityState::Succeeded, .. }
+            if name == DIAGRAM_FINISH_TOOL_NAME
+    )));
 
     let first_request = provider.requests()[0].body_json().unwrap();
     let tool_names = first_request["tools"]

@@ -190,11 +190,21 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
     loading.ai = AiStatus::Loading {
         since_epoch: codescope_core::Epoch(3),
     };
+    loading.ai_activity = codescope_tui::snapshot::AiActivity {
+        active: true,
+        waiting_for_model: true,
+        calls: vec![codescope_tui::snapshot::AiToolCallActivity {
+            id: "call-1".to_string(),
+            name: "git_diff_file".to_string(),
+            detail: "service.go · hunk 0".to_string(),
+            state: codescope_tui::snapshot::AiToolCallActivityState::Succeeded,
+        }],
+    };
     app.update(loading.clone());
     t.draw(|f| render(f, &app, &loading)).unwrap();
     assert!(
-        buffer_text(&t).contains("Generating a deeper explanation…"),
-        "the generated half shows progress while loading"
+        buffer_text(&t).contains("✓ git_diff_file · service.go · hunk 0"),
+        "the generated half shows tool progress while loading"
     );
 
     let mut ready = sample();

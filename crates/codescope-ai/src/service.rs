@@ -18,7 +18,9 @@
 //! and never blocks the UI: callers `tokio::spawn` the future and apply the outcome at
 //! their epoch gate.
 
-use crate::client::{AiClient, AiClientOptions, ChatMessage, RawPlanResponse, TokenUsage};
+use crate::client::{
+    AiClient, AiClientOptions, ChatMessage, RawPlanResponse, RawToolCall, TokenUsage,
+};
 use crate::config::{AiConfig, ReasoningEffort};
 use crate::error::AiError;
 use crate::plan::{parse_plan, MAX_AI_EVIDENCE, MAX_AI_FORM_EDGES, MAX_AI_FORM_NODES};
@@ -44,6 +46,38 @@ const MAX_PLAN_REPAIRS: usize = 3;
 /// Receives each accepted incremental diagram mutation. Dispatchers use this to render the
 /// model's validated partial work while the same request continues researching and editing.
 pub type DiagramObserver = Arc<dyn Fn(DiagramDraft) + Send + Sync>;
+
+/// Lifecycle state of one model-requested research or diagram tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiToolActivityState {
+    /// The tool was selected by the model and is currently executing.
+    Running,
+    /// The tool completed successfully.
+    Succeeded,
+    /// The tool or its arguments were rejected; the model receives repair feedback.
+    Failed,
+}
+
+/// One incremental activity update emitted while the model researches and builds a diagram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiActivityUpdate {
+    /// Tool results have been returned and Codescope is waiting for the model's next turn.
+    WaitingForModel,
+    /// A tool call started or reached a terminal state.
+    ToolCall {
+        /// Provider-assigned call id, stable across start and finish updates.
+        id: String,
+        /// Exact tool name exposed to the model.
+        name: String,
+        /// Short, scrubbed path/symbol/diagram-operation context.
+        detail: String,
+        /// Current execution state.
+        state: AiToolActivityState,
+    },
+}
+
+/// Receives tool-call activity without making the provider loop wait for UI rendering.
+pub type AiActivityObserver = Arc<dyn Fn(AiActivityUpdate) + Send + Sync>;
 
 /// Terminal result of one plan request, ready for the dispatcher/TUI.
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +248,22 @@ impl AiService {
         epoch: Epoch,
         observer: Option<DiagramObserver>,
     ) -> AiOutcome {
+        self.request_plan_with_observers(brief, previous, tools, facts, epoch, observer, None)
+            .await
+    }
+
+    /// Request a plan while reporting both accepted draft mutations and tool-call activity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_plan_with_observers(
+        &self,
+        brief: &str,
+        previous: Option<&VisualizationPlan>,
+        tools: &dyn ToolExecutor,
+        facts: &dyn FactView,
+        epoch: Epoch,
+        diagram_observer: Option<DiagramObserver>,
+        activity_observer: Option<AiActivityObserver>,
+    ) -> AiOutcome {
         let user_prompt = build_user_prompt(epoch, brief, previous);
         let user_prompt =
             crate::scrub::scrub_secrets(&redact_repo_root(&user_prompt, &self.repo_root));
@@ -239,7 +289,8 @@ impl AiService {
             tools,
             facts,
             epoch,
-            observer.as_ref(),
+            diagram_observer.as_ref(),
+            activity_observer.as_ref(),
         )
         .await
     }
@@ -257,6 +308,7 @@ impl AiService {
         facts: &dyn FactView,
         epoch: Epoch,
         observer: Option<&DiagramObserver>,
+        activity_observer: Option<&AiActivityObserver>,
     ) -> AiOutcome {
         let mut draft = previous
             .map(DiagramDraft::from_plan)
@@ -274,6 +326,9 @@ impl AiService {
         let max_turns = self.config.max_tool_calls as usize + MAX_PLAN_REPAIRS + 2;
 
         for turn in 0..max_turns {
+            if let Some(observe) = activity_observer {
+                observe(AiActivityUpdate::WaitingForModel);
+            }
             let response = match self.chat_turn(messages, tool_defs).await {
                 Ok(response) => response,
                 Err(error) => return outcome_from_error(&error),
@@ -309,6 +364,12 @@ impl AiService {
                     return AiOutcome::Failed(error.to_string());
                 }
                 remaining -= 1;
+                observe_tool_activity(
+                    activity_observer,
+                    call,
+                    AiToolActivityState::Running,
+                    &self.repo_root,
+                );
 
                 match call.name.as_str() {
                     DIAGRAM_EDIT_TOOL_NAME => {
@@ -321,6 +382,12 @@ impl AiService {
                                         "finish is not an edit; call {DIAGRAM_FINISH_TOOL_NAME}"
                                     )),
                                 ));
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Failed,
+                                    &self.repo_root,
+                                );
                                 continue;
                             }
                             Ok(command) => command,
@@ -331,6 +398,12 @@ impl AiService {
                                         "diagram command is not valid JSON for the shared editor API: {error}"
                                     )),
                                 ));
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Failed,
+                                    &self.repo_root,
+                                );
                                 continue;
                             }
                         };
@@ -364,17 +437,35 @@ impl AiService {
                                     })
                                     .to_string(),
                                 ));
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Succeeded,
+                                    &self.repo_root,
+                                );
                             }
-                            Err(error) => tool_messages.push(ChatMessage::tool(
-                                call.id.clone(),
-                                error_result(error.to_string()),
-                            )),
+                            Err(error) => {
+                                tool_messages.push(ChatMessage::tool(
+                                    call.id.clone(),
+                                    error_result(error.to_string()),
+                                ));
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Failed,
+                                    &self.repo_root,
+                                );
+                            }
                         }
                     }
                     DIAGRAM_INSPECT_TOOL_NAME => {
-                        let result = serde_json::to_string(&draft).unwrap_or_else(|error| {
-                            error_result(format!("could not serialize diagram draft: {error}"))
-                        });
+                        let (result, succeeded) = match serde_json::to_string(&draft) {
+                            Ok(result) => (result, true),
+                            Err(error) => (
+                                error_result(format!("could not serialize diagram draft: {error}")),
+                                false,
+                            ),
+                        };
                         tool_messages.push(ChatMessage::tool(
                             call.id.clone(),
                             crate::scrub::scrub_secrets(&redact_repo_root(
@@ -382,6 +473,16 @@ impl AiService {
                                 &self.repo_root,
                             )),
                         ));
+                        observe_tool_activity(
+                            activity_observer,
+                            call,
+                            if succeeded {
+                                AiToolActivityState::Succeeded
+                            } else {
+                                AiToolActivityState::Failed
+                            },
+                            &self.repo_root,
+                        );
                     }
                     DIAGRAM_FINISH_TOOL_NAME => {
                         if tools.requires_research() && research_calls == 0 {
@@ -393,12 +494,24 @@ impl AiService {
                                 })
                                 .to_string(),
                             ));
+                            observe_tool_activity(
+                                activity_observer,
+                                call,
+                                AiToolActivityState::Failed,
+                                &self.repo_root,
+                            );
                             continue;
                         }
 
                         let serialized = match serde_json::to_string(&draft.plan()) {
                             Ok(serialized) => serialized,
                             Err(error) => {
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Failed,
+                                    &self.repo_root,
+                                );
                                 return AiOutcome::Failed(format!(
                                     "could not serialize diagram draft: {error}"
                                 ));
@@ -408,6 +521,12 @@ impl AiService {
                             Ok(plan) => plan,
                             Err(error) => {
                                 if repairs >= MAX_PLAN_REPAIRS {
+                                    observe_tool_activity(
+                                        activity_observer,
+                                        call,
+                                        AiToolActivityState::Failed,
+                                        &self.repo_root,
+                                    );
                                     return outcome_from_error(&error);
                                 }
                                 repairs += 1;
@@ -420,16 +539,36 @@ impl AiService {
                                     })
                                     .to_string(),
                                 ));
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Failed,
+                                    &self.repo_root,
+                                );
                                 continue;
                             }
                         };
                         let report = validate(&mut plan, facts, epoch);
                         match report.verdict {
-                            ValidationVerdict::Stale => return AiOutcome::Stale,
+                            ValidationVerdict::Stale => {
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Failed,
+                                    &self.repo_root,
+                                );
+                                return AiOutcome::Stale;
+                            }
                             ValidationVerdict::Valid | ValidationVerdict::ValidWithDrops => {
                                 if let Some(observe) = observer {
                                     observe(DiagramDraft::from_plan(&plan));
                                 }
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Succeeded,
+                                    &self.repo_root,
+                                );
                                 return AiOutcome::Plan(plan, report);
                             }
                             ValidationVerdict::Rejected => {
@@ -438,6 +577,12 @@ impl AiService {
                                     let user_summary =
                                         user_rejection_summary(&report, &self.repo_root);
                                     let detail = user_rejection_detail(&report, &self.repo_root);
+                                    observe_tool_activity(
+                                        activity_observer,
+                                        call,
+                                        AiToolActivityState::Failed,
+                                        &self.repo_root,
+                                    );
                                     return AiOutcome::Failed(format!(
                                         "diagram rejected: {user_summary}\n\nValidation details:\n{detail}"
                                     ));
@@ -452,6 +597,12 @@ impl AiService {
                                     })
                                     .to_string(),
                                 ));
+                                observe_tool_activity(
+                                    activity_observer,
+                                    call,
+                                    AiToolActivityState::Failed,
+                                    &self.repo_root,
+                                );
                             }
                         }
                     }
@@ -460,11 +611,29 @@ impl AiService {
                             self.execute_tool(tools, &call.name, &call.arguments).await;
                         research_calls += usize::from(researched);
                         tool_messages.push(ChatMessage::tool(call.id.clone(), result));
+                        observe_tool_activity(
+                            activity_observer,
+                            call,
+                            if researched {
+                                AiToolActivityState::Succeeded
+                            } else {
+                                AiToolActivityState::Failed
+                            },
+                            &self.repo_root,
+                        );
                     }
-                    _ => tool_messages.push(ChatMessage::tool(
-                        call.id.clone(),
-                        error_result(format!("unknown tool {:?}", call.name)),
-                    )),
+                    _ => {
+                        tool_messages.push(ChatMessage::tool(
+                            call.id.clone(),
+                            error_result(format!("unknown tool {:?}", call.name)),
+                        ));
+                        observe_tool_activity(
+                            activity_observer,
+                            call,
+                            AiToolActivityState::Failed,
+                            &self.repo_root,
+                        );
+                    }
                 }
             }
 
@@ -542,6 +711,67 @@ impl AiService {
                 )
             }
         }
+    }
+}
+
+fn observe_tool_activity(
+    observer: Option<&AiActivityObserver>,
+    call: &RawToolCall,
+    state: AiToolActivityState,
+    repo_root: &Utf8Path,
+) {
+    let Some(observe) = observer else { return };
+    let detail = tool_activity_detail(call);
+    let detail = crate::scrub::scrub_secrets(&redact_repo_root(&detail, repo_root));
+    observe(AiActivityUpdate::ToolCall {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        detail: cap_activity_detail(&detail, 96),
+        state,
+    });
+}
+
+fn tool_activity_detail(call: &RawToolCall) -> String {
+    let Ok(arguments) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+        return "invalid arguments".to_string();
+    };
+    if call.name == DIAGRAM_EDIT_TOOL_NAME {
+        let operation = arguments
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("edit");
+        let subject = arguments
+            .pointer("/node/label")
+            .or_else(|| arguments.get("form_id"))
+            .or_else(|| arguments.get("from"))
+            .and_then(serde_json::Value::as_str);
+        return match subject {
+            Some(subject) => format!("{operation} · {subject}"),
+            None => operation.to_string(),
+        };
+    }
+
+    let subject = ["path", "file", "symbol"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(serde_json::Value::as_str));
+    let hunk = arguments
+        .get("hunk_index")
+        .and_then(serde_json::Value::as_u64);
+    match (subject, hunk) {
+        (Some(subject), Some(hunk)) => format!("{subject} · hunk {hunk}"),
+        (Some(subject), None) => subject.to_string(),
+        (None, Some(hunk)) => format!("hunk {hunk}"),
+        (None, None) => String::new(),
+    }
+}
+
+fn cap_activity_detail(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
     }
 }
 
@@ -675,7 +905,7 @@ fn rejection_summary(report: &ValidationReport, repo_root: &Utf8Path) -> String 
             .collect();
     }
     if reasons.is_empty() {
-        return "no renderable forms remain; use the deterministic fallback".to_string();
+        return "no renderable forms remain".to_string();
     }
     let omitted = reasons.len().saturating_sub(MAX_REASONS);
     let suffix = if omitted > 0 {
@@ -763,7 +993,7 @@ fn user_rejection_detail(report: &ValidationReport, repo_root: &Utf8Path) -> Str
         }
     }
     if lines.is_empty() {
-        "- No renderable forms remain; use the deterministic fallback.".to_string()
+        "- No renderable forms remain.".to_string()
     } else {
         lines.join("\n")
     }
@@ -934,6 +1164,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tool_activity_details_keep_only_bounded_useful_context() {
+        let diff = RawToolCall {
+            id: "call-1".to_string(),
+            name: "git_diff_file".to_string(),
+            arguments: serde_json::json!({"path": "src/service.rs", "hunk_index": 2}).to_string(),
+        };
+        assert_eq!(tool_activity_detail(&diff), "src/service.rs · hunk 2");
+
+        let edit = RawToolCall {
+            id: "call-2".to_string(),
+            name: DIAGRAM_EDIT_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({
+                "op": "create_node",
+                "form_id": "main",
+                "node": {"label": "Request queue"}
+            })
+            .to_string(),
+        };
+        assert_eq!(tool_activity_detail(&edit), "create_node · Request queue");
+        assert_eq!(
+            cap_activity_detail(&"x".repeat(120), 96).chars().count(),
+            97
+        );
+    }
+
     /// A rejected plan surfaces the concrete dropped-form reason, not the generic tail.
     #[test]
     fn rejection_summary_surfaces_dropped_reasons() {
@@ -946,7 +1202,7 @@ mod tests {
                 ("form 1 (CallTree)", "root symbol does not resolve"),
                 ("form 2 (Sequence)", "edge not queried"),
             ],
-            &["no renderable forms remain; use the deterministic fallback"],
+            &["no renderable forms remain"],
         );
         let summary = rejection_summary(&report, Utf8Path::new("/Users/dev/repo"));
         assert!(
