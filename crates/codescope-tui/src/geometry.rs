@@ -4,6 +4,7 @@
 //! Built once per frame in the draw closure and retained by the run loop. Do not cache it
 //! in App or recompute it in input handling.
 
+use codescope_core::AiStatus;
 use ratatui::layout::Rect;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -46,13 +47,31 @@ pub struct UiGeometry {
     pub files_first_visible: usize,
     /// Independently scrollable rectangles in the frame the user actually saw.
     pub(crate) scroll_regions: Vec<ScrollRegion>,
-    /// Visible generated-plan node spans. Several rects may share one target when a box
-    /// occupies multiple rows or a compact node has separate label/detail spans.
+    /// Generated diagram content in screen coordinates. Its local `(0, 0)` origin is
+    /// the coordinate system persisted by free box dragging.
+    pub(crate) generated_content: Option<Rect>,
+    /// Current vertical origin of the generated canvas in content-local rows.
+    pub(crate) ai_plan_scroll: usize,
+    /// Base diagram geometry built once from the persistent diagram state for this frame.
+    pub(crate) diagram_canvas: Option<crate::diagram::DiagramCanvas>,
+    /// Expanded relationship overlay in screen geometry. It is registered separately so
+    /// its visible z-order wins hit-testing without changing the base canvas.
+    pub(crate) plan_relationship_overlay: Option<PlanRelationshipOverlay>,
+    /// Visible generated-plan box rects derived from the retained Canvas geometry.
     pub(crate) plan_node_rects: Vec<(Rect, PlanNodeTarget)>,
-    /// Visible relationship-label spans, used for click-to-expand hit-testing.
+    /// Visible arrow routes and compact-label rects derived from the retained Canvas.
     pub(crate) plan_relationship_rects: Vec<(Rect, PlanRelationshipTarget)>,
     /// Exact laid-out diff text behind mouse selection and clipboard extraction.
     pub(crate) diff_copy: Option<crate::render::DiffCopyFrame>,
+}
+
+/// Retained page geometry for the visible relationship text overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanRelationshipOverlay {
+    pub(crate) rect: Rect,
+    pub(crate) target: PlanRelationshipTarget,
+    pub(crate) offset: usize,
+    pub(crate) max_offset: usize,
 }
 
 impl UiGeometry {
@@ -244,79 +263,105 @@ impl UiGeometry {
             .find(|region| hit(region.rect, x, y))
     }
 
+    /// Expanded relationship overlay under a point. This is the topmost diagram layer.
+    pub(crate) fn plan_relationship_overlay_at(
+        &self,
+        x: u16,
+        y: u16,
+    ) -> Option<PlanRelationshipTarget> {
+        self.plan_relationship_overlay
+            .as_ref()
+            .and_then(|overlay| hit(overlay.rect, x, y).then(|| overlay.target.clone()))
+    }
+
+    /// New absolute overlay offset for a wheel delta over its visible page.
+    pub(crate) fn overlay_scrolled_offset(&self, x: u16, y: u16, delta: i32) -> Option<usize> {
+        let overlay = self.plan_relationship_overlay.as_ref()?;
+        if !hit(overlay.rect, x, y) {
+            return None;
+        }
+        // Advance one wrapped content row per wheel event. A larger generic pane step can
+        // skip pages entirely when this overlay has room for only one data row.
+        let next = if delta < 0 {
+            overlay.offset.saturating_sub(1)
+        } else {
+            overlay.offset.saturating_add(1).min(overlay.max_offset)
+        };
+        (next != overlay.offset).then_some(next)
+    }
+
+    /// Generated-plan box under a point with its full screen rect. Rect union keeps a
+    /// click on any line of a multi-line card tied to the same persisted top-left.
+    pub(crate) fn plan_node_rect_at(&self, x: u16, y: u16) -> Option<(PlanNodeTarget, Rect)> {
+        let target = self
+            .plan_node_rects
+            .iter()
+            .rev()
+            .find_map(|(rect, target)| hit(*rect, x, y).then(|| target.clone()))?;
+        let rect = self
+            .plan_node_rects
+            .iter()
+            .filter(|(_, candidate)| candidate == &target)
+            .map(|(rect, _)| *rect)
+            .reduce(union)?;
+        Some((target, rect))
+    }
+
     /// Generated-plan node under a point, resolved from the exact rendered span layout.
     pub(crate) fn plan_node_at(&self, x: u16, y: u16) -> Option<PlanNodeTarget> {
-        self.plan_node_rects
-            .iter()
-            .find_map(|(rect, target)| hit(*rect, x, y).then(|| target.clone()))
+        self.plan_node_rect_at(x, y).map(|(target, _)| target)
+    }
+
+    /// The node pressed plus the pointer offset from its actual canvas top-left. Unlike
+    /// the visible clipped screen rect, this preserves a grab on a box that begins above
+    /// the scrolled viewport, so the first drag cannot make it jump.
+    pub(crate) fn plan_node_drag_at(&self, x: u16, y: u16) -> Option<(PlanNodeTarget, u16, u16)> {
+        let (target, screen_rect) = self.plan_node_rect_at(x, y)?;
+        let Some(canvas) = &self.diagram_canvas else {
+            return Some((
+                target,
+                x.saturating_sub(screen_rect.x),
+                y.saturating_sub(screen_rect.y),
+            ));
+        };
+        let node = canvas.nodes.iter().find(|node| node.target == target)?;
+        let content = self.generated_content?;
+        let pointer_local_x = x.saturating_sub(content.x);
+        let pointer_local_y = y
+            .saturating_sub(content.y)
+            .saturating_add(u16::try_from(self.ai_plan_scroll).unwrap_or(u16::MAX));
+        Some((
+            target,
+            pointer_local_x.saturating_sub(node.rect.x),
+            pointer_local_y.saturating_sub(node.rect.y),
+        ))
+    }
+
+    /// Convert one screen pointer position into a content-local box top-left while
+    /// retaining the offset recorded on mouse-down. Saturation permits dragging against
+    /// the viewport's top/left edge without underflow.
+    pub(crate) fn plan_position_from_screen(
+        &self,
+        x: u16,
+        y: u16,
+        offset_x: u16,
+        offset_y: u16,
+    ) -> Option<crate::diagram::DiagramPosition> {
+        let content = self.generated_content?;
+        Some(crate::diagram::DiagramPosition {
+            x: x.saturating_sub(content.x).saturating_sub(offset_x),
+            y: y.saturating_sub(content.y)
+                .saturating_add(u16::try_from(self.ai_plan_scroll).unwrap_or(u16::MAX))
+                .saturating_sub(offset_y),
+        })
     }
 
     /// Generated-plan relationship label under a point.
     pub(crate) fn plan_relationship_at(&self, x: u16, y: u16) -> Option<PlanRelationshipTarget> {
         self.plan_relationship_rects
             .iter()
+            .rev()
             .find_map(|(rect, target)| hit(*rect, x, y).then(|| target.clone()))
-    }
-
-    /// Nearest box and insertion side for a box drag inside the generated viewport.
-    /// Exact coordinates come from retained card spans, so scrolling cannot desynchronize
-    /// the drop target from the frame the user saw.
-    pub(crate) fn plan_node_drop_at(
-        &self,
-        x: u16,
-        y: u16,
-        dragged: &PlanNodeTarget,
-    ) -> Option<(PlanNodeTarget, bool)> {
-        let generated = self
-            .scroll_regions
-            .iter()
-            .find(|region| region.id == ScrollRegionId::GeneratedImpact)?;
-        if !hit(generated.rect, x, y) {
-            return None;
-        }
-
-        let bounds_for = |wanted: &PlanNodeTarget| {
-            self.plan_node_rects
-                .iter()
-                .filter(|(_, target)| target == wanted)
-                .map(|(rect, _)| *rect)
-                .reduce(union)
-        };
-        let dragged_rect = bounds_for(dragged)?;
-        let mut candidates: Vec<(PlanNodeTarget, Rect)> = Vec::new();
-        for (_, target) in &self.plan_node_rects {
-            if target == dragged || candidates.iter().any(|(seen, _)| seen == target) {
-                continue;
-            }
-            if let Some(rect) = bounds_for(target) {
-                candidates.push((target.clone(), rect));
-            }
-        }
-        let (anchor, rect) = candidates.into_iter().min_by_key(|(_, rect)| {
-            let dx = if x < rect.x {
-                rect.x - x
-            } else {
-                x.saturating_sub(rect.x.saturating_add(rect.width.saturating_sub(1)))
-            };
-            let dy = if y < rect.y {
-                rect.y - y
-            } else {
-                y.saturating_sub(rect.y.saturating_add(rect.height.saturating_sub(1)))
-            };
-            u32::from(dx) + u32::from(dy)
-        })?;
-        let source_center_x = dragged_rect.x.saturating_add(dragged_rect.width / 2);
-        let source_center_y = dragged_rect.y.saturating_add(dragged_rect.height / 2);
-        let anchor_center_x = rect.x.saturating_add(rect.width / 2);
-        let anchor_center_y = rect.y.saturating_add(rect.height / 2);
-        let horizontally_separated =
-            source_center_x.abs_diff(anchor_center_x) > source_center_y.abs_diff(anchor_center_y);
-        let after = if horizontally_separated {
-            x >= anchor_center_x
-        } else {
-            y >= anchor_center_y
-        };
-        Some((anchor, after))
     }
 
     /// Resolve a screen cell to the exact physical diff line/column displayed there.
@@ -455,76 +500,113 @@ impl UiGeometry {
             generated.width.saturating_sub(2),
             generated.height,
         );
-        let generated_lines =
-            crate::render::generated_impact_content(app, snap, generated_inner.width);
-        let viewport = usize::from(generated_inner.height);
-        let max_scroll = scroll_max(generated_lines.len(), viewport);
-        let first = app.ai_plan_scroll.min(max_scroll);
-        for (screen_row, line) in generated_lines
-            .iter()
-            .skip(first)
-            .take(viewport)
-            .enumerate()
-        {
-            let mut x = generated_inner.x;
-            let right = generated_inner.x.saturating_add(generated_inner.width);
-            if first + screen_row == 0 && snap.ai_failure_status().is_some() {
-                let line_width = line
-                    .spans
-                    .iter()
-                    .map(|span| span.text.width())
-                    .sum::<usize>();
-                let visible_width = u16::try_from(line_width)
-                    .unwrap_or(u16::MAX)
-                    .min(generated_inner.width);
-                if visible_width > 0 {
-                    self.ai_failure_status = Some(Rect::new(
-                        generated_inner.x,
-                        generated_inner.y.saturating_add(screen_row as u16),
-                        visible_width,
-                        1,
-                    ));
+        self.generated_content = Some(generated_inner);
+        self.ai_plan_scroll = app.ai_plan_scroll;
+        let canvas = snap
+            .semantic
+            .plan
+            .as_ref()
+            .filter(|_| snap.semantic.ai_generated && matches!(snap.ai, AiStatus::Ready { .. }))
+            .map(|plan| {
+                let annotations =
+                    crate::diagram::leading_annotations(snap.semantic.report.as_ref());
+                crate::diagram::DiagramCanvas::build_with_annotations(
+                    plan,
+                    crate::diagram::DiagramViewport {
+                        width: generated_inner.width,
+                        height: generated_inner.height,
+                    },
+                    app.diagram.positions(),
+                    app.diagram.expanded_node(),
+                    app.diagram.z_order(),
+                    &annotations,
+                )
+            });
+        if let Some(canvas) = canvas {
+            let max_scroll = scroll_max(
+                usize::from(canvas.size.height),
+                usize::from(generated_inner.height),
+            );
+            let first = app.ai_plan_scroll.min(max_scroll);
+            self.ai_plan_scroll = first;
+            for node in &canvas.nodes {
+                if let Some(rect) = canvas_rect_on_screen(node.rect, generated_inner, first) {
+                    self.plan_node_rects.push((rect, node.target.clone()));
                 }
             }
-            for span in &line.spans {
-                let requested = u16::try_from(span.text.width()).unwrap_or(u16::MAX);
-                let width = requested.min(right.saturating_sub(x));
-                if width > 0 {
-                    if let Some(target) = &span.target {
-                        self.plan_node_rects.push((
-                            Rect::new(
-                                x,
-                                generated_inner.y.saturating_add(screen_row as u16),
-                                width,
-                                1,
-                            ),
-                            target.clone(),
-                        ));
-                    }
-                    if let Some(target) = &span.relationship {
-                        self.plan_relationship_rects.push((
-                            Rect::new(
-                                x,
-                                generated_inner.y.saturating_add(screen_row as u16),
-                                width,
-                                1,
-                            ),
-                            target.clone(),
-                        ));
-                    }
-                    x = x.saturating_add(width);
+            for relationship in &canvas.relationships {
+                if let Some(rect) =
+                    canvas_rect_on_screen(relationship.label_rect, generated_inner, first)
+                {
+                    self.plan_relationship_rects
+                        .push((rect, relationship.target.clone()));
                 }
-                if x >= right {
-                    break;
+                for route_rect in relationship_path_rects(&relationship.path) {
+                    if let Some(rect) = canvas_rect_on_screen(route_rect, generated_inner, first) {
+                        self.plan_relationship_rects
+                            .push((rect, relationship.target.clone()));
+                    }
                 }
             }
+            if let (Some(target), Some(overlay)) = (
+                app.diagram.expanded_relationship(),
+                app.diagram.expanded_relationship().and_then(|target| {
+                    canvas.relationship_overlay_in_viewport(
+                        snap.semantic.plan.as_ref().expect("canvas requires plan"),
+                        target,
+                        u16::try_from(first).unwrap_or(u16::MAX),
+                        generated_inner.height,
+                        app.diagram.overlay_scroll(),
+                    )
+                }),
+            ) {
+                if let Some(rect) = canvas_rect_on_screen(overlay.rect, generated_inner, first) {
+                    self.plan_relationship_overlay = Some(PlanRelationshipOverlay {
+                        rect,
+                        target: target.clone(),
+                        offset: overlay.scroll,
+                        max_offset: overlay.max_scroll,
+                    });
+                }
+            }
+            self.diagram_canvas = Some(canvas);
+            self.register_scroll_region(
+                ScrollRegionId::GeneratedImpact,
+                generated,
+                first,
+                max_scroll,
+            );
+        } else {
+            let generated_lines =
+                crate::render::generated_impact_content(snap, generated_inner.width);
+            let viewport = usize::from(generated_inner.height);
+            let max_scroll = scroll_max(generated_lines.len(), viewport);
+            let first = app.ai_plan_scroll.min(max_scroll);
+            self.ai_plan_scroll = first;
+            // Non-ready states render line content only. Canvas is the sole source of
+            // Ready-plan hit geometry; retain just the failure banner's visible bounds.
+            if first == 0 && snap.ai_failure_status().is_some() {
+                if let Some(line) = generated_lines.first() {
+                    let visible_width = u16::try_from(line.text().width())
+                        .unwrap_or(u16::MAX)
+                        .min(generated_inner.width);
+                    if visible_width > 0 {
+                        self.ai_failure_status = Some(Rect::new(
+                            generated_inner.x,
+                            generated_inner.y,
+                            visible_width,
+                            1,
+                        ));
+                    }
+                }
+            }
+            self.register_scroll_region(
+                ScrollRegionId::GeneratedImpact,
+                generated,
+                first,
+                max_scroll,
+            );
         }
-        self.register_scroll_region(
-            ScrollRegionId::GeneratedImpact,
-            generated,
-            app.ai_plan_scroll,
-            max_scroll,
-        );
         register_horizontal_sectional(
             &mut self.dividers,
             DividerId::SelectedCallers,
@@ -538,6 +620,47 @@ impl UiGeometry {
             rows[2],
         );
     }
+}
+
+/// Translate and clip a content-local canvas rectangle into the current generated viewport.
+fn canvas_rect_on_screen(
+    rect: crate::diagram::DiagramRect,
+    viewport: Rect,
+    scroll: usize,
+) -> Option<Rect> {
+    let top = usize::from(rect.y);
+    let bottom = top.saturating_add(usize::from(rect.height));
+    let visible_top = top.max(scroll);
+    let visible_bottom = bottom.min(scroll.saturating_add(usize::from(viewport.height)));
+    if rect.width == 0 || visible_top >= visible_bottom || rect.x >= viewport.width {
+        return None;
+    }
+    Some(Rect::new(
+        viewport.x.saturating_add(rect.x),
+        viewport
+            .y
+            .saturating_add(u16::try_from(visible_top.saturating_sub(scroll)).unwrap_or(u16::MAX)),
+        rect.width.min(viewport.width.saturating_sub(rect.x)),
+        u16::try_from(visible_bottom.saturating_sub(visible_top)).unwrap_or(u16::MAX),
+    ))
+}
+
+/// Rectangles covering every orthogonal route segment, inclusive of its endpoint cell.
+fn relationship_path_rects(
+    path: &[crate::diagram::DiagramPosition],
+) -> Vec<crate::diagram::DiagramRect> {
+    path.windows(2)
+        .map(|segment| {
+            let a = segment[0];
+            let b = segment[1];
+            crate::diagram::DiagramRect {
+                x: a.x.min(b.x),
+                y: a.y.min(b.y),
+                width: a.x.abs_diff(b.x).saturating_add(1),
+                height: a.y.abs_diff(b.y).saturating_add(1),
+            }
+        })
+        .collect()
 }
 
 fn impact_list_capacity(section_height: u16, bottom_divider: bool) -> usize {

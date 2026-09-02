@@ -36,17 +36,19 @@ pub enum DragState {
         /// Whether the pointer has moved since mouse-down.
         moved: bool,
     },
-    /// A generated-plan box is armed for click or being dragged to a new order.
+    /// A generated-plan box is armed for a click or a free X/Y drag.
     PlanNode {
-        /// Box being moved.
+        /// Box that was under the original press. Release always applies to this target.
         source: PlanNodeTarget,
         /// Pointer coordinate where the gesture began.
         start_x: u16,
         /// Pointer row where the gesture began.
         start_y: u16,
-        /// Most recent valid drop anchor and insertion side.
-        drop: Option<(PlanNodeTarget, bool)>,
-        /// Whether the pointer has moved.
+        /// Pointer offset from the box's top-left, retained through the whole drag.
+        offset_x: u16,
+        /// Pointer offset from the box's top-left, retained through the whole drag.
+        offset_y: u16,
+        /// Whether the pointer crossed the drag threshold.
         moved: bool,
     },
     /// A linear text selection is being dragged across the rendered diff.
@@ -130,17 +132,6 @@ pub fn map_mouse(
         };
     }
 
-    // A floating plan inspector is intentionally modal: clicking it (or anywhere else)
-    // closes it, while the diagram beneath remains in exactly the same layout.
-    if app.plan_inspector_open() {
-        return match event.kind {
-            K::Down(MouseButton::Left) => {
-                MouseOutcome::action(Action::ClosePlanInspector, DragState::Idle)
-            }
-            _ => MouseOutcome::inert(DragState::Idle),
-        };
-    }
-
     // 3. An active drag consumes Drag/Up regardless of the pointer's rectangle.
     if !matches!(drag, DragState::Idle) {
         return route_drag(event, app, geometry, drag);
@@ -161,7 +152,13 @@ pub fn map_mouse(
 /// Motion only redraws when the semantic node target changes. A steady stream inside
 /// one box is inert, so any-motion terminal tracking cannot starve snapshot delivery.
 fn route_hover(x: u16, y: u16, app: &App, geo: &UiGeometry) -> MouseOutcome {
-    let target = geo.plan_node_at(x, y);
+    // The relationship overlay is the topmost diagram layer. It masks a card below it
+    // for hover as well as click, so linked diff emphasis cannot leak through it.
+    let target = if geo.plan_relationship_overlay_at(x, y).is_some() {
+        None
+    } else {
+        geo.plan_node_at(x, y)
+    };
     if target == app.hovered_plan_node {
         MouseOutcome::inert(DragState::Idle)
     } else {
@@ -171,6 +168,18 @@ fn route_hover(x: u16, y: u16, app: &App, geo: &UiGeometry) -> MouseOutcome {
 
 /// Wheel routing is hover-only: it neither focuses a pane nor changes a row selection.
 fn route_wheel(x: u16, y: u16, delta: i32, geo: &UiGeometry) -> MouseOutcome {
+    // The overlay is visually above the canvas and owns wheel paging before the diagram.
+    if geo.plan_relationship_overlay_at(x, y).is_some() {
+        return geo
+            .overlay_scrolled_offset(x, y, delta)
+            .map(|offset| {
+                MouseOutcome::action(
+                    Action::ScrollPlanRelationshipOverlay { offset },
+                    DragState::Idle,
+                )
+            })
+            .unwrap_or_else(|| MouseOutcome::inert(DragState::Idle));
+    }
     let Some(region) = geo.scroll_region_at(x, y) else {
         return MouseOutcome::inert(DragState::Idle);
     };
@@ -217,28 +226,34 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         };
     }
 
-    // 6. Relationship labels expand independently from their endpoint boxes.
-    if let Some(target) = geo.plan_relationship_at(x, y) {
+    // 6. The full relationship overlay is visibly above the canvas and receives its own
+    // second click before a covered node or route can see it.
+    if let Some(target) = geo.plan_relationship_overlay_at(x, y) {
         return MouseOutcome::action(Action::TogglePlanRelationship(target), DragState::Idle);
     }
 
-    // 7. A generated-plan node: arm a click-or-drag gesture. A release without motion
-    // toggles details; dragging reorders boxes inside the automatic bounded layout.
-    if let Some(target) = geo.plan_node_at(x, y) {
+    // 7. Visible boxes take priority over an arrow routed beneath them.
+    if let Some((target, offset_x, offset_y)) = geo.plan_node_drag_at(x, y) {
         return MouseOutcome {
             action: None,
             drag: DragState::PlanNode {
                 source: target,
                 start_x: x,
                 start_y: y,
-                drop: None,
+                offset_x,
+                offset_y,
                 moved: false,
             },
             dirty: false,
         };
     }
 
-    // 8. Diff text uses native-style drag selection. Release copies the exact retained
+    // 8. Relationship arrows and clipped labels expand independently from boxes.
+    if let Some(target) = geo.plan_relationship_at(x, y) {
+        return MouseOutcome::action(Action::TogglePlanRelationship(target), DragState::Idle);
+    }
+
+    // 9. Diff text uses native-style drag selection. Release copies the exact retained
     // code text, while a click without movement clears the previous selection.
     if let Some(start) = geo.diff_text_point_at(x, y) {
         return MouseOutcome {
@@ -333,23 +348,32 @@ fn route_drag(event: MouseEvent, _app: &App, geo: &UiGeometry, drag: DragState) 
             source,
             start_x,
             start_y,
-            drop,
+            offset_x,
+            offset_y,
             moved,
         } => {
-            let did_move = event.column != start_x || event.row != start_y;
-            let next_drop = geo
-                .plan_node_drop_at(event.column, event.row, &source)
-                .or(drop.clone());
+            // A one-cell jitter is still a click. Once the threshold is crossed, retain
+            // the original pointer-to-box offset so the card does not jump under the mouse.
+            const DRAG_THRESHOLD: u16 = 1;
+            let did_move = event.column.abs_diff(start_x) > DRAG_THRESHOLD
+                || event.row.abs_diff(start_y) > DRAG_THRESHOLD;
+            let move_action = || {
+                geo.plan_position_from_screen(event.column, event.row, offset_x, offset_y)
+                    .map(|position| Action::MovePlanNode {
+                        target: source.clone(),
+                        x: position.x,
+                        y: position.y,
+                    })
+            };
             match event.kind {
                 K::Drag(MouseButton::Left) => MouseOutcome {
-                    action: next_drop
-                        .as_ref()
-                        .map(|(target, _)| Action::HoverPlanNode(Some(target.clone()))),
+                    action: (moved || did_move).then(move_action).flatten(),
                     drag: DragState::PlanNode {
                         source,
                         start_x,
                         start_y,
-                        drop: next_drop,
+                        offset_x,
+                        offset_y,
                         moved: moved || did_move,
                     },
                     dirty: moved || did_move,
@@ -357,11 +381,7 @@ fn route_drag(event: MouseEvent, _app: &App, geo: &UiGeometry, drag: DragState) 
                 K::Up(MouseButton::Left) => {
                     let moved = moved || did_move;
                     let action = if moved {
-                        next_drop.map(|(anchor, after)| Action::ReorderPlanNode {
-                            dragged: source,
-                            anchor,
-                            after,
-                        })
+                        move_action()
                     } else {
                         Some(Action::TogglePlanNode(source))
                     };
@@ -449,10 +469,6 @@ mod tests {
     fn wheel_up(x: u16, y: u16) -> MouseEvent {
         mouse(MouseEventKind::ScrollUp, x, y)
     }
-    fn moved(x: u16, y: u16) -> MouseEvent {
-        mouse(MouseEventKind::Moved, x, y)
-    }
-
     /// A snapshot with two files: a collapsed one and an expanded one with two symbols.
     fn snap() -> UiSnapshot {
         UiSnapshot {
@@ -929,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_boxes_open_a_modal_inspector_and_still_drag_between_grid_slots() {
+    fn free_xy_drag_inline_expansion_and_overlay_preserve_base_geometry() {
         let mut s = snap();
         let mut plan = codescope_core::VisualizationPlan::new(codescope_core::Epoch(1));
         plan.intent = "A changed entry point forwards work to storage.".to_string();
@@ -941,229 +957,310 @@ mod tests {
                     "Handle",
                     codescope_core::PlanNodeChange::Modified,
                 )
-                .with_detail("accepts the request"),
+                .with_detail("accepts the complete request and validates every input"),
                 codescope_core::PlanNode::new(
                     "n2",
                     "Store",
                     codescope_core::PlanNodeChange::Unchanged,
                 )
                 .with_detail("persists the result"),
-                codescope_core::PlanNode::new(
-                    "n3",
-                    "Publish",
-                    codescope_core::PlanNodeChange::Unchanged,
-                )
-                .with_detail("announces the result"),
-                codescope_core::PlanNode::new(
-                    "n4",
-                    "Observe",
-                    codescope_core::PlanNodeChange::Unchanged,
-                )
-                .with_detail("records completion"),
             ],
-            edges: vec![
-                codescope_core::PlanEdge {
-                    from: "n1".to_string(),
-                    to: "n2".to_string(),
-                    kind: codescope_core::PlanEdgeKind::Writes,
-                    label: Some(
-                        "writes a durable record after validating the complete request".to_string(),
-                    ),
-                },
-                codescope_core::PlanEdge {
-                    from: "n2".to_string(),
-                    to: "n3".to_string(),
-                    kind: codescope_core::PlanEdgeKind::Calls,
-                    label: Some("publishes the stored result".to_string()),
-                },
-                codescope_core::PlanEdge {
-                    from: "n3".to_string(),
-                    to: "n4".to_string(),
-                    kind: codescope_core::PlanEdgeKind::Calls,
-                    label: Some("records the completion".to_string()),
-                },
+            edges: vec![codescope_core::PlanEdge {
+                from: "n1".to_string(),
+                to: "n2".to_string(),
+                kind: codescope_core::PlanEdgeKind::Writes,
+                label: Some(
+                    "writes a durable record after validating the complete request ".repeat(40),
+                ),
+            }],
+        });
+        plan.forms[0].nodes[0].expanded_detail = Some(
+            "The complete description explains validation, persistence, and downstream effects in full.".to_string(),
+        );
+        s.semantic.plan = Some(plan);
+        s.semantic.ai_generated = true;
+        s.ai = codescope_core::AiStatus::Ready {
+            epoch: codescope_core::Epoch(1),
+        };
+        let mut app = app_with(&s);
+        app.diagram.sync_plan(s.semantic.plan.as_ref().unwrap());
+        let g = geo(&app, &s);
+        let canvas_before = g.diagram_canvas.as_ref().expect("canvas").clone();
+        let (source, source_rect) = g
+            .plan_node_rect_at(g.plan_node_rects[0].0.x, g.plan_node_rects[0].0.y)
+            .expect("source node");
+        let source_before = canvas_before
+            .nodes
+            .iter()
+            .find(|node| node.target == source)
+            .expect("source in canvas")
+            .rect;
+        let edge_before = canvas_before.relationships[0].path.clone();
+
+        // A real drag updates free X/Y from the pointer offset and persists through redraw.
+        let armed = map_mouse(
+            down(source_rect.x + 1, source_rect.y + 1),
+            &app,
+            &s,
+            &g,
+            DragState::Idle,
+        );
+        let moving = map_mouse(
+            drag(source_rect.x + 11, source_rect.y + 5),
+            &app,
+            &s,
+            &g,
+            armed.drag,
+        );
+        let action = moving.action.clone().expect("live XY move");
+        assert!(matches!(action, Action::MovePlanNode { ref target, .. } if target == &source));
+        app.apply(action);
+        let released = map_mouse(
+            up(source_rect.x + 11, source_rect.y + 5),
+            &app,
+            &s,
+            &g,
+            moving.drag,
+        );
+        app.apply(released.action.expect("final XY move"));
+        let moved_geometry = geo(&app, &s);
+        let moved_canvas = moved_geometry
+            .diagram_canvas
+            .as_ref()
+            .expect("moved canvas");
+        let moved_node = moved_canvas
+            .nodes
+            .iter()
+            .find(|node| node.target == source)
+            .unwrap();
+        let expected_position = crate::diagram::DiagramPosition {
+            x: source_before.x.saturating_add(10),
+            y: source_before.y.saturating_add(4),
+        };
+        assert_eq!(
+            app.diagram.positions().get(&source),
+            Some(&expected_position)
+        );
+        assert_eq!(
+            (moved_node.rect.x, moved_node.rect.y),
+            (expected_position.x, expected_position.y),
+            "screen movement is measured from the Canvas box origin, including annotations"
+        );
+        assert_ne!(
+            moved_canvas.relationships[0].path, edge_before,
+            "arrows read moved box geometry"
+        );
+
+        // Down/up on the original box toggles only that card's inline height at the same XY.
+        let moved_screen = moved_geometry
+            .plan_node_rects
+            .iter()
+            .find(|(_, target)| target == &source)
+            .unwrap()
+            .0;
+        let click = map_mouse(
+            down(moved_screen.x, moved_screen.y),
+            &app,
+            &s,
+            &moved_geometry,
+            DragState::Idle,
+        );
+        let click = map_mouse(
+            up(moved_screen.x, moved_screen.y),
+            &app,
+            &s,
+            &moved_geometry,
+            click.drag,
+        );
+        app.apply(click.action.expect("inline toggle"));
+        let expanded = geo(&app, &s);
+        let expanded_canvas = expanded.diagram_canvas.as_ref().unwrap();
+        let expanded_node = expanded_canvas
+            .nodes
+            .iter()
+            .find(|node| node.target == source)
+            .unwrap();
+        assert_eq!(
+            (expanded_node.rect.x, expanded_node.rect.y),
+            (expected_position.x, expected_position.y),
+            "expansion is in place"
+        );
+        assert!(
+            expanded_node.rect.height > moved_node.rect.height,
+            "complete detail expands only this box"
+        );
+        assert_eq!(app.diagram.expanded_node(), Some(&source));
+
+        // Overlay is a top layer only: all canvas nodes/routes remain exactly unchanged.
+        let relationship = expanded_canvas.relationships[0].target.clone();
+        let base_nodes = expanded_canvas.nodes.clone();
+        let base_routes = expanded_canvas.relationships.clone();
+        app.apply(Action::TogglePlanRelationship(relationship.clone()));
+        let overlay_geometry = geo(&app, &s);
+        let overlay_canvas = overlay_geometry.diagram_canvas.as_ref().unwrap();
+        assert_eq!(overlay_canvas.nodes, base_nodes);
+        assert_eq!(overlay_canvas.relationships, base_routes);
+        let overlay = overlay_geometry
+            .plan_relationship_overlay
+            .clone()
+            .expect("full label overlay");
+        assert!(
+            overlay.max_offset > 0,
+            "long label must page in the viewport"
+        );
+        let base_scroll = app.ai_plan_scroll;
+        let wheel = map_mouse(
+            wheel_down(overlay.rect.x, overlay.rect.y),
+            &app,
+            &s,
+            &overlay_geometry,
+            DragState::Idle,
+        );
+        assert_eq!(
+            wheel.action,
+            Some(Action::ScrollPlanRelationshipOverlay { offset: 1 }),
+            "one wheel event advances exactly one wrapped row without skipping text",
+        );
+        app.apply(wheel.action.expect("overlay page"));
+        assert!(app.diagram.overlay_scroll() > 0);
+        assert_eq!(
+            app.ai_plan_scroll, base_scroll,
+            "overlay wheel cannot move canvas"
+        );
+        let paged = geo(&app, &s);
+        let paged_overlay = paged
+            .plan_relationship_overlay
+            .clone()
+            .expect("paged overlay");
+        assert!(paged_overlay.rect.height <= paged.generated_content.unwrap().height);
+        // Wheel boundaries are consumed by the overlay rather than leaking to base scroll.
+        app.diagram.set_overlay_scroll(0);
+        let first_page = geo(&app, &s);
+        let first_overlay = first_page.plan_relationship_overlay.clone().unwrap();
+        assert!(map_mouse(
+            wheel_up(first_overlay.rect.x, first_overlay.rect.y),
+            &app,
+            &s,
+            &first_page,
+            DragState::Idle
+        )
+        .action
+        .is_none());
+        assert_eq!(app.ai_plan_scroll, base_scroll);
+        app.diagram.set_overlay_scroll(first_overlay.max_offset);
+        let last_page = geo(&app, &s);
+        let last_overlay = last_page.plan_relationship_overlay.clone().unwrap();
+        assert!(map_mouse(
+            wheel_down(last_overlay.rect.x, last_overlay.rect.y),
+            &app,
+            &s,
+            &last_page,
+            DragState::Idle
+        )
+        .action
+        .is_none());
+        assert_eq!(app.ai_plan_scroll, base_scroll);
+        let second = map_mouse(
+            down(last_overlay.rect.x, last_overlay.rect.y),
+            &app,
+            &s,
+            &last_page,
+            DragState::Idle,
+        );
+        assert_eq!(
+            second.action,
+            Some(Action::TogglePlanRelationship(last_overlay.target.clone()))
+        );
+        // Hover is also masked by the overlay even when it covers the moved card.
+        app.hovered_plan_node = Some(source.clone());
+        let hover = map_mouse(
+            mouse(
+                MouseEventKind::Moved,
+                last_overlay.rect.x,
+                last_overlay.rect.y,
+            ),
+            &app,
+            &s,
+            &overlay_geometry,
+            DragState::Idle,
+        );
+        assert_eq!(hover.action, Some(Action::HoverPlanNode(None)));
+    }
+
+    #[test]
+    fn drag_position_accounts_for_scroll_and_clipped_box_offset() {
+        let mut s = snap();
+        let mut plan = codescope_core::VisualizationPlan::new(codescope_core::Epoch(1));
+        plan.forms.push(codescope_core::VizForm {
+            kind: codescope_core::FormKind::Sequence,
+            nodes: vec![
+                codescope_core::PlanNode::new(
+                    "n1",
+                    "Handle",
+                    codescope_core::PlanNodeChange::Modified,
+                ),
+                codescope_core::PlanNode::new(
+                    "n2",
+                    "Tail",
+                    codescope_core::PlanNodeChange::Unchanged,
+                ),
             ],
+            edges: vec![],
         });
         s.semantic.plan = Some(plan);
         s.semantic.ai_generated = true;
         s.ai = codescope_core::AiStatus::Ready {
             epoch: codescope_core::Epoch(1),
         };
-        s.impact.selected_change = Some(crate::snapshot::SelectedChange {
-            file: "a.go".to_string(),
-            label: "Handle".to_string(),
-            change: "modified",
-            interpretation: "Accepts a request.".to_string(),
-            interpretation_source: crate::snapshot::InterpretationSource::Deterministic,
-        });
         let mut app = app_with(&s);
+        app.diagram.move_node(
+            PlanNodeTarget {
+                form: 0,
+                id: "n1".into(),
+            },
+            crate::diagram::DiagramPosition { x: 4, y: 20 },
+        );
+        // Make the card begin above the visible viewport, so its screen rect is clipped.
+        app.diagram.move_node(
+            PlanNodeTarget {
+                form: 0,
+                id: "n2".into(),
+            },
+            crate::diagram::DiagramPosition { x: 4, y: 60 },
+        );
+        app.ai_plan_scroll = 21;
         let g = geo(&app, &s);
-        let diagram_text = |app: &App| {
-            crate::render::generated_impact_content(app, &s, 80)
-                .iter()
-                .map(crate::diagram::DiagramLine::text)
-                .collect::<Vec<_>>()
-        };
-        let base_diagram = diagram_text(&app);
-        let (rect, target) = g
-            .plan_node_rects
-            .first()
-            .expect("visible node hitbox")
-            .clone();
-
-        let hover = map_mouse(moved(rect.x, rect.y), &app, &s, &g, DragState::Idle);
-        assert_eq!(
-            hover.action,
-            Some(Action::HoverPlanNode(Some(target.clone())))
-        );
-        assert!(hover.dirty);
-        app.apply(hover.action.unwrap());
-
-        let steady = map_mouse(moved(rect.x, rect.y), &app, &s, &g, DragState::Idle);
-        assert_eq!(steady.action, None);
-        assert!(!steady.dirty, "steady motion cannot force redraws");
-
-        app.ai_plan_scroll = 10;
-        let armed = map_mouse(down(rect.x, rect.y), &app, &s, &g, DragState::Idle);
-        assert!(matches!(armed.drag, DragState::PlanNode { .. }));
-        let click = map_mouse(up(rect.x, rect.y), &app, &s, &g, armed.drag);
-        assert_eq!(click.action, Some(Action::TogglePlanNode(target.clone())));
-        app.apply(click.action.expect("node toggle"));
-        assert_eq!(app.inspected_plan_node, Some(target.clone()));
-        assert_eq!(
-            app.ai_plan_scroll, 10,
-            "the inspector does not move the canvas"
-        );
-        assert_eq!(
-            diagram_text(&app),
-            base_diagram,
-            "opening details cannot change any diagram row"
-        );
-        assert_eq!(
-            app.active_code_node().map(|node| node.id.as_str()),
-            Some("n1"),
-            "the inspected box pins its code links"
-        );
-
-        let close = map_mouse(down(0, 0), &app, &s, &g, DragState::Idle);
-        assert_eq!(close.action, Some(Action::ClosePlanInspector));
-        app.apply(close.action.expect("close inspector"));
-        assert!(!app.plan_inspector_open());
-        assert!(app.hovered_plan_node.is_none());
-
-        let relationship_geometry = geo(&app, &s);
-        let (relationship_rect, relationship_target) = relationship_geometry
-            .plan_relationship_rects
-            .first()
-            .expect("relationship hitbox")
-            .clone();
-        let expand_relationship = map_mouse(
-            down(relationship_rect.x, relationship_rect.y),
-            &app,
-            &s,
-            &relationship_geometry,
-            DragState::Idle,
-        );
-        assert_eq!(
-            expand_relationship.action,
-            Some(Action::TogglePlanRelationship(relationship_target.clone()))
-        );
-        app.apply(expand_relationship.action.expect("relationship toggle"));
-        assert_eq!(
-            app.inspected_plan_relationship,
-            Some(relationship_target),
-            "the full label is owned by the floating inspector"
-        );
-        assert_eq!(
-            diagram_text(&app),
-            base_diagram,
-            "opening an arrow label cannot change card positions"
-        );
-        let close_relationship = map_mouse(
-            down(relationship_rect.x, relationship_rect.y),
-            &app,
-            &s,
-            &relationship_geometry,
-            DragState::Idle,
-        );
-        assert_eq!(
-            close_relationship.action,
-            Some(Action::ClosePlanInspector),
-            "clicking again closes the full arrow label"
-        );
-        app.apply(close_relationship.action.expect("close arrow inspector"));
-
-        let drag_geometry = geo(&app, &s);
-        let source_rect = drag_geometry
-            .plan_node_rects
-            .iter()
-            .find(|(_, candidate)| candidate.id == "n1")
-            .expect("source box")
-            .0;
-        let anchor_rect = drag_geometry
-            .plan_node_rects
-            .iter()
-            .rev()
-            .find(|(_, candidate)| candidate.id == "n3")
-            .expect("anchor box")
-            .0;
-        let armed = map_mouse(
-            down(source_rect.x, source_rect.y),
-            &app,
-            &s,
-            &drag_geometry,
-            DragState::Idle,
-        );
-        let moving = map_mouse(
-            drag(
-                anchor_rect
-                    .x
-                    .saturating_add(anchor_rect.width.saturating_sub(1)),
-                anchor_rect.y,
-            ),
-            &app,
-            &s,
-            &drag_geometry,
-            armed.drag,
-        );
-        let dropped = map_mouse(
-            up(
-                anchor_rect
-                    .x
-                    .saturating_add(anchor_rect.width.saturating_sub(1)),
-                anchor_rect.y,
-            ),
-            &app,
-            &s,
-            &drag_geometry,
-            moving.drag,
-        );
-        assert!(matches!(
-            dropped.action,
-            Some(Action::ReorderPlanNode { ref dragged, ref anchor, after: true })
-                if dragged.id == "n1" && anchor.id == "n3"
-        ));
-        app.apply(dropped.action.expect("box reorder"));
-        assert_eq!(
-            app.plan_node_order
-                .iter()
-                .map(|target| target.id.as_str())
-                .collect::<Vec<_>>(),
-            ["n2", "n3", "n1", "n4"]
-        );
-        let reordered_geometry = geo(&app, &s);
-        let row = |id: &str| {
-            reordered_geometry
-                .plan_node_rects
-                .iter()
-                .find(|(_, target)| target.id == id)
-                .expect("reordered box")
-                .0
-                .y
-        };
         assert!(
-            row("n1") > row("n3"),
-            "drop moves a box into another grid row"
+            g.ai_plan_scroll > 0,
+            "fixture must exercise real canvas scrolling"
+        );
+        let n1_y = g
+            .diagram_canvas
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|node| node.target.id == "n1")
+            .unwrap()
+            .rect
+            .y;
+        assert!(
+            usize::from(n1_y) < g.ai_plan_scroll,
+            "n1 top must be above viewport"
+        );
+        let (target, clipped) = g
+            .plan_node_rect_at(g.plan_node_rects[0].0.x, g.plan_node_rects[0].0.y)
+            .unwrap();
+        let armed = map_mouse(down(clipped.x, clipped.y), &app, &s, &g, DragState::Idle);
+        let moved = map_mouse(drag(clipped.x + 3, clipped.y + 2), &app, &s, &g, armed.drag);
+        assert_eq!(
+            moved.action,
+            Some(Action::MovePlanNode {
+                target,
+                x: 7,
+                y: 22
+            }),
+            "screen conversion retains the hidden top-row grab offset"
         );
     }
 

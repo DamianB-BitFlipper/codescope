@@ -139,10 +139,10 @@ count. Branch diffs always run from that resolved merge-base toward the checked-
 | `R` | refresh repository state |
 | `b` | pick the comparison base for the branch scope |
 | mouse hover (AI node) | highlight that node's exact linked old/new diff lines |
-| click / `Space` (AI node) | open its floating detail and source inspector |
-| click AI relationship | open its complete, untruncated label in a floating inspector |
-| drag AI node | reorder cards across the renderer's row/column slots |
-| mouse wheel | scroll the section under the pointer without focusing/selecting it |
+| click / `Space` (AI node) | expand or collapse that box in place with its full detail and source refs |
+| click AI relationship | toggle its complete text in an overlay without moving the diagram |
+| drag AI node | move the box freely in X/Y; connected arrows follow it |
+| mouse wheel | scroll the section or relationship overlay under the pointer without changing focus |
 | mouse drag | resize any pane divider |
 | drag diff code | select code without line-number gutters; release copies it |
 | click diff | clear the retained text selection |
@@ -183,11 +183,13 @@ the controller-visible draft; when the model naturally ends its tool sequence, C
 and publishes the accumulated result against known repository facts. The model can inspect, update, and delete existing boxes and relationships
 instead of repeatedly returning the whole plan. Each node also carries one or two exact, side-aware
 `code_refs` copied from annotated `git_diff_file` tool results plus optional
-`expanded_detail`. The model describes semantics, not coordinates: the renderer places three or
-more nodes in a responsive two-column card grid (one column in narrow panes), bounds every line to
-the pane width, and uses a single vertical scroll axis when the result is taller than the viewport.
-Dragging reorders cards across those stable row/column slots. Clicking a card or relationship opens
-a floating inspector with the full text; the overlay never changes card or arrow geometry. While an
+`expanded_detail`. The model describes semantics, not coordinates. The renderer seeds a responsive
+two-dimensional canvas, keeps every box inside the pane width, and uses one vertical scroll axis
+when the result is taller than the viewport. Dragging a box stores its session-local X/Y position;
+every connected arrow is routed again from the box's current bounds. Clicking a box grows that same
+box in place to show its complete detail and source refs. Clicking an arrow toggles its complete text
+in a top-layer overlay. Long overlay text pages with the mouse wheel. Opening, paging, or closing the
+overlay does not change any box, arrow, canvas extent, or base scroll position. While an
 internal request
 is running, the generated pane shows only `AI in progress` and its research/diagram tool calls
 progressing from running to succeeded/failed. The complete call history remains vertically
@@ -195,7 +197,8 @@ scrollable, and failed calls include their scrubbed error reason. Draft boxes ne
 shows one clickable `AI failed` banner; it does not replace the unfinished draft with known
 relationships. Hovering a rendered
 node highlights those old/new rows in the main diff; clicking it (or pressing `Space` while it is
-hovered) pins its code highlight and opens its deeper explanation and source locators. Every cited file, hunk, source line,
+hovered) pins its code highlight and expands the box in place with deeper detail and source locators.
+Every cited file, hunk, source line,
 symbol, or typed graph edge must resolve against the fact store; conceptual entityless nodes and
 hunk-derived links are allowed as interpretation, rendered dashed and clearly marked inferred,
 never as verified graph facts.

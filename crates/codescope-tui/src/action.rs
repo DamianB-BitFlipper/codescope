@@ -26,6 +26,9 @@ pub struct PlanNodeTarget {
 pub struct PlanRelationshipTarget {
     /// Zero-based form index inside the plan.
     pub form: usize,
+    /// Zero-based edge index inside the form. This distinguishes parallel edges with the
+    /// same endpoints, which can have distinct labels and interaction state.
+    pub edge: usize,
     /// Source plan-local node id.
     pub from: String,
     /// Destination plan-local node id.
@@ -195,22 +198,25 @@ pub enum Action {
     /// Mouse motion: set the generated-plan node currently under the pointer. `None`
     /// clears transient hover and its linked diff highlighting.
     HoverPlanNode(Option<PlanNodeTarget>),
-    /// Mouse click: expand or collapse one generated-plan node's detail inspector.
+    /// Mouse click: expand or collapse one generated-plan box in place.
     TogglePlanNode(PlanNodeTarget),
-    /// Mouse drag: place one generated-plan box before or after another box in the same
-    /// form. This changes only the renderer-owned session layout, never the AI plan.
-    ReorderPlanNode {
+    /// Mouse drag: move one generated-plan box to this content-local top-left position.
+    /// The position is retained for the current plan; it never mutates the AI plan.
+    MovePlanNode {
         /// Box being moved.
-        dragged: PlanNodeTarget,
-        /// Box used as the drop anchor.
-        anchor: PlanNodeTarget,
-        /// Place after the anchor when true, before it otherwise.
-        after: bool,
+        target: PlanNodeTarget,
+        /// Requested content-local column.
+        x: u16,
+        /// Requested content-local row.
+        y: u16,
     },
-    /// Mouse click: open or close the full relationship-label inspector.
+    /// Mouse click: show or hide the full relationship text in the canvas overlay.
     TogglePlanRelationship(PlanRelationshipTarget),
-    /// Close the floating box/relationship detail inspector without changing layout.
-    ClosePlanInspector,
+    /// Mouse wheel: set the absolute page offset of the visible relationship overlay.
+    ScrollPlanRelationshipOverlay {
+        /// Clamped overlay line offset from the complete relationship text.
+        offset: usize,
+    },
     /// Mouse drag preview: update the visible diff text selection.
     SetDiffSelection(DiffTextSelection),
     /// Mouse click: clear the retained diff highlight without copying anything.
@@ -287,12 +293,6 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
     }
     if app.show_base_picker {
         return picker_key(key, Action::BasePicker, Action::BaseSelected(String::new()));
-    }
-    if app.plan_inspector_open() {
-        return match key.code {
-            KeyCode::Esc => Action::ClosePlanInspector,
-            _ => Action::None,
-        };
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -527,18 +527,6 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Char('?')), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Esc), &a), Action::ToggleStatusDetail);
-    }
-
-    #[test]
-    fn plan_inspector_swallows_keys_and_esc_closes_it() {
-        let mut a = app();
-        a.inspected_plan_node = Some(PlanNodeTarget {
-            form: 0,
-            id: "node".to_string(),
-        });
-        assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
-        assert_eq!(map_key(key(KeyCode::Char('?')), &a), Action::None);
-        assert_eq!(map_key(key(KeyCode::Esc), &a), Action::ClosePlanInspector);
     }
 
     #[test]

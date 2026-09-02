@@ -122,17 +122,17 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    and never serializing secrets or repository state.
 9. **TUI**: ratatui 0.30 + crossterm 0.29 (pin both; mismatch = duplicate crossterm);
    `ratatui::init/restore` (panic-safe), 4-tier responsive layout, modeless keymap, pure
-   `map_key` for testability. Validated AI plans use one width-aware visual grammar: boxed nodes
-   and labeled relationship connectors. Chains may sit side by side when they fit; otherwise all
-   forms stack their boxes vertically (each node once, edges naming effect and destination, cycles
-   explicit). Layout owns placement and constrains every row to the live pane
-   width; overflow grows vertically through one scroll axis, never into a horizontal canvas.
-   Dashed labeled connectors mark inferred/hunk-derived links.
-   Hovering a node highlights its validated logical diff rows without erasing add/delete meaning;
-   click/`Space` expands its details without pinning hover styling, dragging a box reorders the
-   automatic layout, and clicking a truncated relationship wraps its complete label in place.
-   External assumptions remain above the full
-   Review block. (research 04)
+   `map_key` for testability. Validated AI plans use one width-aware visual grammar: positioned
+   boxes joined by directed relationship paths. A pure canvas derives default positions, current
+   box bounds, routed edges, compact labels, and hit regions from the same plan and view state used
+   by rendering. It constrains X to the live pane and lets Y grow through one vertical scroll axis.
+   Solid paths mark validator-verified relationships; dashed paths and hollow heads mark inferred
+   or hunk-derived links. Hovering a node highlights its validated logical diff rows without
+   erasing add/delete meaning. Click/`Space` grows that box in place with lossless detail and source
+   refs. Dragging stores a session-local X/Y position and reroutes incident arrows. Clicking an
+   arrow toggles a top-layer, wheel-pageable full-text overlay. Overlay state never changes base
+   box/edge geometry, canvas extent, or scroll. External assumptions remain above the full Review
+   block. (research 04)
 10. **Fixture + tests**: shell-regenerable Go fixture with deterministic OIDs; hand-rolled fake
    LSP server for negative tests; ScriptedProvider fake AI; live AI behind #[ignore] + env.
    (research 08)

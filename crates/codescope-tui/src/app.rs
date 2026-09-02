@@ -74,14 +74,9 @@ pub struct App {
     /// Generated-plan node currently under the mouse. This is transient view state and
     /// drives both node emphasis and linked diff-row highlighting.
     pub hovered_plan_node: Option<PlanNodeTarget>,
-    /// Generated-plan node shown in the floating inspector. It also pins diff highlighting
-    /// when nothing is hovered.
-    pub inspected_plan_node: Option<PlanNodeTarget>,
-    /// User-defined box order, grouped by plan form. Empty means the automatic placer's
-    /// semantic order. It is session-only and resets when the generated plan changes.
-    pub plan_node_order: Vec<PlanNodeTarget>,
-    /// Relationship whose complete label is shown in the floating inspector.
-    pub inspected_plan_relationship: Option<PlanRelationshipTarget>,
+    /// Persistent free box positions and inline expansion state for the current plan.
+    /// [`crate::diagram::DiagramState`] is the sole owner of this interaction state.
+    pub diagram: crate::diagram::DiagramState,
     /// Independent offset for the deterministic incoming-callers list.
     pub callers_scroll: usize,
     /// Independent offset for the deterministic downstream-relationships list.
@@ -177,9 +172,17 @@ impl App {
         if generated_retargeted {
             self.ai_plan_scroll = 0;
             self.hovered_plan_node = None;
-            self.inspected_plan_node = None;
-            self.plan_node_order.clear();
-            self.inspected_plan_relationship = None;
+            // A selected-impact change is a new diagram scope even when a generic plan
+            // reuses ids such as n1/n2 in the same epoch. Other equivalent refreshes keep
+            // stable free positions and only prune stale identities.
+            if impact_retargeted {
+                self.diagram = crate::diagram::DiagramState::default();
+            }
+            if let Some(plan) = self.snapshot.semantic.plan.as_ref() {
+                self.diagram.sync_plan(plan);
+            } else {
+                self.diagram = crate::diagram::DiagramState::default();
+            }
         }
         if impact_retargeted {
             self.callers_scroll = 0;
@@ -267,30 +270,21 @@ impl App {
                 self.focused = Pane::Impact;
                 self.toggle_plan_node(target);
             }
-            Action::ReorderPlanNode {
-                dragged,
-                anchor,
-                after,
-            } => {
+            Action::MovePlanNode { target, x, y } => {
                 self.focused = Pane::Impact;
-                self.reorder_plan_node(dragged, anchor, after);
+                if self.plan_node(&target).is_some() {
+                    self.diagram
+                        .move_node(target, crate::diagram::DiagramPosition { x, y });
+                }
             }
             Action::TogglePlanRelationship(target) => {
                 self.focused = Pane::Impact;
                 if self.plan_relationship_exists(&target) {
-                    if self.inspected_plan_relationship.as_ref() == Some(&target) {
-                        self.inspected_plan_relationship = None;
-                    } else {
-                        self.hovered_plan_node = None;
-                        self.inspected_plan_node = None;
-                        self.inspected_plan_relationship = Some(target);
-                    }
+                    self.diagram.toggle_relationship(target);
                 }
             }
-            Action::ClosePlanInspector => {
-                self.inspected_plan_node = None;
-                self.inspected_plan_relationship = None;
-                self.hovered_plan_node = None;
+            Action::ScrollPlanRelationshipOverlay { offset } => {
+                self.diagram.set_overlay_scroll(offset);
             }
             Action::SetDiffSelection(selection) => {
                 self.focused = Pane::Diff;
@@ -342,8 +336,7 @@ impl App {
                     self.diff_selection = None;
                 }
                 Pane::Impact => {
-                    self.inspected_plan_node = None;
-                    self.inspected_plan_relationship = None;
+                    self.diagram.clear_expansion();
                 }
                 // Files-pane expansion is dispatcher-owned: run.rs routes Space/h/l to
                 // the targeted SetFileExpanded command; App applies no local tree
@@ -359,7 +352,7 @@ impl App {
                 Pane::Impact => {
                     if let Some(target) = self.hovered_plan_node.clone() {
                         if self.plan_node(&target).is_some() {
-                            self.expand_plan_node(target);
+                            self.diagram.toggle_node(target);
                         }
                     }
                 }
@@ -453,9 +446,7 @@ impl App {
         self.downstream_scroll = 0;
         self.ai_plan_scroll = 0;
         self.hovered_plan_node = None;
-        self.inspected_plan_node = None;
-        self.plan_node_order.clear();
-        self.inspected_plan_relationship = None;
+        self.diagram = crate::diagram::DiagramState::default();
         self.current_hunk = usize::from(self.snapshot.diff.total_hunks > 0);
     }
 
@@ -481,118 +472,29 @@ impl App {
             .and_then(|target| self.plan_node(target))
     }
 
-    /// Node whose code links are active. Transient hover wins; otherwise the most recently
-    /// inspected node remains pinned while the pointer moves into the diff.
+    /// Node whose code links are active. Transient hover wins; otherwise the expanded
+    /// inline card remains the pinned source while the pointer moves into the diff.
     #[must_use]
     pub fn active_code_node(&self) -> Option<&codescope_core::PlanNode> {
         self.hovered_node().or_else(|| {
-            self.inspected_plan_node
-                .as_ref()
+            self.diagram
+                .expanded_node()
                 .and_then(|target| self.plan_node(target))
         })
     }
 
-    /// Whether a floating box or relationship inspector currently owns interaction.
-    #[must_use]
-    pub fn plan_inspector_open(&self) -> bool {
-        self.inspected_plan_node.is_some() || self.inspected_plan_relationship.is_some()
-    }
-
     fn toggle_plan_node(&mut self, target: PlanNodeTarget) {
-        if self.plan_node(&target).is_none() {
-            return;
+        if self.plan_node(&target).is_some() {
+            self.diagram.toggle_node(target);
         }
-        if self.inspected_plan_node.as_ref() == Some(&target) {
-            self.inspected_plan_node = None;
-        } else {
-            self.inspected_plan_node = None;
-            self.inspected_plan_relationship = None;
-            self.expand_plan_node(target);
-        }
-    }
-
-    fn expand_plan_node(&mut self, target: PlanNodeTarget) {
-        self.inspected_plan_node = Some(target);
-        self.hovered_plan_node = None;
-    }
-
-    fn reorder_plan_node(&mut self, dragged: PlanNodeTarget, anchor: PlanNodeTarget, after: bool) {
-        if dragged == anchor || dragged.form != anchor.form {
-            return;
-        }
-        let Some(form) = self
-            .snapshot
-            .semantic
-            .plan
-            .as_ref()
-            .and_then(|plan| plan.forms.get(dragged.form))
-        else {
-            return;
-        };
-        if !form.nodes.iter().any(|node| node.id == dragged.id)
-            || !form.nodes.iter().any(|node| node.id == anchor.id)
-        {
-            return;
-        }
-
-        let mut order = form
-            .nodes
-            .iter()
-            .map(|node| PlanNodeTarget {
-                form: dragged.form,
-                id: node.id.clone(),
-            })
-            .collect::<Vec<_>>();
-        if self
-            .plan_node_order
-            .iter()
-            .any(|target| target.form == dragged.form)
-        {
-            order.sort_by_key(|target| {
-                self.plan_node_order
-                    .iter()
-                    .position(|ordered| ordered == target)
-                    .unwrap_or(usize::MAX)
-            });
-        }
-        let Some(from) = order.iter().position(|target| target == &dragged) else {
-            return;
-        };
-        order.remove(from);
-        let Some(anchor_index) = order.iter().position(|target| target == &anchor) else {
-            return;
-        };
-        order.insert(anchor_index + usize::from(after), dragged);
-        self.plan_node_order
-            .retain(|target| target.form != anchor.form);
-        self.plan_node_order.extend(order);
-        self.ai_plan_scroll = 0;
-        self.hovered_plan_node = None;
     }
 
     fn plan_relationship_exists(&self, target: &PlanRelationshipTarget) -> bool {
-        let Some(form) = self
-            .snapshot
+        self.snapshot
             .semantic
             .plan
             .as_ref()
-            .and_then(|plan| plan.forms.get(target.form))
-        else {
-            return false;
-        };
-        form.edges
-            .iter()
-            .any(|edge| edge.from == target.from && edge.to == target.to)
-            || form.nodes.iter().any(|node| {
-                node.id == target.from && node.children.iter().any(|child| child == &target.to)
-            })
-            || (form.kind == codescope_core::FormKind::BeforeAfter
-                && form.edges.is_empty()
-                && form
-                    .nodes
-                    .first()
-                    .is_some_and(|node| node.id == target.from)
-                && form.nodes.get(1).is_some_and(|node| node.id == target.to))
+            .is_some_and(|plan| crate::diagram::relationship_exists(plan, target))
     }
 
     /// Model candidates matching the picker's filter query (the visible list).

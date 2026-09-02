@@ -640,7 +640,7 @@ fn diagram_node_schema() -> Value {
             "entity": diagram_entity_schema(),
             "label": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Short identifier or action displayed as the box title."},
             "detail": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "Required concrete reviewer-facing preview; keep it to at most 8 words and 56 characters."},
-            "expanded_detail": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "Optional self-contained deeper explanation shown in the box inspector."},
+            "expanded_detail": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "Optional self-contained deeper explanation shown when the box expands in place."},
             "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": diagram_code_ref_schema(), "description": "One or two exact changed-line references."},
             "change": {"type": "string", "enum": ["added", "modified", "removed", "unchanged", "diagnostic"], "description": "Optional change badge string."},
             "severity": {"type": "string", "enum": ["error", "warning", "information", "hint"], "description": "Optional diagnostic severity badge."},

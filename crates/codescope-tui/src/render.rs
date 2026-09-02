@@ -1728,8 +1728,58 @@ fn render_impact_body(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsho
 /// The generated explanation is laid out from validated structure at the current width.
 /// While it is being built, this same vertically scrollable region contains the complete
 /// tool-call history.
+/// Base annotation rows that must be supplied to both the renderer and retained geometry.
+#[must_use]
+pub(crate) fn generated_plan_leading_annotations(
+    semantic: &crate::snapshot::SemanticPane,
+) -> Vec<String> {
+    crate::diagram::leading_annotations(semantic.report.as_ref())
+}
+
 fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
-    let lines = generated_impact_content(app, snap, area.width);
+    let sem = &snap.semantic;
+    if let Some(plan) = sem
+        .plan
+        .as_ref()
+        .filter(|_| sem.ai_generated && matches!(snap.ai, AiStatus::Ready { .. }))
+    {
+        let leading_annotations = generated_plan_leading_annotations(sem);
+        let canvas = crate::diagram::DiagramCanvas::build_with_annotations(
+            plan,
+            crate::diagram::DiagramViewport {
+                width: area.width,
+                height: area.height,
+            },
+            app.diagram.positions(),
+            app.diagram.expanded_node(),
+            app.diagram.z_order(),
+            &leading_annotations,
+        );
+        render_diagram_canvas(
+            frame,
+            area,
+            &canvas,
+            plan,
+            DiagramRenderState {
+                selected_label: snap
+                    .impact
+                    .selected_change
+                    .as_ref()
+                    .map(|change| change.label.as_str())
+                    .unwrap_or(""),
+                hovered: app.hovered_plan_node.as_ref(),
+                expanded_relationship: app.diagram.expanded_relationship(),
+                overlay_scroll: app.diagram.overlay_scroll(),
+                scroll_y: app
+                    .ai_plan_scroll
+                    .min(usize::from(canvas.size.height.saturating_sub(area.height)))
+                    as u16,
+            },
+        );
+        return;
+    }
+
+    let lines = generated_impact_content(snap, area.width);
     let height = usize::from(area.height);
     let max_scroll = lines.len().saturating_sub(height);
     let start = app.ai_plan_scroll.min(max_scroll);
@@ -1740,103 +1790,220 @@ fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSn
         .map(render_diagram_line)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(rendered), area);
-    render_plan_inspector(frame, area, app, snap);
 }
 
-/// Floating detail card for the most recently clicked box or relationship. It is drawn after
-/// the diagram and never contributes rows to `generated_impact_content`, so opening it cannot
-/// move cards, connectors, hitboxes, or the vertical scroll range.
-fn render_plan_inspector(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
-    let Some((kind, content)) = plan_inspector_content(app, snap) else {
-        return;
-    };
-    let popup = status_detail_rect(area, &content);
-    let title = format!(" {kind} details · click or Esc to close ");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(ACCENT))
-        .title(truncate_cells(&title, popup.width.into()));
-    let paragraph = Paragraph::new(content)
-        .style(Style::new().fg(TEXT))
-        .wrap(Wrap { trim: false })
-        .block(block);
-    frame.render_widget(ratatui::widgets::Clear, popup);
-    frame.render_widget(paragraph, popup);
+/// Transient inputs that style or overlay a derived diagram without changing its base Canvas.
+struct DiagramRenderState<'a> {
+    selected_label: &'a str,
+    hovered: Option<&'a crate::action::PlanNodeTarget>,
+    expanded_relationship: Option<&'a crate::action::PlanRelationshipTarget>,
+    overlay_scroll: usize,
+    scroll_y: u16,
 }
 
-fn plan_inspector_content(app: &App, snap: &UiSnapshot) -> Option<(&'static str, String)> {
-    if let Some(target) = app.inspected_plan_node.as_ref() {
-        let node = app.plan_node(target)?;
-        let detail = node
-            .expanded_detail
-            .as_deref()
-            .filter(|detail| !detail.trim().is_empty())
-            .or(node.detail.as_deref())
-            .unwrap_or("No additional detail.");
-        let mut content = format!("{}\n\n{}", node.label.trim(), detail.trim());
-        if !node.code_refs.is_empty() {
-            content.push_str("\n\nSource");
-            for code_ref in &node.code_refs {
-                let side = match code_ref.side {
-                    DiffSide::Old => "old",
-                    DiffSide::New => "new",
-                };
-                content.push_str(&format!(
-                    "\n{}:{}-{} · {side} · hunk {}",
-                    code_ref.file,
-                    code_ref.start_line,
-                    code_ref.end_line,
-                    code_ref.hunk.saturating_add(1)
-                ));
+/// Rasterize the independent canvas layers. The relationship overlay is deliberately last and
+/// is not used to calculate `canvas.size`, scroll range, or any box/arrow position.
+fn render_diagram_canvas(
+    frame: &mut Frame,
+    area: Rect,
+    canvas: &crate::diagram::DiagramCanvas,
+    plan: &codescope_core::VisualizationPlan,
+    state: DiagramRenderState<'_>,
+) {
+    let DiagramRenderState {
+        selected_label,
+        hovered,
+        expanded_relationship,
+        overlay_scroll,
+        scroll_y,
+    } = state;
+    for (row, line) in canvas.annotations.iter().enumerate() {
+        draw_canvas_text(
+            frame,
+            area,
+            scroll_y,
+            0,
+            row as u16,
+            line,
+            Style::new().fg(if line.starts_with("⚠ sanitized AI plan") {
+                WARN
+            } else if row < 2 {
+                TEXT
+            } else {
+                MUTED
+            }),
+        );
+    }
+    for relationship in &canvas.relationships {
+        let route_style = Style::new().fg(if relationship.verified { ACCENT } else { MUTED });
+        for segment in relationship.path.windows(2) {
+            draw_route_segment(
+                frame,
+                area,
+                scroll_y,
+                segment[0],
+                segment[1],
+                relationship.verified,
+                route_style,
+            );
+        }
+        draw_canvas_text(
+            frame,
+            area,
+            scroll_y,
+            relationship.label_rect.x,
+            relationship.label_rect.y,
+            &relationship.label,
+            Style::new().fg(ACCENT),
+        );
+        if relationship.path.len() >= 2 {
+            let before = relationship.path[relationship.path.len() - 2];
+            let end = *relationship.path.last().expect("len checked");
+            draw_canvas_text(
+                frame,
+                area,
+                scroll_y,
+                end.x,
+                end.y,
+                arrow_head(before, end, relationship.verified),
+                route_style,
+            );
+        }
+    }
+    for node in &canvas.nodes {
+        let selected = plan
+            .forms
+            .get(node.target.form)
+            .and_then(|form| form.nodes.iter().find(|item| item.id == node.target.id))
+            .is_some_and(|item| {
+                item.hint.highlight
+                    || (!selected_label.is_empty()
+                        && (item.label == selected_label
+                            || item
+                                .entity
+                                .as_ref()
+                                .and_then(|entity| entity.symbol.as_deref())
+                                == Some(selected_label)))
+            });
+        let style = if hovered == Some(&node.target) || selected {
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(TEXT)
+        };
+        for (row, line) in node.lines.iter().enumerate() {
+            draw_canvas_text(
+                frame,
+                area,
+                scroll_y,
+                node.rect.x,
+                node.rect.y.saturating_add(row as u16),
+                line,
+                style,
+            );
+        }
+    }
+    if let Some(target) = expanded_relationship {
+        if let Some(overlay) = canvas.relationship_overlay_in_viewport(
+            plan,
+            target,
+            scroll_y,
+            area.height,
+            overlay_scroll,
+        ) {
+            let rect = Rect::new(
+                area.x.saturating_add(overlay.rect.x),
+                area.y,
+                overlay
+                    .rect
+                    .width
+                    .min(area.width.saturating_sub(overlay.rect.x)),
+                overlay.rect.height.min(area.height),
+            );
+            frame.render_widget(ratatui::widgets::Clear, rect);
+            for (row, line) in overlay.lines.iter().enumerate() {
+                draw_canvas_text(
+                    frame,
+                    area,
+                    scroll_y,
+                    overlay.rect.x,
+                    overlay.rect.y.saturating_add(row as u16),
+                    line,
+                    Style::new().fg(TEXT).bg(SURFACE_ALT),
+                );
             }
         }
-        return Some(("box", content));
     }
-
-    let target = app.inspected_plan_relationship.as_ref()?;
-    let form = snap.semantic.plan.as_ref()?.forms.get(target.form)?;
-    let source = form
-        .nodes
-        .iter()
-        .find(|node| node.id == target.from)
-        .map_or(target.from.as_str(), |node| node.label.trim());
-    let destination = form
-        .nodes
-        .iter()
-        .find(|node| node.id == target.to)
-        .map_or(target.to.as_str(), |node| node.label.trim());
-    let label = form
-        .edges
-        .iter()
-        .find(|edge| edge.from == target.from && edge.to == target.to)
-        .map(crate::diagram::edge_label)
-        .or_else(|| {
-            form.nodes
-                .iter()
-                .find(|node| node.id == target.from && node.children.contains(&target.to))
-                .map(|_| "contains")
-        })
-        .or_else(|| {
-            (form.kind == codescope_core::FormKind::BeforeAfter
-                && form.edges.is_empty()
-                && form
-                    .nodes
-                    .first()
-                    .is_some_and(|node| node.id == target.from)
-                && form.nodes.get(1).is_some_and(|node| node.id == target.to))
-            .then_some("becomes")
-        })?;
-    Some((
-        "relationship",
-        format!("{source} → {destination}\n\n{}", label.trim()),
-    ))
 }
 
-/// The generated pane's semantic line layout, shared by rendering and retained mouse
-/// geometry. Node-bearing spans keep their plan-local targets until the final Ratatui
-/// conversion, so hover hitboxes cannot drift from the cells a user sees.
+fn draw_route_segment(
+    frame: &mut Frame,
+    area: Rect,
+    scroll_y: u16,
+    from: crate::diagram::DiagramPosition,
+    to: crate::diagram::DiagramPosition,
+    verified: bool,
+    style: Style,
+) {
+    let horizontal = from.y == to.y;
+    let glyph = match (horizontal, verified) {
+        (true, true) => "─",
+        (true, false) => "┄",
+        (false, true) => "│",
+        (false, false) => "┆",
+    };
+    if horizontal {
+        for x in from.x.min(to.x)..=from.x.max(to.x) {
+            draw_canvas_text(frame, area, scroll_y, x, from.y, glyph, style);
+        }
+    } else if from.x == to.x {
+        for y in from.y.min(to.y)..=from.y.max(to.y) {
+            draw_canvas_text(frame, area, scroll_y, from.x, y, glyph, style);
+        }
+    }
+}
+
+fn arrow_head(
+    from: crate::diagram::DiagramPosition,
+    to: crate::diagram::DiagramPosition,
+    verified: bool,
+) -> &'static str {
+    match (to.x.cmp(&from.x), to.y.cmp(&from.y), verified) {
+        (std::cmp::Ordering::Greater, _, true) => "▶",
+        (std::cmp::Ordering::Less, _, true) => "◀",
+        (_, std::cmp::Ordering::Greater, true) => "▼",
+        (_, _, true) => "▲",
+        (std::cmp::Ordering::Greater, _, false) => "▷",
+        (std::cmp::Ordering::Less, _, false) => "◁",
+        (_, std::cmp::Ordering::Greater, false) => "▽",
+        (_, _, false) => "△",
+    }
+}
+
+/// Write one content-local string only inside the current visible, scrolled canvas viewport.
+fn draw_canvas_text(
+    frame: &mut Frame,
+    area: Rect,
+    scroll_y: u16,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: Style,
+) {
+    if y < scroll_y || y.saturating_sub(scroll_y) >= area.height || x >= area.width {
+        return;
+    }
+    let screen_x = area.x.saturating_add(x);
+    let screen_y = area.y.saturating_add(y.saturating_sub(scroll_y));
+    let width = usize::from(area.width.saturating_sub(x));
+    frame
+        .buffer_mut()
+        .set_stringn(screen_x, screen_y, text, width, style);
+}
+
+/// Build non-interactive generated-pane rows for loading and failure states.
+/// Ready plans bypass this helper and use [`crate::diagram::DiagramCanvas`] for both
+/// rendering and retained mouse geometry.
 pub(crate) fn generated_impact_content(
-    app: &App,
     snap: &UiSnapshot,
     width: u16,
 ) -> Vec<crate::diagram::DiagramLine> {
@@ -1853,29 +2020,12 @@ pub(crate) fn generated_impact_content(
     }
 
     let sem = &snap.semantic;
-    let Some(plan) = sem
-        .plan
-        .as_ref()
-        .filter(|_| sem.ai_generated && matches!(snap.ai, AiStatus::Ready { .. }))
-    else {
+    if !(sem.ai_generated && sem.plan.is_some() && matches!(snap.ai, AiStatus::Ready { .. })) {
         return ai_progress_lines(snap, width);
-    };
+    }
 
-    // Node highlighting follows the actual selection, not the dispatcher's data-quality
-    // note: the selected change label is what node labels and entity symbols must match.
-    let selected_label = snap
-        .impact
-        .selected_change
-        .as_ref()
-        .map(|selected| selected.label.as_str())
-        .unwrap_or("");
-    let diagram = crate::diagram::interactive_plan_lines(
-        plan,
-        width,
-        selected_label,
-        app.hovered_plan_node.as_ref(),
-        &app.plan_node_order,
-    );
+    // Ready plans are rendered by DiagramCanvas. This compatibility helper retains only the
+    // validator annotation rows for callers that ask for semantic status text.
 
     let mut lines = Vec::new();
     if let Some(report) = &sem.report {
@@ -1893,7 +2043,6 @@ pub(crate) fn generated_impact_content(
             ));
         }
     }
-    lines.extend(diagram);
     lines
 }
 
@@ -2367,9 +2516,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  mouse hover     impact node highlights its linked diff code"),
         Line::from("  click / Space   expand hovered impact-node details"),
         Line::from("  click arrow     expand / collapse its complete relationship text"),
-        Line::from("  mouse wheel     scroll the section under the pointer"),
+        Line::from("  mouse wheel     scroll section / page open relationship text"),
         Line::from("  drag divider    resize adjacent panes"),
-        Line::from("  drag AI box     reorder boxes in the automatic layout"),
+        Line::from("  drag AI box     move freely on the canvas"),
         Line::from("  drag diff code  select code only; release copies · click clears"),
         Line::from("  n / N           next / previous diff hunk"),
         Line::from("  z               zoom the focused pane (Tab still switches)"),
@@ -3662,82 +3811,6 @@ mod tests {
     }
 
     #[test]
-    fn card_and_relationship_inspectors_show_full_text_without_reflowing_the_canvas() {
-        let mut snap = ai_plan_snap(4);
-        let form = &mut snap.semantic.plan.as_mut().unwrap().forms[0];
-        form.nodes[0].expanded_detail = Some(
-            "The complete box explanation stays readable in a floating inspector.".to_string(),
-        );
-        form.edges[0].label =
-            Some("validates the complete request before publishing the durable result".to_string());
-        let mut app = app_after_ai_landed(&snap);
-        let base = generated_impact_content(&app, &snap, 86)
-            .iter()
-            .map(crate::diagram::DiagramLine::text)
-            .collect::<Vec<_>>();
-
-        app.apply(crate::action::Action::TogglePlanNode(
-            crate::action::PlanNodeTarget {
-                form: 0,
-                id: "n0".to_string(),
-            },
-        ));
-        let (kind, content) = plan_inspector_content(&app, &snap).expect("box inspector");
-        assert_eq!(kind, "box");
-        assert!(content.contains("complete box explanation"));
-        assert_eq!(
-            generated_impact_content(&app, &snap, 86)
-                .iter()
-                .map(crate::diagram::DiagramLine::text)
-                .collect::<Vec<_>>(),
-            base,
-            "the floating box inspector cannot change canvas rows"
-        );
-        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
-        let rendered = buffer_text(&terminal);
-        assert!(
-            rendered.contains("box details"),
-            "inspector title: {rendered}"
-        );
-        assert!(
-            rendered.contains("complete box explanation"),
-            "full box text: {rendered}"
-        );
-
-        app.apply(crate::action::Action::ClosePlanInspector);
-        app.apply(crate::action::Action::TogglePlanRelationship(
-            crate::action::PlanRelationshipTarget {
-                form: 0,
-                from: "n0".to_string(),
-                to: "n1".to_string(),
-            },
-        ));
-        let (kind, content) = plan_inspector_content(&app, &snap).expect("arrow inspector");
-        assert_eq!(kind, "relationship");
-        assert!(content.contains("PlanStep0 → PlanStep1"));
-        assert!(content.contains("publishing the durable result"));
-        assert_eq!(
-            generated_impact_content(&app, &snap, 86)
-                .iter()
-                .map(crate::diagram::DiagramLine::text)
-                .collect::<Vec<_>>(),
-            base,
-            "the floating relationship inspector cannot change canvas rows"
-        );
-        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
-        let rendered = buffer_text(&terminal);
-        assert!(
-            rendered.contains("relationship details"),
-            "inspector title: {rendered}"
-        );
-        assert!(
-            rendered.contains("publishing the durable") && rendered.contains("result"),
-            "full relationship text: {rendered}"
-        );
-    }
-
-    #[test]
     fn ai_plan_renders_one_description_after_loading_to_ready() {
         let plan = ai_plan_snap(3);
         let app = app_after_ai_landed(&plan);
@@ -3795,6 +3868,67 @@ mod tests {
         // The deterministic context stays visible beside generated Impact.
         let body: String = (24..38).map(|y| row_text(&t, y)).collect();
         assert!(body.contains("SELECTED CHANGE"), "impact context: {body}");
+    }
+
+    #[test]
+    fn relationship_overlay_renders_full_text_without_moving_the_canvas() {
+        let mut snap = ai_plan_snap(2);
+        let label =
+            "validates the request, records the decision, and publishes UNIQUE_RELATIONSHIP_TAIL";
+        snap.semantic.plan.as_mut().unwrap().forms[0].edges[0].label = Some(label.into());
+        let mut app = app_after_ai_landed(&snap);
+        let plan = snap.semantic.plan.as_ref().unwrap();
+        let target = crate::action::PlanRelationshipTarget {
+            form: 0,
+            edge: 0,
+            from: "n0".into(),
+            to: "n1".into(),
+        };
+        let viewport = crate::diagram::DiagramViewport {
+            width: 80,
+            height: 14,
+        };
+        let base = crate::diagram::DiagramCanvas::build_with_annotations(
+            plan,
+            viewport,
+            app.diagram.positions(),
+            app.diagram.expanded_node(),
+            app.diagram.z_order(),
+            &crate::diagram::leading_annotations(snap.semantic.report.as_ref()),
+        );
+        let base_scroll = app.ai_plan_scroll;
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("UNIQUE_RELATIONSHIP_TAIL"),
+            "the compact route label is truncated before the unique tail"
+        );
+
+        app.apply(crate::action::Action::TogglePlanRelationship(
+            target.clone(),
+        ));
+        let with_overlay = crate::diagram::DiagramCanvas::build_with_annotations(
+            plan,
+            viewport,
+            app.diagram.positions(),
+            app.diagram.expanded_node(),
+            app.diagram.z_order(),
+            &crate::diagram::leading_annotations(snap.semantic.report.as_ref()),
+        );
+        assert_eq!(
+            base, with_overlay,
+            "overlay state is outside base Canvas geometry"
+        );
+        assert_eq!(app.ai_plan_scroll, base_scroll);
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("UNIQUE_RELATIONSHIP_TAIL"),
+            "the top-layer overlay renders the complete relationship text"
+        );
+
+        app.apply(crate::action::Action::TogglePlanRelationship(target));
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        assert!(!buffer_text(&terminal).contains("UNIQUE_RELATIONSHIP_TAIL"));
     }
 
     #[test]
@@ -3908,7 +4042,7 @@ mod tests {
                 .collect(),
         };
 
-        let lines = generated_impact_content(&App::new(), &snap, 80);
+        let lines = generated_impact_content(&snap, 80);
         let text = lines
             .iter()
             .map(crate::diagram::DiagramLine::text)
@@ -3929,7 +4063,7 @@ mod tests {
         snap.ai = AiStatus::Failed {
             reason: "tool budget exceeded".to_string(),
         };
-        let lines = generated_impact_content(&App::new(), &snap, 80);
+        let lines = generated_impact_content(&snap, 80);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "AI failed · click for details");
         assert!(!lines[0].text().contains("known relationships"));
@@ -4148,15 +4282,6 @@ mod tests {
             pane.contains("Step2") && pane.contains("Step3"),
             "the next grid row is visible without scrolling: {pane}"
         );
-        let generated = generated_impact_content(&app, &plan, 86)
-            .iter()
-            .map(crate::diagram::DiagramLine::text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            generated.contains("Step0 → SIGTERM/SIGINT triggers") && generated.contains(" → Step1"),
-            "the compact relationship remains available by scrolling: {generated}"
-        );
         // With the retired summary/status rows gone, 80x20 gives Impact 11 rows while
         // still preserving the seven-row work minimum.
         let mut t80 = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -4339,12 +4464,8 @@ mod tests {
     #[test]
     fn generated_impact_content_never_exceeds_the_viewport_width() {
         let plan = ai_plan_snap(8);
-        let app = app_after_ai_landed(&plan);
         for width in 1..=120u16 {
-            for (row, line) in generated_impact_content(&app, &plan, width)
-                .iter()
-                .enumerate()
-            {
+            for (row, line) in generated_impact_content(&plan, width).iter().enumerate() {
                 assert!(
                     line.text().width() <= usize::from(width),
                     "width {width}, row {row}: {:?}",

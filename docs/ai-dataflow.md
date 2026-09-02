@@ -96,23 +96,21 @@ remain explicit rather than being replaced by deterministic summary content.
 7. **Epoch gate** — the plan carries the epoch it was requested against. If the repository has
    changed since, the plan is **stale**: the generated half returns to `AI in progress` and a new
    request is issued. A stale plan can never remain visible against a newer repository state.
-8. **Render + interact** — the TUI draws validated plans using only boxed nodes and labeled
-   relationship connectors. Forms with three or more nodes use a responsive two-column card grid
-   (one column in narrow panes); two-node comparisons retain a direct horizontal or vertical
-   connector. Each
-   node renders once and every edge names its effect/destination. Validator-verified connectors are solid; inferred or
-   hunk-derived links are dashed and visibly labeled. The layout retains semantic node hitboxes
-   from the same physical spans that were rendered. Mouse motion only redraws when the hovered
-   target changes; it never starts AI/LSP work. Placement is entirely renderer-owned: no model
-   or retained node coordinates exist, every physical line is bounded to the current pane width,
-   and content that does not fit grows downward through the one vertical scroll axis. Hover adds
-   a non-colour diff-row cue to every
-   exact linked logical row (including all wrapped fragments), while click/`Space` pins the node and
-   opens a floating detail/source inspector without changing the canvas. Box drag changes the
-   session-local row/column order while preserving automatic placement; clicking a relationship
-   opens its complete label in the same floating inspector. Clicking again or pressing Esc closes
-   the overlay. External assumptions get an upfront warning plus
-   the full Review block, and plan-level evidence remains below the map.
+8. **Render + interact** — the TUI draws validated plans as positioned boxes joined by directed
+   relationship paths. A pure Canvas is the single source of current node rectangles, compact edge
+   labels, routed paths, drawing order, and hit regions for both rendering and mouse input. It seeds
+   responsive one- or two-column positions, clamps X to the live pane, and lets Y grow through one
+   vertical scroll axis. The model never supplies coordinates. Validator-verified paths are solid;
+   inferred or hunk-derived paths are dashed with hollow arrowheads. Optional edge descriptions are
+   truncated to their available route lane. Mouse motion only redraws when the hovered target
+   changes and never starts AI/LSP work. Hover adds a non-colour diff-row cue to every exact linked
+   logical row, including wrapped fragments. Click/`Space` grows the selected box at the same X/Y
+   and shows its lossless concise detail, expanded detail, and source refs inside the box. Dragging
+   stores that box's session-local X/Y and reroutes its incident arrows from the new bounds.
+   Clicking an arrow or compact label toggles its complete text in a top-layer overlay; long text
+   pages under the mouse wheel. Opening, paging, and closing that overlay do not change any base
+   node rectangle, edge path, canvas extent, or scroll position. Plan intent, sanitizer warnings,
+   and evidence share the same canvas coordinate system, so geometry and rendering cannot drift.
 
 ## One diagram API, two agent surfaces
 

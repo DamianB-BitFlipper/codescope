@@ -289,7 +289,7 @@ impl PlanNode {
         self
     }
 
-    /// Attach optional detail for the node's expanded inspector.
+    /// Attach optional detail shown when the rendered node box expands in place.
     #[must_use]
     pub fn with_expanded_detail(mut self, detail: impl Into<String>) -> Self {
         self.expanded_detail = Some(detail.into());
