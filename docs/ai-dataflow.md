@@ -97,8 +97,9 @@ remain explicit rather than being replaced by deterministic summary content.
    changed since, the plan is **stale**: the generated half returns to `AI in progress` and a new
    request is issued. A stale plan can never remain visible against a newer repository state.
 8. **Render + interact** — the TUI draws validated plans using only boxed nodes and labeled
-   relationship connectors. Chains sit horizontally when they fit and stack vertically when
-   they do not; nonlinear graphs and trees use boxed nodes with target-naming connectors. Each
+   relationship connectors. Forms with three or more nodes use a responsive two-column card grid
+   (one column in narrow panes); two-node comparisons retain a direct horizontal or vertical
+   connector. Each
    node renders once and every edge names its effect/destination. Validator-verified connectors are solid; inferred or
    hunk-derived links are dashed and visibly labeled. The layout retains semantic node hitboxes
    from the same physical spans that were rendered. Mouse motion only redraws when the hovered
@@ -106,10 +107,11 @@ remain explicit rather than being replaced by deterministic summary content.
    or retained node coordinates exist, every physical line is bounded to the current pane width,
    and content that does not fit grows downward through the one vertical scroll axis. Hover adds
    a non-colour diff-row cue to every
-   exact linked logical row (including all wrapped fragments), while click/`Space` pins the node and expands a
-   bounded detail strip with source locators without pinning hover styling. Box drag changes the
-   session-local order while preserving automatic placement; clicking a truncated relationship
-   expands its complete label into wrapped connector rows and clicking again collapses it. External assumptions get an upfront warning plus
+   exact linked logical row (including all wrapped fragments), while click/`Space` pins the node and
+   opens a floating detail/source inspector without changing the canvas. Box drag changes the
+   session-local row/column order while preserving automatic placement; clicking a relationship
+   opens its complete label in the same floating inspector. Clicking again or pressing Esc closes
+   the overlay. External assumptions get an upfront warning plus
    the full Review block, and plan-level evidence remains below the map.
 
 ## One diagram API, two agent surfaces

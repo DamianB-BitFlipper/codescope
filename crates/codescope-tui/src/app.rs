@@ -74,14 +74,14 @@ pub struct App {
     /// Generated-plan node currently under the mouse. This is transient view state and
     /// drives both node emphasis and linked diff-row highlighting.
     pub hovered_plan_node: Option<PlanNodeTarget>,
-    /// Generated-plan nodes whose deeper details are open, in expansion order. The most
-    /// recently expanded node pins diff highlighting when nothing is hovered.
-    pub expanded_plan_nodes: Vec<PlanNodeTarget>,
+    /// Generated-plan node shown in the floating inspector. It also pins diff highlighting
+    /// when nothing is hovered.
+    pub inspected_plan_node: Option<PlanNodeTarget>,
     /// User-defined box order, grouped by plan form. Empty means the automatic placer's
     /// semantic order. It is session-only and resets when the generated plan changes.
     pub plan_node_order: Vec<PlanNodeTarget>,
-    /// Relationship labels currently expanded to their complete wrapped text.
-    pub expanded_plan_relationships: Vec<PlanRelationshipTarget>,
+    /// Relationship whose complete label is shown in the floating inspector.
+    pub inspected_plan_relationship: Option<PlanRelationshipTarget>,
     /// Independent offset for the deterministic incoming-callers list.
     pub callers_scroll: usize,
     /// Independent offset for the deterministic downstream-relationships list.
@@ -177,9 +177,9 @@ impl App {
         if generated_retargeted {
             self.ai_plan_scroll = 0;
             self.hovered_plan_node = None;
-            self.expanded_plan_nodes.clear();
+            self.inspected_plan_node = None;
             self.plan_node_order.clear();
-            self.expanded_plan_relationships.clear();
+            self.inspected_plan_relationship = None;
         }
         if impact_retargeted {
             self.callers_scroll = 0;
@@ -265,7 +265,6 @@ impl App {
             }
             Action::TogglePlanNode(target) => {
                 self.focused = Pane::Impact;
-                self.hovered_plan_node = Some(target.clone());
                 self.toggle_plan_node(target);
             }
             Action::ReorderPlanNode {
@@ -279,17 +278,19 @@ impl App {
             Action::TogglePlanRelationship(target) => {
                 self.focused = Pane::Impact;
                 if self.plan_relationship_exists(&target) {
-                    if let Some(index) = self
-                        .expanded_plan_relationships
-                        .iter()
-                        .position(|expanded| expanded == &target)
-                    {
-                        self.expanded_plan_relationships.remove(index);
+                    if self.inspected_plan_relationship.as_ref() == Some(&target) {
+                        self.inspected_plan_relationship = None;
                     } else {
-                        self.expanded_plan_relationships.push(target);
+                        self.hovered_plan_node = None;
+                        self.inspected_plan_node = None;
+                        self.inspected_plan_relationship = Some(target);
                     }
-                    self.ai_plan_scroll = 0;
                 }
+            }
+            Action::ClosePlanInspector => {
+                self.inspected_plan_node = None;
+                self.inspected_plan_relationship = None;
+                self.hovered_plan_node = None;
             }
             Action::SetDiffSelection(selection) => {
                 self.focused = Pane::Diff;
@@ -341,12 +342,8 @@ impl App {
                     self.diff_selection = None;
                 }
                 Pane::Impact => {
-                    if let Some(target) = self.hovered_plan_node.as_ref() {
-                        self.expanded_plan_nodes
-                            .retain(|expanded| expanded != target);
-                    } else {
-                        self.expanded_plan_nodes.pop();
-                    }
+                    self.inspected_plan_node = None;
+                    self.inspected_plan_relationship = None;
                 }
                 // Files-pane expansion is dispatcher-owned: run.rs routes Space/h/l to
                 // the targeted SetFileExpanded command; App applies no local tree
@@ -456,9 +453,9 @@ impl App {
         self.downstream_scroll = 0;
         self.ai_plan_scroll = 0;
         self.hovered_plan_node = None;
-        self.expanded_plan_nodes.clear();
+        self.inspected_plan_node = None;
         self.plan_node_order.clear();
-        self.expanded_plan_relationships.clear();
+        self.inspected_plan_relationship = None;
         self.current_hunk = usize::from(self.snapshot.diff.total_hunks > 0);
     }
 
@@ -485,37 +482,38 @@ impl App {
     }
 
     /// Node whose code links are active. Transient hover wins; otherwise the most recently
-    /// expanded node remains pinned while the pointer moves into the diff.
+    /// inspected node remains pinned while the pointer moves into the diff.
     #[must_use]
     pub fn active_code_node(&self) -> Option<&codescope_core::PlanNode> {
         self.hovered_node().or_else(|| {
-            self.expanded_plan_nodes
-                .iter()
-                .rev()
-                .find_map(|target| self.plan_node(target))
+            self.inspected_plan_node
+                .as_ref()
+                .and_then(|target| self.plan_node(target))
         })
+    }
+
+    /// Whether a floating box or relationship inspector currently owns interaction.
+    #[must_use]
+    pub fn plan_inspector_open(&self) -> bool {
+        self.inspected_plan_node.is_some() || self.inspected_plan_relationship.is_some()
     }
 
     fn toggle_plan_node(&mut self, target: PlanNodeTarget) {
         if self.plan_node(&target).is_none() {
             return;
         }
-        if let Some(index) = self
-            .expanded_plan_nodes
-            .iter()
-            .position(|expanded| expanded == &target)
-        {
-            self.expanded_plan_nodes.remove(index);
+        if self.inspected_plan_node.as_ref() == Some(&target) {
+            self.inspected_plan_node = None;
         } else {
+            self.inspected_plan_node = None;
+            self.inspected_plan_relationship = None;
             self.expand_plan_node(target);
         }
     }
 
     fn expand_plan_node(&mut self, target: PlanNodeTarget) {
-        if !self.expanded_plan_nodes.contains(&target) {
-            self.expanded_plan_nodes.push(target);
-            self.ai_plan_scroll = 0;
-        }
+        self.inspected_plan_node = Some(target);
+        self.hovered_plan_node = None;
     }
 
     fn reorder_plan_node(&mut self, dragged: PlanNodeTarget, anchor: PlanNodeTarget, after: bool) {

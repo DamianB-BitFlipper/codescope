@@ -1587,6 +1587,96 @@ fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSn
         .map(render_diagram_line)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(rendered), area);
+    render_plan_inspector(frame, area, app, snap);
+}
+
+/// Floating detail card for the most recently clicked box or relationship. It is drawn after
+/// the diagram and never contributes rows to `generated_impact_content`, so opening it cannot
+/// move cards, connectors, hitboxes, or the vertical scroll range.
+fn render_plan_inspector(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
+    let Some((kind, content)) = plan_inspector_content(app, snap) else {
+        return;
+    };
+    let popup = status_detail_rect(area, &content);
+    let title = format!(" {kind} details · click or Esc to close ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(ACCENT))
+        .title(truncate_cells(&title, popup.width.into()));
+    let paragraph = Paragraph::new(content)
+        .style(Style::new().fg(TEXT))
+        .wrap(Wrap { trim: false })
+        .block(block);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+fn plan_inspector_content(app: &App, snap: &UiSnapshot) -> Option<(&'static str, String)> {
+    if let Some(target) = app.inspected_plan_node.as_ref() {
+        let node = app.plan_node(target)?;
+        let detail = node
+            .expanded_detail
+            .as_deref()
+            .filter(|detail| !detail.trim().is_empty())
+            .or(node.detail.as_deref())
+            .unwrap_or("No additional detail.");
+        let mut content = format!("{}\n\n{}", node.label.trim(), detail.trim());
+        if !node.code_refs.is_empty() {
+            content.push_str("\n\nSource");
+            for code_ref in &node.code_refs {
+                let side = match code_ref.side {
+                    DiffSide::Old => "old",
+                    DiffSide::New => "new",
+                };
+                content.push_str(&format!(
+                    "\n{}:{}-{} · {side} · hunk {}",
+                    code_ref.file,
+                    code_ref.start_line,
+                    code_ref.end_line,
+                    code_ref.hunk.saturating_add(1)
+                ));
+            }
+        }
+        return Some(("box", content));
+    }
+
+    let target = app.inspected_plan_relationship.as_ref()?;
+    let form = snap.semantic.plan.as_ref()?.forms.get(target.form)?;
+    let source = form
+        .nodes
+        .iter()
+        .find(|node| node.id == target.from)
+        .map_or(target.from.as_str(), |node| node.label.trim());
+    let destination = form
+        .nodes
+        .iter()
+        .find(|node| node.id == target.to)
+        .map_or(target.to.as_str(), |node| node.label.trim());
+    let label = form
+        .edges
+        .iter()
+        .find(|edge| edge.from == target.from && edge.to == target.to)
+        .map(crate::diagram::edge_label)
+        .or_else(|| {
+            form.nodes
+                .iter()
+                .find(|node| node.id == target.from && node.children.contains(&target.to))
+                .map(|_| "contains")
+        })
+        .or_else(|| {
+            (form.kind == codescope_core::FormKind::BeforeAfter
+                && form.edges.is_empty()
+                && form
+                    .nodes
+                    .first()
+                    .is_some_and(|node| node.id == target.from)
+                && form.nodes.get(1).is_some_and(|node| node.id == target.to))
+            .then_some("becomes")
+        })?;
+    Some((
+        "relationship",
+        format!("{source} → {destination}\n\n{}", label.trim()),
+    ))
 }
 
 /// The generated pane's semantic line layout, shared by rendering and retained mouse
@@ -1631,9 +1721,7 @@ pub(crate) fn generated_impact_content(
         width,
         selected_label,
         app.hovered_plan_node.as_ref(),
-        &app.expanded_plan_nodes,
         &app.plan_node_order,
-        &app.expanded_plan_relationships,
     );
 
     let mut lines = Vec::new();
@@ -3324,6 +3412,82 @@ mod tests {
     }
 
     #[test]
+    fn card_and_relationship_inspectors_show_full_text_without_reflowing_the_canvas() {
+        let mut snap = ai_plan_snap(4);
+        let form = &mut snap.semantic.plan.as_mut().unwrap().forms[0];
+        form.nodes[0].expanded_detail = Some(
+            "The complete box explanation stays readable in a floating inspector.".to_string(),
+        );
+        form.edges[0].label =
+            Some("validates the complete request before publishing the durable result".to_string());
+        let mut app = app_after_ai_landed(&snap);
+        let base = generated_impact_content(&app, &snap, 86)
+            .iter()
+            .map(crate::diagram::DiagramLine::text)
+            .collect::<Vec<_>>();
+
+        app.apply(crate::action::Action::TogglePlanNode(
+            crate::action::PlanNodeTarget {
+                form: 0,
+                id: "n0".to_string(),
+            },
+        ));
+        let (kind, content) = plan_inspector_content(&app, &snap).expect("box inspector");
+        assert_eq!(kind, "box");
+        assert!(content.contains("complete box explanation"));
+        assert_eq!(
+            generated_impact_content(&app, &snap, 86)
+                .iter()
+                .map(crate::diagram::DiagramLine::text)
+                .collect::<Vec<_>>(),
+            base,
+            "the floating box inspector cannot change canvas rows"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(
+            rendered.contains("box details"),
+            "inspector title: {rendered}"
+        );
+        assert!(
+            rendered.contains("complete box explanation"),
+            "full box text: {rendered}"
+        );
+
+        app.apply(crate::action::Action::ClosePlanInspector);
+        app.apply(crate::action::Action::TogglePlanRelationship(
+            crate::action::PlanRelationshipTarget {
+                form: 0,
+                from: "n0".to_string(),
+                to: "n1".to_string(),
+            },
+        ));
+        let (kind, content) = plan_inspector_content(&app, &snap).expect("arrow inspector");
+        assert_eq!(kind, "relationship");
+        assert!(content.contains("PlanStep0 → PlanStep1"));
+        assert!(content.contains("publishing the durable result"));
+        assert_eq!(
+            generated_impact_content(&app, &snap, 86)
+                .iter()
+                .map(crate::diagram::DiagramLine::text)
+                .collect::<Vec<_>>(),
+            base,
+            "the floating relationship inspector cannot change canvas rows"
+        );
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(
+            rendered.contains("relationship details"),
+            "inspector title: {rendered}"
+        );
+        assert!(
+            rendered.contains("publishing the durable") && rendered.contains("result"),
+            "full relationship text: {rendered}"
+        );
+    }
+
+    #[test]
     fn ai_plan_renders_one_description_after_loading_to_ready() {
         let plan = ai_plan_snap(3);
         let app = app_after_ai_landed(&plan);
@@ -3689,10 +3853,10 @@ mod tests {
         );
     }
 
-    /// A validated sequence starts in an automatically laid-out vertical flow; the
-    /// first causal steps and their complete relationship remain visible immediately.
+    /// A validated sequence starts in a two-column card grid. Relationship rows remain
+    /// in the same vertically scrollable canvas below the cards.
     #[test]
-    fn default_impact_pane_shows_stacked_boxes() {
+    fn default_impact_pane_shows_a_two_dimensional_card_grid() {
         let mut plan = ai_plan_snap(7);
         {
             let viz = plan.semantic.plan.as_mut().unwrap();
@@ -3731,8 +3895,17 @@ mod tests {
             "the second step is visible without scrolling: {pane}"
         );
         assert!(
-            pane.contains("SIGTERM/SIGINT triggers shutdown, unblocks waiters"),
-            "the causal label keeps the full pane width: {pane}"
+            pane.contains("Step2") && pane.contains("Step3"),
+            "the next grid row is visible without scrolling: {pane}"
+        );
+        let generated = generated_impact_content(&app, &plan, 86)
+            .iter()
+            .map(crate::diagram::DiagramLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            generated.contains("Step0 → SIGTERM/SIGINT triggers") && generated.contains(" → Step1"),
+            "the compact relationship remains available by scrolling: {generated}"
         );
         // With the retired summary/status rows gone, 80x20 gives Impact 11 rows while
         // still preserving the seven-row work minimum.
@@ -3855,10 +4028,6 @@ mod tests {
         assert!(
             !moved.contains("Each request moves through the changed authentication path."),
             "description scrolled: {moved}"
-        );
-        assert!(
-            !moved.contains("PlanStep0"),
-            "the first step scrolled out: {moved}"
         );
         assert!(
             moved.contains("PlanStep3") || moved.contains("PlanStep4"),

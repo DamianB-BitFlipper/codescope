@@ -207,8 +207,10 @@ pub enum Action {
         /// Place after the anchor when true, before it otherwise.
         after: bool,
     },
-    /// Mouse click: expand or collapse a truncated relationship label.
+    /// Mouse click: open or close the full relationship-label inspector.
     TogglePlanRelationship(PlanRelationshipTarget),
+    /// Close the floating box/relationship detail inspector without changing layout.
+    ClosePlanInspector,
     /// Mouse drag preview: update the visible diff text selection.
     SetDiffSelection(DiffTextSelection),
     /// Mouse click: clear the retained diff highlight without copying anything.
@@ -285,6 +287,12 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
     }
     if app.show_base_picker {
         return picker_key(key, Action::BasePicker, Action::BaseSelected(String::new()));
+    }
+    if app.plan_inspector_open() {
+        return match key.code {
+            KeyCode::Esc => Action::ClosePlanInspector,
+            _ => Action::None,
+        };
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -519,6 +527,18 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Char('?')), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Esc), &a), Action::ToggleStatusDetail);
+    }
+
+    #[test]
+    fn plan_inspector_swallows_keys_and_esc_closes_it() {
+        let mut a = app();
+        a.inspected_plan_node = Some(PlanNodeTarget {
+            form: 0,
+            id: "node".to_string(),
+        });
+        assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('?')), &a), Action::None);
+        assert_eq!(map_key(key(KeyCode::Esc), &a), Action::ClosePlanInspector);
     }
 
     #[test]

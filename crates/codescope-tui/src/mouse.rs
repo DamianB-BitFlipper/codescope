@@ -130,6 +130,17 @@ pub fn map_mouse(
         };
     }
 
+    // A floating plan inspector is intentionally modal: clicking it (or anywhere else)
+    // closes it, while the diagram beneath remains in exactly the same layout.
+    if app.plan_inspector_open() {
+        return match event.kind {
+            K::Down(MouseButton::Left) => {
+                MouseOutcome::action(Action::ClosePlanInspector, DragState::Idle)
+            }
+            _ => MouseOutcome::inert(DragState::Idle),
+        };
+    }
+
     // 3. An active drag consumes Drag/Up regardless of the pointer's rectangle.
     if !matches!(drag, DragState::Idle) {
         return route_drag(event, app, geometry, drag);
@@ -918,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_node_click_toggles_only_that_box_and_preserves_other_expansions() {
+    fn plan_boxes_open_a_modal_inspector_and_still_drag_between_grid_slots() {
         let mut s = snap();
         let mut plan = codescope_core::VisualizationPlan::new(codescope_core::Epoch(1));
         plan.intent = "A changed entry point forwards work to storage.".to_string();
@@ -937,15 +948,41 @@ mod tests {
                     codescope_core::PlanNodeChange::Unchanged,
                 )
                 .with_detail("persists the result"),
+                codescope_core::PlanNode::new(
+                    "n3",
+                    "Publish",
+                    codescope_core::PlanNodeChange::Unchanged,
+                )
+                .with_detail("announces the result"),
+                codescope_core::PlanNode::new(
+                    "n4",
+                    "Observe",
+                    codescope_core::PlanNodeChange::Unchanged,
+                )
+                .with_detail("records completion"),
             ],
-            edges: vec![codescope_core::PlanEdge {
-                from: "n1".to_string(),
-                to: "n2".to_string(),
-                kind: codescope_core::PlanEdgeKind::Writes,
-                label: Some(
-                    "writes a durable record after validating the complete request".to_string(),
-                ),
-            }],
+            edges: vec![
+                codescope_core::PlanEdge {
+                    from: "n1".to_string(),
+                    to: "n2".to_string(),
+                    kind: codescope_core::PlanEdgeKind::Writes,
+                    label: Some(
+                        "writes a durable record after validating the complete request".to_string(),
+                    ),
+                },
+                codescope_core::PlanEdge {
+                    from: "n2".to_string(),
+                    to: "n3".to_string(),
+                    kind: codescope_core::PlanEdgeKind::Calls,
+                    label: Some("publishes the stored result".to_string()),
+                },
+                codescope_core::PlanEdge {
+                    from: "n3".to_string(),
+                    to: "n4".to_string(),
+                    kind: codescope_core::PlanEdgeKind::Calls,
+                    label: Some("records the completion".to_string()),
+                },
+            ],
         });
         s.semantic.plan = Some(plan);
         s.semantic.ai_generated = true;
@@ -961,6 +998,13 @@ mod tests {
         });
         let mut app = app_with(&s);
         let g = geo(&app, &s);
+        let diagram_text = |app: &App| {
+            crate::render::generated_impact_content(app, &s, 80)
+                .iter()
+                .map(crate::diagram::DiagramLine::text)
+                .collect::<Vec<_>>()
+        };
+        let base_diagram = diagram_text(&app);
         let (rect, target) = g
             .plan_node_rects
             .first()
@@ -985,85 +1029,27 @@ mod tests {
         let click = map_mouse(up(rect.x, rect.y), &app, &s, &g, armed.drag);
         assert_eq!(click.action, Some(Action::TogglePlanNode(target.clone())));
         app.apply(click.action.expect("node toggle"));
-        assert_eq!(app.expanded_plan_nodes, vec![target.clone()]);
-        assert_eq!(app.ai_plan_scroll, 0, "pinned detail strip is revealed");
-
-        let expanded_geometry = geo(&app, &s);
-        let (second_rect, second_target) = expanded_geometry
-            .plan_node_rects
-            .iter()
-            .find(|(_, candidate)| candidate.id == "n2")
-            .expect("second node hitbox remains visible")
-            .clone();
-        let second_armed = map_mouse(
-            down(second_rect.x, second_rect.y),
-            &app,
-            &s,
-            &expanded_geometry,
-            DragState::Idle,
-        );
-        let second_click = map_mouse(
-            up(second_rect.x, second_rect.y),
-            &app,
-            &s,
-            &expanded_geometry,
-            second_armed.drag,
+        assert_eq!(app.inspected_plan_node, Some(target.clone()));
+        assert_eq!(
+            app.ai_plan_scroll, 10,
+            "the inspector does not move the canvas"
         );
         assert_eq!(
-            second_click.action,
-            Some(Action::TogglePlanNode(second_target.clone()))
+            diagram_text(&app),
+            base_diagram,
+            "opening details cannot change any diagram row"
         );
-        app.apply(second_click.action.unwrap());
-        assert_eq!(
-            app.expanded_plan_nodes,
-            vec![target.clone(), second_target.clone()],
-            "expanding a second box keeps the first open"
-        );
-
-        let both_expanded_geometry = geo(&app, &s);
-        let (first_rect, _) = both_expanded_geometry
-            .plan_node_rects
-            .iter()
-            .find(|(_, candidate)| candidate == &target)
-            .expect("first expanded node remains clickable")
-            .clone();
-        let collapse_armed = map_mouse(
-            down(first_rect.x, first_rect.y),
-            &app,
-            &s,
-            &both_expanded_geometry,
-            DragState::Idle,
-        );
-        let collapse_first = map_mouse(
-            up(first_rect.x, first_rect.y),
-            &app,
-            &s,
-            &both_expanded_geometry,
-            collapse_armed.drag,
-        );
-        app.apply(collapse_first.action.expect("first node toggle"));
-        assert_eq!(
-            app.expanded_plan_nodes,
-            vec![second_target],
-            "collapsing one box leaves the other open"
-        );
-
-        let leave = map_mouse(moved(0, 0), &app, &s, &g, DragState::Idle);
-        assert_eq!(leave.action, Some(Action::HoverPlanNode(None)));
-        app.apply(leave.action.unwrap());
-        assert!(app.hovered_plan_node.is_none());
         assert_eq!(
             app.active_code_node().map(|node| node.id.as_str()),
-            Some("n2"),
-            "most recently expanded details pin code links after hover leaves"
+            Some("n1"),
+            "the inspected box pins its code links"
         );
-        assert!(
-            crate::render::generated_impact_content(&app, &s, 80)
-                .iter()
-                .flat_map(|line| &line.spans)
-                .all(|span| span.role != crate::diagram::DiagramRole::Hovered),
-            "expanded content stays open without sticky hover styling"
-        );
+
+        let close = map_mouse(down(0, 0), &app, &s, &g, DragState::Idle);
+        assert_eq!(close.action, Some(Action::ClosePlanInspector));
+        app.apply(close.action.expect("close inspector"));
+        assert!(!app.plan_inspector_open());
+        assert!(app.hovered_plan_node.is_none());
 
         let relationship_geometry = geo(&app, &s);
         let (relationship_rect, relationship_target) = relationship_geometry
@@ -1083,36 +1069,29 @@ mod tests {
             Some(Action::TogglePlanRelationship(relationship_target.clone()))
         );
         app.apply(expand_relationship.action.expect("relationship toggle"));
-        let expanded_label = crate::render::generated_impact_content(&app, &s, 48)
-            .iter()
-            .filter(|line| {
-                line.spans
-                    .iter()
-                    .any(|span| span.relationship.as_ref() == Some(&relationship_target))
-            })
-            .map(crate::diagram::DiagramLine::text)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            expanded_label.contains("complete request"),
-            "click reveals the complete relationship: {expanded_label}"
+        assert_eq!(
+            app.inspected_plan_relationship,
+            Some(relationship_target),
+            "the full label is owned by the floating inspector"
         );
-
-        let collapse_geometry = geo(&app, &s);
-        let collapse_rect = collapse_geometry
-            .plan_relationship_rects
-            .first()
-            .expect("expanded relationship hitbox")
-            .0;
-        let collapse_relationship = map_mouse(
-            down(collapse_rect.x, collapse_rect.y),
+        assert_eq!(
+            diagram_text(&app),
+            base_diagram,
+            "opening an arrow label cannot change card positions"
+        );
+        let close_relationship = map_mouse(
+            down(relationship_rect.x, relationship_rect.y),
             &app,
             &s,
-            &collapse_geometry,
+            &relationship_geometry,
             DragState::Idle,
         );
-        app.apply(collapse_relationship.action.expect("relationship collapse"));
-        assert!(app.expanded_plan_relationships.is_empty());
+        assert_eq!(
+            close_relationship.action,
+            Some(Action::ClosePlanInspector),
+            "clicking again closes the full arrow label"
+        );
+        app.apply(close_relationship.action.expect("close arrow inspector"));
 
         let drag_geometry = geo(&app, &s);
         let source_rect = drag_geometry
@@ -1125,7 +1104,7 @@ mod tests {
             .plan_node_rects
             .iter()
             .rev()
-            .find(|(_, candidate)| candidate.id == "n2")
+            .find(|(_, candidate)| candidate.id == "n3")
             .expect("anchor box")
             .0;
         let armed = map_mouse(
@@ -1162,7 +1141,7 @@ mod tests {
         assert!(matches!(
             dropped.action,
             Some(Action::ReorderPlanNode { ref dragged, ref anchor, after: true })
-                if dragged.id == "n1" && anchor.id == "n2"
+                if dragged.id == "n1" && anchor.id == "n3"
         ));
         app.apply(dropped.action.expect("box reorder"));
         assert_eq!(
@@ -1170,23 +1149,22 @@ mod tests {
                 .iter()
                 .map(|target| target.id.as_str())
                 .collect::<Vec<_>>(),
-            ["n2", "n1"]
+            ["n2", "n3", "n1", "n4"]
         );
-        let reordered = crate::render::generated_impact_content(&app, &s, 80);
-        let label_row = |id: &str| {
-            reordered
+        let reordered_geometry = geo(&app, &s);
+        let row = |id: &str| {
+            reordered_geometry
+                .plan_node_rects
                 .iter()
-                .position(|line| {
-                    line.spans.iter().any(|span| {
-                        span.target.as_ref().is_some_and(|target| target.id == id)
-                            && span.relationship.is_none()
-                    }) && line
-                        .text()
-                        .contains(if id == "n1" { "Handle" } else { "Store" })
-                })
-                .expect("reordered label row")
+                .find(|(_, target)| target.id == id)
+                .expect("reordered box")
+                .0
+                .y
         };
-        assert!(label_row("n2") < label_row("n1"), "drop changes box order");
+        assert!(
+            row("n1") > row("n3"),
+            "drop moves a box into another grid row"
+        );
     }
 
     #[test]

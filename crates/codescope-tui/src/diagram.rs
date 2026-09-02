@@ -107,8 +107,6 @@ struct DiagramContext<'a> {
     form: usize,
     selected_label: &'a str,
     hovered: Option<&'a PlanNodeTarget>,
-    expanded: &'a [PlanNodeTarget],
-    expanded_relationships: &'a [PlanRelationshipTarget],
 }
 
 impl DiagramContext<'_> {
@@ -130,21 +128,12 @@ impl DiagramContext<'_> {
         }
     }
 
-    fn expanded(&self, node: &PlanNode) -> bool {
-        self.expanded.contains(&self.target(node))
-    }
-
     fn relationship_target(&self, edge: &PlanEdge) -> PlanRelationshipTarget {
         PlanRelationshipTarget {
             form: self.form,
             from: edge.from.clone(),
             to: edge.to.clone(),
         }
-    }
-
-    fn relationship_expanded(&self, edge: &PlanEdge) -> bool {
-        self.expanded_relationships
-            .contains(&self.relationship_target(edge))
     }
 }
 
@@ -158,10 +147,10 @@ const EVIDENCE_REASON_MIN_WIDTH: usize = 60;
 /// Lay out a validated plan for the current pane width without transient interaction.
 #[must_use]
 pub fn plan_lines(plan: &VisualizationPlan, width: u16, selected_label: &str) -> Vec<DiagramLine> {
-    interactive_plan_lines(plan, width, selected_label, None, &[], &[], &[])
+    interactive_plan_lines(plan, width, selected_label, None, &[])
 }
 
-/// Lay out a validated plan plus transient hover/expansion state.
+/// Lay out a validated plan plus transient hover and card-order state.
 ///
 /// Node-bearing spans retain their [`PlanNodeTarget`] so geometry can derive hitboxes from
 /// exactly the same width-aware output that the renderer displays.
@@ -171,9 +160,7 @@ pub fn interactive_plan_lines(
     width: u16,
     selected_label: &str,
     hovered: Option<&PlanNodeTarget>,
-    expanded: &[PlanNodeTarget],
     order: &[PlanNodeTarget],
-    expanded_relationships: &[PlanRelationshipTarget],
 ) -> Vec<DiagramLine> {
     let width = usize::from(width).max(1);
     let mut lines = Vec::new();
@@ -187,8 +174,6 @@ pub fn interactive_plan_lines(
             form: index,
             selected_label,
             hovered,
-            expanded,
-            expanded_relationships,
         };
         let manually_ordered = order.iter().any(|target| target.form == index);
         let mut reordered;
@@ -312,11 +297,18 @@ fn render_flow(
     context: DiagramContext<'_>,
     lines: &mut Vec<DiagramLine>,
 ) {
+    // Three or more nodes use the same two-dimensional card canvas as branching graphs.
+    // This keeps drag-reordered nodes in visible row/column slots instead of collapsing the
+    // entire form into one horizontal or vertical run.
+    if form.nodes.len() > 2 {
+        render_branching_flow(form, width, context, lines);
+        return;
+    }
     if let Some((nodes, edges)) = linear_chain(form) {
         let count = nodes.len();
         let gap = horizontal_gap(&edges);
         let min_width = count * MIN_BOX_WIDTH + count.saturating_sub(1) * gap;
-        if width >= min_width && !edges.iter().any(|edge| context.relationship_expanded(edge)) {
+        if width >= min_width {
             render_horizontal_chain(&nodes, &edges, width, context, false, lines);
             return;
         }
@@ -382,14 +374,7 @@ fn render_horizontal_chain(
     // when both endpoints carry entities: it never borrows their verification.
     let mut boxes: Vec<Vec<String>> = nodes
         .iter()
-        .map(|node| {
-            node_box_text(
-                &node.label,
-                displayed_node_detail(node, context.expanded(node)),
-                box_width,
-                context.expanded(node),
-            )
-        })
+        .map(|node| node_box_text(&node.label, displayed_node_detail(node), box_width))
         .collect();
     let box_heights: Vec<usize> = boxes.iter().map(Vec::len).collect();
     let row_count = box_heights.iter().copied().max().unwrap_or_default();
@@ -461,39 +446,112 @@ fn render_branching_flow(
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    // Nonlinear graphs use the same visual vocabulary as chains: every node is a box,
-    // followed by labeled relationship connectors naming its destinations. Cycles and
-    // shared targets remain unambiguous because every connector names its target.
-    let box_width = width.min(MAX_BOX_WIDTH);
-    for node in &form.nodes {
-        lines.extend(plan_node_box(node, box_width, context));
-        let outgoing: Vec<&PlanEdge> = form
-            .edges
+    render_box_grid(&form.nodes, width, context, lines);
+    if !form.edges.is_empty() {
+        lines.push(DiagramLine::plain("", DiagramRole::Muted));
+    }
+    // Relationship arrows remain below the fixed card grid. Their labels can be inspected
+    // without changing card dimensions or positions.
+    for (index, edge) in form.edges.iter().enumerate() {
+        let last = index + 1 == form.edges.len();
+        render_relationship_connector(edge, &by_id, last, width, context, lines);
+    }
+}
+
+/// Place compact cards into stable row-major slots. At useful widths the canvas has two
+/// columns, so a drag can visibly move a box both across a row and between rows. Narrow panes
+/// retain the same card representation in one column.
+fn render_box_grid(
+    nodes: &[PlanNode],
+    width: usize,
+    context: DiagramContext<'_>,
+    lines: &mut Vec<DiagramLine>,
+) {
+    if nodes.is_empty() {
+        return;
+    }
+    const GRID_GAP: usize = 4;
+    let columns: usize = if nodes.len() > 1 && width >= 2 * MIN_BOX_WIDTH + GRID_GAP {
+        2
+    } else {
+        1
+    };
+    let box_width = ((width.saturating_sub(GRID_GAP * columns.saturating_sub(1))) / columns)
+        .clamp(1, MAX_BOX_WIDTH);
+    if box_width < 4 {
+        for (index, node) in nodes.iter().enumerate() {
+            if index > 0 {
+                lines.push(DiagramLine::plain("", DiagramRole::Muted));
+            }
+            lines.extend(plan_node_box(node, box_width, context));
+        }
+        return;
+    }
+    let used = box_width * columns + GRID_GAP * columns.saturating_sub(1);
+    let left_pad = " ".repeat(width.saturating_sub(used) / 2);
+
+    let row_count = nodes.len().div_ceil(columns);
+    for (row_index, row_nodes) in nodes.chunks(columns).enumerate() {
+        let mut boxes = row_nodes
             .iter()
-            .filter(|edge| edge.from == node.id)
-            .collect();
-        for (index, edge) in outgoing.iter().enumerate() {
-            let last = index + 1 == outgoing.len();
-            let target = by_id.get(edge.to.as_str());
-            let verified = matches!((by_id.get(edge.from.as_str()), target), (Some(from), Some(to))
-                if edge_verified(from, to, edge));
-            render_relationship_connector(edge, target, verified, last, width, context, lines);
+            .map(|node| node_box_text(&node.label, displayed_node_detail(node), box_width))
+            .collect::<Vec<_>>();
+        let row_height = boxes.iter().map(Vec::len).max().unwrap_or_default();
+        for node_box in &mut boxes {
+            node_box.resize(row_height, " ".repeat(box_width));
+        }
+        for (row, _) in boxes[0].iter().enumerate() {
+            let mut spans = vec![DiagramSpan {
+                text: left_pad.clone(),
+                role: DiagramRole::Muted,
+                target: None,
+                relationship: None,
+            }];
+            for (column, node) in row_nodes.iter().enumerate() {
+                let text = boxes[column][row].clone();
+                let normal = if text.starts_with('┌') || text.starts_with('└') {
+                    DiagramRole::Border
+                } else {
+                    DiagramRole::Text
+                };
+                spans.push(DiagramSpan {
+                    text,
+                    role: context.role(node, normal),
+                    target: Some(context.target(node)),
+                    relationship: None,
+                });
+                if column + 1 < row_nodes.len() {
+                    spans.push(DiagramSpan {
+                        text: " ".repeat(GRID_GAP),
+                        role: DiagramRole::Muted,
+                        target: None,
+                        relationship: None,
+                    });
+                }
+            }
+            lines.push(DiagramLine { spans });
+        }
+        if row_index + 1 < row_count {
+            lines.push(DiagramLine::plain("", DiagramRole::Muted));
         }
     }
 }
 
-/// One outgoing relationship connector under its source box: `  ├┄ <effect> → <target>`.
-/// The connector is solid only for validator-verified edges; the effect and target
-/// label share the available width, with the effect yielding first.
+/// One relationship row below the fixed card grid:
+/// `  ├┄ <source> → <effect> → <target>`. Every normal-width row names both endpoint
+/// cards; clicking anywhere on it opens the full untruncated relationship inspector.
 fn render_relationship_connector(
     edge: &PlanEdge,
-    target: Option<&&PlanNode>,
-    verified: bool,
+    by_id: &HashMap<&str, &PlanNode>,
     last: bool,
     width: usize,
     context: DiagramContext<'_>,
     lines: &mut Vec<DiagramLine>,
 ) {
+    let source = by_id.get(edge.from.as_str());
+    let target = by_id.get(edge.to.as_str());
+    let verified = matches!((source, target), (Some(from), Some(to))
+        if edge_verified(from, to, edge));
     let branch = match (last, verified) {
         (true, true) => "└─ ",
         (true, false) => "└┄ ",
@@ -503,77 +561,9 @@ fn render_relationship_connector(
     let prefix = format!("  {branch}");
     let prefix_width = prefix.width();
     let relationship = context.relationship_target(edge);
-    if context.relationship_expanded(edge) {
-        if width <= prefix_width {
-            lines.push(DiagramLine::for_relationship(
-                truncate(if verified { "▼" } else { "┊" }, width),
-                DiagramRole::Arrow,
-                relationship,
-            ));
-            return;
-        }
-        let target_label = target.map_or(edge.to.as_str(), |target| target.label.trim());
-        let full = format!("{} → {target_label}", edge_label(edge).trim());
-        let available = width.saturating_sub(prefix_width).max(1);
-        for (index, text) in wrap_text_full(&full, available).into_iter().enumerate() {
-            lines.push(DiagramLine {
-                spans: vec![
-                    DiagramSpan {
-                        text: if index == 0 {
-                            prefix.clone()
-                        } else {
-                            " ".repeat(prefix_width.min(width.saturating_sub(1)))
-                        },
-                        role: DiagramRole::Arrow,
-                        target: None,
-                        relationship: Some(relationship.clone()),
-                    },
-                    DiagramSpan {
-                        text,
-                        role: DiagramRole::Arrow,
-                        target: None,
-                        relationship: Some(relationship.clone()),
-                    },
-                ],
-            });
-        }
-        return;
-    }
-    // ` → ` between the effect and the target label.
-    const ARROW_WIDTH: usize = 3;
-    // Smallest still-recognizable heads for either side of the arrow.
-    const MIN_SIDE_WIDTH: usize = 4;
-    let Some(target) = target else {
-        // Unknown target id: nothing to name; the effect takes the line.
-        if width < prefix_width + 2 {
-            lines.push(DiagramLine::for_relationship(
-                truncate(if verified { "▼" } else { "┊" }, width),
-                DiagramRole::Arrow,
-                relationship,
-            ));
-            return;
-        }
-        lines.push(DiagramLine {
-            spans: vec![
-                DiagramSpan {
-                    text: prefix,
-                    role: DiagramRole::Arrow,
-                    target: None,
-                    relationship: Some(relationship.clone()),
-                },
-                DiagramSpan {
-                    text: truncate(edge_label(edge).trim(), width - prefix_width),
-                    role: DiagramRole::Arrow,
-                    target: None,
-                    relationship: Some(relationship),
-                },
-            ],
-        });
-        return;
-    };
-    let target_label = target.label.trim();
-    // Genuinely tiny: even branch + arrow + one target cell cannot fit.
-    if width < prefix_width + ARROW_WIDTH + 2 {
+    const TWO_ARROWS_WIDTH: usize = 6;
+    const THREE_LABELS_MIN_WIDTH: usize = 3;
+    if width < prefix_width + TWO_ARROWS_WIDTH + THREE_LABELS_MIN_WIDTH {
         lines.push(DiagramLine::for_relationship(
             truncate(if verified { "▼" } else { "┊" }, width),
             DiagramRole::Arrow,
@@ -581,34 +571,48 @@ fn render_relationship_connector(
         ));
         return;
     }
-    let budget = width - prefix_width;
+    let label_budget = width - prefix_width - TWO_ARROWS_WIDTH;
+    let source_full = source.map_or(edge.from.as_str(), |node| node.label.trim());
     let effect_full = edge_label(edge).trim();
-    // Effect yields first, but both sides stay recognizable: cap each side's truncation
-    // so neither starves, and let whichever side is naturally shorter keep its spare
-    // cells.
-    let pair_budget = budget.saturating_sub(ARROW_WIDTH);
+    let target_full = target.map_or(edge.to.as_str(), |node| node.label.trim());
+    let source_width = source_full.width();
     let effect_width = effect_full.width();
-    let target_width = target_label.width();
-    let (effect_budget, target_budget) = if effect_width + target_width <= pair_budget {
-        // Both fit completely.
-        (effect_width, target_width)
-    } else if pair_budget < 2 * MIN_SIDE_WIDTH {
-        // Squeeze: split evenly with at least one cell each side. Each side renders
-        // at least its ellipsis, and the pair always fits the budget exactly.
-        let half = (pair_budget / 2).max(1);
-        let b = pair_budget.saturating_sub(half).max(1);
-        (half, b)
+    let target_width = target_full.width();
+    let (source_budget, effect_budget, target_budget) = if source_width
+        .saturating_add(effect_width)
+        .saturating_add(target_width)
+        <= label_budget
+    {
+        (source_width, effect_width, target_width)
     } else {
-        // The target is reserved FIRST with a bounded share (its full width, or half
-        // the pair when it is long); the effect truncates into the remainder. The
-        // effect therefore yields, but neither side can starve the other.
-        let target_share = target_width.min(pair_budget / 2).max(MIN_SIDE_WIDTH);
-        (pair_budget - target_share, target_share)
+        // Preserve a recognizable head for both endpoints; the semantic effect gets the
+        // remainder. The inspector owns the lossless form of all three labels.
+        let endpoint_share = (label_budget / 3).max(1);
+        let source_budget = source_width.min(endpoint_share).max(1);
+        let target_budget = target_width.min(endpoint_share).max(1);
+        let effect_budget = label_budget
+            .saturating_sub(source_budget + target_budget)
+            .max(1);
+        (source_budget, effect_budget, target_budget)
     };
     lines.push(DiagramLine {
         spans: vec![
             DiagramSpan {
                 text: prefix,
+                role: DiagramRole::Arrow,
+                target: None,
+                relationship: Some(relationship.clone()),
+            },
+            DiagramSpan {
+                text: truncate(source_full, source_budget),
+                role: source.map_or(DiagramRole::Text, |node| {
+                    context.role(node, DiagramRole::Text)
+                }),
+                target: None,
+                relationship: Some(relationship.clone()),
+            },
+            DiagramSpan {
+                text: " → ".into(),
                 role: DiagramRole::Arrow,
                 target: None,
                 relationship: Some(relationship.clone()),
@@ -626,9 +630,11 @@ fn render_relationship_connector(
                 relationship: Some(relationship.clone()),
             },
             DiagramSpan {
-                text: truncate(target_label, target_budget),
-                role: context.role(target, DiagramRole::Text),
-                target: Some(context.target(target)),
+                text: truncate(target_full, target_budget),
+                role: target.map_or(DiagramRole::Text, |node| {
+                    context.role(node, DiagramRole::Text)
+                }),
+                target: None,
                 relationship: Some(relationship),
             },
         ],
@@ -661,7 +667,7 @@ fn render_before_after(
         };
         let nodes = [&form.nodes[0], &form.nodes[1]];
         let min_width = 2 * MIN_BOX_WIDTH + horizontal_gap(&[edge]);
-        if width >= min_width && !context.relationship_expanded(edge) {
+        if width >= min_width {
             render_horizontal_chain(&nodes, &[edge], width, context, is_synthetic, lines);
         } else {
             let box_width = width.min(MAX_BOX_WIDTH);
@@ -788,25 +794,14 @@ fn horizontal_gap(edges: &[&PlanEdge]) -> usize {
         .clamp(MIN_HORIZONTAL_GAP, MAX_HORIZONTAL_GAP)
 }
 
-/// The compact preview is always `detail`; expansion swaps in the complete explanation
-/// when the model supplied one. Keeping this choice in one helper gives every box the
-/// same interaction semantics.
-pub(crate) fn displayed_node_detail(node: &PlanNode, expanded: bool) -> &str {
-    if expanded {
-        node.expanded_detail
-            .as_deref()
-            .filter(|detail| !detail.trim().is_empty())
-            .or(node.detail.as_deref())
-            .unwrap_or_default()
-    } else {
-        node.detail.as_deref().unwrap_or_default()
-    }
+/// The canvas always uses the compact preview; complete text belongs to the inspector.
+fn displayed_node_detail(node: &PlanNode) -> &str {
+    node.detail.as_deref().unwrap_or_default()
 }
 
 fn plan_node_box(node: &PlanNode, width: usize, context: DiagramContext<'_>) -> Vec<DiagramLine> {
     let target = context.target(node);
-    let expanded = context.expanded(node);
-    let detail = displayed_node_detail(node, expanded);
+    let detail = displayed_node_detail(node);
     // A full box needs at least four cells; at pathological widths retain the box
     // vocabulary with a single-cell box glyph rather than switching to plain text.
     if width < 4 {
@@ -816,7 +811,7 @@ fn plan_node_box(node: &PlanNode, width: usize, context: DiagramContext<'_>) -> 
             target,
         )];
     }
-    let box_lines = node_box_text(&node.label, detail, width, expanded);
+    let box_lines = node_box_text(&node.label, detail, width);
     let last = box_lines.len().saturating_sub(1);
     box_lines
         .into_iter()
@@ -832,36 +827,14 @@ fn plan_node_box(node: &PlanNode, width: usize, context: DiagramContext<'_>) -> 
         .collect()
 }
 
-/// Draw a node in its collapsed or expanded state.
-///
-/// Collapsed nodes reserve two rows for the model's short `detail` preview. Expanded
-/// nodes replace that preview with the complete `expanded_detail` and grow vertically;
-/// nothing is ellipsized in that state, including identifiers longer than one row.
-pub(crate) fn node_box_text(
-    label: &str,
-    detail: &str,
-    width: usize,
-    expanded: bool,
-) -> Vec<String> {
+/// Draw a fixed-height compact card. Full text lives in the floating inspector, so a
+/// clicked card never changes the canvas geometry.
+fn node_box_text(label: &str, detail: &str, width: usize) -> Vec<String> {
     let width = width.max(4);
     let inner = width.saturating_sub(2);
-    let label_lines = if expanded {
-        wrap_text_full(label.trim(), inner)
-    } else {
-        vec![truncate(label.trim(), inner)]
-    };
-    let mut detail_lines = if expanded {
-        wrap_text_full(detail.trim(), inner)
-    } else {
-        wrap_text(detail.trim(), inner, 2)
-    };
-    if expanded {
-        if detail_lines.is_empty() {
-            detail_lines.push(String::new());
-        }
-    } else {
-        detail_lines.resize(2, String::new());
-    }
+    let label_lines = [truncate(label.trim(), inner)];
+    let mut detail_lines = wrap_text(detail.trim(), inner, 2);
+    detail_lines.resize(2, String::new());
     let mut lines = Vec::with_capacity(label_lines.len() + detail_lines.len() + 2);
     lines.push(format!("┌{}┐", "─".repeat(inner)));
     lines.extend(
@@ -897,46 +870,11 @@ fn vertical_relationship_lines(
     context: DiagramContext<'_>,
 ) -> Vec<DiagramLine> {
     let relationship = context.relationship_target(edge);
-    if !context.relationship_expanded(edge) {
-        let mut line = centered_arrow(edge_label(edge), width, verified);
-        for span in &mut line.spans {
-            span.relationship = Some(relationship.clone());
-        }
-        return vec![line];
+    let mut line = centered_arrow(edge_label(edge), width, verified);
+    for span in &mut line.spans {
+        span.relationship = Some(relationship.clone());
     }
-    if width <= 4 {
-        let glyph = if verified { "▼" } else { "┊" };
-        return vec![DiagramLine::for_relationship(
-            truncate(glyph, width),
-            DiagramRole::Arrow,
-            relationship,
-        )];
-    }
-    let prefix = if verified { "  ▼ " } else { "  ┊ " };
-    wrap_text_full(edge_label(edge).trim(), width - 4)
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| DiagramLine {
-            spans: vec![
-                DiagramSpan {
-                    text: if index == 0 {
-                        prefix.to_string()
-                    } else {
-                        "    ".to_string()
-                    },
-                    role: DiagramRole::Arrow,
-                    target: None,
-                    relationship: Some(relationship.clone()),
-                },
-                DiagramSpan {
-                    text,
-                    role: DiagramRole::Arrow,
-                    target: None,
-                    relationship: Some(relationship.clone()),
-                },
-            ],
-        })
-        .collect()
+    vec![line]
 }
 
 fn centered_text(text: &str, width: usize) -> String {
@@ -1018,69 +956,6 @@ fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
         if let Some(last) = lines.last_mut() {
             *last = truncate_with_ellipsis(last, width);
         }
-    }
-    lines
-}
-
-/// Lossless word wrapping for expanded content. Unlike [`wrap_text`], this has no line
-/// cap and splits long identifiers across rows instead of replacing their tail with an
-/// ellipsis. A double-width glyph in a one-cell viewport is the sole impossible case;
-/// it degrades to a one-cell ellipsis to preserve the renderer's width contract.
-fn wrap_text_full(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-
-    for word in text.split_whitespace() {
-        if word.width() <= width {
-            let candidate_width = current.width() + usize::from(!current.is_empty()) + word.width();
-            if candidate_width <= width {
-                if !current.is_empty() {
-                    current.push(' ');
-                }
-                current.push_str(word);
-            } else {
-                if !current.is_empty() {
-                    lines.push(std::mem::take(&mut current));
-                }
-                current.push_str(word);
-            }
-            continue;
-        }
-
-        if !current.is_empty() {
-            lines.push(std::mem::take(&mut current));
-        }
-        let mut chunk = String::new();
-        let mut chunk_width = 0usize;
-        for ch in word.chars() {
-            let char_width = ch.width().unwrap_or(0);
-            if char_width > width {
-                if !chunk.is_empty() {
-                    lines.push(std::mem::take(&mut chunk));
-                    chunk_width = 0;
-                }
-                lines.push("…".to_string());
-                continue;
-            }
-            if chunk_width + char_width > width && !chunk.is_empty() {
-                lines.push(std::mem::take(&mut chunk));
-                chunk_width = 0;
-            }
-            chunk.push(ch);
-            chunk_width += char_width;
-            if chunk_width == width {
-                lines.push(std::mem::take(&mut chunk));
-                chunk_width = 0;
-            }
-        }
-        current = chunk;
-    }
-    if !current.is_empty() {
-        lines.push(current);
     }
     lines
 }
@@ -1172,12 +1047,14 @@ mod tests {
     }
 
     #[test]
-    fn wide_flow_uses_horizontal_boxes_and_arrows() {
+    fn wide_flow_uses_a_two_dimensional_card_grid_and_arrows() {
         // flow_plan's nodes carry no entities, so its arrows are inferred and dashed.
         // Solid arrows stay reserved for verified relationships.
         let text = plan_text(&flow_plan(), 100, "shutdown");
         assert!(text.contains("┌"));
-        assert!(text.contains("▷"));
+        assert_eq!(text.matches('┌').count(), 3, "one card per node: {text}");
+        assert!(text.contains("┄"), "inferred relationship: {text}");
+        assert!(text.contains(" → "), "relationship arrow: {text}");
         assert!(
             !text.contains("▶"),
             "no solid arrow for inferred edges: {text}"
@@ -1190,16 +1067,15 @@ mod tests {
     }
 
     #[test]
-    fn narrow_flow_stacks_boxes_and_relationships() {
-        // A chain that cannot fit side by side keeps the same visual grammar and stacks.
+    fn flow_grid_uses_two_columns_at_the_fit_boundary() {
         let text = plan_text(&flow_plan(), 40, "shutdown");
         assert!(text.contains("shutdown"), "first box: {text}");
         assert!(text.contains("load balancer"), "second box: {text}");
         assert!(
-            text.contains("readiness becomes 503"),
-            "edge label keeps the pane width: {text}"
+            text.contains("shutdown → readiness b… → load bal…"),
+            "long relationship stays compact: {text}"
         );
-        assert!(text.contains('┊'), "inferred rail: {text}");
+        assert!(text.contains('┄'), "inferred arrow: {text}");
         assert!(
             !text.contains("inferred from cited diff"),
             "no legend: {text}"
@@ -1247,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn seven_node_sequence_stacks_every_box_and_relationship() {
+    fn seven_node_sequence_grids_every_box_and_lists_every_relationship() {
         let plan = seven_step_sequence_plan();
         let lines = plan_lines(&plan, 96, "");
         let text = lines
@@ -1268,10 +1144,11 @@ mod tests {
         }
         assert_eq!(text.matches('┌').count(), 7, "seven boxes: {text}");
         assert!(
-            text.contains("SIGTERM/SIGINT triggers shutdown, unblocks waiters"),
-            "the longest causal label is not box-truncated: {text}"
+            text.contains("SIGTERM/SIGINT triggers shutdown")
+                && !text.contains("SIGTERM/SIGINT triggers shutdown, unblocks waiters"),
+            "the canvas keeps the long label compact for its inspector: {text}"
         );
-        assert!(text.contains('┊'), "entityless chain is inferred: {text}");
+        assert!(text.contains('┄'), "entityless chain is inferred: {text}");
         assert!(
             !text.contains("inferred from cited diff"),
             "no legend: {text}"
@@ -1358,11 +1235,11 @@ mod tests {
         });
         let text = plan_text(&plan, 40, "");
         assert!(
-            text.contains("▼ clears the healthy flag"),
+            text.contains("├─ signal → clears the he… → readiness"),
             "verified connector stays solid: {text}"
         );
         assert!(
-            text.contains("┊ waits the drain delay"),
+            text.contains("└┄ readiness → waits the drai… → drain"),
             "entityless endpoint makes the rail inferred: {text}"
         );
         assert!(
@@ -1996,8 +1873,8 @@ mod tests {
         );
         let body = lines.len() - first_node;
         assert!(
-            body >= 30,
-            "five boxes grow vertically, got {body} lines: {text}"
+            body >= 20,
+            "five cards span multiple rows, got {body}: {text}"
         );
         // Every line respects the requested width.
         for line in &lines {
@@ -2010,7 +1887,7 @@ mod tests {
             let narrow = plan_lines(&plan, width, "");
             let relationships: Vec<&DiagramLine> = narrow
                 .iter()
-                .filter(|line| line.text().starts_with("  ├") || line.text().starts_with("  └"))
+                .filter(|line| line.spans.iter().any(|span| span.relationship.is_some()))
                 .collect();
             assert_eq!(relationships.len(), 6, "six relationships at {width}");
             for line in &relationships {
@@ -2035,19 +1912,24 @@ mod tests {
         }
     }
 
-    /// The target stays visible whenever the connector, arrow, and one target cell fit.
+    /// Both endpoints stay visible once the connector can carry three label heads and two arrows.
     #[test]
     fn relationship_target_survives_until_the_label_floor() {
         let plan = cyclic_flow_plan();
-        for width in 10..=17u16 {
-            let text = plan_text(&plan, width, "");
-            let relationships: Vec<&str> = text
-                .lines()
-                .filter(|l| l.starts_with("  ├") || l.starts_with("  └"))
+        for width in 15..=20u16 {
+            let lines = plan_lines(&plan, width, "");
+            let relationships: Vec<String> = lines
+                .iter()
+                .filter(|line| line.spans.iter().any(|span| span.relationship.is_some()))
+                .map(DiagramLine::text)
                 .collect();
             assert!(!relationships.is_empty(), "connectors render at {width}");
             for line in relationships {
-                assert!(line.contains(" → "), "target visible at {width}: {line}");
+                assert_eq!(
+                    line.matches(" → ").count(),
+                    2,
+                    "both endpoint arrows visible at {width}: {line}"
+                );
             }
         }
     }
@@ -2095,12 +1977,12 @@ mod tests {
         });
         let text = plan_text(&plan, 96, "");
         assert!(
-            text.contains("  ├─ flips readiness → readiness"),
+            text.contains("  ├─ signal → flips readiness → readiness"),
             "solid verified branch: {text}"
         );
         assert!(
-            text.contains("  └─ starts drain → drain"),
-            "last branch: {text}"
+            text.contains("  ├─ signal → starts drain → drain"),
+            "middle branch: {text}"
         );
         assert!(!text.contains('┄'), "no dashed branch: {text}");
         assert!(!text.contains("cited diff"), "no basis note: {text}");
@@ -2109,11 +1991,11 @@ mod tests {
         plan.forms[0].edges[1].kind = PlanEdgeKind::Reads;
         let text = plan_text(&plan, 96, "");
         assert!(
-            text.contains("  └┄ starts drain → drain"),
+            text.contains("  ├┄ signal → starts drain → drain"),
             "the inferred branch is dashed and still names its target: {text}"
         );
         assert!(
-            text.contains("  ├─ flips readiness"),
+            text.contains("  ├─ signal → flips readiness"),
             "the verified sibling stays solid: {text}"
         );
         assert!(
@@ -2204,7 +2086,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_layout_expands_the_clicked_box_in_place_without_truncation() {
+    fn interactive_layout_keeps_cards_compact_while_hovering() {
         let mut plan = before_after_plan();
         let node = &mut plan.forms[0].nodes[0];
         node.detail = Some("Prints the unversioned parse error and exits".to_string());
@@ -2216,9 +2098,8 @@ mod tests {
             form: 0,
             id: "before".to_string(),
         };
-        let collapsed = interactive_plan_lines(&plan, 100, "", None, &[], &[], &[]);
-        let expanded = [target.clone()];
-        let lines = interactive_plan_lines(&plan, 100, "", Some(&target), &expanded, &[], &[]);
+        let collapsed = interactive_plan_lines(&plan, 100, "", None, &[]);
+        let lines = interactive_plan_lines(&plan, 100, "", Some(&target), &[]);
         assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
             span.target.as_ref() == Some(&target) && span.role == DiagramRole::Hovered
         }));
@@ -2230,45 +2111,27 @@ mod tests {
                 "
 ",
             );
-        assert!(
-            !text.contains("Details ·"),
-            "expansion belongs to the clicked box: {text}"
-        );
-        assert!(text.contains("When parsing fails"), "{text}");
-        assert!(text.contains("diagnostic-version"), "{text}");
-        assert!(text.contains("preserves status one"), "{text}");
-        assert!(
-            lines.len() > collapsed.len(),
-            "the selected box grows vertically"
-        );
-        assert!(
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .filter(|span| span.target.as_ref() == Some(&target))
-                .all(|span| !span.text.contains('…')),
-            "expanded target has no ellipsis: {text}"
-        );
-
-        let unhovered = interactive_plan_lines(&plan, 100, "", None, &expanded, &[], &[]);
+        assert!(!text.contains("When parsing fails"), "{text}");
+        assert_eq!(lines.len(), collapsed.len(), "hover cannot move the cards");
+        let unhovered = interactive_plan_lines(&plan, 100, "", None, &[]);
         assert!(
             unhovered
                 .iter()
                 .flat_map(|line| &line.spans)
                 .all(|span| span.role != DiagramRole::Hovered),
-            "an expanded box is not implicitly hovered"
+            "hover clears independently from the card layout"
         );
     }
 
     #[test]
-    fn truncated_relationship_click_state_reveals_the_full_label() {
+    fn relationship_labels_stay_compact_and_clickable() {
         let plan = seven_step_sequence_plan();
         let target = PlanRelationshipTarget {
             form: 0,
             from: "n0".to_string(),
             to: "n1".to_string(),
         };
-        let collapsed = interactive_plan_lines(&plan, 40, "", None, &[], &[], &[]);
+        let collapsed = interactive_plan_lines(&plan, 40, "", None, &[]);
         let collapsed_text = collapsed
             .iter()
             .filter(|line| {
@@ -2284,36 +2147,11 @@ mod tests {
             "label starts truncated: {collapsed_text}"
         );
         assert!(!collapsed_text.contains("unblocks waiters"));
-
-        let expanded =
-            interactive_plan_lines(&plan, 40, "", None, &[], &[], std::slice::from_ref(&target));
-        let expanded_text = expanded
-            .iter()
-            .filter(|line| {
-                line.spans
-                    .iter()
-                    .any(|span| span.relationship.as_ref() == Some(&target))
-            })
-            .map(DiagramLine::text)
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            expanded_text.contains("unblocks waiters"),
-            "full label wraps after expansion: {expanded_text}"
-        );
         for width in 1..=17u16 {
-            for line in interactive_plan_lines(
-                &plan,
-                width,
-                "",
-                None,
-                &[],
-                &[],
-                std::slice::from_ref(&target),
-            ) {
+            for line in interactive_plan_lines(&plan, width, "", None, &[]) {
                 assert!(
                     line.text().width() <= usize::from(width),
-                    "expanded relationship exceeds width {width}: {:?}",
+                    "compact relationship exceeds width {width}: {:?}",
                     line.text()
                 );
             }

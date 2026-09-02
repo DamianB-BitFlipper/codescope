@@ -136,7 +136,9 @@ count. Branch diffs always run from that resolved merge-base toward the checked-
 | `R` | refresh repository state |
 | `b` | pick the comparison base for the branch scope |
 | mouse hover (AI node) | highlight that node's exact linked old/new diff lines |
-| click / `Space` (AI node) | expand or collapse deeper details and code locators |
+| click / `Space` (AI node) | open its floating detail and source inspector |
+| click AI relationship | open its complete, untruncated label in a floating inspector |
+| drag AI node | reorder cards across the renderer's row/column slots |
 | mouse wheel | scroll the section under the pointer without focusing/selecting it |
 | mouse drag | resize any pane divider |
 | drag diff code | select code without line-number gutters; release copies it |
@@ -178,9 +180,12 @@ the controller-visible draft; when the model naturally ends its tool sequence, C
 and publishes the accumulated result against known repository facts. The model can inspect, update, and delete existing boxes and relationships
 instead of repeatedly returning the whole plan. Each node also carries one or two exact, side-aware
 `code_refs` copied from annotated `git_diff_file` tool results plus optional
-`expanded_detail`. The model describes semantics, not coordinates: the renderer chooses a
-responsive horizontal or vertical arrangement, bounds every line to the pane width, and uses a
-single vertical scroll axis when the result is taller than the viewport. While an internal request
+`expanded_detail`. The model describes semantics, not coordinates: the renderer places three or
+more nodes in a responsive two-column card grid (one column in narrow panes), bounds every line to
+the pane width, and uses a single vertical scroll axis when the result is taller than the viewport.
+Dragging reorders cards across those stable row/column slots. Clicking a card or relationship opens
+a floating inspector with the full text; the overlay never changes card or arrow geometry. While an
+internal request
 is running, the generated pane shows only `AI in progress` and its research/diagram tool calls
 progressing from running to succeeded/failed. The complete call history remains vertically
 scrollable, and failed calls include their scrubbed error reason. Draft boxes never render. A terminal failure

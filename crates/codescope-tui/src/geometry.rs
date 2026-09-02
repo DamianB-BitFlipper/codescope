@@ -259,8 +259,8 @@ impl UiGeometry {
     }
 
     /// Nearest box and insertion side for a box drag inside the generated viewport.
-    /// Exact coordinates come from retained rendered spans, so expanded boxes and
-    /// scrolling cannot desynchronize the drop target from the frame the user saw.
+    /// Exact coordinates come from retained card spans, so scrolling cannot desynchronize
+    /// the drop target from the frame the user saw.
     pub(crate) fn plan_node_drop_at(
         &self,
         x: u16,
