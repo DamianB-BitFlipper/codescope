@@ -11,9 +11,10 @@ visibly marked inferred. Typed entity and graph claims remain deterministic and 
   fact store — or present an interpreted link as a graph-verified fact
 - execute a shell command, access the network, or read outside the selected changed-file scope
 - write to the repository
-- replace the deterministic visualization with unverified content
+- publish unfinished draft boxes as though they were a completed summary
 
-The app is fully functional with AI disabled, unavailable, slow, or rate-limited.
+Interactive startup requires a configured AI provider. Slow requests show progress, and failures
+remain explicit rather than being replaced by deterministic summary content.
 
 ## The pipeline
 
@@ -25,7 +26,9 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    asynchronous symbol-analysis queue. The focused file runs immediately and at most one
    background file warms alongside it. Expansion only controls whether completed symbols
    are visible.
-3. **Deterministic first** — the TUI immediately renders the deterministic impact view.
+3. **Facts first** — the relationship half immediately renders deterministic selected-change,
+   caller, and downstream facts. The generated half renders only `AI in progress` until a final
+   summary has passed validation.
 4. **Research brief** — the initial request contains only the selection kind/target, virtual
    working directory, comparison scope, changed-file count, and the review assignment. It does
    not proactively include source bodies, hunks, diagnostics, symbols, or relationship lists.
@@ -41,10 +44,10 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    requeued. The TUI and headless backend use this same selection-only policy. Each job returns
    a reviewer-first `DiagramDraft` through a bounded agentic loop (at most 48 total research and
    diagram operations). `edit_visualization` applies atomic intent/form/node/edge/evidence
-   create-update-delete commands, `inspect_visualization` returns the current draft, and
-   `finish_visualization` asks the validator to publish it. The model never needs to resend the
-   complete plan after each correction. Tool choice is required by default;
-   `CODESCOPE_AI_TOOL_CHOICE=auto` supports providers that reject forced tool calls.
+   create-update-delete commands, and `inspect_visualization` returns the current draft. The model
+   never needs to resend the complete plan after each correction. Tool selection is always
+   automatic; ending a turn without another tool call implicitly validates and publishes the
+   accumulated draft.
    `intent`, `forms`, and `evidence` are required, and the primary form
    must be structural — one of changed-symbol tree, call tree, type/impl tree, relationship
    flow, before/after, or sequence; the legacy `impact_summary` and `focused_diff` forms
@@ -54,9 +57,9 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    file's parent), absolute/parent-traversal paths are rejected, file reads cannot leave the
    selected changed files, and results are line/byte capped. Git status/diff results come from
    the immutable captured `ChangeSet`, so exact evidence cannot drift during the loop. Diff rows
-   carry copyable one-based `[old:… new:…]` coordinates. A finish requested before one successful
-   research call is rejected and the model is sent back to research. Each accepted draft edit is
-   published into the shared snapshot/controller state, while the in-flight TUI view shows the
+   carry copyable one-based `[old:… new:…]` coordinates. Completion before one successful research
+   call is rejected and the model is sent back to research. Each accepted draft edit is retained
+   in the shared snapshot/controller state, while the in-flight TUI view shows the
    ordered tool-call lifecycle (`running`, `succeeded`, or `failed`) rather than unfinished boxes.
    Final diagram publication still requires full validation. No shell command is executed and no
    repository state is mutated.
@@ -89,8 +92,8 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    dropped items, notes), while the TUI shows one concise sanitized-plan warning above the
    diagram for ValidWithDrops.
 7. **Epoch gate** — the plan carries the epoch it was requested against. If the repository has
-   changed since, the plan is **stale**: the last valid render stays on screen with a "stale"
-   badge and a new request is issued. A stale plan can never replace a newer state's view.
+   changed since, the plan is **stale**: the generated half returns to `AI in progress` and a new
+   request is issued. A stale plan can never remain visible against a newer repository state.
 8. **Render + interact** — the TUI draws validated plans using only boxed nodes and labeled
    relationship connectors. Chains sit horizontally when they fit and stack vertically when
    they do not; nonlinear graphs and trees use boxed nodes with target-naming connectors. Each
@@ -132,7 +135,7 @@ the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` re
 
 ## Failure modes
 
-- **No API key** → AI status "off"; deterministic views only.
+- **No API key** — interactive startup exits with a configuration error.
 - **Timeout / rate limit** — configurable per-request timeout, `Retry-After` honored,
   exponential backoff, an 8-request in-flight cap, and the high 600 rpm local safety ceiling
   awaited asynchronously; a circuit breaker (3 transport failures in 60 s) cools down for 60 s.
@@ -143,10 +146,9 @@ the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` re
 
 ## Provider neutrality
 
-The client speaks OpenAI-compatible `chat/completions` with tool calling. It sends
-`tool_choice: required` by default; set `CODESCOPE_AI_TOOL_CHOICE=auto` for providers that only
-accept automatic tool selection. If an auto-mode model answers in plain text, the service
-uses one of its bounded repair turns to request the required structured tool call. Verified against Prime
+The client speaks OpenAI-compatible `chat/completions` with automatic tool selection. A tool-less
+assistant turn is the completion signal; if its accumulated draft is invalid, the service uses one
+of its bounded repair turns to return exact validation feedback. Verified against Prime
 Inference (`https://api.pinference.ai/api/v1`) and OpenAI; anything compatible (Ollama, vLLM, …)
 works by setting the base URL. The default model is a small, schema-constrained one — plans are
 structured, so they don't need a frontier model.

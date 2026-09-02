@@ -1,7 +1,7 @@
 //! Provider-neutral OpenAI-compatible chat-completions client (research 05 §5, 07 §4).
 //!
 //! One endpoint: `POST {base_url}/chat/completions` with the configured tool choice
-//! (`required` by default). Callers provide the incremental `finish_visualization` and
+//! (`auto`, so ending a tool sequence is the completion signal). Callers provide incremental
 //! draft-editor tools. Streaming is off (`"stream": false`); draft mutations are ordinary
 //! tool turns and final publication is atomic.
 //!
@@ -22,7 +22,7 @@
 //! time and marked sensitive; message/tool contents are never logged (counts only); reqwest
 //! errors are sanitized with [`reqwest::Error::without_url`].
 
-use crate::config::{AiConfig, ProviderKind, ReasoningEffort, ToolChoice};
+use crate::config::{AiConfig, ProviderKind, ReasoningEffort};
 use crate::error::AiError;
 use crate::tools::ToolDef;
 use governor::clock::{Clock, QuantaClock};
@@ -196,7 +196,6 @@ pub struct AiClient {
     prime_team_id: Option<String>,
     timeout: Duration,
     provider: ProviderKind,
-    tool_choice: ToolChoice,
     limiter: DirectLimiter,
     in_flight: tokio::sync::Semaphore,
     clock: QuantaClock,
@@ -214,7 +213,6 @@ impl std::fmt::Debug for AiClient {
             .field("reasoning_effort", &self.reasoning_effort)
             .field("api_key", &self.api_key.as_ref().map(|_| "«redacted»"))
             .field("timeout", &self.timeout)
-            .field("tool_choice", &self.tool_choice)
             .field("options", &self.options)
             .finish_non_exhaustive()
     }
@@ -273,7 +271,6 @@ impl AiClient {
             prime_team_id: config.prime_team_id.clone(),
             timeout: config.timeout,
             provider,
-            tool_choice: config.tool_choice,
             limiter,
             in_flight: tokio::sync::Semaphore::new(options.max_in_flight_requests),
             clock,
@@ -397,7 +394,7 @@ impl AiClient {
                     "model": model,
                     "messages": messages,
                     "tools": tool_values,
-                    "tool_choice": self.tool_choice.as_str(),
+                    "tool_choice": "auto",
                     "stream": false,
                 });
                 let reasoning_effort = self.reasoning_effort();
@@ -421,9 +418,7 @@ impl AiClient {
                 }
                 body
             }
-            ProviderKind::Anthropic => {
-                build_anthropic_body(&self.model(), messages, tool_values, self.tool_choice)
-            }
+            ProviderKind::Anthropic => build_anthropic_body(&self.model(), messages, tool_values),
         }
     }
 
@@ -714,12 +709,7 @@ fn body_snippet(text: String) -> String {
 /// with `tool_calls` / `tool` results). Anthropic expects: `system` hoisted to a top-level
 /// field, `messages` alternating user/assistant, tool calls as assistant `tool_use` content
 /// blocks, and tool results as user `tool_result` blocks.
-fn build_anthropic_body(
-    model: &str,
-    messages: &[ChatMessage],
-    tool_values: &[Value],
-    tool_choice: ToolChoice,
-) -> Value {
+fn build_anthropic_body(model: &str, messages: &[ChatMessage], tool_values: &[Value]) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
     let mut out_messages: Vec<Value> = Vec::new();
     for msg in messages {
@@ -760,7 +750,7 @@ fn build_anthropic_body(
         "max_tokens": 4096,
         "messages": merged,
         "tools": anthropic_tools(tool_values),
-        "tool_choice": { "type": tool_choice.anthropic_type() },
+        "tool_choice": { "type": "auto" },
     });
     if !system_parts.is_empty() {
         body["system"] = Value::String(system_parts.join("\n\n"));
@@ -844,37 +834,43 @@ fn merge_same_role(messages: Vec<Value>) -> Vec<Value> {
 fn parse_anthropic_response(body: Value) -> Result<RawPlanResponse, AiError> {
     let model = body["model"].as_str().map(str::to_string);
     let mut tool_calls = Vec::new();
+    let mut text_parts = Vec::new();
     if let Some(blocks) = body.get("content").and_then(Value::as_array) {
         for b in blocks {
-            if b.get("type").and_then(Value::as_str) == Some("tool_use") {
-                let name = b["name"].as_str().unwrap_or_default();
-                if name.is_empty() {
-                    return Err(AiError::MalformedResponse("tool_use without a name".into()));
+            match b.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    let name = b["name"].as_str().unwrap_or_default();
+                    if name.is_empty() {
+                        return Err(AiError::MalformedResponse("tool_use without a name".into()));
+                    }
+                    let input = b
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(Value::Object(Default::default()));
+                    tool_calls.push(RawToolCall {
+                        id: b["id"].as_str().unwrap_or_default().to_string(),
+                        name: name.to_string(),
+                        arguments: input.to_string(),
+                    });
                 }
-                let input = b
-                    .get("input")
-                    .cloned()
-                    .unwrap_or(Value::Object(Default::default()));
-                tool_calls.push(RawToolCall {
-                    id: b["id"].as_str().unwrap_or_default().to_string(),
-                    name: name.to_string(),
-                    arguments: input.to_string(),
-                });
+                Some("text") => text_parts.push(b["text"].as_str().unwrap_or_default()),
+                _ => {}
             }
         }
     }
-    if tool_calls.is_empty() {
-        return Err(AiError::NoToolCall);
-    }
     // Rebuild an OpenAI-shaped assistant message so the tool loop's echo path stays uniform.
-    let message = json!({
-        "role": "assistant",
-        "tool_calls": tool_calls.iter().map(|c| json!({
-            "id": c.id,
-            "type": "function",
-            "function": {"name": c.name, "arguments": c.arguments},
-        })).collect::<Vec<_>>(),
-    });
+    let message = if tool_calls.is_empty() {
+        json!({"role": "assistant", "content": text_parts.join("\n")})
+    } else {
+        json!({
+            "role": "assistant",
+            "tool_calls": tool_calls.iter().map(|c| json!({
+                "id": c.id,
+                "type": "function",
+                "function": {"name": c.name, "arguments": c.arguments},
+            })).collect::<Vec<_>>(),
+        })
+    };
     Ok(RawPlanResponse {
         message,
         tool_calls,
@@ -950,7 +946,6 @@ mod tests {
             reasoning_effort: ReasoningEffort::Default,
             api_key: Some(SecretString::from("sk-test".to_string())),
             timeout: Duration::from_millis(50),
-            tool_choice: ToolChoice::Required,
             max_tool_calls: 8,
             prime_team_id: None,
         }
@@ -1074,13 +1069,13 @@ mod tests {
                     {"id": "c1", "type": "function",
                      "function": {"name": "get_hunk", "arguments": "{\"file\":\"a.go\",\"hunk_index\":0}"}},
                     {"id": "c2", "type": "function",
-                     "function": {"name": "finish_visualization", "arguments": "{}"}}
+                     "function": {"name": "inspect_visualization", "arguments": "{}"}}
                 ]
             }}]
         });
         let parsed = parse_completion(completion).unwrap();
         assert_eq!(parsed.tool_calls.len(), 2);
-        assert_eq!(parsed.tool_calls[1].name, "finish_visualization");
+        assert_eq!(parsed.tool_calls[1].name, "inspect_visualization");
         assert_eq!(parsed.tool_calls[1].arguments, "{}");
         assert_eq!(parsed.model.as_deref(), Some("m"));
     }
@@ -1233,10 +1228,10 @@ mod tests {
             "type": "function",
             "function": {"name": "get_hunk", "description": "d", "parameters": {"type":"object"}},
         })];
-        let body = build_anthropic_body("claude-x", &messages, &tools, ToolChoice::Required);
+        let body = build_anthropic_body("claude-x", &messages, &tools);
         assert_eq!(body["model"], "claude-x");
         assert_eq!(body["system"], "sys");
-        assert_eq!(body["tool_choice"]["type"], "any");
+        assert_eq!(body["tool_choice"]["type"], "auto");
         // user, assistant(tool_use), user(tool_result)
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 3);
@@ -1245,9 +1240,6 @@ mod tests {
         assert_eq!(msgs[2]["content"][0]["tool_use_id"], "c1");
         // tools mapped to input_schema
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
-
-        let auto = build_anthropic_body("claude-x", &messages, &tools, ToolChoice::Auto);
-        assert_eq!(auto["tool_choice"]["type"], "auto");
     }
 
     #[test]
@@ -1256,23 +1248,22 @@ mod tests {
             "model": "claude-x",
             "content": [
                 {"type": "text", "text": "thinking"},
-                {"type": "tool_use", "id": "t1", "name": "finish_visualization",
+                {"type": "tool_use", "id": "t1", "name": "inspect_visualization",
                  "input": {"plan_version": 1}},
             ],
         });
         let res = parse_anthropic_response(body).unwrap();
         assert_eq!(res.tool_calls.len(), 1);
-        assert_eq!(res.tool_calls[0].name, "finish_visualization");
+        assert_eq!(res.tool_calls[0].name, "inspect_visualization");
         assert!(res.tool_calls[0].arguments.contains("plan_version"));
     }
 
     #[test]
-    fn anthropic_response_without_tool_use_is_no_tool_call() {
+    fn anthropic_response_without_tool_use_is_a_natural_completion() {
         let body = json!({"model": "claude-x", "content": [{"type": "text", "text": "hi"}]});
-        assert!(matches!(
-            parse_anthropic_response(body),
-            Err(AiError::NoToolCall)
-        ));
+        let response = parse_anthropic_response(body).unwrap();
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.message["content"], "hi");
     }
 
     #[test]

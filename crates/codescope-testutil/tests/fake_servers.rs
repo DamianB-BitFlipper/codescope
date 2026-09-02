@@ -2,9 +2,7 @@
 //! through their public APIs with hand-rolled test clients (no client frameworks).
 
 use codescope_core::Epoch;
-use codescope_testutil::fake_ai::{
-    AiScriptStep, ScriptedProvider, DIAGRAM_FINISH_TOOL_NAME, FAKE_MODEL,
-};
+use codescope_testutil::fake_ai::{AiScriptStep, ScriptedProvider, FAKE_MODEL};
 use codescope_testutil::fake_lsp::{
     read_frame, spawn_in_process, write_frame, FakeLspConfig, ScriptedResponse, METHOD_NOT_FOUND,
 };
@@ -300,8 +298,7 @@ fn chat_request() -> Value {
         "model": "gpt-fake",
         "messages": [{"role": "user", "content": "visualize the change set"}],
         "tools": [
-            {"type": "function", "function": {"name": "edit_visualization"}},
-            {"type": "function", "function": {"name": DIAGRAM_FINISH_TOOL_NAME}}
+            {"type": "function", "function": {"name": "edit_visualization"}}
         ]
     })
 }
@@ -323,10 +320,9 @@ async fn ai_valid_plan_round_trips_through_core_types() {
     let calls = choice["message"]["tool_calls"].as_array().unwrap();
     assert_eq!(calls[0]["type"], "function");
     assert_eq!(calls[0]["function"]["name"], "edit_visualization");
-    assert_eq!(
-        calls.last().unwrap()["function"]["name"],
-        DIAGRAM_FINISH_TOOL_NAME
-    );
+    assert!(calls
+        .iter()
+        .all(|call| call["function"]["name"] == "edit_visualization"));
     assert!(calls.iter().any(|call| {
         call["function"]["arguments"]
             .as_str()
@@ -340,7 +336,7 @@ async fn ai_valid_plan_round_trips_through_core_types() {
     assert_eq!(requests[0].path, "/v1/chat/completions");
     assert_eq!(requests[0].headers["authorization"], "Bearer fake-key");
     assert_eq!(requests[0].body_json().unwrap()["model"], "gpt-fake");
-    assert_eq!(provider.remaining_steps(), 0);
+    assert_eq!(provider.remaining_steps(), 1);
 }
 
 #[tokio::test]
@@ -383,7 +379,13 @@ async fn ai_scripted_failure_modes_in_order() {
         .as_str()
         .is_some_and(|arguments| arguments.contains("internal/api/quantum_flux.go"))));
 
-    // 3. Plain text instead of a tool call.
+    // 3. Typed diagram fixtures naturally end their tool sequence on the next turn.
+    let response = post_chat(&provider, &chat_request()).await;
+    let completion: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+    assert_eq!(completion["choices"][0]["message"]["content"], "");
+
+    // 4. Explicit plain-text fixture instead of a tool call.
     let response = post_chat(&provider, &chat_request()).await;
     let completion: Value = serde_json::from_str(&response.body).unwrap();
     assert_eq!(completion["choices"][0]["finish_reason"], "stop");
@@ -393,24 +395,24 @@ async fn ai_scripted_failure_modes_in_order() {
     );
     assert!(completion["choices"][0]["message"]["tool_calls"].is_null());
 
-    // 4. 429 + Retry-After.
+    // 5. 429 + Retry-After.
     let response = post_chat(&provider, &chat_request()).await;
     assert_eq!(response.status, 429);
     assert_eq!(response.headers["retry-after"], "7");
 
-    // 5. Raw scripted response.
+    // 6. Raw scripted response.
     let response = post_chat(&provider, &chat_request()).await;
     assert_eq!(response.status, 503);
     assert_eq!(response.headers["content-type"], "text/html");
     assert_eq!(response.body, "<h1>down</h1>");
 
-    // 6. Script exhausted → explanatory 500, never a panic.
+    // 7. Script exhausted → explanatory 500, never a panic.
     let response = post_chat(&provider, &chat_request()).await;
     assert_eq!(response.status, 500);
     let error: Value = serde_json::from_str(&response.body).unwrap();
     assert_eq!(error["error"]["type"], "script_exhausted");
 
-    assert_eq!(provider.requests().len(), 6);
+    assert_eq!(provider.requests().len(), 7);
 }
 
 #[tokio::test]
@@ -447,7 +449,7 @@ async fn ai_steps_can_be_pushed_while_serving() {
 
     let response = post_chat(&provider, &chat_request()).await;
     assert_eq!(response.status, 200);
-    assert_eq!(provider.remaining_steps(), 0);
+    assert_eq!(provider.remaining_steps(), 1);
     assert!(provider
         .chat_completions_url()
         .ends_with("/v1/chat/completions"));

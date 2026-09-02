@@ -4,8 +4,8 @@
 //! framework — and answers each incoming HTTP request by consuming the next
 //! [`AiScriptStep`] from its queue (research 08 §3):
 //!
-//! - [`AiScriptStep::valid_plan`] — a schema-valid batch of incremental diagram edits and
-//!   `finish_visualization`, built from [`codescope_core`] plan types;
+//! - [`AiScriptStep::valid_plan`] — a schema-valid batch of incremental diagram edits,
+//!   followed automatically by a natural assistant completion;
 //! - [`AiScriptStep::hallucinated_plan`] — same shape, but every entity points at files
 //!   and symbols that exist nowhere (the validator must drop them);
 //! - [`AiScriptStep::malformed_json`] — a tool call whose `arguments` string is not valid
@@ -34,8 +34,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
-/// Final incremental diagram tool called by generated provider responses.
-pub const DIAGRAM_FINISH_TOOL_NAME: &str = "finish_visualization";
 const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
 
 /// Model name reported in fake completions.
@@ -54,7 +52,8 @@ const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AiScriptStep {
-    /// `200`: completion carrying the edits needed to build and finish `plan`.
+    /// `200`: tool calls carrying the edits needed to build `plan`, followed by a natural
+    /// assistant completion.
     DiagramPlan {
         /// The plan JSON value to serialize into `function.arguments`.
         plan: Value,
@@ -399,6 +398,12 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
 
     match step {
         Some(AiScriptStep::DiagramPlan { plan }) => {
+            // A real agent applies its edits, receives their results, and then naturally
+            // ends the next turn. Queue that terminal turn so typed plan fixtures exercise
+            // the same implicit-completion path as production.
+            lock_ignore_poison(&state.steps).push_front(AiScriptStep::AssistantText {
+                content: String::new(),
+            });
             let completion = diagram_plan_completion(call, plan);
             write_json(&mut stream, 200, "OK", &completion).await
         }
@@ -500,8 +505,6 @@ fn diagram_plan_completion(call: u64, plan: Value) -> Value {
             ));
         }
     }
-    operations.push((DIAGRAM_FINISH_TOOL_NAME, json!({})));
-
     let tool_calls = operations
         .into_iter()
         .enumerate()
@@ -832,10 +835,9 @@ mod tests {
         let calls = completion["choices"][0]["message"]["tool_calls"]
             .as_array()
             .unwrap();
-        assert_eq!(
-            calls.last().unwrap()["function"]["name"],
-            DIAGRAM_FINISH_TOOL_NAME
-        );
+        assert!(calls
+            .iter()
+            .all(|call| call["function"]["name"] == DIAGRAM_EDIT_TOOL_NAME));
     }
 
     #[test]

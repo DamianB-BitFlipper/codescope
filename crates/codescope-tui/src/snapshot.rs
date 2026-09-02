@@ -37,14 +37,14 @@ pub struct UiSnapshot {
     pub ls: LsStatus,
     /// AI status for the top bar.
     pub ai: AiStatus,
-    /// The AI model currently selected (empty when AI is off).
+    /// The AI model currently selected (empty before AI initialization).
     pub ai_model: String,
     /// Selected Chat Completions reasoning budget (`default` uses automatic behavior).
     pub ai_reasoning_effort: String,
     /// Reasoning-budget values accepted by the backend, in picker order.
     pub available_reasoning_efforts: Vec<String>,
     /// Which AI provider/credential is active ("prime"/"openai"/"anthropic"/"custom"; empty
-    /// when AI is off).
+    /// before AI initialization).
     pub ai_provider: String,
     /// Provider-reported tokens consumed by this running process.
     pub ai_tokens: AiTokenUsage,
@@ -370,12 +370,12 @@ pub struct SemanticPane {
     /// boxed diagrams and labeled relationships can respond to the pane's current width.
     pub plan: Option<codescope_core::VisualizationPlan>,
     /// The validation report that produced `plan` (verdict, dropped items, notes).
-    /// `Some` only for published AI panes; fallback/stale panes carry `None` so a prior
+    /// `Some` only for completed AI panes; progress/stale panes carry `None` so a prior
     /// selection's report can never leak (Terra: sanitized content must stay labeled).
     pub report: Option<codescope_core::ValidationReport>,
     /// A one-line note when the data is partial/approximate/AI-interpretive.
     pub note: String,
-    /// `true` when this view came from the AI plan (vs the deterministic fallback).
+    /// `true` only when this view carries a completed AI plan.
     pub ai_generated: bool,
 }
 

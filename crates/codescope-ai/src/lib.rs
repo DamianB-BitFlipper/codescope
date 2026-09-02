@@ -1,4 +1,4 @@
-//! `codescope-ai` — the optional AI visualization layer (research 05, 07).
+//! `codescope-ai` — the AI visualization engine (research 05, 07).
 //!
 //! The AI only *chooses and parameterizes* visualizations; codescope owns facts,
 //! validation, and rendering. This crate provides:
@@ -37,7 +37,7 @@ pub use client::{
     RETRY_AFTER_CAP,
 };
 pub use config::{
-    AiConfig, AiFileConfig, ProviderKind, ReasoningEffort, ToolChoice, ANTHROPIC_BASE_URL,
+    AiConfig, AiFileConfig, ProviderKind, ReasoningEffort, ANTHROPIC_BASE_URL,
     DEFAULT_ANTHROPIC_MODEL, DEFAULT_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_TIMEOUT, OPENAI_BASE_URL,
     PRIME_BASE_URL,
 };
@@ -51,6 +51,6 @@ pub use service::{
 pub use tools::{
     diagram_tools, is_diagram_tool, is_read_only_tool, read_only_tools, research_tools,
     NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
-    DIAGRAM_FINISH_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
+    DIAGRAM_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
 };
 pub use validator::{validate, FactView, Lookup, IMPACT_SUMMARY_MAX_BULLETS};

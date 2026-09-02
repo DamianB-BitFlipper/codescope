@@ -84,7 +84,7 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    publication.
 6. **AI**: OpenAI-compatible chat completions via reqwest 0.13. A bounded loop researches and
    incrementally builds the renderer-native `DiagramDraft` through create/update/delete tools;
-   `finish_visualization` validates and publishes it. Six structural forms (legacy
+   a natural end to the tool sequence validates and publishes it. Six structural forms (legacy
    `impact_summary`/`focused_diff` are rejected at the AI plan boundary); reviewer-first
    contract (required intent/forms/evidence, 1–4 evidence, default 4 / hard max 5 nodes
    and ≤8 edges per form, nonempty 1–2 forms — core keeps larger node backstops). Plan schema v5
@@ -109,7 +109,8 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    supplies that selection's previous validated plan as the revision seed. Replacing guidance
    may cancel only an older request for that same target. Navigation itself retains the 16-entry
    active-request behavior above.
-   AI off unless configured. (research 05)
+   Interactive startup requires a resolved AI provider; missing or disabled configuration is a
+   startup error rather than a reduced-function mode. (research 05)
 7. **Privacy**: 4-layer exclusion (git ignore rules < .codescopeignore < compiled denylist <
    content sniffing), applied to diff paths too; keys via env name only into secrecy::SecretString.
    (research 07)

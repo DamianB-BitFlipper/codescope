@@ -478,12 +478,12 @@ impl ValidationReport {
     }
 }
 
-/// Lifecycle of the optional AI subsystem, for the status bar (research 05: AI is off
-/// unless configured; the app is fully functional without it).
+/// Lifecycle of the AI subsystem, for the status bar. `Disabled` remains an initialization
+/// and library state; the interactive binary rejects it before starting the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiStatus {
-    /// No API key configured / `CODESCOPE_AI=off`.
+    /// No API key configured / explicitly disabled before interactive startup.
     Disabled,
     /// Enabled, no plan requested or in flight.
     Idle,

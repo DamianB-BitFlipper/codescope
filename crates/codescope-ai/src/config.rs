@@ -3,8 +3,7 @@
 //! Environment-over-file resolution: [`AiConfig::from_env`] reads environment only, while
 //! [`AiConfig::from_env_with_file`] accepts the binary's global `[ai]` configuration and then
 //! applies the same environment variables as higher-precedence overrides. The supported vars are
-//! `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_TIMEOUT_MS`,
-//! `CODESCOPE_AI_TOOL_CHOICE`, and the API key from the first of
+//! `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_TIMEOUT_MS`, and the API key from the first of
 //! `PRIME_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` that is set. **AI is disabled by
 //! default**: with no explicit `CODESCOPE_AI=on|off` the subsystem enables itself only when
 //! an API key is found (auto mode). The default `base_url` follows the key's provider
@@ -50,49 +49,6 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-latest";
 
 /// Default per-request timeout (research 07 §4: 20 s budget).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(20_000);
-
-/// How the provider should decide whether to call one of Codescope's tools.
-///
-/// [`ToolChoice::Required`] preserves Codescope's strict default. Some OpenAI-compatible
-/// providers only accept [`ToolChoice::Auto`], which can be selected with
-/// `CODESCOPE_AI_TOOL_CHOICE=auto`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum ToolChoice {
-    /// Require the model to call a tool (`required` for OpenAI-compatible providers,
-    /// `any` for Anthropic).
-    #[default]
-    Required,
-    /// Let the model decide whether to call a tool.
-    Auto,
-}
-
-impl ToolChoice {
-    fn parse(value: &str) -> Result<Self, AiError> {
-        match value.to_ascii_lowercase().as_str() {
-            "required" => Ok(Self::Required),
-            "auto" => Ok(Self::Auto),
-            other => Err(AiError::Config(format!(
-                "CODESCOPE_AI_TOOL_CHOICE must be required|auto, got {other:?}"
-            ))),
-        }
-    }
-
-    /// OpenAI-compatible wire value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Required => "required",
-            Self::Auto => "auto",
-        }
-    }
-
-    pub(crate) const fn anthropic_type(self) -> &'static str {
-        match self {
-            Self::Required => "any",
-            Self::Auto => "auto",
-        }
-    }
-}
 
 /// Reasoning budget requested from an OpenAI-compatible Chat Completions model.
 ///
@@ -214,8 +170,6 @@ pub struct AiConfig {
     pub api_key: Option<SecretString>,
     /// Per-request timeout.
     pub timeout: Duration,
-    /// Provider tool-selection policy. Defaults to [`ToolChoice::Required`].
-    pub tool_choice: ToolChoice,
     /// Research plus incremental diagram-operation budget per plan (≤ [`MAX_TOOL_CALLS`]).
     pub max_tool_calls: u32,
     /// Prime Inference team id, sent as `X-Prime-Team-ID` so requests bill the team balance
@@ -235,7 +189,6 @@ impl AiConfig {
             reasoning_effort: ReasoningEffort::Default,
             api_key: None,
             timeout: DEFAULT_TIMEOUT,
-            tool_choice: ToolChoice::Required,
             max_tool_calls: MAX_TOOL_CALLS,
             prime_team_id: None,
         }
@@ -273,7 +226,6 @@ impl AiConfig {
     ///   [`OPENAI_BASE_URL`]. `CODESCOPE_AI_BASE_URL` overrides.
     /// - A literal [`AiFileConfig::api_key`] in the file layer is
     ///   [`AiError::LiteralApiKeyInConfig`], even when AI ends up disabled.
-    /// - `CODESCOPE_AI_TOOL_CHOICE` accepts `required` (default) or `auto`.
     ///
     /// Empty / whitespace-only env values are treated as unset.
     pub fn resolve(
@@ -369,11 +321,6 @@ impl AiConfig {
             return Err(AiError::Config("timeout must be greater than zero".into()));
         }
 
-        let tool_choice = env("CODESCOPE_AI_TOOL_CHOICE")
-            .map(|value| ToolChoice::parse(&value))
-            .transpose()?
-            .unwrap_or_default();
-
         let max_tool_calls = file
             .and_then(|f| f.max_tool_calls)
             .unwrap_or(MAX_TOOL_CALLS);
@@ -395,7 +342,6 @@ impl AiConfig {
             model = %model,
             reasoning_effort = %reasoning_effort,
             timeout_ms,
-            tool_choice = tool_choice.as_str(),
             max_tool_calls,
             keyed = key.is_some(),
             "ai enabled"
@@ -407,7 +353,6 @@ impl AiConfig {
             reasoning_effort,
             api_key: key.map(SecretString::from),
             timeout: Duration::from_millis(timeout_ms),
-            tool_choice,
             max_tool_calls,
             prime_team_id,
         })
@@ -470,7 +415,6 @@ impl fmt::Debug for AiConfig {
             .field("reasoning_effort", &self.reasoning_effort)
             .field("api_key", &self.api_key.as_ref().map(|_| "«redacted»"))
             .field("timeout", &self.timeout)
-            .field("tool_choice", &self.tool_choice)
             .field("max_tool_calls", &self.max_tool_calls)
             .finish()
     }
@@ -743,7 +687,6 @@ mod tests {
                 ("CODESCOPE_AI", "on"),
                 ("CODESCOPE_AI_BASE_URL", "https://example.test/v1"),
                 ("CODESCOPE_AI_TIMEOUT_MS", "1500"),
-                ("CODESCOPE_AI_TOOL_CHOICE", "auto"),
                 ("OPENAI_API_KEY", "sk-x"),
             ]),
         )
@@ -751,13 +694,6 @@ mod tests {
         assert_eq!(cfg.base_url, "https://example.test/v1");
         assert_eq!(cfg.model, DEFAULT_OPENAI_MODEL);
         assert_eq!(cfg.timeout, Duration::from_millis(1500));
-        assert_eq!(cfg.tool_choice, ToolChoice::Auto);
-    }
-
-    #[test]
-    fn tool_choice_defaults_to_required() {
-        let cfg = AiConfig::resolve(None, env_of(&[("OPENAI_API_KEY", "sk-x")])).unwrap();
-        assert_eq!(cfg.tool_choice, ToolChoice::Required);
     }
 
     #[test]
@@ -777,16 +713,6 @@ mod tests {
             AiConfig::resolve(
                 None,
                 env_of(&[("CODESCOPE_AI", "on"), ("CODESCOPE_AI_TIMEOUT_MS", "0")]),
-            ),
-            Err(AiError::Config(_))
-        ));
-        assert!(matches!(
-            AiConfig::resolve(
-                None,
-                env_of(&[
-                    ("CODESCOPE_AI", "on"),
-                    ("CODESCOPE_AI_TOOL_CHOICE", "sometimes"),
-                ]),
             ),
             Err(AiError::Config(_))
         ));

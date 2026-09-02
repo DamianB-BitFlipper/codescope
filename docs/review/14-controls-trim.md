@@ -123,10 +123,9 @@ explicit error can be contextual; it does not need a normal-mode binding.
 
 At present `a` only gates whether `A` can start work. It does not itself generate a view, and it
 does not reliably remove an already rendered AI view. Because AI generation is already an
-explicit `A` action, a second enable bit adds no useful consent boundary. Keep `--no-ai` for a
-session-wide hard disable and keep `A` as the deliberate per-view operation. Restore a runtime
-toggle only if AI ever becomes automatic, in which case it must actually pause work and remove or
-clearly mark the AI presentation.
+explicit `A` action, a second enable bit adds no useful consent boundary. This recommendation was
+superseded when generation became automatic and interactive Codescope began requiring AI; the
+session-wide no-AI flag and runtime toggle were both removed.
 
 ### Keep `g` / `G`
 

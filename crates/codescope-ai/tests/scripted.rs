@@ -6,8 +6,8 @@
 use codescope_ai::{
     diagram_tools, research_tools, AiActivityObserver, AiActivityUpdate, AiClient, AiClientOptions,
     AiConfig, AiError, AiOutcome, AiService, AiToolActivityState, ChatMessage, DiagramObserver,
-    FactView, Lookup, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolChoice, ToolDef,
-    ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_FINISH_TOOL_NAME,
+    FactView, Lookup, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolDef, ToolExecError,
+    ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
 };
 use codescope_core::{
     DiagramCommand, DiagramDraft, DiffSide, EntityRef, Epoch, FileId, FormKind, LineRange,
@@ -35,7 +35,6 @@ fn config_for(provider: &ScriptedProvider, timeout: Duration) -> AiConfig {
         reasoning_effort: ReasoningEffort::Default,
         api_key: Some(SecretString::from("sk-test".to_string())),
         timeout,
-        tool_choice: ToolChoice::Required,
         max_tool_calls: 48,
         prime_team_id: None,
     }
@@ -347,14 +346,14 @@ async fn valid_plan_end_to_end_with_redaction_and_wire_shape() {
 
     // Wire assertions on what was actually sent.
     let requests = provider.requests();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     let req = &requests[0];
     assert_eq!(req.method, "POST");
     assert_eq!(req.path, "/v1/chat/completions");
     assert_eq!(req.headers.get("authorization").unwrap(), "Bearer sk-test");
     let body = req.body_json().unwrap();
     assert_eq!(body["model"], "codescope-test/model");
-    assert_eq!(body["tool_choice"], "required");
+    assert_eq!(body["tool_choice"], "auto");
     assert_eq!(body["stream"], false);
     let tool_names: Vec<&str> = body["tools"]
         .as_array()
@@ -363,7 +362,6 @@ async fn valid_plan_end_to_end_with_redaction_and_wire_shape() {
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
     assert!(tool_names.contains(&DIAGRAM_EDIT_TOOL_NAME));
-    assert!(tool_names.contains(&DIAGRAM_FINISH_TOOL_NAME));
     for expected in [
         "get_file_outline",
         "get_symbol",
@@ -430,12 +428,11 @@ async fn previous_validated_design_is_sent_as_a_non_evidentiary_revision_seed() 
 }
 
 #[tokio::test]
-async fn auto_tool_choice_is_sent_to_openai_compatible_providers() {
+async fn automatic_tool_choice_is_always_sent_to_openai_compatible_providers() {
     let provider = ScriptedProvider::start([AiScriptStep::valid_plan(Epoch(7)).unwrap()])
         .await
         .unwrap();
-    let mut config = config_for(&provider, Duration::from_secs(5));
-    config.tool_choice = ToolChoice::Auto;
+    let config = config_for(&provider, Duration::from_secs(5));
     let service =
         AiService::with_options(config, REPO_ROOT, AiClientOptions::default(), fast_retry())
             .unwrap();
@@ -451,7 +448,7 @@ async fn auto_tool_choice_is_sent_to_openai_compatible_providers() {
     assert!(matches!(outcome, AiOutcome::Plan(_, _)), "{outcome:?}");
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].body_json().unwrap()["tool_choice"], "auto");
 }
 
@@ -460,8 +457,7 @@ async fn no_tool_executor_advertises_only_incremental_diagram_tools() {
     let provider = ScriptedProvider::start([AiScriptStep::valid_plan(Epoch(7)).unwrap()])
         .await
         .unwrap();
-    let mut config = config_for(&provider, Duration::from_secs(5));
-    config.tool_choice = ToolChoice::Auto;
+    let config = config_for(&provider, Duration::from_secs(5));
     let service =
         AiService::with_options(config, REPO_ROOT, AiClientOptions::default(), fast_retry())
             .unwrap();
@@ -483,7 +479,6 @@ async fn no_tool_executor_advertises_only_incremental_diagram_tools() {
         [
             DIAGRAM_EDIT_TOOL_NAME,
             codescope_ai::DIAGRAM_INSPECT_TOOL_NAME,
-            DIAGRAM_FINISH_TOOL_NAME,
         ]
     );
     let system = body["messages"][0]["content"].as_str().unwrap();
@@ -509,7 +504,7 @@ async fn malformed_diagram_command_gets_tool_feedback_then_recovers() {
         .await;
     assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let feedback = requests[1].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
@@ -543,7 +538,7 @@ async fn syntactically_valid_incomplete_edit_gets_one_protocol_repair() {
     assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let messages = requests[1].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
@@ -553,11 +548,10 @@ async fn syntactically_valid_incomplete_edit_gets_one_protocol_repair() {
     assert!(feedback.contains("shared editor API"), "{feedback}");
 }
 
-/// Under automatic tool choice a provider may answer in plain text instead of calling the
-/// diagram tools. That turn costs one bounded repair — the assistant text is preserved and
-/// a user turn asks for `finish_visualization` — and the corrected incremental tool batch
-/// validates. Repeated plain-text answers exhaust the repair
-/// allowance and terminate with the bounded no-tool-call failure instead of looping.
+/// A tool-less assistant turn is the completion signal. If its current draft is invalid,
+/// that turn costs one bounded repair: the assistant text is preserved and deterministic
+/// validation feedback asks it to continue editing. Repeated premature completions exhaust
+/// the repair allowance instead of looping.
 #[tokio::test]
 async fn plain_text_response_gets_structured_repair_then_validates() {
     let provider = ScriptedProvider::start([
@@ -568,8 +562,7 @@ async fn plain_text_response_gets_structured_repair_then_validates() {
     ])
     .await
     .unwrap();
-    let mut config = config_for(&provider, Duration::from_secs(5));
-    config.tool_choice = ToolChoice::Auto;
+    let config = config_for(&provider, Duration::from_secs(5));
     let service =
         AiService::with_options(config, REPO_ROOT, AiClientOptions::default(), fast_retry())
             .unwrap();
@@ -591,8 +584,8 @@ async fn plain_text_response_gets_structured_repair_then_validates() {
     let requests = provider.requests();
     assert_eq!(
         requests.len(),
-        2,
-        "plain-text turn plus one structured repair"
+        3,
+        "premature completion, corrected edits, and natural completion"
     );
     let messages = requests[1].body_json().unwrap()["messages"]
         .as_array()
@@ -602,24 +595,18 @@ async fn plain_text_response_gets_structured_repair_then_validates() {
         .iter()
         .map(|message| message["role"].as_str().unwrap())
         .collect();
-    // The plain-text assistant turn is preserved, then a user turn demands the tool call.
+    // The premature assistant completion is preserved, then validation asks for edits.
     assert_eq!(roles, ["system", "user", "assistant", "user"]);
     assert_eq!(
         messages[2]["content"], "I think the change is fine.",
         "assistant text echoed back to the provider"
     );
     let repair = messages[3]["content"].as_str().unwrap();
-    assert!(
-        repair.contains(DIAGRAM_FINISH_TOOL_NAME),
-        "the required tool is named: {repair}"
-    );
-    assert!(
-        repair.contains("Return no prose"),
-        "plain text prohibited: {repair}"
-    );
+    assert!(repair.contains("completed draft was rejected"), "{repair}");
+    assert!(repair.contains("Continue editing"), "{repair}");
 
     // Boundedness: a provider that keeps answering in plain text exhausts the three
-    // repairs and terminates with the no-tool-call failure (4 requests, never a loop).
+    // repairs and terminates with the contract failure (4 requests, never a loop).
     let text_step = AiScriptStep::AssistantText {
         content: "still just prose".into(),
     };
@@ -631,8 +618,7 @@ async fn plain_text_response_gets_structured_repair_then_validates() {
     ])
     .await
     .unwrap();
-    let mut config = config_for(&provider, Duration::from_secs(5));
-    config.tool_choice = ToolChoice::Auto;
+    let config = config_for(&provider, Duration::from_secs(5));
     let service =
         AiService::with_options(config, REPO_ROOT, AiClientOptions::default(), fast_retry())
             .unwrap();
@@ -647,7 +633,10 @@ async fn plain_text_response_gets_structured_repair_then_validates() {
     let AiOutcome::Failed(reason) = outcome else {
         panic!("expected bounded failure, got {outcome:?}");
     };
-    assert!(reason.contains("no tool call"), "{reason}");
+    assert!(
+        reason.contains("intent") || reason.contains("forms"),
+        "{reason}"
+    );
     assert_eq!(
         provider.requests().len(),
         4,
@@ -687,7 +676,6 @@ async fn null_content_reasoning_response_repairs_without_invalid_assistant_repla
     .await
     .unwrap();
     let mut config = config_for(&provider, Duration::from_secs(5));
-    config.tool_choice = ToolChoice::Auto;
     config.reasoning_effort = ReasoningEffort::High;
     let service =
         AiService::with_options(config, REPO_ROOT, AiClientOptions::default(), fast_retry())
@@ -704,7 +692,7 @@ async fn null_content_reasoning_response_repairs_without_invalid_assistant_repla
     assert!(matches!(outcome, AiOutcome::Plan(_, _)), "{outcome:?}");
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let repair_body = requests[1].body_json().unwrap();
     assert_eq!(repair_body["reasoning_effort"], "high");
     let messages = repair_body["messages"].as_array().unwrap();
@@ -746,7 +734,7 @@ async fn rate_limited_then_success_honors_retry_after() {
         .await;
     let elapsed = started.elapsed();
     assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
-    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(provider.requests().len(), 3);
     assert!(
         elapsed >= Duration::from_millis(950),
         "Retry-After not honored: {elapsed:?}"
@@ -868,7 +856,7 @@ async fn tool_loop_executes_reads_and_finishes_diagram() {
 
     // Second request must carry the assistant echo and the redacted tool results.
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let body = requests[1].body_json().unwrap();
     let messages = body["messages"].as_array().unwrap();
     let roles: Vec<&str> = messages
@@ -913,7 +901,9 @@ async fn incremental_tools_build_and_publish_the_observed_live_draft() {
         json!({"path": MIDDLEWARE_FILE, "hunk_index": 0}),
     )];
     script.extend(commands.iter().map(diagram_step));
-    script.push(AiScriptStep::tool_call(DIAGRAM_FINISH_TOOL_NAME, json!({})));
+    script.push(AiScriptStep::AssistantText {
+        content: String::new(),
+    });
     let provider = ScriptedProvider::start(script).await.unwrap();
     let service = service_for(&provider);
     let observed = Arc::new(Mutex::new(Vec::<DiagramDraft>::new()));
@@ -963,11 +953,6 @@ async fn incremental_tools_build_and_publish_the_observed_live_draft() {
         AiActivityUpdate::ToolCall { name, state: AiToolActivityState::Running, .. }
             if name == "git_diff_file"
     )));
-    assert!(activities.iter().any(|activity| matches!(
-        activity,
-        AiActivityUpdate::ToolCall { name, state: AiToolActivityState::Succeeded, .. }
-            if name == DIAGRAM_FINISH_TOOL_NAME
-    )));
 
     let first_request = provider.requests()[0].body_json().unwrap();
     let tool_names = first_request["tools"]
@@ -977,7 +962,6 @@ async fn incremental_tools_build_and_publish_the_observed_live_draft() {
         .filter_map(|tool| tool["function"]["name"].as_str())
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&DIAGRAM_EDIT_TOOL_NAME));
-    assert!(tool_names.contains(&DIAGRAM_FINISH_TOOL_NAME));
 }
 
 #[tokio::test]
@@ -999,14 +983,14 @@ async fn research_executor_rejects_a_plan_until_one_tool_succeeds() {
     assert_eq!(executor.0.count.load(Ordering::SeqCst), 1);
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 3);
-    let second = requests[1].body_json().unwrap();
+    assert_eq!(requests.len(), 5);
+    let second = requests[2].body_json().unwrap();
     let feedback = second["messages"].as_array().unwrap().last().unwrap();
-    assert_eq!(feedback["role"], "tool");
+    assert_eq!(feedback["role"], "user");
     assert!(feedback["content"]
         .as_str()
         .unwrap()
-        .contains("cannot be published before inspecting"));
+        .contains("cannot be completed before inspecting"));
 }
 
 #[tokio::test]
@@ -1044,26 +1028,20 @@ async fn two_validation_repair_turns_can_cross_schema_and_fact_boundaries() {
     assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 3);
-    let messages = requests[1].body_json().unwrap()["messages"]
+    assert_eq!(requests.len(), 6);
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
-    let roles: Vec<&str> = messages
-        .iter()
-        .map(|message| message["role"].as_str().unwrap())
-        .collect();
-    assert_eq!(&roles[..3], ["system", "user", "assistant"]);
-    assert!(roles[3..].iter().all(|role| *role == "tool"));
     let feedback = messages
         .iter()
         .filter_map(|message| message["content"].as_str())
         .find(|content| content.contains("node has no reviewer-facing detail"))
-        .expect("finish feedback");
+        .expect("completion feedback");
     assert!(feedback.contains("node has no reviewer-facing detail"));
     assert!(feedback.contains("Edit the current draft"));
 
-    let third_messages = requests[2].body_json().unwrap()["messages"]
+    let third_messages = requests[4].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
@@ -1182,7 +1160,11 @@ async fn unqueried_symbol_entity_gets_entity_repair_then_validates() {
     );
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "initial submission plus one repair");
+    assert_eq!(
+        requests.len(),
+        4,
+        "initial edits/completion plus repaired edits/completion"
+    );
     // The no-tool session contract ships in the system prompt.
     let first_body = requests[0].body_json().unwrap();
     let system = first_body["messages"][0]["content"].as_str().unwrap();
@@ -1190,23 +1172,17 @@ async fn unqueried_symbol_entity_gets_entity_repair_then_validates() {
     assert!(system.contains("hunk-derived"));
     assert!(system.contains("current symbol catalog"));
     // The repair feedback is entity-specific.
-    let messages = requests[1].body_json().unwrap()["messages"]
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
-    let roles: Vec<&str> = messages
-        .iter()
-        .map(|message| message["role"].as_str().unwrap())
-        .collect();
-    assert_eq!(&roles[..3], ["system", "user", "assistant"]);
-    assert!(roles[3..].iter().all(|role| *role == "tool"));
     let feedback = messages
         .iter()
         .filter_map(|message| message["content"].as_str())
         .find(|content| {
             content.contains("not queried") && content.contains("exact current fact or tool result")
         })
-        .expect("entity-specific finish feedback");
+        .expect("entity-specific completion feedback");
     assert!(
         feedback.contains("not queried"),
         "reason echoes the unqueried symbol: {feedback}"
@@ -1262,8 +1238,8 @@ async fn structural_missing_edge_gets_structural_repair_and_keeps_sequence() {
     assert_eq!(plan.forms[0].kind, FormKind::Sequence);
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one structural repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
+    assert_eq!(requests.len(), 4, "one structural repair");
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
@@ -1321,8 +1297,8 @@ async fn unqueried_typed_edge_still_gets_conservative_repair() {
         .await;
     assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one fact repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
+    assert_eq!(requests.len(), 4, "one fact repair");
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
@@ -1365,7 +1341,7 @@ async fn third_repair_succeeds_and_fourth_rejection_terminates() {
         matches!(outcome, AiOutcome::Plan(..)),
         "third submission validates: {outcome:?}"
     );
-    assert_eq!(provider.requests().len(), 3);
+    assert_eq!(provider.requests().len(), 6);
 
     // The exhausted allowance: three rejected repairs, then a fourth rejection fails.
     let hallucinated = AiScriptStep::hallucinated_plan(Epoch(1)).unwrap();
@@ -1393,13 +1369,13 @@ async fn third_repair_succeeds_and_fourth_rejection_terminates() {
     assert!(reason.contains("diagram rejected"), "{reason}");
     assert_eq!(
         provider.requests().len(),
-        4,
+        8,
         "initial plan plus exactly three bounded repairs"
     );
 }
 
-/// Atomic edits reject a seventh node at the draft cap; finish then reports that the six
-/// accepted nodes still exceed the renderer's five-node contract, and a compact repair wins.
+/// Atomic edits reject a seventh node at the draft cap; natural completion then reports that
+/// the six accepted nodes still exceed the renderer's five-node contract, and a compact repair wins.
 #[tokio::test]
 async fn seven_node_plan_gets_cap_repair_then_five_node_plan_validates() {
     let mut oversized = drain_plan(Epoch(9), false);
@@ -1439,8 +1415,8 @@ async fn seven_node_plan_gets_cap_repair_then_five_node_plan_validates() {
     assert_eq!(plan.forms[0].nodes.len(), 3, "fixture plan has 3 nodes");
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "initial submission plus one cap repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
+    assert_eq!(requests.len(), 4, "initial submission plus one cap repair");
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
@@ -1494,7 +1470,7 @@ async fn whole_plan_blob_is_not_accepted_as_a_diagram_command() {
     );
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one protocol repair");
+    assert_eq!(requests.len(), 3, "one protocol repair");
     let messages = requests[1].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
@@ -1506,8 +1482,8 @@ async fn whole_plan_blob_is_not_accepted_as_a_diagram_command() {
     );
 }
 
-/// The atomic editor refuses edges beyond its cap before finish; missing evidence still
-/// receives finish-time feedback and can be repaired incrementally.
+/// The atomic editor refuses edges beyond its cap; missing evidence still receives
+/// completion-time feedback and can be repaired incrementally.
 #[tokio::test]
 async fn edges_and_evidence_cap_violations_get_count_repair_then_validate() {
     // 9 edges: fixture 2 + 7 extra = 9 > MAX_AI_FORM_EDGES (8).
@@ -1535,7 +1511,7 @@ async fn edges_and_evidence_cap_violations_get_count_repair_then_validate() {
     };
     assert!(plan.forms[0].edges.len() <= 8);
     let requests = provider.requests();
-    assert_eq!(requests.len(), 1, "edge overflow is rejected atomically");
+    assert_eq!(requests.len(), 2, "edge overflow is rejected atomically");
 
     // Empty evidence: the parse boundary rejects with the no-evidence reason.
     let mut no_evidence = drain_plan(Epoch(14), false);
@@ -1552,8 +1528,8 @@ async fn edges_and_evidence_cap_violations_get_count_repair_then_validate() {
         .await;
     assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one evidence-floor repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
+    assert_eq!(requests.len(), 4, "one evidence-floor repair");
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
@@ -1594,8 +1570,8 @@ async fn invalid_evidence_gets_citation_repair_then_validates() {
     assert!(plan.evidence[0].hunk == Some(0));
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one evidence repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
+    assert_eq!(requests.len(), 4, "one evidence repair");
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
@@ -1660,8 +1636,8 @@ async fn missing_code_refs_gets_named_repair_and_refs_survive_the_loop() {
     );
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one code_refs repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
+    assert_eq!(requests.len(), 4, "one code_refs repair");
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
@@ -1723,8 +1699,8 @@ async fn code_ref_outside_the_hunk_is_rejected_then_exact_refs_validate() {
     );
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one code_ref repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
+    assert_eq!(requests.len(), 4, "one code_ref repair");
+    let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
@@ -1764,7 +1740,7 @@ async fn repeated_invalid_evidence_stays_bounded() {
     );
     assert_eq!(
         provider.requests().len(),
-        4,
+        8,
         "initial submission plus exactly three bounded repairs"
     );
 }
@@ -1774,7 +1750,9 @@ async fn repeated_invalid_evidence_stays_bounded() {
 /// fails with the parse error instead of looping.
 #[tokio::test]
 async fn repeated_contract_violations_terminate_within_repair_bound() {
-    let step = AiScriptStep::tool_call(DIAGRAM_FINISH_TOOL_NAME, json!({}));
+    let step = AiScriptStep::AssistantText {
+        content: String::new(),
+    };
     let provider =
         ScriptedProvider::start([step.clone(), step.clone(), step.clone(), step.clone()])
             .await
@@ -1884,7 +1862,7 @@ async fn hallucinated_plan_is_rejected_by_validation() {
     assert!(reason.contains("diagram rejected"), "{reason}");
     assert_eq!(
         provider.requests().len(),
-        4,
+        8,
         "initial plan plus exactly three bounded repairs"
     );
     // Sanity: the scripted plan really was hallucinated.
@@ -1934,7 +1912,7 @@ async fn scheduler_path_waits_for_local_rate_capacity() {
         )
         .await;
     assert!(matches!(second, AiOutcome::Plan(..)), "got {second:?}");
-    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(provider.requests().len(), 4);
 }
 
 #[tokio::test]
@@ -1950,7 +1928,9 @@ async fn model_discovery_bypasses_exhausted_inference_limiter() {
     .await
     .unwrap();
     let options = AiClientOptions {
-        requests_per_minute: 1,
+        // Keep the proof quick now that one logical inference includes an edit turn and a
+        // natural-completion turn. Model discovery still bypasses this exhausted burst.
+        requests_per_minute: 6_000,
         burst: 1,
         ..AiClientOptions::default()
     };
@@ -1974,9 +1954,9 @@ async fn model_discovery_bypasses_exhausted_inference_limiter() {
     let models = service.client().list_models().await.unwrap();
     assert_eq!(models, ["recovery/model"]);
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].method, "GET");
-    assert_eq!(requests[1].path, "/v1/models");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].method, "GET");
+    assert_eq!(requests[2].path, "/v1/models");
 }
 
 #[tokio::test]

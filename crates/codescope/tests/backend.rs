@@ -127,10 +127,9 @@ fn incremental_plan_script(plan: &VisualizationPlan) -> Vec<AiScriptStep> {
             evidence: evidence.clone(),
         });
     }
-    script.push(AiScriptStep::tool_call(
-        "finish_visualization",
-        serde_json::json!({}),
-    ));
+    script.push(AiScriptStep::AssistantText {
+        content: String::new(),
+    });
     script
 }
 
@@ -644,7 +643,7 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
     assert_eq!(
         requests.len(),
         request_count,
-        "one research turn, incremental draft edits, and one finish turn"
+        "one research turn, incremental draft edits, and one completion turn"
     );
     let body = requests[0].body_json().expect("debug-ai request JSON");
     assert_eq!(body["reasoning_effort"], "high");
@@ -665,7 +664,6 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
             "git_diff_file",
             "edit_visualization",
             "inspect_visualization",
-            "finish_visualization",
         ],
         "the production executor advertises its scoped mini-shell and shared diagram tools"
     );
@@ -824,7 +822,7 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
         .as_array()
         .expect("form edges");
     assert_eq!(edges.len(), 2, "the back-edge no longer renders: {json}");
-    // One research request, bounded draft edits, then finish; sanitization needs no repair.
+    // One research request, bounded draft edits, then natural completion; sanitization needs no repair.
     assert_eq!(provider.requests().len(), request_count);
 }
 

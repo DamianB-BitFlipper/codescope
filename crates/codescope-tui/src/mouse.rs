@@ -872,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_routes_to_each_scrollable_impact_section() {
+    fn wheel_routes_to_each_scrollable_relationship_section() {
         let mut s = snap();
         let rows = (0..12)
             .map(|index| crate::snapshot::ImpactRow {
@@ -897,7 +897,6 @@ mod tests {
         for id in [
             crate::scroll::ScrollRegionId::Callers,
             crate::scroll::ScrollRegionId::Downstream,
-            crate::scroll::ScrollRegionId::GeneratedImpact,
         ] {
             let region = g
                 .scroll_regions
@@ -950,6 +949,9 @@ mod tests {
         });
         s.semantic.plan = Some(plan);
         s.semantic.ai_generated = true;
+        s.ai = codescope_core::AiStatus::Ready {
+            epoch: codescope_core::Epoch(1),
+        };
         s.impact.selected_change = Some(crate::snapshot::SelectedChange {
             file: "a.go".to_string(),
             label: "Handle".to_string(),
@@ -1217,6 +1219,9 @@ mod tests {
         });
         s.semantic.plan = Some(plan);
         s.semantic.ai_generated = true;
+        s.ai = codescope_core::AiStatus::Ready {
+            epoch: codescope_core::Epoch(1),
+        };
         s.impact.selected_change = Some(crate::snapshot::SelectedChange {
             file: "a.go".to_string(),
             label: "Before".to_string(),

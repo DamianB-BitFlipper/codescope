@@ -213,8 +213,8 @@ Validation-list scorecard:
 - **Severity: low**
 - **Where:** `Cargo.toml:54-57` (`assert_cmd`, `insta`, `rstest`, `portable-pty` in workspace
   deps; zero consumers — `insta` snapshots and `rstest` parametrized fixture-state tests from
-  research 08 §5 were never adopted, and there are no `assert_cmd` CLI tests for `--no-ai`,
-  `--log-file`, non-repo exit); `crates/codescope-testutil/src/helpers.rs:41-56` (canonical
+  research 08 §5 were never adopted, and there are no `assert_cmd` CLI tests for `--log-file`
+  or non-repo exit); `crates/codescope-testutil/src/helpers.rs:41-56` (canonical
   fixture `TempDir` lives in a `static OnceLock` and is never dropped — each test-binary run
   leaks one `codescope-fixture-*` dir in `$TMPDIR`); `crates/codescope-tui/src/run.rs:24-70`
   (event loop and `dispatch` untested: quit path, work-action forwarding vs local apply; note

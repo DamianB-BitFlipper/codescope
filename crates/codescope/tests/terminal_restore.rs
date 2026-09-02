@@ -21,7 +21,6 @@ fn terminal_is_restored_on_panic() {
         .expect("open pty");
 
     let mut cmd = portable_pty::CommandBuilder::new(binary);
-    cmd.arg("--no-ai");
     cmd.env("CODESCOPE_TEST_PANIC", "1");
     cmd.env("TERM", "xterm-256color");
     cmd.cwd("/tmp");

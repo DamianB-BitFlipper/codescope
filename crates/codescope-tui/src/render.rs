@@ -18,7 +18,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{filter_candidates, App, Pane};
-use crate::diagram::{fallback_lines, DiagramRole};
+use crate::diagram::DiagramRole;
 use crate::divider::DividerId;
 use crate::intraline;
 use crate::layout::{
@@ -1596,9 +1596,6 @@ pub(crate) fn generated_impact_content(
     snap: &UiSnapshot,
     width: u16,
 ) -> Vec<crate::diagram::DiagramLine> {
-    if matches!(snap.ai, AiStatus::Loading { .. }) && snap.ai_activity.active {
-        return ai_activity_lines(snap, width);
-    }
     if matches!(snap.ai, AiStatus::Failed { .. }) {
         return snap
             .ai_failure_status()
@@ -1612,6 +1609,14 @@ pub(crate) fn generated_impact_content(
     }
 
     let sem = &snap.semantic;
+    let Some(plan) = sem
+        .plan
+        .as_ref()
+        .filter(|_| sem.ai_generated && matches!(snap.ai, AiStatus::Ready { .. }))
+    else {
+        return ai_progress_lines(snap, width);
+    };
+
     // Node highlighting follows the actual selection, not the dispatcher's data-quality
     // note: the selected change label is what node labels and entity symbols must match.
     let selected_label = snap
@@ -1620,63 +1625,18 @@ pub(crate) fn generated_impact_content(
         .as_ref()
         .map(|selected| selected.label.as_str())
         .unwrap_or("");
-    let diagram = if sem.ai_generated {
-        sem.plan.as_ref().map(|plan| {
-            crate::diagram::interactive_plan_lines(
-                plan,
-                width,
-                selected_label,
-                app.hovered_plan_node.as_ref(),
-                &app.expanded_plan_nodes,
-                &app.plan_node_order,
-                &app.expanded_plan_relationships,
-            )
-        })
-    } else {
-        None
-    }
-    .unwrap_or_else(|| fallback_lines(&snap.impact, width));
+    let diagram = crate::diagram::interactive_plan_lines(
+        plan,
+        width,
+        selected_label,
+        app.hovered_plan_node.as_ref(),
+        &app.expanded_plan_nodes,
+        &app.plan_node_order,
+        &app.expanded_plan_relationships,
+    );
 
     let mut lines = Vec::new();
-    if sem.note.starts_with("Agent ") || sem.note.starts_with("AI draft") {
-        lines.push(crate::diagram::DiagramLine::plain(
-            truncate_cells(&sem.note, width.into()),
-            DiagramRole::Title,
-        ));
-    }
-    if !sem.ai_generated {
-        let status: Option<(String, DiagramRole)> = match snap.ai {
-            AiStatus::WaitingForSymbols { .. } => Some((
-                "Waiting for symbol analysis…".to_string(),
-                DiagramRole::Warning,
-            )),
-            AiStatus::Debouncing { .. } => Some((
-                "Waiting for selection to settle…".to_string(),
-                DiagramRole::Warning,
-            )),
-            AiStatus::Loading { .. } => None,
-            AiStatus::Failed { .. } => None,
-            AiStatus::Stale { .. } => Some((
-                "Repository changed; showing known relationships".to_string(),
-                DiagramRole::Warning,
-            )),
-            AiStatus::Disabled => Some((
-                "Known relationships · AI not configured".to_string(),
-                DiagramRole::Muted,
-            )),
-            AiStatus::Idle => Some((
-                "Known relationships · AI generation is automatic".to_string(),
-                DiagramRole::Muted,
-            )),
-            AiStatus::Ready { .. } => None,
-        };
-        if let Some((text, role)) = status {
-            lines.push(crate::diagram::DiagramLine::plain(
-                truncate_cells(&text, width.into()),
-                role,
-            ));
-        }
-    } else if let Some(report) = &sem.report {
+    if let Some(report) = &sem.report {
         // A sanitized plan (the validator dropped content) gets one concise WARN line
         // before the visual; the full reasons stay in the debug-ai JSON, not this pane.
         if report.verdict == ValidationVerdict::ValidWithDrops || !report.dropped.is_empty() {
@@ -1695,10 +1655,10 @@ pub(crate) fn generated_impact_content(
     lines
 }
 
-fn ai_activity_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::DiagramLine> {
+fn ai_progress_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::DiagramLine> {
     const MAX_VISIBLE_CALLS: usize = 9;
     let mut lines = vec![crate::diagram::DiagramLine::plain(
-        truncate_cells("AI activity", width.into()),
+        truncate_cells("AI in progress", width.into()),
         DiagramRole::Title,
     )];
     let hidden = snap
@@ -1731,6 +1691,21 @@ fn ai_activity_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::Diagr
     if snap.ai_activity.waiting_for_model {
         lines.push(crate::diagram::DiagramLine::plain(
             truncate_cells("… waiting for model", width.into()),
+            DiagramRole::Muted,
+        ));
+    } else if snap.ai_activity.calls.is_empty() {
+        let stage = match snap.ai {
+            AiStatus::WaitingForSymbols { .. } => "… waiting for symbol analysis",
+            AiStatus::Debouncing { .. } => "… waiting for selection to settle",
+            AiStatus::Loading { .. } => "… starting AI research",
+            AiStatus::Stale { .. } => "… refreshing summary",
+            AiStatus::Ready { .. } => "… finalizing summary",
+            AiStatus::Disabled => "… waiting for AI configuration",
+            AiStatus::Idle => "… preparing summary",
+            AiStatus::Failed { .. } => "… AI failed",
+        };
+        lines.push(crate::diagram::DiagramLine::plain(
+            truncate_cells(stage, width.into()),
             DiagramRole::Muted,
         ));
     }
@@ -3436,7 +3411,7 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
         let text = buffer_text(&t);
-        assert!(text.contains("AI activity"), "loading title: {text}");
+        assert!(text.contains("AI in progress"), "loading title: {text}");
         assert!(
             text.contains("✓ git_status_file · service.go"),
             "done: {text}"
@@ -3485,13 +3460,13 @@ mod tests {
                 AiStatus::WaitingForSymbols {
                     epoch: codescope_core::Epoch(3),
                 },
-                "Waiting for symbol analysis…",
+                "… waiting for symbol analysis",
             ),
             (
                 AiStatus::Debouncing {
                     epoch: codescope_core::Epoch(3),
                 },
-                "Waiting for selection to settle…",
+                "… waiting for selection to settle",
             ),
         ];
         for (status, expected) in cases {
@@ -3508,29 +3483,41 @@ mod tests {
     }
 
     #[test]
-    fn ai_plan_view_explains_empty_or_unavailable_states() {
+    fn generated_pane_never_falls_back_to_manual_relationships() {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        // A validated-but-empty plan falls back to deterministic selection guidance.
+        // A ready status without a final plan remains in the progress presentation.
         let mut app = App::new();
         let empty = ai_plan_snap(0);
         app.update(empty.clone());
         t.draw(|f| render(f, &app, &empty)).unwrap();
+        let text = buffer_text(&t);
         assert!(
-            buffer_text(&t).contains("Select a changed file or symbol"),
-            "empty generated impact: {}",
-            buffer_text(&t)
+            text.contains("AI in progress"),
+            "empty generated impact: {text}"
         );
-        // AI off: unavailable. (update() flips the view back; toggle after it.)
+        assert!(
+            text.contains("finalizing summary"),
+            "empty generated impact: {text}"
+        );
+        assert!(
+            !text.contains("Known relationships"),
+            "manual fallback: {text}"
+        );
+
+        // Even impossible internal disabled state uses the same presentation; interactive
+        // startup now rejects missing AI configuration before the TUI is constructed.
         let mut snap = sample(); // ai: Disabled, semantic: default
         let mut app = App::new();
         app.update(snap.clone());
         t.draw(|f| render(f, &app, &snap)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("AI in progress"), "disabled: {text}");
         assert!(
-            buffer_text(&t).contains("Known relationships · AI not configured"),
-            "disabled: {}",
-            buffer_text(&t)
+            !text.contains("Known relationships"),
+            "manual fallback: {text}"
         );
-        // A stale publish carries the dispatcher's note.
+
+        // A stale publish hides the old plan while regeneration is in progress.
         snap.ai = AiStatus::Stale {
             epoch: codescope_core::Epoch(2),
         };
@@ -3538,10 +3525,11 @@ mod tests {
         let mut app = App::new();
         app.update(snap.clone());
         t.draw(|f| render(f, &app, &snap)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("refreshing summary"), "stale note: {text}");
         assert!(
-            buffer_text(&t).contains("Repository changed; showing known relationships"),
-            "stale note: {}",
-            buffer_text(&t)
+            !text.contains("known relationships"),
+            "manual fallback: {text}"
         );
     }
 

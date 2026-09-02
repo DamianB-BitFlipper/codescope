@@ -336,7 +336,6 @@ async fn debug_ai_session(args: &DebugAiArgs) -> Result<DebugAiOut> {
         model = %ai_config.model,
         reasoning_effort = %ai_config.reasoning_effort,
         request_timeout = ?ai_config.timeout,
-        tool_choice = ai_config.tool_choice.as_str(),
         max_tool_calls = ai_config.max_tool_calls,
         "AI configuration resolved"
     );

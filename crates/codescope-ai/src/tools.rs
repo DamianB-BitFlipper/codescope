@@ -20,8 +20,6 @@ pub const MAX_TOOL_CALLS: u32 = 48;
 pub const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
 /// Read the complete in-progress diagram draft.
 pub const DIAGRAM_INSPECT_TOOL_NAME: &str = "inspect_visualization";
-/// Validate and publish the in-progress diagram draft.
-pub const DIAGRAM_FINISH_TOOL_NAME: &str = "finish_visualization";
 
 /// One tool definition in OpenAI tool-calling format.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -266,7 +264,7 @@ pub fn diagram_tools() -> Vec<ToolDef> {
                         "enum": ["reset", "set_intent", "create_form", "delete_form",
                                  "create_node", "update_node", "delete_node", "create_edge",
                                  "update_edge", "delete_edge", "add_evidence", "delete_evidence"],
-                        "description": "Atomic edit operation. finish is a separate tool."
+                        "description": "Atomic edit operation."
                     },
                     "intent": {"type": "string", "description": "set_intent: the one concrete sentence displayed above the diagram."},
                     "form_id": {"type": "string", "description": "Stable editor id such as main; not displayed."},
@@ -322,16 +320,6 @@ pub fn diagram_tools() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
         },
-        ToolDef {
-            name: DIAGRAM_FINISH_TOOL_NAME,
-            description: "Validate and publish the current draft. Call only after research, intent, at least one connected renderer-native form, exact code_refs on every box, and exact evidence are complete. A rejected finish returns validator feedback so the same draft can be edited and retried.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": false
-            }),
-        },
     ]
 }
 
@@ -347,10 +335,7 @@ pub fn is_read_only_tool(name: &str) -> bool {
 /// `true` when `name` is part of the shared incremental diagram API.
 #[must_use]
 pub fn is_diagram_tool(name: &str) -> bool {
-    matches!(
-        name,
-        DIAGRAM_EDIT_TOOL_NAME | DIAGRAM_INSPECT_TOOL_NAME | DIAGRAM_FINISH_TOOL_NAME
-    )
+    matches!(name, DIAGRAM_EDIT_TOOL_NAME | DIAGRAM_INSPECT_TOOL_NAME)
 }
 
 /// A tool execution failure, reported back to the model as an error tool result (it never
@@ -394,7 +379,7 @@ pub trait ToolExecutor: Send + Sync {
     }
 
     /// Whether this executor represents a research workflow that must inspect at least one
-    /// fact before a diagram can be finished. This is `false` for minimal fact stores and tests;
+    /// fact before a diagram can be completed. This is `false` for minimal fact stores and tests;
     /// the scoped diff executor enables it so the small initial brief cannot be guessed from.
     fn requires_research(&self) -> bool {
         false
@@ -510,11 +495,9 @@ mod tests {
         assert!(is_read_only_tool("get_hunk"));
         assert!(is_read_only_tool("read_file"));
         assert!(is_read_only_tool("git_status_file"));
-        assert!(!is_read_only_tool(DIAGRAM_FINISH_TOOL_NAME));
         assert!(!is_read_only_tool("rm_rf"));
         assert!(is_diagram_tool(DIAGRAM_EDIT_TOOL_NAME));
         assert!(is_diagram_tool(DIAGRAM_INSPECT_TOOL_NAME));
-        assert!(is_diagram_tool(DIAGRAM_FINISH_TOOL_NAME));
     }
 
     #[test]

@@ -11,8 +11,8 @@
 //! 3. research and atomic diagram mutations share the ≤
 //!    [`MAX_TOOL_CALLS`](crate::MAX_TOOL_CALLS) budget; accepted mutations can be observed by
 //!    the UI immediately;
-//! 4. `finish_visualization` projects the draft into a plan, then [`parse_plan`] and
-//!    [`validate`] enforce the renderer/fact boundary for the current epoch.
+//! 4. a normal assistant completion implicitly projects the draft into a plan, then
+//!    [`parse_plan`] and [`validate`] enforce the renderer/fact boundary for the current epoch.
 //!
 //! Every path ends in an [`AiOutcome`] — the service never panics on provider behavior
 //! and never blocks the UI: callers `tokio::spawn` the future and apply the outcome at
@@ -25,8 +25,7 @@ use crate::config::{AiConfig, ReasoningEffort};
 use crate::error::AiError;
 use crate::plan::{parse_plan, MAX_AI_EVIDENCE, MAX_AI_FORM_EDGES, MAX_AI_FORM_NODES};
 use crate::tools::{
-    is_read_only_tool, ToolDef, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_FINISH_TOOL_NAME,
-    DIAGRAM_INSPECT_TOOL_NAME,
+    is_read_only_tool, ToolDef, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME,
 };
 use crate::validator::{validate, FactView};
 use backon::{ExponentialBuilder, Retryable};
@@ -43,8 +42,8 @@ use std::time::Duration;
 /// a rejected provider from multiplying latency or spend indefinitely.
 const MAX_PLAN_REPAIRS: usize = 3;
 
-/// Receives each accepted incremental diagram mutation. Dispatchers use this to render the
-/// model's validated partial work while the same request continues researching and editing.
+/// Receives each accepted incremental diagram mutation. Dispatchers retain this for the
+/// shared controller API while the same request continues researching and editing.
 pub type DiagramObserver = Arc<dyn Fn(DiagramDraft) + Send + Sync>;
 
 /// Lifecycle state of one model-requested research or diagram tool call.
@@ -88,8 +87,7 @@ pub enum AiOutcome {
     Stale,
     /// The request failed; `reason` is safe for the status line (never contains secrets).
     Failed(String),
-    /// The provider is unreachable/cooling down (circuit open, local throttle, disabled):
-    /// deterministic-only mode.
+    /// The provider is unreachable or cooling down (circuit open, local throttle, disabled).
     Unavailable,
 }
 
@@ -296,7 +294,7 @@ impl AiService {
     }
 
     /// Shared incremental mode: research and renderer edits happen in the same bounded tool
-    /// loop. The draft is the source of truth; `finish_visualization` merely asks the normal
+    /// loop. The draft is the source of truth; a tool-less assistant completion asks the
     /// parser and fact validator to publish its current projection.
     #[allow(clippy::too_many_arguments)]
     async fn request_incremental_diagram(
@@ -314,7 +312,7 @@ impl AiService {
             .map(DiagramDraft::from_plan)
             .unwrap_or_else(|| DiagramDraft::new(epoch));
         // Epoch is repository-owned even when an older validated plan seeds the editable
-        // content. The seed remains untrusted until finish-time validation.
+        // content. The seed remains untrusted until completion-time validation.
         draft.epoch = epoch;
         if let Some(observe) = observer {
             observe(draft.clone());
@@ -335,17 +333,55 @@ impl AiService {
             };
 
             if response.tool_calls.is_empty() {
-                if repairs >= MAX_PLAN_REPAIRS {
-                    return AiOutcome::Failed(AiError::NoToolCall.to_string());
+                if tools.requires_research() && research_calls == 0 {
+                    if repairs >= MAX_PLAN_REPAIRS {
+                        return AiOutcome::Failed(
+                            "diagram cannot be completed before inspecting the selected change"
+                                .to_string(),
+                        );
+                    }
+                    repairs += 1;
+                    if let Some(assistant) =
+                        ChatMessage::assistant_text_for_repair(&response.message)
+                    {
+                        messages.push(assistant);
+                    }
+                    messages.push(ChatMessage::user(
+                        "The draft cannot be completed before inspecting the selected change. \
+                         Use git_status_file and git_diff_file, continue editing this same \
+                         draft, then end your turn without prose when it is complete."
+                            .to_string(),
+                    ));
+                    continue;
                 }
-                repairs += 1;
-                if let Some(assistant) = ChatMessage::assistant_text_for_repair(&response.message) {
-                    messages.push(assistant);
+
+                match complete_draft(&draft, facts, epoch) {
+                    DraftCompletion::Plan(plan, report) => {
+                        if let Some(observe) = observer {
+                            observe(DiagramDraft::from_plan(&plan));
+                        }
+                        return AiOutcome::Plan(plan, report);
+                    }
+                    DraftCompletion::Stale => return AiOutcome::Stale,
+                    completion if repairs >= MAX_PLAN_REPAIRS => {
+                        return completion_failure(completion, &self.repo_root);
+                    }
+                    completion => {
+                        repairs += 1;
+                        if let Some(assistant) =
+                            ChatMessage::assistant_text_for_repair(&response.message)
+                        {
+                            messages.push(assistant);
+                        }
+                        messages.push(ChatMessage::user(format!(
+                            "The completed draft was rejected. {} Continue editing this same \
+                             draft from that feedback, then end your turn without prose when \
+                             it is complete.",
+                            completion_feedback(&completion, &self.repo_root)
+                        )));
+                        continue;
+                    }
                 }
-                messages.push(ChatMessage::user(format!(
-                    "Continue with the offered tools. Research or edit the current draft, then call {DIAGRAM_FINISH_TOOL_NAME}. Return no prose."
-                )));
-                continue;
             }
 
             tracing::debug!(
@@ -378,9 +414,11 @@ impl AiService {
                             Ok(DiagramCommand::Finish) => {
                                 tool_messages.push(ChatMessage::tool(
                                     call.id.clone(),
-                                    error_result(format!(
-                                        "finish is not an edit; call {DIAGRAM_FINISH_TOOL_NAME}"
-                                    )),
+                                    error_result(
+                                        "finish is not an edit; end the tool sequence when the \
+                                         draft is complete"
+                                            .to_string(),
+                                    ),
                                 ));
                                 observe_tool_activity(
                                     activity_observer,
@@ -484,128 +522,6 @@ impl AiService {
                             &self.repo_root,
                         );
                     }
-                    DIAGRAM_FINISH_TOOL_NAME => {
-                        if tools.requires_research() && research_calls == 0 {
-                            tool_messages.push(ChatMessage::tool(
-                                call.id.clone(),
-                                serde_json::json!({
-                                    "error": "the draft cannot be published before inspecting the selected change",
-                                    "instruction": "Use git_status_file and git_diff_file, then edit this same draft and finish again."
-                                })
-                                .to_string(),
-                            ));
-                            observe_tool_activity(
-                                activity_observer,
-                                call,
-                                AiToolActivityState::Failed,
-                                &self.repo_root,
-                            );
-                            continue;
-                        }
-
-                        let serialized = match serde_json::to_string(&draft.plan()) {
-                            Ok(serialized) => serialized,
-                            Err(error) => {
-                                observe_tool_activity(
-                                    activity_observer,
-                                    call,
-                                    AiToolActivityState::Failed,
-                                    &self.repo_root,
-                                );
-                                return AiOutcome::Failed(format!(
-                                    "could not serialize diagram draft: {error}"
-                                ));
-                            }
-                        };
-                        let mut plan = match parse_plan(&serialized) {
-                            Ok(plan) => plan,
-                            Err(error) => {
-                                if repairs >= MAX_PLAN_REPAIRS {
-                                    observe_tool_activity(
-                                        activity_observer,
-                                        call,
-                                        AiToolActivityState::Failed,
-                                        &self.repo_root,
-                                    );
-                                    return outcome_from_error(&error);
-                                }
-                                repairs += 1;
-                                tool_messages.push(ChatMessage::tool(
-                                    call.id.clone(),
-                                    serde_json::json!({
-                                        "error": "diagram draft rejected by the renderer input contract",
-                                        "reason": error.to_string(),
-                                        "instruction": "Edit the existing draft to address this exact issue, then finish again. Do not recreate the entire plan."
-                                    })
-                                    .to_string(),
-                                ));
-                                observe_tool_activity(
-                                    activity_observer,
-                                    call,
-                                    AiToolActivityState::Failed,
-                                    &self.repo_root,
-                                );
-                                continue;
-                            }
-                        };
-                        let report = validate(&mut plan, facts, epoch);
-                        match report.verdict {
-                            ValidationVerdict::Stale => {
-                                observe_tool_activity(
-                                    activity_observer,
-                                    call,
-                                    AiToolActivityState::Failed,
-                                    &self.repo_root,
-                                );
-                                return AiOutcome::Stale;
-                            }
-                            ValidationVerdict::Valid | ValidationVerdict::ValidWithDrops => {
-                                if let Some(observe) = observer {
-                                    observe(DiagramDraft::from_plan(&plan));
-                                }
-                                observe_tool_activity(
-                                    activity_observer,
-                                    call,
-                                    AiToolActivityState::Succeeded,
-                                    &self.repo_root,
-                                );
-                                return AiOutcome::Plan(plan, report);
-                            }
-                            ValidationVerdict::Rejected => {
-                                let summary = rejection_summary(&report, &self.repo_root);
-                                if repairs >= MAX_PLAN_REPAIRS {
-                                    let user_summary =
-                                        user_rejection_summary(&report, &self.repo_root);
-                                    let detail = user_rejection_detail(&report, &self.repo_root);
-                                    observe_tool_activity(
-                                        activity_observer,
-                                        call,
-                                        AiToolActivityState::Failed,
-                                        &self.repo_root,
-                                    );
-                                    return AiOutcome::Failed(format!(
-                                        "diagram rejected: {user_summary}\n\nValidation details:\n{detail}"
-                                    ));
-                                }
-                                repairs += 1;
-                                tool_messages.push(ChatMessage::tool(
-                                    call.id.clone(),
-                                    serde_json::json!({
-                                        "error": "diagram rejected by deterministic validation",
-                                        "reason": summary,
-                                        "instruction": plan_repair_instruction(&summary),
-                                    })
-                                    .to_string(),
-                                ));
-                                observe_tool_activity(
-                                    activity_observer,
-                                    call,
-                                    AiToolActivityState::Failed,
-                                    &self.repo_root,
-                                );
-                            }
-                        }
-                    }
                     _ if is_read_only_tool(&call.name) => {
                         let (result, researched) =
                             self.execute_tool(tools, &call.name, &call.arguments).await;
@@ -642,7 +558,7 @@ impl AiService {
         }
 
         AiOutcome::Failed(format!(
-            "model did not finish the diagram within {max_turns} turns"
+            "model did not complete the diagram within {max_turns} turns"
         ))
     }
 
@@ -710,6 +626,81 @@ impl AiService {
                     false,
                 )
             }
+        }
+    }
+}
+
+/// Result of projecting and validating the accumulated incremental draft after the model
+/// naturally ends its tool sequence.
+enum DraftCompletion {
+    Plan(VisualizationPlan, ValidationReport),
+    Stale,
+    Contract(String),
+    Rejected(ValidationReport),
+    Fatal(String),
+}
+
+fn complete_draft(draft: &DiagramDraft, facts: &dyn FactView, epoch: Epoch) -> DraftCompletion {
+    let serialized = match serde_json::to_string(&draft.plan()) {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            return DraftCompletion::Fatal(format!("could not serialize diagram draft: {error}"));
+        }
+    };
+    let mut plan = match parse_plan(&serialized) {
+        Ok(plan) => plan,
+        Err(error) => return DraftCompletion::Contract(error.to_string()),
+    };
+    let report = validate(&mut plan, facts, epoch);
+    match report.verdict {
+        ValidationVerdict::Stale => DraftCompletion::Stale,
+        ValidationVerdict::Valid | ValidationVerdict::ValidWithDrops => {
+            DraftCompletion::Plan(plan, report)
+        }
+        ValidationVerdict::Rejected => DraftCompletion::Rejected(report),
+    }
+}
+
+fn completion_feedback(completion: &DraftCompletion, repo_root: &Utf8Path) -> String {
+    match completion {
+        DraftCompletion::Contract(reason) => serde_json::json!({
+            "error": "diagram draft rejected by the renderer input contract",
+            "reason": reason,
+            "instruction": "Edit the existing draft to address this exact issue, then complete it again. Do not recreate the entire plan."
+        })
+        .to_string(),
+        DraftCompletion::Rejected(report) => {
+            let summary = rejection_summary(report, repo_root);
+            serde_json::json!({
+                "error": "diagram rejected by deterministic validation",
+                "reason": summary,
+                "instruction": plan_repair_instruction(&summary),
+            })
+            .to_string()
+        }
+        DraftCompletion::Fatal(reason) => serde_json::json!({"error": reason}).to_string(),
+        DraftCompletion::Stale => {
+            serde_json::json!({"error": "repository facts became stale"}).to_string()
+        }
+        DraftCompletion::Plan(_, _) => {
+            serde_json::json!({"error": "diagram was already complete"}).to_string()
+        }
+    }
+}
+
+fn completion_failure(completion: DraftCompletion, repo_root: &Utf8Path) -> AiOutcome {
+    match completion {
+        DraftCompletion::Plan(plan, report) => AiOutcome::Plan(plan, report),
+        DraftCompletion::Stale => AiOutcome::Stale,
+        DraftCompletion::Contract(reason) | DraftCompletion::Fatal(reason) => {
+            AiOutcome::Failed(reason)
+        }
+        DraftCompletion::Rejected(report) => {
+            let summary = user_rejection_summary(&report, repo_root);
+            let detail = user_rejection_detail(&report, repo_root);
+            AiOutcome::Failed(format!(
+                "diagram rejected: {summary}\n\nValidation details:\n{detail}"
+            ))
         }
     }
 }
@@ -811,7 +802,7 @@ fn plan_repair_instruction(summary: &str) -> &'static str {
         || (summary.contains("edge") && summary.contains("not queried"))
         || (summary.contains("edge") && summary.contains("cannot validate"))
     {
-        "Edit the current draft to correct this issue, then finish it again. The relationship graph is unavailable, so do not assert typed edges or use relationship_flow/sequence. Use changed_symbol_tree with children and edges: []; use only the selected file-level entity and omit entities on presentational action/state nodes. Preserve the epoch and cite only supplied file/hunk evidence."
+        "Edit the current draft to correct this issue, then end your turn without prose. The relationship graph is unavailable, so do not assert typed edges or use relationship_flow/sequence. Use changed_symbol_tree with children and edges: []; use only the selected file-level entity and omit entities on presentational action/state nodes. Preserve the epoch and cite only supplied file/hunk evidence."
     }
     // 2. Structural failures: the form is sound, its wiring is not. Preserve the visual.
     else if summary.contains("before_after needs exactly two nodes")
@@ -820,7 +811,7 @@ fn plan_repair_instruction(summary: &str) -> &'static str {
         || summary.contains("before_after allows at most one transition edge")
         || summary.contains("before_after transition edge needs an explanatory label")
     {
-        "Edit the current draft to correct this issue, then finish it again. Reshape the before_after form: exactly two flat nodes (before, after) with no children, and at most one transition edge directed from the before node to the after node, carrying an explanatory label naming the state change. Move any additional structure into another form, or use a call_tree/changed_symbol_tree when nesting is the point. Preserve the epoch and all other evidence facts."
+        "Edit the current draft to correct this issue, then end your turn without prose. Reshape the before_after form: exactly two flat nodes (before, after) with no children, and at most one transition edge directed from the before node to the after node, carrying an explanatory label naming the state change. Move any additional structure into another form, or use a call_tree/changed_symbol_tree when nesting is the point. Preserve the epoch and all other evidence facts."
     }
     // 3. Sequence wiring failures: the form is sound, its wiring is not. Preserve it.
     else if summary.contains("sequence has no ordered edge")
@@ -829,7 +820,7 @@ fn plan_repair_instruction(summary: &str) -> &'static str {
         || summary.contains("relationship visual is disconnected")
         || summary.contains("relationship visual needs at least one labeled edge")
     {
-        "Edit the current draft to correct this issue, then finish it again. Preserve the useful sequence/relationship_flow: connect every consecutive sequence node in document order exactly once with a directed edge, reference only declared node ids, and give every edge a label naming its trigger, condition, or effect. With no relationship facts available, keep conceptual nodes entityless and label each causal edge as your interpretation of the change, not a verified call. Preserve the epoch, the node order, and all other evidence facts."
+        "Edit the current draft to correct this issue, then end your turn without prose. Preserve the useful sequence/relationship_flow: connect every consecutive sequence node in document order exactly once with a directed edge, reference only declared node ids, and give every edge a label naming its trigger, condition, or effect. With no relationship facts available, keep conceptual nodes entityless and label each causal edge as your interpretation of the change, not a verified call. Preserve the epoch, the node order, and all other evidence facts."
     }
     // 4. An exact diff citation was incorrectly decorated with a symbol from a file whose
     //    symbol universe is unavailable. Do not offer another symbol as an alternative:
@@ -838,7 +829,7 @@ fn plan_repair_instruction(summary: &str) -> &'static str {
         && summary.contains("symbol")
         && summary.contains("not queried")
     {
-        "Edit the current draft to correct this issue, then finish it again. This file has exact diff hunks but no symbol catalog. In every plan-level evidence item for this file, keep the exact file and zero-based hunk id but remove symbol and range entirely; do not replace them with another symbol. Use entityless conceptual nodes or an exact file-only entity, never a symbol entity. Preserve the epoch and the useful visual structure."
+        "Edit the current draft to correct this issue, then end your turn without prose. This file has exact diff hunks but no symbol catalog. In every plan-level evidence item for this file, keep the exact file and zero-based hunk id but remove symbol and range entirely; do not replace them with another symbol. Use entityless conceptual nodes or an exact file-only entity, never a symbol entity. Preserve the epoch and the useful visual structure."
     }
     // 5. Evidence failures: every cited source was dropped, or an evidence citation itself
     //    is invalid (bad hunk/file/symbol/range).
@@ -849,12 +840,12 @@ fn plan_repair_instruction(summary: &str) -> &'static str {
         || (summary.contains("evidence") && summary.contains("not queried"))
         || (summary.contains("evidence") && summary.contains("outside symbol extent"))
     {
-        "Edit the current draft to correct this issue, then finish it again. The cited evidence did not validate. Cite at least one exact repo_path with its zero-based hunk id copied from git_status_file or git_diff_file; remove every invented or invalid reference. Preserve the epoch and all valid evidence facts."
+        "Edit the current draft to correct this issue, then end your turn without prose. The cited evidence did not validate. Cite at least one exact repo_path with its zero-based hunk id copied from git_status_file or git_diff_file; remove every invented or invalid reference. Preserve the epoch and all valid evidence facts."
     }
     // 6. Node-to-diff link failures: copy an exact annotated range instead of doing line
     //    arithmetic or citing a line on the wrong side of a hunk.
     else if summary.contains("code_ref") {
-        "Edit the current draft to correct this issue, then finish it again. A node code_ref did not match the focused selection. For every node copy 1-2 exact ranges from git_diff_file: repo_path as file, zero-based hunk_id, side old for removed lines or new for added/post-change context, and the one-based start_line/end_line shown in [old:… new:…]. Keep each range on one side and inside one hunk; never invent or calculate line numbers. Preserve the epoch and all other valid facts."
+        "Edit the current draft to correct this issue, then end your turn without prose. A node code_ref did not match the focused selection. For every node copy 1-2 exact ranges from git_diff_file: repo_path as file, zero-based hunk_id, side old for removed lines or new for added/post-change context, and the one-based start_line/end_line shown in [old:… new:…]. Keep each range on one side and inside one hunk; never invent or calculate line numbers. Preserve the epoch and all other valid facts."
     }
     // 7. Entity failures: resolve the entity or drop it.
     else if summary.contains("not queried")
@@ -863,9 +854,9 @@ fn plan_repair_instruction(summary: &str) -> &'static str {
         || summary.contains("outside symbol extent")
         || (summary.contains("endpoint") && summary.contains("invalid"))
     {
-        "Edit the current draft to correct this issue, then finish it again. The rejected node attached an entity the fact store cannot resolve. A file-only entity is allowed for an exact repo_path from a tool result; a symbol or range is allowed only when an exact current fact or tool result provides it. Never attach a symbol or range merely because its spelling appears in source or diff text. For a conceptual action or state supported by git_diff_file, omit entity entirely and ground the node with the exact file and zero-based hunk. Preserve the epoch and all other evidence facts."
+        "Edit the current draft to correct this issue, then end your turn without prose. The rejected node attached an entity the fact store cannot resolve. A file-only entity is allowed for an exact repo_path from a tool result; a symbol or range is allowed only when an exact current fact or tool result provides it. Never attach a symbol or range merely because its spelling appears in source or diff text. For a conceptual action or state supported by git_diff_file, omit entity entirely and ground the node with the exact file and zero-based hunk. Preserve the epoch and all other evidence facts."
     } else {
-        "Edit the current draft to correct this issue, then finish it again. Preserve the epoch and evidence facts; ensure every node has a non-empty reviewer-facing detail, 1-2 exact code_refs copied from git_diff_file results, and every required field is present."
+        "Edit the current draft to correct this issue, then end your turn without prose. Preserve the epoch and evidence facts; ensure every node has a non-empty reviewer-facing detail, 1-2 exact code_refs copied from git_diff_file results, and every required field is present."
     }
 }
 
@@ -1062,20 +1053,21 @@ fn build_system_prompt(
              git_diff_file for the relevant changed lines. Use read_file or \
              search_changed_files only when surrounding context is necessary. Tool paths are \
              cwd-relative; copy repo_path, hunk_id, side, and line numbers from results exactly. \
-             You must call at least one research tool before finishing the draft."
+             You must call at least one research tool before completing the draft."
         )
     } else {
         "No read-only tools are available in this session. Treat the supplied current-revision facts as the complete evidence boundary; do not invent missing source facts.".to_string()
     };
 
+    let completion = "When the draft is complete, end your turn without prose or another tool \
+        call. Codescope will implicitly validate and publish it; if validation rejects it, \
+        continue editing the same draft from the returned feedback.";
     let output = format!(
         "Return no prose or complete plan object. Build the live draft with \
              {DIAGRAM_EDIT_TOOL_NAME}: set its intent, create a form, then create/update/delete \
              boxes and relationships as your understanding improves. Use \
              {DIAGRAM_INSPECT_TOOL_NAME} whenever current ids or text are uncertain. Each \
-             successful edit is immediately visible in the application. Call \
-             {DIAGRAM_FINISH_TOOL_NAME} only when the draft is complete; if validation rejects \
-             it, edit the same draft from the returned feedback and finish again. The server \
+             successful edit updates the controller-visible draft. {completion} The server \
              owns plan_version {PLAN_VERSION} and epoch {}. intent is one concrete sentence of \
              at most 24 words. Prefer one form and about four decisive nodes; hard limits are \
              {MAX_FORMS_PER_PLAN} forms, {MAX_AI_FORM_NODES} nodes per form, \
@@ -1410,8 +1402,8 @@ mod tests {
         assert!(prompt.contains("at most 48 total research and diagram operations"));
         assert!(prompt.contains(DIAGRAM_EDIT_TOOL_NAME));
         assert!(prompt.contains(DIAGRAM_INSPECT_TOOL_NAME));
-        assert!(prompt.contains(DIAGRAM_FINISH_TOOL_NAME));
-        assert!(prompt.contains("Each successful edit is immediately visible"));
+        assert!(prompt.contains("implicitly validate and publish"));
+        assert!(prompt.contains("controller-visible draft"));
         assert!(prompt.contains("no prose or complete plan object"));
         assert!(prompt.contains("renderer owns all placement"));
     }

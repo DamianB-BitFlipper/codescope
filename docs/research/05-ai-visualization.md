@@ -164,10 +164,10 @@ OpenAI (`https://api.openai.com/v1`) and Prime Inference (`https://api.pinferenc
 models like `openai/gpt-5.4`, `openai/gpt-5-mini` — confirmed via `prime inference models`).
 Also covers Ollama/vLLM/LM Studio for free.
 
-Plan construction uses the shared incremental diagram tools with `tool_choice: required`:
-atomic edits mutate a bounded draft, inspection returns its current state, and finish requests
-deterministic validation/publication. The service always advertises this protocol; there is no
-whole-plan tool fallback.
+Plan construction uses shared incremental diagram tools with automatic tool selection: atomic
+edits mutate a bounded draft, inspection returns its current state, and a natural end to the tool
+sequence requests deterministic validation/publication. There is no whole-plan tool fallback or
+separate model completion tool.
 
 **Crate choice: `reqwest` 0.13.4 + `serde` 1.0.229 + `serde_json` 1.0.151** (features:
 `json`, `stream`, `rustls-tls`). One endpoint, ~150 lines of types; full control over the
@@ -181,8 +181,8 @@ HTTP streaming remains off. Accepted draft edits remain available through the sh
 between ordinary tool turns the TUI shows each research/edit call progressing through
 running/succeeded/failed. Diagram publication remains atomic after validation.
 
-Config (env-first, all optional unless enabled; AI disabled = full functionality):
-- `CODESCOPE_AI=off|on` (default: auto = on iff an API key is found)
+Config resolution remains env-first, but interactive startup now requires the result to be enabled:
+- `CODESCOPE_AI=on` supports keyless local endpoints; an explicit `off` result prevents startup
 - `CODESCOPE_AI_BASE_URL` (default `https://api.pinference.ai/api/v1` if `PRIME_API_KEY` set,
   else `https://api.openai.com/v1`), `CODESCOPE_AI_API_KEY` (fallback: `PRIME_API_KEY`, then
   `OPENAI_API_KEY`), `--model` / `-m` (default `openai/gpt-5-mini`-class; plans are
@@ -205,5 +205,5 @@ paths and env values from the payload.
 4. Prompt digest of 5 tiers, ~4–8k tokens, hard cap 12k; 8 read-only tools, ≤8 calls/plan;
    tool outputs carry ready-to-echo `entity` JSON.
 5. Client: reqwest + serde, OpenAI-compatible chat completions and the shared incremental
-   diagram tools; `CODESCOPE_AI_*` env config with `PRIME_API_KEY` auto-detection; AI off by
-   default when no key exists.
+   diagram tools; `CODESCOPE_AI_*` env config with `PRIME_API_KEY` auto-detection; interactive
+   startup fails clearly when no provider credential or explicit local endpoint exists.

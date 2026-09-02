@@ -1,4 +1,4 @@
-//! Width-aware terminal diagrams for validated AI plans and deterministic impact facts.
+//! Width-aware terminal diagrams for completed, validated AI plans.
 //!
 //! The dispatcher deliberately publishes structure, not pre-rendered rows. This module is
 //! the single layout boundary: it turns that structure into boxes and relationship connectors
@@ -13,7 +13,6 @@ use codescope_core::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::action::{PlanNodeTarget, PlanRelationshipTarget};
-use crate::snapshot::ImpactPane;
 
 /// Semantic styling role for a span in a terminal diagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,67 +304,6 @@ fn evidence_source(evidence: &PlanEvidence, include_hunk: bool) -> String {
 /// Last path component of a repo-relative file.
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-/// A useful relationship visual that remains available without AI.
-#[must_use]
-pub fn fallback_lines(impact: &ImpactPane, width: u16) -> Vec<DiagramLine> {
-    let width = usize::from(width).max(1);
-    let Some(selected) = &impact.selected_change else {
-        return vec![DiagramLine::plain(
-            truncate(
-                "Select a changed file or symbol to inspect its relationships.",
-                width,
-            ),
-            DiagramRole::Muted,
-        )];
-    };
-
-    let mut lines = wrap_role(
-        &format!("{} {}", selected.label, selected.change),
-        width,
-        DiagramRole::Title,
-        2,
-    );
-    lines.extend(wrap_role(
-        &selected.interpretation,
-        width,
-        DiagramRole::Text,
-        3,
-    ));
-
-    let box_width = width.min(MAX_BOX_WIDTH);
-    if !impact.callers.rows.is_empty() {
-        for caller in impact.callers.rows.iter().take(3) {
-            lines.extend(node_box(&caller.label, "caller", box_width, false));
-            lines.push(centered_arrow("reaches", width, true));
-        }
-    }
-    lines.extend(node_box(
-        &selected.label,
-        &selected.interpretation,
-        box_width,
-        true,
-    ));
-    for downstream in impact.downstream.rows.iter().take(3) {
-        lines.push(centered_arrow(downstream.relation, width, true));
-        lines.extend(node_box(
-            &downstream.label,
-            "affected downstream",
-            box_width,
-            false,
-        ));
-    }
-    if impact.callers.rows.is_empty() && impact.downstream.rows.is_empty() {
-        lines.push(DiagramLine::plain(
-            truncate(
-                "No caller or downstream relationship is currently known.",
-                width,
-            ),
-            DiagramRole::Muted,
-        ));
-    }
-    lines
 }
 
 fn render_flow(
@@ -863,31 +801,6 @@ pub(crate) fn displayed_node_detail(node: &PlanNode, expanded: bool) -> &str {
     } else {
         node.detail.as_deref().unwrap_or_default()
     }
-}
-
-fn node_box(label: &str, detail: &str, width: usize, selected: bool) -> Vec<DiagramLine> {
-    if width < 4 {
-        let role = if selected {
-            DiagramRole::Selected
-        } else {
-            DiagramRole::Text
-        };
-        return vec![DiagramLine::plain(truncate("□", width), role)];
-    }
-    node_box_text(label, detail, width, false)
-        .into_iter()
-        .enumerate()
-        .map(|(index, text)| {
-            let role = if selected {
-                DiagramRole::Selected
-            } else if index == 0 || index == 4 {
-                DiagramRole::Border
-            } else {
-                DiagramRole::Text
-            };
-            DiagramLine::plain(text, role)
-        })
-        .collect()
 }
 
 fn plan_node_box(node: &PlanNode, width: usize, context: DiagramContext<'_>) -> Vec<DiagramLine> {

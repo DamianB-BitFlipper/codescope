@@ -1,7 +1,7 @@
 //! codescope: understand what your current code changes do to the broader system.
 //!
-//! Read-only: never edits files, stages, commits, or changes branches. AI is opt-in
-//! (`CODESCOPE_AI_*` / an API key); the app is fully functional without it.
+//! Read-only: never edits files, stages, commits, or changes branches. The interactive
+//! application requires an AI provider credential.
 
 mod agent_protocol;
 mod backend;
@@ -42,10 +42,6 @@ struct Cli {
     /// backend subcommands take their own PATH argument.
     #[arg(default_value = ".")]
     path: PathBuf,
-
-    /// Disable AI even if an API key is configured.
-    #[arg(long)]
-    no_ai: bool,
 
     /// AI model for this run. Overrides the remembered/global model without persisting it.
     #[arg(short = 'm', long, value_name = "MODEL_NAME")]
@@ -113,24 +109,19 @@ async fn main() -> Result<()> {
     // (LsStatus::Starting); when gopls finishes initializing, the engine is handed to the
     // dispatcher via DispatchEvent::EngineReady and semantic analysis begins (rv-perf H2).
 
-    let ai = if cli.no_ai {
-        None
-    } else {
-        match config_store.resolve_ai_config(cli.model.as_deref(), cli.reasoning_effort) {
-            Ok(config) if config.enabled => match AiService::new(config, root.clone()) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    tracing::warn!(%e, "AI misconfigured; running without AI");
-                    None
-                }
-            },
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(%e, "AI misconfigured; running without AI");
-                None
-            }
-        }
-    };
+    let ai_config = config_store
+        .resolve_ai_config(cli.model.as_deref(), cli.reasoning_effort)
+        .context("AI configuration is required for interactive Codescope")?;
+    if !ai_config.enabled {
+        anyhow::bail!(
+            "AI is required for interactive Codescope; set PRIME_API_KEY, OPENAI_API_KEY, or \
+             ANTHROPIC_API_KEY"
+        );
+    }
+    let ai = Some(
+        AiService::new(ai_config, root.clone())
+            .context("invalid AI configuration for interactive Codescope")?,
+    );
 
     // Channels: dispatcher publishes snapshots (watch = latest-wins); the TUI sends back
     // work actions; optional watchers send change events; spawned jobs report back on the same queue.
@@ -259,9 +250,6 @@ mod tests {
         let cli = Cli::try_parse_from(["codescope", "/some/repo"]).unwrap();
         assert!(cli.command.is_none());
         assert_eq!(cli.path, PathBuf::from("/some/repo"));
-        let cli = Cli::try_parse_from(["codescope", "--no-ai", "/some/repo"]).unwrap();
-        assert!(cli.command.is_none());
-        assert!(cli.no_ai);
         let cli = Cli::try_parse_from(["codescope", "-m", "z-ai/glm-5.3", "/some/repo"]).unwrap();
         assert_eq!(cli.model.as_deref(), Some("z-ai/glm-5.3"));
         let cli =
@@ -270,6 +258,11 @@ mod tests {
         let cli = Cli::try_parse_from(["codescope", "--watch", "/some/repo"]).unwrap();
         assert!(cli.watch);
         assert_eq!(cli.path, PathBuf::from("/some/repo"));
+    }
+
+    #[test]
+    fn no_ai_flag_is_rejected() {
+        assert!(Cli::try_parse_from(["codescope", "--no-ai"]).is_err());
     }
 
     #[test]

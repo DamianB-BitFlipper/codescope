@@ -90,9 +90,8 @@ also missing while AI silently auto-enables off ambient `OPENAI_API_KEY`/`PRIME_
   `OPENAI_API_KEY` gets AI armed at startup; one `A` keypress sends repo-derived content
   (finding 1 unfiltered) with no indication of endpoint or payload.
 - **Why it matters:** consent-by-ambient-env-var is the exact failure mode the research
-  called out; `OPENAI_API_KEY` is extremely common in shells. The mitigations that do
-  exist (nothing sent without an explicit `A`; `--no-ai` flag; `CODESCOPE_AI=off`) reduce
-  but do not replace informed consent.
+  called out; `OPENAI_API_KEY` is extremely common in shells. This pre-automatic-generation
+  review predates the current AI-required startup contract and explicit provider/model status.
 - **Suggested fix:** first `AiRefresh` per session opens a confirm modal listing endpoint,
   model, key env-var name, and payload summary; render provider/model in the status bar
   when enabled. Alternatively require explicit `CODESCOPE_AI=on` when the key came from the

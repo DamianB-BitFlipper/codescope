@@ -475,8 +475,6 @@ pub struct Dispatcher {
     ai_cache: std::collections::HashMap<AiSelectionKey, CachedAiPlan>,
     /// Latest editable diagram per selection, shared with internal tools and controllers.
     ai_drafts: std::collections::HashMap<AiSelectionKey, DiagramDraft>,
-    /// Last renderable projection of a draft while construction continues.
-    ai_previews: std::collections::HashMap<AiSelectionKey, CachedAiPlan>,
     /// Drafts currently owned by the controller CLI rather than an internal provider job.
     agent_owned_drafts: HashSet<AiSelectionKey>,
     /// Last validated design for a stable directory/file/symbol identity. Unlike `ai_cache`, this
@@ -594,7 +592,6 @@ impl Dispatcher {
             ai_rows: None,
             ai_cache: std::collections::HashMap::new(),
             ai_drafts: std::collections::HashMap::new(),
-            ai_previews: std::collections::HashMap::new(),
             agent_owned_drafts: HashSet::new(),
             ai_revision_cache: std::collections::HashMap::new(),
             agent_guidance: std::collections::HashMap::new(),
@@ -1043,7 +1040,6 @@ impl Dispatcher {
     fn reset_ai_for_settings_change(&mut self) {
         self.ai_cache.clear();
         self.ai_drafts.clear();
-        self.ai_previews.clear();
         self.agent_owned_drafts.clear();
         self.ai_revision_cache.clear();
         self.ai_failures.clear();
@@ -1251,7 +1247,6 @@ impl Dispatcher {
             match self.validated_draft(&selection, &draft) {
                 Ok(cached) => {
                     self.ai_cache.insert(selection.clone(), cached.clone());
-                    self.ai_previews.insert(selection.clone(), cached.clone());
                     self.ai_revision_cache
                         .insert(AiRevisionKey::from(&selection), cached.clone());
                     self.agent_owned_drafts.remove(&selection);
@@ -1276,11 +1271,6 @@ impl Dispatcher {
         } else {
             self.ai_cache.remove(&selection);
             self.ai_rows = None;
-            if draft.forms.is_empty() {
-                self.ai_previews.remove(&selection);
-            } else if let Ok(preview) = self.validated_draft(&selection, &draft) {
-                self.ai_previews.insert(selection.clone(), preview);
-            }
             self.ai_status = AiStatus::Loading {
                 since_epoch: self.epoch,
             };
@@ -1382,7 +1372,6 @@ impl Dispatcher {
         if invalidate_cache {
             self.ai_cache.remove(&selection);
             self.ai_drafts.remove(&selection);
-            self.ai_previews.remove(&selection);
             self.agent_owned_drafts.remove(&selection);
             self.ai_failures.remove(&selection);
         } else if let Some(plan) = self.ai_cache.get(&selection).cloned() {
@@ -1725,7 +1714,6 @@ impl Dispatcher {
         // seeds, never current UI state.
         self.ai_cache.clear();
         self.ai_drafts.clear();
-        self.ai_previews.clear();
         self.agent_owned_drafts.clear();
         if self.ai.is_some() {
             self.ai_status = AiStatus::Stale { epoch };
@@ -2341,12 +2329,6 @@ impl Dispatcher {
             return;
         }
 
-        let preview = self.validated_draft(&selection, &draft).ok();
-        if draft.forms.is_empty() {
-            self.ai_previews.remove(&selection);
-        } else if let Some(preview) = preview {
-            self.ai_previews.insert(selection.clone(), preview);
-        }
         self.ai_drafts.insert(selection.clone(), draft);
         self.agent_owned_drafts.remove(&selection);
         if self.current_ai_selection().as_ref() == Some(&selection) {
@@ -2447,7 +2429,6 @@ impl Dispatcher {
                 if is_current_epoch {
                     self.ai_cache.insert(selection.clone(), cached.clone());
                     self.ai_drafts.insert(selection.clone(), final_draft);
-                    self.ai_previews.insert(selection.clone(), cached.clone());
                     self.ai_failures.remove(&selection);
                     if is_focused {
                         self.ai_rows = Some((epoch, selection.clone(), cached));
@@ -2676,77 +2657,13 @@ impl Dispatcher {
                     ai_generated: true,
                 }
             }
-            Some((ep, _, _)) if *ep != self.epoch => SemanticPane {
-                plan: None,
-                report: None,
-                note: "AI view stale (repo changed); regenerating…".to_string(),
-                ai_generated: false,
+            // Unfinished drafts remain available through `diagram_draft` for the internal
+            // and controller APIs, but never become renderable UI. A stale plan or selection
+            // mismatch is equally non-renderable until a complete, current plan is ready.
+            _ => SemanticPane {
+                note: guidance_note.unwrap_or_default(),
+                ..SemanticPane::default()
             },
-            // A selection mismatch must never display the previous row's explanation —
-            // or its validation report.
-            _ => {
-                let preview = current_ai_selection
-                    .as_ref()
-                    .and_then(|selection| self.ai_previews.get(selection));
-                if let Some(preview) = preview {
-                    SemanticPane {
-                        plan: Some(preview.plan.clone()),
-                        report: Some(preview.report.clone()),
-                        note: if current_ai_selection
-                            .as_ref()
-                            .is_some_and(|selection| self.agent_owned_drafts.contains(selection))
-                        {
-                            "Agent diagram draft · edit or finish through the controller"
-                                .to_string()
-                        } else {
-                            "AI draft · building boxes and relationships…".to_string()
-                        },
-                        ai_generated: true,
-                    }
-                } else {
-                    let draft = current_ai_selection
-                        .as_ref()
-                        .and_then(|selection| self.ai_drafts.get(selection));
-                    if let Some(draft) =
-                        draft.filter(|draft| draft.forms.iter().any(|form| !form.nodes.is_empty()))
-                    {
-                        // A draft must be visibly incremental, but it has not crossed the
-                        // fact validator yet. Strip entity claims so draft connectors render
-                        // inferred/dashed; final publication restores only validated facts.
-                        let mut plan = draft.plan();
-                        for node in plan.forms.iter_mut().flat_map(|form| &mut form.nodes) {
-                            node.entity = None;
-                        }
-                        SemanticPane {
-                            plan: Some(plan),
-                            report: None,
-                            note: if current_ai_selection.as_ref().is_some_and(|selection| {
-                                self.agent_owned_drafts.contains(selection)
-                            }) {
-                                "Agent diagram draft · unvalidated boxes; edit or finish"
-                                    .to_string()
-                            } else {
-                                "AI draft · unvalidated boxes; building relationships…".to_string()
-                            },
-                            ai_generated: true,
-                        }
-                    } else {
-                        SemanticPane {
-                            note: current_ai_selection
-                                .as_ref()
-                                .and_then(|selection| {
-                                    self.ai_drafts.contains_key(selection).then_some(
-                                        "AI draft · researching and building the first box…"
-                                            .to_string(),
-                                    )
-                                })
-                                .or(guidance_note)
-                                .unwrap_or_default(),
-                            ..SemanticPane::default()
-                        }
-                    }
-                }
-            }
         };
         (diff, semantic)
     }
@@ -4026,7 +3943,6 @@ mod tests {
             reasoning_effort: ReasoningEffort::Default,
             api_key: None,
             timeout: std::time::Duration::from_millis(100),
-            tool_choice: codescope_ai::ToolChoice::Required,
             max_tool_calls: 1,
             prime_team_id: None,
         };
@@ -4077,7 +3993,6 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Low,
                 api_key: None,
                 timeout: std::time::Duration::from_millis(100),
-                tool_choice: codescope_ai::ToolChoice::Required,
                 max_tool_calls: 1,
                 prime_team_id: None,
             },
@@ -5290,7 +5205,6 @@ mod tests {
             reasoning_effort: ReasoningEffort::Default,
             api_key: None,
             timeout: std::time::Duration::from_millis(50),
-            tool_choice: codescope_ai::ToolChoice::Required,
             max_tool_calls: 1,
             prime_team_id: None,
         };
@@ -5340,7 +5254,6 @@ mod tests {
             reasoning_effort: ReasoningEffort::Default,
             api_key: None,
             timeout: std::time::Duration::from_millis(25),
-            tool_choice: codescope_ai::ToolChoice::Required,
             max_tool_calls: 1,
             prime_team_id: None,
         };
@@ -5388,6 +5301,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unfinished_ai_draft_is_controller_visible_but_never_renderable() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.selected_file = Some("a.txt".to_string());
+        let selection = disp.current_ai_selection().expect("selected file");
+        let generation = 7;
+        disp.ai_running.insert(
+            generation,
+            AiRunningJob {
+                selection: selection.clone(),
+                epoch: disp.epoch,
+                generation,
+            },
+        );
+
+        let mut draft = DiagramDraft::new(disp.epoch);
+        draft
+            .apply(&DiagramCommand::SetIntent {
+                intent: "Explain the incomplete draft".to_string(),
+            })
+            .unwrap();
+        draft
+            .apply(&DiagramCommand::CreateForm {
+                form_id: "main".to_string(),
+                kind: codescope_core::FormKind::CallTree,
+            })
+            .unwrap();
+        draft
+            .apply(&DiagramCommand::CreateNode {
+                form_id: "main".to_string(),
+                node: codescope_core::PlanNode::new(
+                    "n1",
+                    "Unfinished box",
+                    codescope_core::PlanNodeChange::Modified,
+                )
+                .with_detail("must stay out of the TUI"),
+            })
+            .unwrap();
+
+        disp.handle(DispatchEvent::AiDraft {
+            epoch: disp.epoch,
+            selection,
+            generation,
+            draft,
+        })
+        .await;
+
+        let snap = snapshot_rx.borrow().clone();
+        assert!(
+            snap.diagram_draft.is_some(),
+            "controller retains the editable draft"
+        );
+        assert!(
+            snap.semantic.plan.is_none(),
+            "unfinished boxes never enter the renderer"
+        );
+        assert!(!snap.semantic.ai_generated);
+        assert!(matches!(snap.ai, AiStatus::Loading { .. }));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn automatic_ai_waits_for_selected_file_symbols_then_starts() {
         let root = scratch_repo();
         let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
@@ -5408,7 +5384,6 @@ mod tests {
             reasoning_effort: ReasoningEffort::Default,
             api_key: None,
             timeout: std::time::Duration::from_millis(25),
-            tool_choice: codescope_ai::ToolChoice::Required,
             max_tool_calls: 1,
             prime_team_id: None,
         };
@@ -5471,7 +5446,6 @@ mod tests {
             reasoning_effort: ReasoningEffort::Default,
             api_key: None,
             timeout: std::time::Duration::from_millis(25),
-            tool_choice: codescope_ai::ToolChoice::Required,
             max_tool_calls: 1,
             prime_team_id: None,
         };
@@ -5543,9 +5517,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A cached plan whose epoch no longer matches the repo state publishes the stale
-    /// pane: no plan, no report — the old report must never leak into the new epoch's
-    /// fallback view.
+    /// A cached plan whose epoch no longer matches the repo state publishes no semantic
+    /// content: neither plan, report, nor stale draft note may leak into the progress view.
     #[tokio::test]
     async fn stale_epoch_ai_pane_carries_neither_plan_nor_report() {
         let root = scratch_repo();
@@ -5567,12 +5540,9 @@ mod tests {
         );
         assert!(
             snap.semantic.report.is_none(),
-            "the stale epoch's report must not leak into the fallback pane"
+            "the stale epoch's report must not leak into the progress pane"
         );
-        assert_eq!(
-            snap.semantic.note,
-            "AI view stale (repo changed); regenerating…"
-        );
+        assert!(snap.semantic.note.is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }
