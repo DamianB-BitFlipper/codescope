@@ -821,6 +821,7 @@ mod tests {
                 }],
                 current_hunk: 1,
                 total_hunks: 1,
+                syntax: std::sync::Arc::default(),
             },
             ..UiSnapshot::default()
         }

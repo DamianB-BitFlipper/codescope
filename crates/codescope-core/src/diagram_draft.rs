@@ -268,7 +268,7 @@ pub struct DiagramDraftForm {
 
 /// A single atomic mutation supported by both model tools and the live controller API.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DiagramCommand {
     /// Clear the draft while preserving its server-owned epoch.
     Reset,

@@ -25,15 +25,18 @@ use crate::config::{AiConfig, ReasoningEffort};
 use crate::error::AiError;
 use crate::plan::{parse_plan, MAX_AI_EVIDENCE, MAX_AI_FORM_EDGES, MAX_AI_FORM_NODES};
 use crate::tools::{
-    is_read_only_tool, ToolDef, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME,
+    diagram_command_example, is_read_only_tool, ToolDef, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
+    DIAGRAM_INSPECT_TOOL_NAME, LSP_INSPECT_TOOL_NAME,
 };
 use crate::validator::{validate, FactView};
 use backon::{ExponentialBuilder, Retryable};
 use camino::{Utf8Path, Utf8PathBuf};
 use codescope_core::{
-    DiagramCommand, DiagramDraft, Epoch, ValidationReport, ValidationVerdict, VisualizationPlan,
+    DiagramCommand, DiagramDraft, DiagramEdgePatch, DiagramNodePatch, Epoch, FormKind, PlanEdge,
+    PlanEvidence, PlanNode, ValidationReport, ValidationVerdict, VisualizationPlan,
     MAX_CODE_REF_LINES, MAX_FORMS_PER_PLAN, MAX_FORM_DEPTH, MAX_NODE_CODE_REFS, PLAN_VERSION,
 };
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -274,11 +277,15 @@ impl AiService {
             }
         }
         let read_only_tools_available = tool_defs.iter().any(|tool| is_read_only_tool(tool.name));
+        let semantic_tools_available = tool_defs
+            .iter()
+            .any(|tool| tool.name == crate::tools::LSP_INSPECT_TOOL_NAME);
         let mut messages = vec![
             ChatMessage::system(build_system_prompt(
                 epoch,
                 self.config.max_tool_calls,
                 read_only_tools_available,
+                semantic_tools_available,
             )),
             ChatMessage::user(user_prompt),
         ];
@@ -411,8 +418,7 @@ impl AiService {
 
                 match call.name.as_str() {
                     DIAGRAM_EDIT_TOOL_NAME => {
-                        let command = match serde_json::from_str::<DiagramCommand>(&call.arguments)
-                        {
+                        let command = match parse_diagram_command(&call.arguments) {
                             Ok(DiagramCommand::Finish) => {
                                 let reason =
                                     "finish is not an edit; end the tool sequence when the \
@@ -784,6 +790,20 @@ fn tool_activity_detail(call: &RawToolCall) -> String {
             None => operation.to_string(),
         };
     }
+    if call.name == LSP_INSPECT_TOOL_NAME {
+        let query = arguments
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("inspect");
+        let anchor = arguments
+            .get("symbol")
+            .or_else(|| arguments.get("path"))
+            .and_then(serde_json::Value::as_str);
+        return match anchor {
+            Some(anchor) => format!("{query} · {anchor}"),
+            None => query.to_string(),
+        };
+    }
 
     let subject = ["path", "file", "symbol"]
         .into_iter()
@@ -806,6 +826,129 @@ fn cap_activity_detail(text: &str, max_chars: usize) -> String {
         format!("{prefix}…")
     } else {
         prefix
+    }
+}
+
+fn parse_diagram_command(arguments: &str) -> Result<DiagramCommand, String> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments).map_err(|error| {
+        format!(
+            "diagram command field `$` is invalid JSON: {error}; valid example: {}",
+            diagram_command_example(None)
+        )
+    })?;
+    let op = value.get("op").and_then(serde_json::Value::as_str);
+    validate_diagram_command_fields(&value, op).map_err(|(path, message)| {
+        format!(
+            "diagram command field `{path}` is invalid: {message}; expected `{}` shape, for example {}",
+            op.unwrap_or("known operation"),
+            diagram_command_example(op)
+        )
+    })?;
+    let mut deserializer = serde_json::Deserializer::from_str(arguments);
+    serde_path_to_error::deserialize::<_, DiagramCommand>(&mut deserializer).map_err(|error| {
+        let message = error.inner().to_string();
+        let path = diagram_error_path(&error.path().to_string(), &message);
+        format!(
+            "diagram command field `{path}` is invalid: {message}; expected `{}` shape, for example {}",
+            op.unwrap_or("known operation"),
+            diagram_command_example(op)
+        )
+    })
+}
+
+fn validate_diagram_command_fields(
+    value: &serde_json::Value,
+    op: Option<&str>,
+) -> Result<(), (String, String)> {
+    match op {
+        Some("reset") => Ok(()),
+        Some("set_intent") => validate_diagram_field::<String>(value, "intent"),
+        Some("create_form") => {
+            validate_diagram_field::<String>(value, "form_id")?;
+            validate_diagram_field::<FormKind>(value, "kind")
+        }
+        Some("delete_form") => validate_diagram_field::<String>(value, "form_id"),
+        Some("create_node") => {
+            validate_diagram_field::<String>(value, "form_id")?;
+            validate_diagram_field::<PlanNode>(value, "node")
+        }
+        Some("update_node") => {
+            validate_diagram_field::<String>(value, "form_id")?;
+            validate_diagram_field::<String>(value, "node_id")?;
+            validate_diagram_field::<DiagramNodePatch>(value, "patch")
+        }
+        Some("delete_node") => {
+            validate_diagram_field::<String>(value, "form_id")?;
+            validate_diagram_field::<String>(value, "node_id")
+        }
+        Some("create_edge") => {
+            validate_diagram_field::<String>(value, "form_id")?;
+            validate_diagram_field::<PlanEdge>(value, "edge")
+        }
+        Some("update_edge") => {
+            validate_diagram_field::<String>(value, "form_id")?;
+            validate_diagram_field::<String>(value, "from")?;
+            validate_diagram_field::<String>(value, "to")?;
+            validate_diagram_field::<DiagramEdgePatch>(value, "patch")
+        }
+        Some("delete_edge") => {
+            validate_diagram_field::<String>(value, "form_id")?;
+            validate_diagram_field::<String>(value, "from")?;
+            validate_diagram_field::<String>(value, "to")
+        }
+        Some("add_evidence") => validate_diagram_field::<PlanEvidence>(value, "evidence"),
+        Some("delete_evidence") => validate_diagram_field::<usize>(value, "index"),
+        Some(_) | None => Ok(()),
+    }
+}
+
+fn validate_diagram_field<T: DeserializeOwned>(
+    command: &serde_json::Value,
+    field: &str,
+) -> Result<(), (String, String)> {
+    let Some(value) = command.get(field) else {
+        return Err((format!("$.{field}"), "missing required field".to_string()));
+    };
+    serde_path_to_error::deserialize::<_, T>(value.clone())
+        .map(|_| ())
+        .map_err(|error| {
+            let nested = error.path().to_string();
+            let path = if nested.is_empty() || nested == "." || nested == "?" {
+                format!("$.{field}")
+            } else if nested.starts_with('[') {
+                format!("$.{field}{nested}")
+            } else {
+                format!("$.{field}.{}", nested.trim_start_matches('.'))
+            };
+            (path, error.inner().to_string())
+        })
+}
+
+fn diagram_error_path(path: &str, message: &str) -> String {
+    let mut path = path.trim().trim_start_matches('.').to_string();
+    if path.is_empty() || path == "?" {
+        if let Some(missing) = message
+            .strip_prefix("missing field `")
+            .and_then(|remainder| remainder.split_once('`'))
+            .map(|(field, _)| field)
+        {
+            path = missing.to_string();
+        } else if let Some(unknown) = message
+            .strip_prefix("unknown field `")
+            .and_then(|remainder| remainder.split_once('`'))
+            .map(|(field, _)| field)
+        {
+            path = unknown.to_string();
+        } else if message.starts_with("unknown variant") {
+            path = "op".to_string();
+        }
+    }
+    if path.is_empty() || path == "?" {
+        "$".to_string()
+    } else if path.starts_with('[') {
+        format!("${path}")
+    } else {
+        format!("$.{path}")
     }
 }
 
@@ -1088,14 +1231,25 @@ fn build_system_prompt(
     epoch: Epoch,
     max_tool_calls: u32,
     read_only_tools_available: bool,
+    semantic_tools_available: bool,
 ) -> String {
+    let semantic_research = if semantic_tools_available {
+        " Use inspect_language_server when symbols, references, callers/callees, implementations, \
+         type relationships, or diagnostics would explain why the change matters. Start with \
+         its capabilities query when support is uncertain, copy exact symbol names from its \
+         symbols result, and respect status, revision, completeness, notes, and truncated. \
+         Language-server facts are worktree semantic evidence; Git diff results remain the \
+         authority for the selected comparison and code_refs."
+    } else {
+        " No language-server inspection tool is available in this session; do not infer semantic relationships that the Git/source tools do not establish."
+    };
     let research = if read_only_tools_available {
         format!(
             "Research before planning. You have a virtual cwd and may make at most {max_tool_calls} total research and diagram operations. For a directory, use list_directory to find \
              changed files. File tools accept paths relative to that cwd, exact repo_path values, \
              or an unambiguous repo-path suffix. Use git_status_file for exact status and hunk headers, then \
              git_diff_file for the relevant changed lines. Use read_file or \
-             search_changed_files only when surrounding context is necessary. Copy repo_path, \
+             search_changed_files only when surrounding context is necessary.{semantic_research} Copy repo_path, \
              hunk_id, side, and line numbers from results exactly. \
              You must call at least one research tool before completing the draft."
         )
@@ -1220,10 +1374,68 @@ mod tests {
             .to_string(),
         };
         assert_eq!(tool_activity_detail(&edit), "create_node · Request queue");
+        let semantic = RawToolCall {
+            id: "call-3".to_string(),
+            name: LSP_INSPECT_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({
+                "query": "callers",
+                "path": "src/service.rs",
+                "symbol": "Service::run"
+            })
+            .to_string(),
+        };
+        assert_eq!(tool_activity_detail(&semantic), "callers · Service::run");
         assert_eq!(
             cap_activity_detail(&"x".repeat(120), 96).chars().count(),
             97
         );
+    }
+
+    #[test]
+    fn diagram_parse_errors_name_the_nested_path_and_show_the_matching_example() {
+        let invalid_hint = serde_json::json!({
+            "op": "create_node",
+            "form_id": "main",
+            "node": {
+                "id": "n1",
+                "label": "Start API service",
+                "detail": "Starts the service",
+                "code_refs": [{
+                    "file": "main.go",
+                    "hunk": 0,
+                    "side": "new",
+                    "start_line": 8,
+                    "end_line": 8
+                }],
+                "hint": {"highlight": "added"}
+            }
+        })
+        .to_string();
+        let error = parse_diagram_command(&invalid_hint).unwrap_err();
+        assert!(error.contains("$.node.hint.highlight"), "{error}");
+        assert!(error.contains("expected `create_node` shape"));
+        assert!(error.contains("\"form_id\":\"main\""));
+        assert!(error.contains("\"highlight\":true"));
+
+        let missing_form = serde_json::json!({
+            "op": "create_node",
+            "node": {
+                "id": "n1",
+                "label": "Start API service",
+                "detail": "Starts the service",
+                "code_refs": [{
+                    "file": "main.go",
+                    "hunk": 0,
+                    "side": "new",
+                    "start_line": 8,
+                    "end_line": 8
+                }]
+            }
+        })
+        .to_string();
+        let error = parse_diagram_command(&missing_form).unwrap_err();
+        assert!(error.contains("$.form_id"), "{error}");
+        assert!(error.contains("expected `create_node` shape"));
     }
 
     /// A rejected plan surfaces the concrete dropped-form reason, not the generic tail.
@@ -1415,13 +1627,16 @@ mod tests {
 
     #[test]
     fn concise_agent_prompt_requires_bounded_research_and_exact_evidence() {
-        let prompt = build_system_prompt(Epoch(42), 8, true);
+        let prompt = build_system_prompt(Epoch(42), 8, true, true);
         assert!(prompt.contains("server owns plan_version"));
         assert!(prompt.contains("epoch 42"));
         assert!(prompt.contains("at most 8 total research and diagram operations"));
         assert!(prompt.contains("You must call at least one research tool"));
         assert!(prompt.contains("git_status_file"));
         assert!(prompt.contains("git_diff_file"));
+        assert!(prompt.contains("inspect_language_server"));
+        assert!(prompt.contains("worktree semantic evidence"));
+        assert!(prompt.contains("completeness"));
         assert!(prompt.contains("File tools accept paths relative to that cwd"));
         assert!(prompt.contains("unambiguous repo-path suffix"));
         assert!(prompt.contains("owns all placement, wrapping"));
@@ -1436,14 +1651,14 @@ mod tests {
             prompt.len()
         );
 
-        let direct = build_system_prompt(Epoch(42), 8, false);
+        let direct = build_system_prompt(Epoch(42), 8, false, false);
         assert!(direct.contains("No read-only tools are available"));
         assert!(!direct.contains("You must call at least one research tool"));
     }
 
     #[test]
     fn incremental_prompt_edits_the_live_draft_instead_of_submitting_a_plan_blob() {
-        let prompt = build_system_prompt(Epoch(42), 48, true);
+        let prompt = build_system_prompt(Epoch(42), 48, true, true);
         assert!(prompt.contains("at most 48 total research and diagram operations"));
         assert!(prompt.contains(DIAGRAM_EDIT_TOOL_NAME));
         assert!(prompt.contains(DIAGRAM_INSPECT_TOOL_NAME));

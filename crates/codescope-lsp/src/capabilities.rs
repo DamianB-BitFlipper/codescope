@@ -2,8 +2,9 @@
 //!
 //! Per research 01: capability shapes differ across servers (bool, object with
 //! `workDoneProgress`, bare integer for `textDocumentSync`, explicit null).
-//! Everything is therefore inspected as raw [`serde_json::Value`] and
-//! "supported" means *present and not `false` and not `null`*.
+//! Everything is therefore inspected as raw [`serde_json::Value`]. Most providers are
+//! supported when present and neither `false` nor `null`; semantic tokens additionally require
+//! the nested `full` operation because Codescope deliberately does not issue range requests.
 //!
 //! The [`Feature`]/[`FeatureSet`]/[`Availability`] types live in
 //! `codescope-core` (they flow to the analysis layer, the TUI, and the AI
@@ -41,6 +42,7 @@ const PROVIDER_KEYS: &[&str] = &[
     "typeHierarchyProvider",
     "completionProvider",
     "documentFormattingProvider",
+    "semanticTokensProvider",
 ];
 
 /// One capability value: present-and-truthy, present-but-disabled, or absent.
@@ -50,6 +52,17 @@ fn capability_state(caps: &Value, key: &str) -> Availability {
         Some(Value::Null) => Availability::Unsupported,
         Some(Value::Bool(false)) => Availability::Unsupported,
         Some(_) => Availability::Supported,
+    }
+}
+
+fn semantic_tokens_full_state(caps: &Value) -> Availability {
+    match caps.get("semanticTokensProvider") {
+        None => Availability::Unknown,
+        Some(Value::Null | Value::Bool(false)) => Availability::Unsupported,
+        Some(provider) => match provider.get("full") {
+            Some(Value::Bool(false) | Value::Null) | None => Availability::Unsupported,
+            Some(_) => Availability::Supported,
+        },
     }
 }
 
@@ -113,6 +126,7 @@ pub fn resolve_features(caps: &Value) -> Result<FeatureSet, SemanticError> {
     set.set(Feature::TypeHierarchySub, type_hierarchy);
 
     set.set(Feature::PushDiagnostics, Availability::Unknown);
+    set.set(Feature::SemanticTokens, semantic_tokens_full_state(caps));
 
     Ok(set)
 }
@@ -228,7 +242,11 @@ mod tests {
             "workspaceSymbolProvider": true,
             "implementationProvider": true,
             "callHierarchyProvider": true,
-            "typeHierarchyProvider": true
+            "typeHierarchyProvider": true,
+            "semanticTokensProvider": {
+                "legend": { "tokenTypes": ["keyword"], "tokenModifiers": [] },
+                "full": true
+            }
         });
         let set = resolve_features(&caps).expect("gopls is not broken");
         for feature in [
@@ -242,11 +260,39 @@ mod tests {
             Feature::TypeHierarchySub,
             Feature::Implementation,
             Feature::Hover,
+            Feature::SemanticTokens,
         ] {
             assert!(set.is_supported(feature), "{feature:?} should be supported");
         }
         // Push diagnostics are not advertised; adapters mark them explicitly.
         assert_eq!(set.get(Feature::PushDiagnostics), Availability::Unknown);
+    }
+
+    #[test]
+    fn semantic_tokens_capability_is_language_neutral_and_optional() {
+        let supported = resolve_features(&json!({
+            "textDocumentSync": 2,
+            "semanticTokensProvider": { "legend": { "tokenTypes": ["keyword"], "tokenModifiers": [] }, "full": true }
+        }))
+        .expect("not broken");
+        assert!(supported.is_supported(Feature::SemanticTokens));
+
+        let absent = resolve_features(&json!({"textDocumentSync": 2})).expect("not broken");
+        assert_eq!(absent.get(Feature::SemanticTokens), Availability::Unknown);
+
+        let range_only = resolve_features(&json!({
+            "textDocumentSync": 2,
+            "semanticTokensProvider": {
+                "legend": { "tokenTypes": ["keyword"], "tokenModifiers": [] },
+                "range": true,
+                "full": false
+            }
+        }))
+        .expect("not broken");
+        assert_eq!(
+            range_only.get(Feature::SemanticTokens),
+            Availability::Unsupported
+        );
     }
 
     #[test]

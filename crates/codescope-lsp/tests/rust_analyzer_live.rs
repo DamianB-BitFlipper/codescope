@@ -71,6 +71,19 @@ async fn rust_analyzer_end_to_end() {
     assert!(names.contains(&"double"), "roots: {names:?}");
     assert!(names.contains(&"main"), "roots: {names:?}");
 
+    if svc
+        .features()
+        .is_supported(codescope_core::Feature::SemanticTokens)
+    {
+        let syntax = tokio::time::timeout(Duration::from_secs(60), svc.semantic_tokens(&file))
+            .await
+            .expect("semantic_tokens timed out")
+            .expect("semantic_tokens failed")
+            .value;
+        assert!(!syntax.is_empty(), "expected rust-analyzer syntax tokens");
+        assert!(syntax.iter().any(|token| token.token_type == "function"));
+    }
+
     // Give rust-analyzer a moment to load workspace metadata before semantic queries.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -87,6 +100,7 @@ async fn rust_analyzer_end_to_end() {
         callers.iter().any(|c| c.name == "main"),
         "callers: {callers:?}"
     );
+    assert!(callers.iter().all(|caller| caller.range.is_some()));
 
     // Capability gating: typeHierarchy/subtypes is unsupported and returns before any
     // wire traffic (rust-analyzer advertises no typeHierarchy provider).
@@ -101,6 +115,14 @@ async fn rust_analyzer_end_to_end() {
         ),
         "unexpected err: {err}"
     );
+    let err = svc
+        .type_supertypes(&file, Position::new(0, 3))
+        .await
+        .expect_err("type_supertypes should be unsupported");
+    assert!(matches!(
+        err,
+        codescope_lsp::SemanticError::Unsupported(codescope_core::Feature::TypeHierarchySuper)
+    ));
 
     // Clean shutdown.
     tokio::time::timeout(Duration::from_secs(10), svc.shutdown())

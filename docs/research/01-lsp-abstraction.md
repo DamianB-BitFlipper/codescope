@@ -16,6 +16,7 @@ LSP initialize handshakes against locally installed servers (Aug 2026).
 | workspaceSymbol       | ✅         | ✅                  | ✅                 | ✅ obj   | ✅              |
 | callHierarchy         | ✅         | ✅                  | ✅                 | ✅ bool  | ✅              |
 | typeHierarchy         | ✅         | ❌ null             | ✅                 | ❌ null  | ❌ null         |
+| semanticTokens/full   | ✅         | ✅                  | ✅                 | varies   | ✅              |
 | positionEncoding resp | absent→utf-16 | **utf-8** (negotiated) | absent→utf-16 | absent→utf-16 | absent→utf-16 |
 | serverInfo            | name+VERSION-IS-BUILDINFO-JSON | name+semver | name+string | **null** | **null** |
 | textDocumentSync      | obj{change:2,save:{}} | obj | obj{save:true} | **bare int 2** | **bare int 2** |
@@ -42,7 +43,7 @@ Key quirks (all verified):
 ```rust
 pub enum Feature { DocumentSymbols, WorkspaceSymbols, References, Definition,
                    CallHierarchyIncoming, CallHierarchyOutgoing, TypeHierarchySuper,
-                   TypeHierarchySub, Implementation, Hover, PushDiagnostics }
+                   TypeHierarchySub, Implementation, Hover, PushDiagnostics, SemanticTokens }
 pub struct FeatureSet { map: BTreeMap<Feature, Availability> }
 pub enum Availability { Supported, Unsupported, Unknown }
 ```
@@ -75,9 +76,42 @@ Core semantic surface (async, returns `Result<T, SemanticError>` where errors in
 - `type_subtypes/supertypes(symbol) -> Evidence<Vec<SymbolRef>>` (gopls: interfaces)
 - `hover(symbol) -> Option<HoverText>`
 - `diagnostics(file) -> Vec<Diagnostic>` (from push cache)
+- `semantic_tokens(file) -> Vec<SyntaxToken>` plus the same query over an exact-content overlay
+
+Semantic-token legend names remain strings at the language-service boundary. Standard LSP names
+receive renderer colors today; an adapter may expose server-specific names without changing the
+core type or diff model. Codescope requests tokens asynchronously only for the visible file after
+that file's symbol analysis completes, keeps a bounded cache of both revisions for the repository
+epoch, and treats an unsupported provider, malformed response, or per-side query failure as an
+empty optional layer.
+The ordinary diff is therefore the exact fallback rather than a separate rendering path.
 
 `Evidence<T> = { value: T, completeness: Complete|Partial|Unknown, notes: Vec<String> }` —
 the honesty layer carried to UI + AI.
+
+## AI semantic inspection
+
+The AI research loop exposes the common surface through one read-only,
+capability-discoverable `inspect_language_server` tool. Query names are intentionally not a
+closed JSON-schema enum: an adapter can expose another semantic fact without adding another
+top-level model tool. Standard queries cover symbols, references, incoming/outgoing calls,
+implementations, type supertypes/subtypes, diagnostics, hover, and semantic tokens. A query may
+be anchored by the current Codescope symbol, an exact symbol returned by `symbols`, or an
+explicit source position.
+
+The executor accepts anchors only from changed files inside the immutable current selection and
+returns repo-relative data only. Related locations may point elsewhere inside the repository and
+are marked `in_selection`; the language adapters already discard external URIs. Results are
+bounded by count and bytes and carry the repository epoch, explicit `worktree` revision,
+capability status, completeness, notes, and truncation. Unsupported capabilities are rejected
+before wire traffic, transport failures become `unavailable`, and repository refresh aborts the
+owning AI generation while the normal completion epoch gate rejects stale results.
+
+Symbols and relationships actually returned to the model are accumulated in an interior-mutable
+per-generation fact view shared with deterministic plan validation. A complete relationship
+query can therefore validate a returned edge (or prove another edge from the same covered
+direction absent); partial and failed queries remain `Unknown`. Git diff facts remain the sole
+authority for comparison-revision code references.
 
 ## Multi-server / multi-root
 

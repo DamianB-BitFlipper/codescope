@@ -50,7 +50,7 @@ pub use service::{
 };
 pub use tools::{
     diagram_tools, is_diagram_tool, is_read_only_tool, read_only_tools, research_tools,
-    NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
-    DIAGRAM_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
+    semantic_tools, NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
+    DIAGRAM_INSPECT_TOOL_NAME, LSP_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
 };
 pub use validator::{validate, FactView, Lookup, IMPACT_SUMMARY_MAX_BULLETS};

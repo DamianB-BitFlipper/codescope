@@ -14,6 +14,7 @@ use std::future::Future;
 
 use codescope_core::{
     Diagnostic, Evidence, FeatureSet, FileId, Location, Position, SymbolRef, SymbolTree,
+    SyntaxToken,
 };
 use codescope_lsp::SemanticError;
 
@@ -53,6 +54,30 @@ pub trait SemanticSource {
         content: &str,
     ) -> impl Future<Output = Result<Evidence<SymbolTree>, SemanticError>> + Send;
 
+    /// Semantic syntax tokens for the worktree content of `file`.
+    ///
+    /// The default lets scripted sources and adapters without highlighting support retain
+    /// their existing behavior without implementing a no-op query path.
+    fn semantic_tokens(
+        &self,
+        _file: &FileId,
+    ) -> impl Future<Output = Result<Evidence<Vec<SyntaxToken>>, SemanticError>> + Send {
+        std::future::ready(Err(SemanticError::Unsupported(
+            codescope_core::Feature::SemanticTokens,
+        )))
+    }
+
+    /// Semantic syntax tokens for exact snapshot `content` in a temporary overlay.
+    fn semantic_tokens_for_content(
+        &self,
+        _file: &FileId,
+        _content: &str,
+    ) -> impl Future<Output = Result<Evidence<Vec<SyntaxToken>>, SemanticError>> + Send {
+        std::future::ready(Err(SemanticError::Unsupported(
+            codescope_core::Feature::SemanticTokens,
+        )))
+    }
+
     /// Reference sites of the symbol at `pos` in `file`.
     fn references(
         &self,
@@ -80,6 +105,17 @@ pub trait SemanticSource {
         file: &FileId,
         pos: Position,
     ) -> impl Future<Output = Result<Evidence<Vec<SymbolRef>>, SemanticError>> + Send;
+
+    /// Supertypes of the type symbol at `pos` (`typeHierarchy/supertypes`).
+    fn type_supertypes(
+        &self,
+        _file: &FileId,
+        _pos: Position,
+    ) -> impl Future<Output = Result<Evidence<Vec<SymbolRef>>, SemanticError>> + Send {
+        std::future::ready(Err(SemanticError::Unsupported(
+            codescope_core::Feature::TypeHierarchySuper,
+        )))
+    }
 
     /// Subtypes of the type symbol at `pos` (`typeHierarchy/subtypes`); for a Go interface
     /// these are its implementers — used as a fallback when
@@ -124,6 +160,21 @@ impl SemanticSource for LanguageService {
         LanguageService::base_document_symbols(self, file, content).await
     }
 
+    async fn semantic_tokens(
+        &self,
+        file: &FileId,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        LanguageService::semantic_tokens(self, file).await
+    }
+
+    async fn semantic_tokens_for_content(
+        &self,
+        file: &FileId,
+        content: &str,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        LanguageService::semantic_tokens_for_content(self, file, content).await
+    }
+
     async fn references(
         &self,
         file: &FileId,
@@ -162,5 +213,13 @@ impl SemanticSource for LanguageService {
         pos: Position,
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
         LanguageService::type_subtypes(self, file, pos).await
+    }
+
+    async fn type_supertypes(
+        &self,
+        file: &FileId,
+        pos: Position,
+    ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
+        LanguageService::type_supertypes(self, file, pos).await
     }
 }

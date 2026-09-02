@@ -35,6 +35,7 @@ mod position;
 mod relation;
 mod semantic;
 mod status;
+mod syntax;
 mod viz;
 
 pub use diagram_draft::*;
@@ -48,4 +49,5 @@ pub use position::*;
 pub use relation::*;
 pub use semantic::*;
 pub use status::*;
+pub use syntax::*;
 pub use viz::*;

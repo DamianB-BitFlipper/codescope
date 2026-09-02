@@ -127,6 +127,8 @@ fn semantic_domain_roundtrips() {
         file: FileId::new("main.go").unwrap(),
         name: "(Greeter).Hello".to_string(),
         kind: SymbolKind::Method,
+        range: Some(LineRange::new(3, 0, 8, 1)),
+        selection: Some(LineRange::new(3, 5, 3, 10)),
     });
     roundtrip(&Location {
         file: FileId::new("main.go").unwrap(),

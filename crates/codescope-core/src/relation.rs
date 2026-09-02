@@ -184,6 +184,8 @@ pub enum Feature {
     Hover,
     /// `textDocument/publishDiagnostics` push notifications.
     PushDiagnostics,
+    /// `textDocument/semanticTokens/full` syntax classification.
+    SemanticTokens,
 }
 
 /// Whether the connected server supports a [`Feature`].

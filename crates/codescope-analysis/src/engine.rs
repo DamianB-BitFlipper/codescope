@@ -14,8 +14,9 @@
 //! dispatcher can drop stale snapshots at apply time (research 06).
 
 use codescope_core::{
-    ChangeScope, ChangeSet, ChangedSymbol, Diagnostic, Epoch, Evidence, FileChange, FileId,
-    FileStatus, HeadState, ImpactGraph, Position, RepoContext, SymbolRef, SymbolTree,
+    ChangeScope, ChangeSet, ChangedSymbol, Diagnostic, DiffSyntax, Epoch, Evidence, Feature,
+    FileChange, FileId, FileStatus, HeadState, ImpactGraph, Position, RepoContext, SymbolRef,
+    SymbolTree,
 };
 use codescope_git::GitRepo;
 
@@ -279,6 +280,104 @@ impl<S: SemanticSource> AnalysisEngine<S> {
         })
     }
 
+    /// Fetch optional semantic syntax tokens for both sides of one changed file.
+    ///
+    /// This is intentionally separate from [`Self::analyze_changed_file`]: the dispatcher
+    /// invokes it only for the visible diff, so opening a large repository does not issue two
+    /// additional LSP requests per changed file. Individual side failures degrade to an empty
+    /// token list and leave the ordinary diff renderer intact.
+    pub async fn diff_syntax(
+        &self,
+        fc: &FileChange,
+        scope: ChangeScope,
+        repo_ctx: &RepoContext,
+    ) -> DiffSyntax {
+        if fc.binary
+            || matches!(fc.status, FileStatus::Gitlink | FileStatus::Unmerged)
+            || !self.svc.features().is_supported(Feature::SemanticTokens)
+        {
+            return DiffSyntax::default();
+        }
+        let Ok(file) = FileId::new(fc.path.clone()) else {
+            return DiffSyntax::default();
+        };
+        if !self.svc.handles(&file) {
+            return DiffSyntax::default();
+        }
+
+        let mut new = match (fc.status, scope) {
+            (FileStatus::Deleted, _) => Vec::new(),
+            // These diff scopes compare committed/index snapshots, which may differ from
+            // the file on disk. Query an exact overlay so token line numbers match the diff.
+            (_, ChangeScope::Branch) => self.syntax_at_revision(&file, "HEAD", "new").await,
+            (_, ChangeScope::Staged) => self.syntax_at_revision(&file, ":0", "new").await,
+            (_, ChangeScope::Unstaged | ChangeScope::Working) => {
+                match self.svc.semantic_tokens(&file).await {
+                    Ok(tokens) => tokens.value,
+                    Err(error) => {
+                        tracing::debug!(%file, %error, "worktree syntax highlighting unavailable");
+                        Vec::new()
+                    }
+                }
+            }
+        };
+
+        let mut old = match base_revspec(scope, repo_ctx) {
+            Some(spec) if needs_base_syntax(fc) => {
+                let base_path = fc.old_path.as_deref().unwrap_or(&fc.path);
+                let base_file = FileId::new_unchecked(base_path.to_path_buf());
+                self.syntax_at_revision(&base_file, &spec, "old").await
+            }
+            _ => Vec::new(),
+        };
+
+        // Full-document replies can contain tens of thousands of tokens while a unified diff
+        // displays only a handful of lines. Trim once off the UI thread so cached snapshots and
+        // per-frame row indexing scale with the diff rather than with the source file.
+        let mut old_lines = std::collections::HashSet::new();
+        let mut new_lines = std::collections::HashSet::new();
+        for line in fc.hunks.iter().flat_map(|hunk| &hunk.lines) {
+            if let Some(line_number) = line.old_ln {
+                old_lines.insert(line_number.saturating_sub(1));
+            }
+            if let Some(line_number) = line.new_ln {
+                new_lines.insert(line_number.saturating_sub(1));
+            }
+        }
+        old.retain(|token| {
+            token.range.start_line == token.range.end_line
+                && old_lines.contains(&token.range.start_line)
+        });
+        new.retain(|token| {
+            token.range.start_line == token.range.end_line
+                && new_lines.contains(&token.range.start_line)
+        });
+
+        DiffSyntax { old, new }
+    }
+
+    async fn syntax_at_revision(
+        &self,
+        file: &FileId,
+        revision: &str,
+        side: &'static str,
+    ) -> Vec<codescope_core::SyntaxToken> {
+        match self.repo.base_file_content(revision, file.as_path()).await {
+            Ok(Some(content)) => match self.svc.semantic_tokens_for_content(file, &content).await {
+                Ok(tokens) => tokens.value,
+                Err(error) => {
+                    tracing::debug!(%file, %revision, side, %error, "syntax highlighting unavailable");
+                    Vec::new()
+                }
+            },
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                tracing::debug!(%file, %revision, side, %error, "source content unavailable for syntax highlighting");
+                Vec::new()
+            }
+        }
+    }
+
     /// Fetch trees and compute mappings for one file; semantic failures become notes.
     async fn analyse_file(
         &self,
@@ -442,6 +541,18 @@ fn needs_base_tree(fc: &FileChange) -> bool {
     }
 }
 
+/// Whether a unified diff can contain old-side source that benefits from highlighting.
+fn needs_base_syntax(fc: &FileChange) -> bool {
+    matches!(
+        fc.status,
+        FileStatus::Modified
+            | FileStatus::Deleted
+            | FileStatus::Renamed { .. }
+            | FileStatus::Copied { .. }
+            | FileStatus::TypeChanged
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +566,7 @@ mod tests {
 
     const MEMSTORE: &str = "internal/store/memstore.go";
     const HEALTH: &str = "internal/api/health.go";
+    const SERVICE: &str = "internal/service/service.go";
 
     fn node(id: &str, name: &str, kind: SymbolKind, start: u32, end: u32) -> SymbolNode {
         SymbolNode {
@@ -503,6 +615,7 @@ mod tests {
         features.set(Feature::CallHierarchyIncoming, Availability::Supported);
         features.set(Feature::CallHierarchyOutgoing, Availability::Supported);
         features.set(Feature::Implementation, Availability::Supported);
+        features.set(Feature::SemanticTokens, Availability::Supported);
         let mut svc = ScriptedSource {
             features,
             ..ScriptedSource::default()
@@ -516,6 +629,25 @@ mod tests {
             FileId::new("internal/store/memory.go").unwrap(),
             memstore_base(),
         );
+        let syntax_token = |line| codescope_core::SyntaxToken {
+            range: LineRange::new(line, 0, line, 7),
+            token_type: "keyword".to_string(),
+            modifiers: Vec::new(),
+        };
+        // Include one in-diff and one off-diff token for each file. The latter verifies that
+        // full-document LSP replies are trimmed before entering the UI cache.
+        svc.syntax.insert(
+            FileId::new(MEMSTORE).unwrap(),
+            vec![syntax_token(13), syntax_token(0)],
+        );
+        svc.overlay_syntax.insert(
+            FileId::new(MEMSTORE).unwrap(),
+            vec![syntax_token(13), syntax_token(0)],
+        );
+        svc.overlay_syntax.insert(
+            FileId::new(SERVICE).unwrap(),
+            vec![syntax_token(27), syntax_token(0)],
+        );
         // Callers of (MemoryRepo).Get (selection starts at 13:5).
         svc.incoming.insert(
             (FileId::new(MEMSTORE).unwrap(), Position::new(13, 5)),
@@ -523,6 +655,8 @@ mod tests {
                 file: FileId::new("internal/service/service.go").unwrap(),
                 name: "(Service).GetUser".to_string(),
                 kind: SymbolKind::Method,
+                range: None,
+                selection: None,
             }])),
         );
         // Callees of (MemoryRepo).Get (lazy expansion path).
@@ -532,6 +666,8 @@ mod tests {
                 file: FileId::new("internal/store/helpers.go").unwrap(),
                 name: "lookup".to_string(),
                 kind: SymbolKind::Function,
+                range: None,
+                selection: None,
             }])),
         );
         svc
@@ -621,11 +757,68 @@ mod tests {
         // The perf fix: refresh must not issue any call-hierarchy requests at all.
         assert_eq!(engine.svc().calls_of("incoming_calls"), 0);
         assert_eq!(engine.svc().calls_of("outgoing_calls"), 0);
+        assert_eq!(
+            engine.svc().calls_of("semantic_tokens"),
+            0,
+            "repository-wide analysis must not prefetch highlighting"
+        );
 
         // Digest builds from the snapshot and mentions the changed symbol.
         let digest = snap.digest();
         assert!(digest.render().contains("(MemoryRepo).Get"));
         assert_eq!(digest.scope, ChangeScope::Unstaged);
+    }
+
+    #[tokio::test]
+    async fn diff_syntax_fetches_old_and_new_only_when_explicitly_requested() {
+        let (_tmp, engine) = fixture_engine().await;
+        let changeset = engine
+            .repo()
+            .changeset(ChangeScope::Unstaged)
+            .await
+            .expect("changeset");
+        let changed_file = changeset
+            .find_file(camino::Utf8Path::new(MEMSTORE))
+            .expect("fixture file");
+        let repo_ctx = engine.repo().repo_context().await.expect("repo context");
+
+        let syntax = engine
+            .diff_syntax(changed_file, ChangeScope::Unstaged, &repo_ctx)
+            .await;
+        assert_eq!(syntax.new.len(), 1);
+        assert_eq!(syntax.old.len(), 1);
+        assert_eq!(engine.svc().calls_of("semantic_tokens"), 1);
+        assert_eq!(engine.svc().calls_of("semantic_tokens_for_content"), 1);
+    }
+
+    #[tokio::test]
+    async fn staged_diff_syntax_queries_index_and_head_overlays_not_the_worktree() {
+        let (_tmp, engine) = fixture_engine().await;
+        let changeset = engine
+            .repo()
+            .changeset(ChangeScope::Staged)
+            .await
+            .expect("changeset");
+        let changed_file = changeset
+            .find_file(camino::Utf8Path::new(SERVICE))
+            .expect("staged modified file");
+        let repo_ctx = engine.repo().repo_context().await.expect("repo context");
+
+        let syntax = engine
+            .diff_syntax(changed_file, ChangeScope::Staged, &repo_ctx)
+            .await;
+        assert_eq!(syntax.new.len(), 1, "new side comes from the index overlay");
+        assert_eq!(syntax.old.len(), 1, "old side comes from the HEAD overlay");
+        assert_eq!(
+            engine.svc().calls_of("semantic_tokens_for_content"),
+            2,
+            "index/new and HEAD/old both use exact-content overlays"
+        );
+        assert_eq!(
+            engine.svc().calls_of("semantic_tokens"),
+            0,
+            "staged highlighting must not read worktree syntax"
+        );
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use std::time::Duration;
 use camino::{Utf8Path, Utf8PathBuf};
 use codescope_core::{
     Diagnostic, Evidence, FeatureSet, FileId, Location, Position, Revision, SymbolKind, SymbolNode,
-    SymbolRef, SymbolTree,
+    SymbolRef, SymbolTree, SyntaxToken,
 };
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -31,6 +31,10 @@ use crate::detect::rust_project_root;
 use crate::encoding::{line_at, position_from_wire, position_to_wire, PositionEncoding};
 use crate::error::{LspError, SemanticError};
 use crate::options::LanguageServiceOptions;
+use crate::semantic_tokens::{
+    client_capability as semantic_tokens_capability, decode as decode_semantic_tokens,
+    legend_from_capabilities, SemanticTokenLegend,
+};
 use crate::uri::{path_from_uri, uri_from_path};
 
 /// Deadline for the very first request (rust-analyzer loads the workspace eagerly).
@@ -56,6 +60,8 @@ pub struct RustAnalyzerService {
     cargo_root: Utf8PathBuf,
     features: FeatureSet,
     encoding: PositionEncoding,
+    /// Server-specific index-to-name mapping negotiated for semantic tokens.
+    semantic_token_legend: Option<SemanticTokenLegend>,
     /// Open document versions and content identities by absolute path.
     documents: Mutex<HashMap<Utf8PathBuf, OpenDocumentState>>,
     /// Content-addressed symbol trees survive repository epochs without becoming stale.
@@ -94,6 +100,7 @@ impl RustAnalyzerService {
         let client = LspClient::spawn(command, "rust-analyzer")?;
 
         let root_uri = uri_from_path(&cargo_root)?;
+        let semantic_tokens = semantic_tokens_capability();
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri.as_str(),
@@ -104,7 +111,8 @@ impl RustAnalyzerService {
                     "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                     "callHierarchy": { "dynamicRegistration": false },
                     "typeHierarchy": { "dynamicRegistration": false },
-                    "publishDiagnostics": { "relatedInformation": true }
+                    "publishDiagnostics": { "relatedInformation": true },
+                    "semanticTokens": semantic_tokens
                 },
                 "workspace": { "workspaceFolders": true, "symbol": {} }
             },
@@ -115,6 +123,13 @@ impl RustAnalyzerService {
             .await?;
         let _ = parse_text_document_sync(&init["capabilities"]);
         let mut features = resolve_features(&init["capabilities"])?;
+        let semantic_token_legend = legend_from_capabilities(&init["capabilities"]);
+        if semantic_token_legend.is_none() {
+            features.set(
+                codescope_core::Feature::SemanticTokens,
+                codescope_core::Availability::Unsupported,
+            );
+        }
         features.set(
             codescope_core::Feature::PushDiagnostics,
             codescope_core::Availability::Supported,
@@ -130,6 +145,7 @@ impl RustAnalyzerService {
             cargo_root,
             features,
             encoding,
+            semantic_token_legend,
             documents: Mutex::new(HashMap::new()),
             symbol_cache: Mutex::new(SymbolTreeCache::default()),
             request_count: AtomicU64::new(0),
@@ -263,7 +279,9 @@ impl RustAnalyzerService {
         let Ok(uri) = uri_from_path(&abs) else {
             return Vec::new();
         };
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
+        let Ok(text) = std::fs::read_to_string(&abs) else {
+            return Vec::new();
+        };
         self.client
             .diagnostics(uri.as_str())
             .iter()
@@ -392,6 +410,88 @@ impl RustAnalyzerService {
             .await
             .insert(abs, Revision::Base, base_hash, tree.clone());
         Ok(tree)
+    }
+
+    /// Semantic syntax tokens for the current worktree content of `file`.
+    #[tracing::instrument(err, skip(self))]
+    pub async fn semantic_tokens(
+        &self,
+        file: &FileId,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        require(&self.features, codescope_core::Feature::SemanticTokens)?;
+        let legend = self
+            .semantic_token_legend
+            .as_ref()
+            .ok_or(SemanticError::Unsupported(
+                codescope_core::Feature::SemanticTokens,
+            ))?;
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let result = self
+            .client
+            .request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri.as_str() } }),
+                self.timeout(),
+            )
+            .await?;
+        Ok(Evidence::complete(decode_semantic_tokens(
+            result,
+            &snapshot.text,
+            self.encoding,
+            legend,
+        )?))
+    }
+
+    /// Semantic syntax tokens for exact snapshot `content` in a temporary overlay.
+    #[tracing::instrument(err, skip(self, content))]
+    pub async fn semantic_tokens_for_content(
+        &self,
+        file: &FileId,
+        content: &str,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        require(&self.features, codescope_core::Feature::SemanticTokens)?;
+        let legend = self
+            .semantic_token_legend
+            .as_ref()
+            .ok_or(SemanticError::Unsupported(
+                codescope_core::Feature::SemanticTokens,
+            ))?;
+        let abs = self.abs_path(file);
+        let base_hash = xxhash_rust::xxh3::xxh3_64(content.as_bytes());
+        let was_open = self.documents.lock().await.contains_key(&abs);
+        let disk = if was_open {
+            std::fs::read_to_string(&abs)
+                .ok()
+                .map(|text| DocumentSnapshot::new(abs.clone(), text))
+        } else {
+            None
+        };
+        self.sync_content(&abs, content, base_hash).await?;
+        let uri = uri_from_path(&abs)?;
+        let result = self
+            .client
+            .request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri.as_str() } }),
+                self.timeout(),
+            )
+            .await;
+        let restore = match (was_open, &disk) {
+            (true, Some(snapshot)) => self
+                .sync_content(&abs, &snapshot.text, snapshot.hash)
+                .await
+                .map(|_| ()),
+            _ => self.close(&abs).await,
+        };
+        let result = result?;
+        restore?;
+        Ok(Evidence::complete(decode_semantic_tokens(
+            result,
+            content,
+            self.encoding,
+            legend,
+        )?))
     }
 
     fn symbol_tree(
@@ -609,6 +709,19 @@ impl RustAnalyzerService {
         Ok(Evidence::complete(refs))
     }
 
+    /// Supertypes of the type symbol at `pos`.
+    ///
+    /// rust-analyzer currently advertises no `typeHierarchy` provider, so this is gated
+    /// without wire traffic. A future advertised-but-not-yet-adapted response remains Unknown.
+    pub async fn type_supertypes(
+        &self,
+        _file: &FileId,
+        _pos: Position,
+    ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
+        require(&self.features, codescope_core::Feature::TypeHierarchySuper)?;
+        Ok(Evidence::unknown(Vec::new()))
+    }
+
     /// Subtypes of the type symbol at `pos`.
     ///
     /// rust-analyzer advertises no `typeHierarchy` provider, so this is gated to
@@ -684,7 +797,7 @@ impl RustAnalyzerService {
     fn location_from_wire(&self, loc: lsp_types::Location) -> Option<Location> {
         let abs = path_from_uri(&loc.uri).ok()?;
         let file = self.file_id(&abs)?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
+        let text = std::fs::read_to_string(&abs).ok()?;
         Some(Location {
             file,
             range: self.range_from_wire(&text, loc.range),
@@ -694,10 +807,13 @@ impl RustAnalyzerService {
     fn call_item_to_ref(&self, item: lsp_types::CallHierarchyItem) -> Option<SymbolRef> {
         let abs = path_from_uri(&item.uri).ok()?;
         let file = self.file_id(&abs)?;
+        let text = std::fs::read_to_string(&abs).ok()?;
         Some(SymbolRef {
             file,
             name: item.name,
             kind: SymbolKind::from(item.kind),
+            range: Some(self.range_from_wire(&text, item.range)),
+            selection: Some(self.range_from_wire(&text, item.selection_range)),
         })
     }
 
@@ -715,6 +831,8 @@ impl RustAnalyzerService {
                     file: location.file,
                     name: format!("{}:{}", location.range.start_line, location.range.start_col),
                     kind: SymbolKind::Unknown,
+                    range: Some(location.range),
+                    selection: None,
                 });
             }
         };
@@ -732,12 +850,17 @@ impl RustAnalyzerService {
                         Err(_) => continue,
                     };
                     if let Some(file) = self.file_id(&abs) {
-                        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-                        let range = self.range_from_wire(&text, l.target_selection_range);
+                        let Ok(text) = std::fs::read_to_string(&abs) else {
+                            continue;
+                        };
+                        let range = self.range_from_wire(&text, l.target_range);
+                        let selection = self.range_from_wire(&text, l.target_selection_range);
                         out.push(SymbolRef {
                             file,
-                            name: format!("{}:{}", range.start_line, range.start_col),
+                            name: format!("{}:{}", selection.start_line, selection.start_col),
                             kind: SymbolKind::Unknown,
+                            range: Some(range),
+                            selection: Some(selection),
                         });
                     }
                 }

@@ -6,6 +6,7 @@ codescope opens a repository and answers, at a glance:
 
 - **What changed** on this branch (staged, unstaged, or branch-vs-base)
 - **Which functions, methods, and types** contain those changes
+- **Syntax-highlighted old and new diff lines** when the file's language server supports them
 - **What calls them and what they call** (from a real language server, not guesswork)
 - **How the AI thinks the change is best explained** — clearly marked as interpretation
 - **What's verified and what's approximate**
@@ -90,7 +91,9 @@ credential variable requires an explicit `base_url` so its value is never sent t
 guessed endpoint.
 
 Open a Go repository with uncommitted or branch changes. The left pane lists changed files
-and the symbols inside them; the center shows a focused diff. The combined Impact pane
+and the symbols inside them; the center shows a focused diff. Syntax colors arrive
+asynchronously from the language server for the visible file and fall back silently to the plain
+diff when unavailable. The combined Impact pane
 stacks the selected change, callers, and downstream relationships on the left and keeps
 the generated selection breakdown visible on the right. Every structural boundary is
 draggable: files/diff, work/review, relationships/generated, selected/callers, and
@@ -207,7 +210,13 @@ substantial; current repository facts are always revalidated and win over cached
 Only the current directory, file, or function is sent for AI generation, after a 250 ms selection
 debounce; there is no prompt prefetch or background generation. The first turn is a small research
 brief rather than a source dump. A bounded agentic loop can list the selection, read sections of
-changed files, search changed files, and inspect captured per-file Git status/diffs. These tools
+changed files, search changed files, inspect captured per-file Git status/diffs, and explore the
+active language server through `inspect_language_server`. That capability-discoverable tool can
+anchor queries at the current symbol, an exact symbol name, or a source position and returns
+symbols, references, callers/callees, implementations, type relationships, diagnostics, hover,
+and semantic tokens when supported by the active adapter. Every response identifies its epoch,
+worktree revision, completeness, notes, and truncation; facts actually returned by relationship
+queries join the validator's evidence catalog for that generation. These tools
 use a virtual cwd; file tools also accept exact repo-relative paths or an unambiguous repo-path suffix.
 They reject absolute paths and `..`, cannot execute commands or leave the selection, and return
 capped results. A plan is accepted only after at least one research call succeeds.

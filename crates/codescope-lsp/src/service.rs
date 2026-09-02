@@ -12,6 +12,7 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use codescope_core::{
     Diagnostic, Evidence, FeatureSet, FileId, Location, Position, SymbolRef, SymbolTree,
+    SyntaxToken,
 };
 
 use crate::detect::{detect_languages, Language};
@@ -132,6 +133,29 @@ impl LanguageService {
         }
     }
 
+    /// Semantic syntax tokens for the current worktree content of `file`.
+    pub async fn semantic_tokens(
+        &self,
+        file: &FileId,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        match self {
+            LanguageService::Gopls(s) => s.semantic_tokens(file).await,
+            LanguageService::RustAnalyzer(s) => s.semantic_tokens(file).await,
+        }
+    }
+
+    /// Semantic syntax tokens for exact snapshot `content` opened as a temporary overlay.
+    pub async fn semantic_tokens_for_content(
+        &self,
+        file: &FileId,
+        content: &str,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        match self {
+            LanguageService::Gopls(s) => s.semantic_tokens_for_content(file, content).await,
+            LanguageService::RustAnalyzer(s) => s.semantic_tokens_for_content(file, content).await,
+        }
+    }
+
     /// Reference sites of the symbol at `pos` in `file`.
     pub async fn references(
         &self,
@@ -181,6 +205,18 @@ impl LanguageService {
         }
     }
 
+    /// Supertypes of the type symbol at `pos` (`typeHierarchy/supertypes`).
+    pub async fn type_supertypes(
+        &self,
+        file: &FileId,
+        pos: Position,
+    ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
+        match self {
+            LanguageService::Gopls(s) => s.type_supertypes(file, pos).await,
+            LanguageService::RustAnalyzer(s) => s.type_supertypes(file, pos).await,
+        }
+    }
+
     /// Subtypes of the type symbol at `pos` (`typeHierarchy/subtypes`).
     pub async fn type_subtypes(
         &self,
@@ -195,17 +231,13 @@ impl LanguageService {
 
     /// Hover text for the symbol at `pos` in `file`.
     ///
-    /// Note: the gopls adapter currently does not expose hover, so the Gopls variant
-    /// returns [`SemanticError::Unsupported`].
     pub async fn hover(
         &self,
         file: &FileId,
         pos: Position,
     ) -> Result<Option<String>, SemanticError> {
         match self {
-            LanguageService::Gopls(_) => {
-                Err(SemanticError::Unsupported(codescope_core::Feature::Hover))
-            }
+            LanguageService::Gopls(s) => s.hover(file, pos).await,
             LanguageService::RustAnalyzer(s) => s.hover(file, pos).await,
         }
     }

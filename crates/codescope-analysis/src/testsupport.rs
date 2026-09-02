@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use codescope_core::{
     Diagnostic, Evidence, FeatureSet, FileId, Location, Position, SymbolRef, SymbolTree,
+    SyntaxToken,
 };
 use codescope_lsp::{LspError, SemanticError};
 
@@ -39,6 +40,8 @@ pub(crate) struct ScriptedSource {
     pub features: FeatureSet,
     pub trees: HashMap<FileId, SymbolTree>,
     pub base_trees: HashMap<FileId, SymbolTree>,
+    pub syntax: HashMap<FileId, Vec<SyntaxToken>>,
+    pub overlay_syntax: HashMap<FileId, Vec<SyntaxToken>>,
     pub diags: HashMap<FileId, Vec<Diagnostic>>,
     pub incoming: HashMap<Key, Reply>,
     pub outgoing: HashMap<Key, Reply>,
@@ -60,7 +63,7 @@ impl ScriptedSource {
             .lock()
             .expect("calls mutex")
             .iter()
-            .filter(|c| c.starts_with(method))
+            .filter(|call| call.split_once(' ').is_some_and(|(name, _)| name == method))
             .count()
     }
 
@@ -106,6 +109,27 @@ impl SemanticSource for ScriptedSource {
             Some(tree) => Ok(Evidence::complete(tree.clone())),
             None => Err(SemanticError::NoRoot(file.as_path().to_path_buf())),
         }
+    }
+
+    async fn semantic_tokens(
+        &self,
+        file: &FileId,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        self.record("semantic_tokens", file, Position::new(0, 0));
+        Ok(Evidence::complete(
+            self.syntax.get(file).cloned().unwrap_or_default(),
+        ))
+    }
+
+    async fn semantic_tokens_for_content(
+        &self,
+        file: &FileId,
+        _content: &str,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        self.record("semantic_tokens_for_content", file, Position::new(0, 0));
+        Ok(Evidence::complete(
+            self.overlay_syntax.get(file).cloned().unwrap_or_default(),
+        ))
     }
 
     async fn references(

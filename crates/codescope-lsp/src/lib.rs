@@ -36,6 +36,7 @@ pub mod gopls;
 pub mod jsonrpc;
 pub mod options;
 pub mod rust_analyzer;
+mod semantic_tokens;
 pub mod service;
 pub mod uri;
 

@@ -422,6 +422,12 @@ pub struct SymbolRef {
     pub name: String,
     /// Language-neutral kind.
     pub kind: SymbolKind,
+    /// Full source extent when the language-server response carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<LineRange>,
+    /// Identifier-only source range, suitable for a follow-up semantic query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<LineRange>,
 }
 
 impl fmt::Display for SymbolRef {

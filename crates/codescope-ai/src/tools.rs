@@ -20,6 +20,8 @@ pub const MAX_TOOL_CALLS: u32 = 48;
 pub const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
 /// Read the complete in-progress diagram draft.
 pub const DIAGRAM_INSPECT_TOOL_NAME: &str = "inspect_visualization";
+/// Inspect language-server facts rooted at the current changed-file selection.
+pub const LSP_INSPECT_TOOL_NAME: &str = "inspect_language_server";
 
 /// One tool definition in OpenAI tool-calling format.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -252,17 +254,261 @@ pub fn research_tools() -> Vec<ToolDef> {
     ]
 }
 
+/// Language-neutral semantic research available from the active language-server adapter.
+///
+/// One operation-discriminated tool keeps the provider prompt compact while allowing new
+/// adapters and semantic query kinds to be added without multiplying top-level tools.
+#[must_use]
+pub fn semantic_tools() -> Vec<ToolDef> {
+    vec![ToolDef {
+        name: LSP_INSPECT_TOOL_NAME,
+        description: "Explore bounded, read-only language-server facts for the current selection. Use capabilities to discover query names supported by the active adapter. Inspection can be anchored by the current Codescope selection, an exact symbol copied from a symbols result, or an explicit source position. Standard queries include symbols, references, callers, callees, implementations, supertypes, subtypes, diagnostics, hover, and semantic_tokens; future adapters may advertise more without changing this tool. Results identify worktree revision, epoch, completeness, truncation, and unavailable/unsupported states. Paths follow the same virtual-cwd rules as the Git tools."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Capability-discoverable semantic fact family. Start with capabilities rather than assuming a fixed query set."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional selected changed-file path, relative to the virtual cwd or copied from repo_path. Required for symbols and when there is no current file/symbol selection."
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Optional exact symbol name copied from a symbols result."
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional one-based source line for position-oriented inspection."
+                },
+                "column": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional zero-based UTF-8 byte column; defaults to 0 when line is supplied."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 20,
+                    "description": "Maximum returned facts; byte limits may truncate earlier."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    }]
+}
+
 /// Incremental diagram tools. `edit_visualization` accepts the same tagged command JSON as
 /// the live `codescope agent diagram apply` controller endpoint.
 #[must_use]
 pub fn diagram_tools() -> Vec<ToolDef> {
+    let form_id = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Existing stable form id, normally `main`. Create it first with create_form."
+        })
+    };
+    let node_id = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Plan-local box id such as `n1`."
+        })
+    };
+    let edge_endpoint = || {
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Existing node id in the specified form."
+        })
+    };
+
+    let variants = vec![
+        diagram_command_variant(
+            "reset",
+            "Clear the draft while preserving the server-owned epoch.",
+            Vec::new(),
+            &[],
+            json!({"op": "reset"}),
+        ),
+        diagram_command_variant(
+            "set_intent",
+            "Set the single reviewer-facing sentence displayed above the diagram.",
+            vec![(
+                "intent",
+                json!({
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "description": "One concrete sentence describing the behavior shown by the diagram."
+                }),
+            )],
+            &["intent"],
+            json!({
+                "op": "set_intent",
+                "intent": "Start the API service and route requests through its initialized dependencies."
+            }),
+        ),
+        diagram_command_variant(
+            "create_form",
+            "Create an empty renderer-native form before adding its nodes.",
+            vec![
+                (
+                    "form_id",
+                    json!({
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "New stable form id, normally `main`."
+                    }),
+                ),
+                ("kind", diagram_form_kind_schema()),
+            ],
+            &["form_id", "kind"],
+            json!({"op": "create_form", "form_id": "main", "kind": "sequence"}),
+        ),
+        diagram_command_variant(
+            "delete_form",
+            "Delete one existing form and all of its nodes and edges.",
+            vec![("form_id", form_id())],
+            &["form_id"],
+            json!({"op": "delete_form", "form_id": "main"}),
+        ),
+        diagram_command_variant(
+            "create_node",
+            "Create one complete box in an existing form. `change` is a string enum; `hint.highlight` and `hint.collapsed` are booleans.",
+            vec![("form_id", form_id()), ("node", diagram_node_schema())],
+            &["form_id", "node"],
+            json!({
+                "op": "create_node",
+                "form_id": "main",
+                "node": {
+                    "id": "n1",
+                    "label": "Start API service",
+                    "detail": "Constructs and starts the HTTP server",
+                    "code_refs": [{
+                        "file": "cmd/api/main.go",
+                        "hunk": 0,
+                        "side": "new",
+                        "start_line": 18,
+                        "end_line": 22
+                    }],
+                    "change": "added",
+                    "hint": {"highlight": true, "collapsed": false}
+                }
+            }),
+        ),
+        diagram_command_variant(
+            "update_node",
+            "Replace or explicitly clear selected fields on an existing box.",
+            vec![
+                ("form_id", form_id()),
+                ("node_id", node_id()),
+                ("patch", diagram_node_patch_schema()),
+            ],
+            &["form_id", "node_id", "patch"],
+            json!({
+                "op": "update_node",
+                "form_id": "main",
+                "node_id": "n1",
+                "patch": {"detail": "Starts the configured HTTP listener", "clear_expanded_detail": true}
+            }),
+        ),
+        diagram_command_variant(
+            "delete_node",
+            "Delete one existing box, its edges, and child references.",
+            vec![("form_id", form_id()), ("node_id", node_id())],
+            &["form_id", "node_id"],
+            json!({"op": "delete_node", "form_id": "main", "node_id": "n1"}),
+        ),
+        diagram_command_variant(
+            "create_edge",
+            "Create one labeled, directed relationship between existing boxes.",
+            vec![("form_id", form_id()), ("edge", diagram_edge_schema())],
+            &["form_id", "edge"],
+            json!({
+                "op": "create_edge",
+                "form_id": "main",
+                "edge": {"from": "n1", "to": "n2", "kind": "calls", "label": "starts listener"}
+            }),
+        ),
+        diagram_command_variant(
+            "update_edge",
+            "Patch an existing relationship selected by its current source and target ids.",
+            vec![
+                ("form_id", form_id()),
+                ("from", edge_endpoint()),
+                ("to", edge_endpoint()),
+                ("patch", diagram_edge_patch_schema()),
+            ],
+            &["form_id", "from", "to", "patch"],
+            json!({
+                "op": "update_edge",
+                "form_id": "main",
+                "from": "n1",
+                "to": "n2",
+                "patch": {"label": "passes initialized service"}
+            }),
+        ),
+        diagram_command_variant(
+            "delete_edge",
+            "Delete an existing relationship selected by its current source and target ids.",
+            vec![
+                ("form_id", form_id()),
+                ("from", edge_endpoint()),
+                ("to", edge_endpoint()),
+            ],
+            &["form_id", "from", "to"],
+            json!({"op": "delete_edge", "form_id": "main", "from": "n1", "to": "n2"}),
+        ),
+        diagram_command_variant(
+            "add_evidence",
+            "Append one exact source citation supporting claims in the diagram.",
+            vec![("evidence", diagram_evidence_schema())],
+            &["evidence"],
+            json!({
+                "op": "add_evidence",
+                "evidence": {
+                    "file": "cmd/api/main.go",
+                    "hunk": 0,
+                    "reason": "The added lines construct and start the API server."
+                }
+            }),
+        ),
+        diagram_command_variant(
+            "delete_evidence",
+            "Delete one evidence item by the current zero-based index returned by inspect_visualization.",
+            vec![(
+                "index",
+                json!({
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Current zero-based evidence index."
+                }),
+            )],
+            &["index"],
+            json!({"op": "delete_evidence", "index": 0}),
+        ),
+    ];
+
     vec![
         ToolDef {
             name: DIAGRAM_EDIT_TOOL_NAME,
-            description: "Apply one atomic renderer-native diagram command. Build the answer incrementally: set intent, create a form, create/update/delete boxes and edges, then add exact evidence. The `op` and remaining arguments are exactly the same JSON accepted by `codescope agent diagram apply`. Use inspect_visualization whenever you need the current ids/state.".into(),
+            description: "Apply exactly one atomic diagram command. Choose the operation-specific schema branch matching `op`; every branch lists its complete required fields, nested types, and a valid example. Build in this order: set_intent, create_form, create_node, create_edge, add_evidence. For create_node, pass `form_id` beside `node`; use `change: \"added\"|...` and only booleans inside `hint`. The arguments are the same JSON accepted by `codescope agent diagram apply`. Use inspect_visualization when ids or current state are uncertain.".into(),
             parameters: json!({
                 "type": "object",
-                "description": "One DiagramCommand. Required fields depend on op. Nodes are complete PlanNode objects; edges are complete PlanEdge objects. Update patches contain only replacement fields plus clear_* booleans.",
+                "description": "A discriminated union of DiagramCommand objects. Exactly one `oneOf` branch must match the selected `op`.",
                 "properties": {
                     "op": {
                         "type": "string",
@@ -270,49 +516,10 @@ pub fn diagram_tools() -> Vec<ToolDef> {
                                  "create_node", "update_node", "delete_node", "create_edge",
                                  "update_edge", "delete_edge", "add_evidence", "delete_evidence"],
                         "description": "Atomic edit operation."
-                    },
-                    "intent": {"type": "string", "description": "set_intent: the one concrete sentence displayed above the diagram."},
-                    "form_id": {"type": "string", "description": "Stable editor id such as main; not displayed."},
-                    "kind": {"type": "string", "enum": ["changed_symbol_tree", "call_tree", "type_impl_tree", "relationship_flow", "before_after", "sequence"]},
-                    "node_id": {"type": "string", "description": "Existing plan-local node id for update/delete."},
-                    "node": {
-                        "type": "object",
-                        "description": "create_node: complete box. Required: id, label, detail, code_refs. Optional: entity, expanded_detail, change, severity, children, hint. code_refs contain file, zero-based hunk, old|new side, and one-based start_line/end_line.",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "entity": {"type": "object"},
-                            "label": {"type": "string"},
-                            "detail": {"type": "string"},
-                            "expanded_detail": {"type": "string"},
-                            "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "object"}},
-                            "change": {"type": "string", "enum": ["added", "modified", "removed", "unchanged", "diagnostic"]},
-                            "severity": {"type": "string"},
-                            "children": {"type": "array", "items": {"type": "string"}},
-                            "hint": {"type": "object"}
-                        },
-                        "required": ["id", "label", "detail", "code_refs"],
-                        "additionalProperties": false
-                    },
-                    "patch": {"type": "object", "description": "update_node or update_edge replacement fields. Node patches support label, detail, expanded_detail, entity, code_refs, change, severity, children, hint and clear_detail/clear_expanded_detail/clear_entity/clear_severity. Edge patches support from, to, kind, label, clear_label."},
-                    "edge": {
-                        "type": "object",
-                        "description": "create_edge: directed relationship with from, to, kind, and a specific label.",
-                        "properties": {
-                            "from": {"type": "string"},
-                            "to": {"type": "string"},
-                            "kind": {"type": "string", "enum": ["calls", "imports", "implements", "contains", "reads", "writes"]},
-                            "label": {"type": "string"}
-                        },
-                        "required": ["from", "to", "kind", "label"],
-                        "additionalProperties": false
-                    },
-                    "from": {"type": "string", "description": "Existing edge source for update/delete."},
-                    "to": {"type": "string", "description": "Existing edge target for update/delete."},
-                    "evidence": {"type": "object", "description": "add_evidence: exact citation with file, optional zero-based hunk/symbol/range, and reason."},
-                    "index": {"type": "integer", "minimum": 0, "description": "delete_evidence: current zero-based index."}
+                    }
                 },
                 "required": ["op"],
-                "additionalProperties": false
+                "oneOf": variants
             }),
         },
         ToolDef {
@@ -328,12 +535,236 @@ pub fn diagram_tools() -> Vec<ToolDef> {
     ]
 }
 
+fn diagram_command_variant(
+    op: &str,
+    description: &str,
+    fields: Vec<(&str, Value)>,
+    required_fields: &[&str],
+    example: Value,
+) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "op".to_string(),
+        json!({
+            "const": op,
+            "description": format!("Selects the `{op}` command.")
+        }),
+    );
+    for (name, schema) in fields {
+        properties.insert(name.to_string(), schema);
+    }
+    let mut required = vec!["op"];
+    required.extend_from_slice(required_fields);
+    json!({
+        "title": op,
+        "description": description,
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+        "examples": [example]
+    })
+}
+
+fn diagram_form_kind_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["changed_symbol_tree", "call_tree", "type_impl_tree", "relationship_flow", "before_after", "sequence"],
+        "description": "Renderer-owned layout grammar. Use sequence for chronological steps, relationship_flow for topology, a tree kind for hierarchy, and before_after only for two literal states."
+    })
+}
+
+fn diagram_line_range_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Exact zero-based UTF-8 source range copied from a semantic tool result.",
+        "properties": {
+            "start_line": {"type": "integer", "minimum": 0},
+            "start_col": {"type": "integer", "minimum": 0},
+            "end_line": {"type": "integer", "minimum": 0},
+            "end_col": {"type": "integer", "minimum": 0}
+        },
+        "required": ["start_line", "start_col", "end_line", "end_col"],
+        "additionalProperties": false
+    })
+}
+
+fn diagram_entity_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Optional exact fact-store identity. Omit this entire object for a presentational node; never invent symbol or range values.",
+        "properties": {
+            "file": {"type": "string", "minLength": 1, "description": "Exact repo-relative file returned by a research tool."},
+            "symbol": {"type": "string", "minLength": 1, "description": "Exact symbol name returned by a semantic tool."},
+            "range": diagram_line_range_schema()
+        },
+        "required": ["file"],
+        "additionalProperties": false
+    })
+}
+
+fn diagram_code_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Exact changed-line citation copied from git_diff_file. Hunk is zero-based; source lines are one-based and inclusive.",
+        "properties": {
+            "file": {"type": "string", "minLength": 1, "description": "Exact repo_path from git_diff_file."},
+            "hunk": {"type": "integer", "minimum": 0, "description": "Zero-based hunk index."},
+            "side": {"type": "string", "enum": ["old", "new"], "description": "Use old for removed lines and new for added/post-change lines."},
+            "start_line": {"type": "integer", "minimum": 1, "description": "First one-based source line, inclusive."},
+            "end_line": {"type": "integer", "minimum": 1, "description": "Last one-based source line, inclusive."}
+        },
+        "required": ["file", "hunk", "side", "start_line", "end_line"],
+        "additionalProperties": false
+    })
+}
+
+fn diagram_hint_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Presentation flags only. Both values are booleans; change badges such as `added` or `removed` belong in node.change, never here.",
+        "properties": {
+            "highlight": {"type": "boolean", "description": "Visually emphasize this box."},
+            "collapsed": {"type": "boolean", "description": "Initially render this box collapsed."}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn diagram_node_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One complete renderer box. All four required fields must be present. `change` is a string; values inside `hint` are booleans.",
+        "properties": {
+            "id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "New plan-local id such as n1."},
+            "entity": diagram_entity_schema(),
+            "label": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Short identifier or action displayed as the box title."},
+            "detail": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "Required concrete reviewer-facing preview; keep it to at most 8 words and 56 characters."},
+            "expanded_detail": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "Optional self-contained deeper explanation shown in the box inspector."},
+            "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": diagram_code_ref_schema(), "description": "One or two exact changed-line references."},
+            "change": {"type": "string", "enum": ["added", "modified", "removed", "unchanged", "diagnostic"], "description": "Optional change badge string."},
+            "severity": {"type": "string", "enum": ["error", "warning", "information", "hint"], "description": "Optional diagnostic severity badge."},
+            "children": {"type": "array", "maxItems": 12, "items": {"type": "string", "minLength": 1}, "description": "Child node ids for tree forms only."},
+            "hint": diagram_hint_schema()
+        },
+        "required": ["id", "label", "detail", "code_refs"],
+        "additionalProperties": false
+    })
+}
+
+fn diagram_node_patch_schema() -> Value {
+    json!({
+        "type": "object",
+        "minProperties": 1,
+        "description": "Node-only patch. Supply replacement values or a clear_* boolean; omitted fields stay unchanged.",
+        "properties": {
+            "label": {"type": "string", "minLength": 1, "maxLength": 512},
+            "detail": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "clear_detail": {"type": "boolean", "description": "Set true to remove detail; do not pass a string."},
+            "expanded_detail": {"type": "string", "minLength": 1, "maxLength": 4000},
+            "clear_expanded_detail": {"type": "boolean", "description": "Set true to remove expanded_detail; do not pass a string."},
+            "entity": diagram_entity_schema(),
+            "clear_entity": {"type": "boolean", "description": "Set true to remove entity; do not pass a string."},
+            "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": diagram_code_ref_schema()},
+            "change": {"type": "string", "enum": ["added", "modified", "removed", "unchanged", "diagnostic"]},
+            "severity": {"type": "string", "enum": ["error", "warning", "information", "hint"]},
+            "clear_severity": {"type": "boolean", "description": "Set true to remove severity; do not pass a string."},
+            "children": {"type": "array", "maxItems": 12, "items": {"type": "string", "minLength": 1}},
+            "hint": diagram_hint_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn diagram_edge_kind_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["calls", "imports", "implements", "contains", "reads", "writes"],
+        "description": "Typed directed relationship. Semantic kinds must be supported by research evidence."
+    })
+}
+
+fn diagram_edge_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Complete directed relationship between two existing node ids.",
+        "properties": {
+            "from": {"type": "string", "minLength": 1, "maxLength": 128},
+            "to": {"type": "string", "minLength": 1, "maxLength": 128},
+            "kind": diagram_edge_kind_schema(),
+            "label": {"type": "string", "minLength": 1, "maxLength": 1000, "description": "Specific trigger, data, condition, or effect displayed on the arrow."}
+        },
+        "required": ["from", "to", "kind", "label"],
+        "additionalProperties": false
+    })
+}
+
+fn diagram_edge_patch_schema() -> Value {
+    json!({
+        "type": "object",
+        "minProperties": 1,
+        "description": "Edge-only patch. The outer from/to identify the current edge; these optional fields replace its values.",
+        "properties": {
+            "from": {"type": "string", "minLength": 1, "maxLength": 128},
+            "to": {"type": "string", "minLength": 1, "maxLength": 128},
+            "kind": diagram_edge_kind_schema(),
+            "label": {"type": "string", "minLength": 1, "maxLength": 1000},
+            "clear_label": {"type": "boolean", "description": "Set true to remove the label; do not pass a string."}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn diagram_evidence_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One exact citation. File and reason are always required; only copy optional hunk, symbol, and range from research results.",
+        "properties": {
+            "file": {"type": "string", "minLength": 1, "description": "Exact repo-relative file from a research result."},
+            "hunk": {"type": "integer", "minimum": 0, "description": "Optional zero-based diff hunk index."},
+            "symbol": {"type": "string", "minLength": 1, "description": "Optional exact semantic symbol name."},
+            "range": diagram_line_range_schema(),
+            "reason": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "Concrete statement of what the cited source directly establishes."}
+        },
+        "required": ["file", "reason"],
+        "additionalProperties": false
+    })
+}
+
+/// Return the canonical example embedded in the strict schema branch for `op`.
+/// Parse failures use this to give the model a concrete recovery shape without maintaining
+/// a second, potentially divergent set of examples.
+pub(crate) fn diagram_command_example(op: Option<&str>) -> Value {
+    let edit = diagram_tools()
+        .into_iter()
+        .next()
+        .expect("edit tool exists");
+    let variants = edit.parameters["oneOf"]
+        .as_array()
+        .expect("edit tool has command variants");
+    variants
+        .iter()
+        .find(|variant| {
+            op.is_some_and(|op| variant["properties"]["op"]["const"].as_str() == Some(op))
+        })
+        .or_else(|| {
+            variants.iter().find(|variant| {
+                variant["properties"]["op"]["const"].as_str() == Some("create_form")
+            })
+        })
+        .and_then(|variant| variant["examples"].as_array())
+        .and_then(|examples| examples.first())
+        .cloned()
+        .unwrap_or_else(|| json!({"op": "create_form", "form_id": "main", "kind": "sequence"}))
+}
+
 /// `true` when `name` is one of the read-only research tools.
 #[must_use]
 pub fn is_read_only_tool(name: &str) -> bool {
     read_only_tools()
         .into_iter()
         .chain(research_tools())
+        .chain(semantic_tools())
         .any(|tool| tool.name == name)
 }
 
@@ -461,10 +892,25 @@ mod tests {
     }
 
     #[test]
+    fn one_open_semantic_inspection_tool_is_capability_discoverable() {
+        let tools = semantic_tools();
+        assert_eq!(tools.len(), 1);
+        let tool = &tools[0];
+        assert_eq!(tool.name, LSP_INSPECT_TOOL_NAME);
+        assert!(tool.parameters["properties"]["query"].get("enum").is_none());
+        assert_eq!(tool.parameters["properties"]["line"]["minimum"], 1);
+        assert_eq!(tool.parameters["properties"]["column"]["minimum"], 0);
+        assert!(tool
+            .description
+            .contains("future adapters may advertise more"));
+    }
+
+    #[test]
     fn every_definition_is_an_object_schema() {
         for tool in read_only_tools()
             .into_iter()
             .chain(research_tools())
+            .chain(semantic_tools())
             .chain(diagram_tools())
         {
             assert_eq!(
@@ -487,6 +933,74 @@ mod tests {
     }
 
     #[test]
+    fn diagram_editor_schema_is_a_strict_documented_union() {
+        let edit = diagram_tools()
+            .into_iter()
+            .find(|tool| tool.name == DIAGRAM_EDIT_TOOL_NAME)
+            .unwrap();
+        let wire_bytes = serde_json::to_string(&edit.to_openai()).unwrap().len();
+        assert!(
+            wire_bytes < 25_000,
+            "strict editor schema regressed to {wire_bytes} bytes"
+        );
+        let variants = edit.parameters["oneOf"].as_array().unwrap();
+        assert_eq!(variants.len(), 12);
+        for variant in variants {
+            assert_eq!(variant["type"], "object");
+            assert_eq!(variant["additionalProperties"], false);
+            assert!(variant["description"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()));
+            assert_eq!(variant["examples"].as_array().unwrap().len(), 1);
+            let example = variant["examples"][0].clone();
+            serde_json::from_value::<codescope_core::DiagramCommand>(example)
+                .expect("every documented example must deserialize through the shared API");
+        }
+
+        let by_op = |op: &str| {
+            variants
+                .iter()
+                .find(|variant| variant["properties"]["op"]["const"] == op)
+                .unwrap()
+        };
+        let create_node = by_op("create_node");
+        assert!(create_node["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("form_id")));
+        assert!(create_node["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("node")));
+        let node = &create_node["properties"]["node"];
+        assert_eq!(
+            node["properties"]["hint"]["properties"]["highlight"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            node["properties"]["hint"]["properties"]["collapsed"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            node["properties"]["code_refs"]["items"]["required"],
+            json!(["file", "hunk", "side", "start_line", "end_line"])
+        );
+
+        let update_node = by_op("update_node");
+        let patch = &update_node["properties"]["patch"];
+        assert_eq!(patch["properties"]["clear_entity"]["type"], "boolean");
+        assert!(patch["properties"].get("clear_label").is_none());
+        let update_edge = by_op("update_edge");
+        assert_eq!(
+            update_edge["properties"]["patch"]["properties"]["clear_label"]["type"],
+            "boolean"
+        );
+        assert!(update_edge["properties"]["patch"]["properties"]
+            .get("clear_entity")
+            .is_none());
+    }
+
+    #[test]
     fn openai_projection_shape() {
         let t = &read_only_tools()[0];
         let v = t.to_openai();
@@ -500,6 +1014,7 @@ mod tests {
         assert!(is_read_only_tool("get_hunk"));
         assert!(is_read_only_tool("read_file"));
         assert!(is_read_only_tool("git_status_file"));
+        assert!(is_read_only_tool(LSP_INSPECT_TOOL_NAME));
         assert!(!is_read_only_tool("rm_rf"));
         assert!(is_diagram_tool(DIAGRAM_EDIT_TOOL_NAME));
         assert!(is_diagram_tool(DIAGRAM_INSPECT_TOOL_NAME));

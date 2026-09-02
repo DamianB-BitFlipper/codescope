@@ -333,6 +333,8 @@ pub struct DiffPane {
     pub current_hunk: usize,
     /// Total hunks in the file (for the `hunk 2/5` indicator).
     pub total_hunks: usize,
+    /// Optional language-server syntax tokens for the old and new revisions.
+    pub syntax: std::sync::Arc<codescope_core::DiffSyntax>,
 }
 
 /// One rendered diff line.

@@ -343,6 +343,8 @@ mod tests {
             file: FileId::new(file).unwrap(),
             name: name.to_string(),
             kind: SymbolKind::Function,
+            range: None,
+            selection: None,
         }
     }
 

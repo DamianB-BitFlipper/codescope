@@ -76,6 +76,15 @@ pub(crate) const HUNK_FG: Color = Color::Rgb(132, 190, 229);
 pub(crate) const CODE_LINK_BG: Color = Color::Rgb(64, 55, 34);
 /// Failures / diagnostics.
 pub(crate) const ERROR: Color = Color::Rgb(238, 95, 101);
+/// Semantic syntax colors are foreground-only so diff and interaction backgrounds remain
+/// authoritative. These groups follow the language-neutral LSP semantic-token vocabulary.
+const SYNTAX_KEYWORD: Color = Color::Rgb(198, 146, 234);
+const SYNTAX_STRING: Color = Color::Rgb(206, 145, 120);
+const SYNTAX_COMMENT: Color = Color::Rgb(106, 153, 85);
+const SYNTAX_NUMBER: Color = Color::Rgb(181, 206, 168);
+const SYNTAX_CALLABLE: Color = Color::Rgb(220, 220, 170);
+const SYNTAX_TYPE: Color = Color::Rgb(78, 201, 176);
+const SYNTAX_VALUE: Color = Color::Rgb(156, 220, 254);
 
 /// One render pass: the arrangement is a pure function of frame area + zoom
 /// ([`choose_tier`]). Never panics at any size; never does I/O.
@@ -845,12 +854,14 @@ fn build_diff_for_view(app: &App, snap: &UiSnapshot, inner_w: usize) -> BuiltDif
     let ln_w = ln_width(&d.rows);
     let body_w = inner_w.saturating_sub(gutter_width(ln_w)).max(1);
     let spans = intraline::row_spans(&d.rows);
+    let syntax = syntax_row_spans(d);
     let mut built = if app.diff_wrap {
-        build_wrapped(&d.rows, &spans, ln_w, body_w)
+        build_wrapped(&d.rows, &spans, &syntax, ln_w, body_w)
     } else {
         build_raw(
             &d.rows,
             &spans,
+            &syntax,
             ln_w,
             app.diff_hscroll as usize,
             body_w,
@@ -860,6 +871,78 @@ fn build_diff_for_view(app: &App, snap: &UiSnapshot, inner_w: usize) -> BuiltDif
     let linked_rows = linked_diff_rows(d, app.active_code_node());
     apply_linked_diff_style(&mut built, &linked_rows);
     built
+}
+
+type SyntaxByteSpans = Vec<(usize, usize, Color)>;
+
+/// Align source-file semantic tokens with the unified rows currently on screen. A context row
+/// uses its new-side classification and falls back to old-side tokens when the new document did
+/// not produce any. Added and deleted rows always use their respective revision.
+fn syntax_row_spans(diff: &crate::snapshot::DiffPane) -> Vec<SyntaxByteSpans> {
+    fn by_line(
+        tokens: &[codescope_core::SyntaxToken],
+    ) -> std::collections::HashMap<u32, SyntaxByteSpans> {
+        let mut lines = std::collections::HashMap::<u32, SyntaxByteSpans>::new();
+        for token in tokens {
+            if token.range.start_line != token.range.end_line {
+                continue;
+            }
+            let Some(color) = syntax_color(&token.token_type) else {
+                continue;
+            };
+            lines.entry(token.range.start_line).or_default().push((
+                token.range.start_col as usize,
+                token.range.end_col as usize,
+                color,
+            ));
+        }
+        for spans in lines.values_mut() {
+            spans.sort_unstable_by_key(|span| (span.0, span.1));
+        }
+        lines
+    }
+
+    let old = by_line(&diff.syntax.old);
+    let new = by_line(&diff.syntax.new);
+    diff.rows
+        .iter()
+        .map(|row| match row {
+            DiffRow::Add { new_ln, .. } => new
+                .get(&new_ln.saturating_sub(1))
+                .cloned()
+                .unwrap_or_default(),
+            DiffRow::Del { old_ln, .. } => old
+                .get(&old_ln.saturating_sub(1))
+                .cloned()
+                .unwrap_or_default(),
+            DiffRow::Context { old_ln, new_ln, .. } => new
+                .get(&new_ln.saturating_sub(1))
+                .or_else(|| old.get(&old_ln.saturating_sub(1)))
+                .cloned()
+                .unwrap_or_default(),
+            DiffRow::HunkHeader(_) => Vec::new(),
+        })
+        .collect()
+}
+
+/// Map standard and common server-extension token names into a compact terminal palette.
+/// Unknown extensions intentionally return `None`, preserving the ordinary diff foreground.
+fn syntax_color(token_type: &str) -> Option<Color> {
+    match token_type {
+        "keyword" | "modifier" | "operator" | "selfKeyword" | "logical" | "arithmetic"
+        | "comparison" => Some(SYNTAX_KEYWORD),
+        "string" | "regexp" | "escapeSequence" | "formatSpecifier" => Some(SYNTAX_STRING),
+        "comment" => Some(SYNTAX_COMMENT),
+        "number" | "boolean" | "enumMember" => Some(SYNTAX_NUMBER),
+        "function" | "method" | "macro" | "derive" | "deriveHelper" => Some(SYNTAX_CALLABLE),
+        "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" | "typeAlias"
+        | "union" | "builtinType" => Some(SYNTAX_TYPE),
+        "namespace" | "parameter" | "variable" | "property" | "event" | "label" | "decorator"
+        | "lifetime" | "generic" | "attribute" | "builtinAttribute" | "toolModule" => {
+            Some(SYNTAX_VALUE)
+        }
+        _ => None,
+    }
 }
 
 /// Plain rendered diff text and viewport anchor used by retained mouse selection.
@@ -1059,6 +1142,7 @@ struct BuiltDiff {
 fn build_wrapped(
     rows: &[DiffRow],
     spans: &[intraline::ByteSpans],
+    syntax: &[SyntaxByteSpans],
     ln_w: usize,
     body_w: usize,
 ) -> BuiltDiff {
@@ -1092,6 +1176,7 @@ fn build_wrapped(
                     ADD_BODY,
                     ADD_HI_STYLE,
                     &spans[i],
+                    &syntax[i],
                     ln_w,
                     body_w,
                 );
@@ -1109,6 +1194,7 @@ fn build_wrapped(
                     DEL_BODY,
                     DEL_HI_STYLE,
                     &spans[i],
+                    &syntax[i],
                     ln_w,
                     body_w,
                 );
@@ -1130,6 +1216,7 @@ fn build_wrapped(
                     CTX_BODY,
                     CTX_BODY,
                     &[],
+                    &syntax[i],
                     ln_w,
                     body_w,
                 );
@@ -1152,6 +1239,7 @@ fn build_wrapped(
 fn build_raw(
     rows: &[DiffRow],
     spans: &[intraline::ByteSpans],
+    syntax: &[SyntaxByteSpans],
     ln_w: usize,
     x: usize,
     body_w: usize,
@@ -1190,6 +1278,7 @@ fn build_raw(
                     ADD_BODY,
                     ADD_HI_STYLE,
                     &spans[i],
+                    &syntax[i],
                     ln_w,
                     effective_x,
                     body_w,
@@ -1205,6 +1294,7 @@ fn build_raw(
                     DEL_BODY,
                     DEL_HI_STYLE,
                     &spans[i],
+                    &syntax[i],
                     ln_w,
                     effective_x,
                     body_w,
@@ -1224,6 +1314,7 @@ fn build_raw(
                     CTX_BODY,
                     CTX_BODY,
                     &[],
+                    &syntax[i],
                     ln_w,
                     effective_x,
                     body_w,
@@ -1273,13 +1364,21 @@ fn push_numbered(
     base: Style,
     hi: Style,
     spans: &[(usize, usize)],
+    syntax: &SyntaxByteSpans,
     ln_w: usize,
     body_w: usize,
 ) {
     let gs: Vec<&str> = unicode_segmentation::UnicodeSegmentation::graphemes(text, true).collect();
     let flags = changed_flags(&gs, spans);
+    let syntax_colors = syntax_colors(&gs, syntax);
     for (i, (s, e)) in wrap_ranges(&gs, body_w).iter().enumerate() {
-        let mut body = styled_graphemes(&gs[*s..*e], &flags[*s..*e], base, hi);
+        let mut body = styled_graphemes(
+            &gs[*s..*e],
+            &flags[*s..*e],
+            &syntax_colors[*s..*e],
+            base,
+            hi,
+        );
         let mut line = if i == 0 {
             gutter_spans(old, new, ln_w, sign, base)
         } else {
@@ -1302,14 +1401,24 @@ fn raw_numbered(
     base: Style,
     hi: Style,
     spans: &[(usize, usize)],
+    syntax: &SyntaxByteSpans,
     ln_w: usize,
     x: usize,
     body_w: usize,
 ) -> Line<'static> {
     let gs: Vec<&str> = unicode_segmentation::UnicodeSegmentation::graphemes(text, true).collect();
     let flags = changed_flags(&gs, spans);
+    let syntax_colors = syntax_colors(&gs, syntax);
     let mut line = gutter_spans(old, new, ln_w, sign, base);
-    line.append(&mut slice_styled(&gs, &flags, x, body_w, base, hi));
+    line.append(&mut slice_styled(
+        &gs,
+        &flags,
+        &syntax_colors,
+        x,
+        body_w,
+        base,
+        hi,
+    ));
     Line::from(line)
 }
 
@@ -1331,14 +1440,50 @@ fn changed_flags(gs: &[&str], spans: &[(usize, usize)]) -> Vec<bool> {
     flags
 }
 
+/// Per-grapheme semantic foreground. Tokens and intraline spans are byte-addressed, while
+/// rendering/wrapping is grapheme-addressed; overlap promotes the entire grapheme so combining
+/// sequences and emoji are never split.
+fn syntax_colors(gs: &[&str], spans: &SyntaxByteSpans) -> Vec<Option<Color>> {
+    let mut colors = Vec::with_capacity(gs.len());
+    let mut byte = 0usize;
+    let mut span_index = 0usize;
+    for grapheme in gs {
+        let end = byte + grapheme.len();
+        while span_index < spans.len() && spans[span_index].1 <= byte {
+            span_index += 1;
+        }
+        let color = spans
+            .get(span_index)
+            .filter(|span| span.0 < end && span.1 > byte)
+            .map(|span| span.2);
+        colors.push(color);
+        byte = end;
+    }
+    colors
+}
+
 /// Group graphemes into styled spans, switching between `base` and `hi` at changed-flag
 /// boundaries. Empty input yields no spans (callers emit the gutter and sign).
-fn styled_graphemes(gs: &[&str], flags: &[bool], base: Style, hi: Style) -> Vec<Span<'static>> {
+fn styled_graphemes(
+    gs: &[&str],
+    flags: &[bool],
+    syntax: &[Option<Color>],
+    base: Style,
+    hi: Style,
+) -> Vec<Span<'static>> {
     debug_assert_eq!(gs.len(), flags.len());
+    debug_assert_eq!(gs.len(), syntax.len());
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
-    for (g, &changed) in gs.iter().zip(flags) {
-        let style = if changed { hi } else { base };
+    for ((g, &changed), &syntax_color) in gs.iter().zip(flags).zip(syntax) {
+        // Intraline changed-word emphasis is intentionally stronger than syntax color.
+        let style = if changed {
+            hi
+        } else if let Some(color) = syntax_color {
+            base.fg(color)
+        } else {
+            base
+        };
         let width = grapheme_cells(g, col);
         // Ratatui stores cells in an intermediate buffer and drops control characters;
         // a literal tab therefore never reaches a terminal for expansion. Materialize it
@@ -1364,16 +1509,18 @@ fn styled_graphemes(gs: &[&str], flags: &[bool], base: Style, hi: Style) -> Vec<
 fn slice_styled(
     gs: &[&str],
     flags: &[bool],
+    syntax: &[Option<Color>],
     skip: usize,
     budget: usize,
     base: Style,
     hi: Style,
 ) -> Vec<Span<'static>> {
     debug_assert_eq!(gs.len(), flags.len());
+    debug_assert_eq!(gs.len(), syntax.len());
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
     let mut taken = 0usize;
-    for (g, &changed) in gs.iter().zip(flags) {
+    for ((g, &changed), &syntax_color) in gs.iter().zip(flags).zip(syntax) {
         let w = grapheme_cells(g, col);
         let next = col + w;
         if next <= skip || col < skip {
@@ -1383,7 +1530,13 @@ fn slice_styled(
         if taken + w > budget {
             break;
         }
-        let style = if changed { hi } else { base };
+        let style = if changed {
+            hi
+        } else if let Some(color) = syntax_color {
+            base.fg(color)
+        } else {
+            base
+        };
         let displayed = if *g == "\t" {
             " ".repeat(w)
         } else {
@@ -2545,6 +2698,7 @@ mod tests {
             ],
             current_hunk: 1,
             total_hunks: 1,
+            syntax: std::sync::Arc::default(),
         };
         snap
     }
@@ -2952,6 +3106,7 @@ mod tests {
             ],
             current_hunk: 1,
             total_hunks: 2,
+            syntax: std::sync::Arc::default(),
         };
         let node =
             codescope_core::PlanNode::new("n1", "update", codescope_core::PlanNodeChange::Modified)
@@ -2973,7 +3128,8 @@ mod tests {
         assert_eq!(linked, vec![false, true, false, true, false, true]);
 
         let spans = intraline::row_spans(&diff.rows);
-        let mut built = build_raw(&diff.rows, &spans, 2, 0, 40, 48);
+        let syntax = syntax_row_spans(&diff);
+        let mut built = build_raw(&diff.rows, &spans, &syntax, 2, 0, 40, 48);
         apply_linked_diff_style(&mut built, &linked);
         for index in [1usize, 3, 5] {
             assert!(built.lines[index]
@@ -3003,6 +3159,100 @@ mod tests {
             .spans
             .iter()
             .all(|span| span.style.bg != Some(CODE_LINK_BG)));
+    }
+
+    #[test]
+    fn syntax_highlights_both_diff_sides_without_overriding_diff_or_intraline_styles() {
+        let token = |line, start, end, token_type: &str| codescope_core::SyntaxToken {
+            range: codescope_core::LineRange::new(line, start, line, end),
+            token_type: token_type.to_string(),
+            modifiers: Vec::new(),
+        };
+        let diff = DiffPane {
+            title: "src/main.rs".to_string(),
+            focused_symbol: None,
+            rows: vec![
+                DiffRow::HunkHeader("@@ -1,1 +1,1 @@".to_string()),
+                DiffRow::Del {
+                    old_ln: 1,
+                    text: "let old = \"x\";".to_string(),
+                },
+                DiffRow::Add {
+                    new_ln: 1,
+                    text: "let new = \"x\";".to_string(),
+                },
+            ],
+            current_hunk: 1,
+            total_hunks: 1,
+            syntax: std::sync::Arc::new(codescope_core::DiffSyntax {
+                old: vec![token(0, 0, 3, "keyword"), token(0, 4, 7, "variable")],
+                new: vec![token(0, 0, 3, "keyword"), token(0, 4, 7, "variable")],
+            }),
+        };
+        let intraline = intraline::row_spans(&diff.rows);
+        let syntax = syntax_row_spans(&diff);
+        let built = build_raw(&diff.rows, &intraline, &syntax, 2, 0, 40, 48);
+
+        for (row, background) in [(1usize, DEL_BG), (2, ADD_BG)] {
+            let keyword = built.lines[row]
+                .spans
+                .iter()
+                .find(|span| span.content.contains("let"))
+                .expect("keyword span");
+            assert_eq!(keyword.style.fg, Some(SYNTAX_KEYWORD));
+            assert_eq!(keyword.style.bg, Some(background));
+        }
+        assert!(built.lines[1]
+            .spans
+            .iter()
+            .any(|span| span.content.contains("old") && span.style.fg == Some(DEL_HI)));
+        assert!(built.lines[2]
+            .spans
+            .iter()
+            .any(|span| span.content.contains("new") && span.style.fg == Some(ADD_HI)));
+    }
+
+    #[test]
+    fn unicode_syntax_spans_survive_wrapping_and_missing_tokens_keep_fallback_style() {
+        let mut diff = DiffPane {
+            title: "src/main.rs".to_string(),
+            focused_symbol: None,
+            rows: vec![DiffRow::Context {
+                old_ln: 1,
+                new_ln: 1,
+                text: "// 文档说明".to_string(),
+            }],
+            current_hunk: 1,
+            total_hunks: 1,
+            syntax: std::sync::Arc::new(codescope_core::DiffSyntax {
+                old: Vec::new(),
+                new: vec![codescope_core::SyntaxToken {
+                    range: codescope_core::LineRange::new(0, 0, 0, "// 文档说明".len() as u32),
+                    token_type: "comment".to_string(),
+                    modifiers: Vec::new(),
+                }],
+            }),
+        };
+        let intraline = intraline::row_spans(&diff.rows);
+        let syntax = syntax_row_spans(&diff);
+        let wrapped = build_wrapped(&diff.rows, &intraline, &syntax, 2, 4);
+        let highlighted = wrapped
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style.fg == Some(SYNTAX_COMMENT))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(highlighted, "// 文档说明");
+
+        diff.syntax = std::sync::Arc::default();
+        let syntax = syntax_row_spans(&diff);
+        let fallback = build_raw(&diff.rows, &intraline, &syntax, 2, 0, 40, 48);
+        assert!(fallback.lines[0]
+            .spans
+            .iter()
+            .filter(|span| span.content.contains('/') || span.content.contains('文'))
+            .all(|span| span.style == CTX_BODY));
     }
 
     #[test]

@@ -29,7 +29,7 @@ use codescope_tui::UiPreferences;
 use tokio::sync::{mpsc, watch};
 
 use crate::request_coordinator::RequestCoordinator;
-use crate::research_tools::{research_brief, ScopedResearchTools};
+use crate::research_tools::{research_brief, QueriedLspFacts, ScopedResearchTools};
 
 /// Publication boundary between the backend dispatcher and a state consumer.
 ///
@@ -139,6 +139,15 @@ pub enum DispatchEvent {
         file: String,
         /// The per-file semantic result (stringified error keeps the event simple).
         result: Result<Box<codescope_analysis::FileSemanticResult>, String>,
+    },
+    /// Optional syntax tokens for both sides of the currently visible file diff resolved.
+    DiffSyntaxReady {
+        /// Epoch whose file contents were queried.
+        epoch: Epoch,
+        /// Current/new repo-relative file path.
+        file: String,
+        /// Language-neutral old/new semantic tokens (possibly empty as a fallback).
+        syntax: codescope_core::DiffSyntax,
     },
     /// An AI plan job completed (spawned; epoch-tagged).
     AiDone {
@@ -339,7 +348,7 @@ impl AiSelectionKey {
         }
     }
 
-    fn contains_file(&self, file: &str) -> bool {
+    pub(crate) fn contains_file(&self, file: &str) -> bool {
         match self {
             Self::Directory(directory) => file.starts_with(&format!("{directory}/")),
             Self::File(path) | Self::Symbol { file: path, .. } => file == path,
@@ -529,6 +538,14 @@ pub struct Dispatcher {
     analysis_in_flight: std::collections::HashMap<String, SemanticRunningJob>,
     /// FIFO queue for per-file analysis beyond the concurrency bound.
     analysis_queue: std::collections::VecDeque<String>,
+    /// Selected-file syntax results for this epoch. Empty results are cached too so an
+    /// unsupported or temporarily unavailable highlighter never loops requests.
+    diff_syntax: std::collections::HashMap<String, std::sync::Arc<codescope_core::DiffSyntax>>,
+    /// LRU order for the bounded selected-file syntax cache.
+    diff_syntax_order: std::collections::VecDeque<String>,
+    /// The single semantic-token job allowed across the service; rapid navigation coalesces
+    /// naturally to the selection visible when this slot frees.
+    diff_syntax_in_flight: std::collections::HashMap<String, Epoch>,
     output: std::sync::Arc<dyn BackendOutput>,
     /// Where completed jobs report back.
     job_tx: mpsc::Sender<DispatchEvent>,
@@ -617,6 +634,9 @@ impl Dispatcher {
             data_epoch: Epoch::ZERO,
             analysis_in_flight: std::collections::HashMap::new(),
             analysis_queue: std::collections::VecDeque::new(),
+            diff_syntax: std::collections::HashMap::new(),
+            diff_syntax_order: std::collections::VecDeque::new(),
+            diff_syntax_in_flight: std::collections::HashMap::new(),
             base_override: None,
             available_bases: Vec::new(),
             available_bases_truncated: false,
@@ -748,6 +768,11 @@ impl Dispatcher {
                 file,
                 result,
             } => self.on_file_analysis_done(epoch, file, result),
+            DispatchEvent::DiffSyntaxReady {
+                epoch,
+                file,
+                syntax,
+            } => self.on_diff_syntax_ready(epoch, file, syntax),
             DispatchEvent::AiDone {
                 epoch,
                 selection,
@@ -784,6 +809,7 @@ impl Dispatcher {
                 self.schedule_all_file_analysis();
                 self.drain_analysis_queue();
                 self.drain_relation_queue();
+                self.schedule_selected_diff_syntax();
                 self.publish();
             }
             DispatchEvent::EngineUnavailable(reason) => {
@@ -1123,8 +1149,140 @@ impl Dispatcher {
             // already moved this file to the front; draining lets it claim the focused lane.
             self.drain_analysis_queue();
         }
+        self.schedule_selected_diff_syntax();
         self.drain_relation_queue();
         self.publish();
+    }
+
+    /// Request syntax only for the file shown in the diff pane. Waiting until its ordinary
+    /// symbol job has completed prevents a base overlay from racing another query for the same
+    /// document, and avoids repository-wide semantic-token traffic.
+    fn schedule_selected_diff_syntax(&mut self) {
+        if self.data_epoch != self.epoch || self.selected_directory.is_some() {
+            return;
+        }
+        let Some(changeset) = &self.changeset else {
+            return;
+        };
+        let file = self
+            .selected_file
+            .as_deref()
+            .and_then(|path| {
+                changeset
+                    .files
+                    .iter()
+                    .find(|file| file.path.as_str() == path)
+            })
+            .or_else(|| changeset.files.first())
+            .cloned();
+        let Some(file) = file else {
+            return;
+        };
+        let path = file.path.to_string();
+        if self.diff_syntax.contains_key(&path) {
+            if let Some(index) = self
+                .diff_syntax_order
+                .iter()
+                .position(|cached| cached == &path)
+            {
+                self.diff_syntax_order.remove(index);
+                self.diff_syntax_order.push_back(path);
+            }
+            return;
+        }
+        if !self.diff_syntax_in_flight.is_empty() {
+            return;
+        }
+        match self.file_semantics.get(&path) {
+            None | Some(FileSemanticState::Loading) => return,
+            Some(FileSemanticState::Unsupported) => {
+                self.cache_diff_syntax(path, codescope_core::DiffSyntax::default());
+                return;
+            }
+            Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Failed) => {}
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let Some(repo_ctx) = self.repo_ctx.clone() else {
+            return;
+        };
+        if !engine
+            .svc()
+            .features()
+            .is_supported(codescope_core::Feature::SemanticTokens)
+        {
+            self.cache_diff_syntax(path, codescope_core::DiffSyntax::default());
+            return;
+        }
+        let epoch = self.epoch;
+        let scope = self.scope;
+        let tx = self.job_tx.clone();
+        let path_for_job = path.clone();
+        self.diff_syntax_in_flight.insert(path, epoch);
+        tokio::spawn(async move {
+            let syntax = engine.diff_syntax(&file, scope, &repo_ctx).await;
+            let _ = tx
+                .send(DispatchEvent::DiffSyntaxReady {
+                    epoch,
+                    file: path_for_job,
+                    syntax,
+                })
+                .await;
+        });
+    }
+
+    fn on_diff_syntax_ready(
+        &mut self,
+        epoch: Epoch,
+        file: String,
+        syntax: codescope_core::DiffSyntax,
+    ) {
+        if self
+            .diff_syntax_in_flight
+            .get(&file)
+            .is_some_and(|running_epoch| *running_epoch == epoch)
+        {
+            self.diff_syntax_in_flight.remove(&file);
+        }
+        if epoch != self.epoch || self.data_epoch != self.epoch {
+            // A newer epoch may already have finished its symbol prerequisite while it
+            // waited behind this path's old overlay job.
+            self.schedule_selected_diff_syntax();
+            return;
+        }
+        if !self.changeset.as_ref().is_some_and(|changeset| {
+            changeset
+                .files
+                .iter()
+                .any(|item| item.path.as_str() == file)
+        }) {
+            self.schedule_selected_diff_syntax();
+            return;
+        }
+        self.cache_diff_syntax(file, syntax);
+        // If navigation moved during this request, start only the latest visible file now.
+        self.schedule_selected_diff_syntax();
+        self.publish();
+    }
+
+    const MAX_DIFF_SYNTAX_CACHE: usize = 16;
+
+    fn cache_diff_syntax(&mut self, file: String, syntax: codescope_core::DiffSyntax) {
+        if let Some(index) = self
+            .diff_syntax_order
+            .iter()
+            .position(|cached| cached == &file)
+        {
+            self.diff_syntax_order.remove(index);
+        }
+        self.diff_syntax_order.push_back(file.clone());
+        self.diff_syntax.insert(file, std::sync::Arc::new(syntax));
+        while self.diff_syntax_order.len() > Self::MAX_DIFF_SYNTAX_CACHE {
+            if let Some(evicted) = self.diff_syntax_order.pop_front() {
+                self.diff_syntax.remove(&evicted);
+            }
+        }
     }
 
     fn on_directory_selection_changed(&mut self, directory: String) {
@@ -1748,6 +1906,8 @@ impl Dispatcher {
         // fresh queue.
         self.file_semantics.clear();
         self.analysis_queue.clear();
+        self.diff_syntax.clear();
+        self.diff_syntax_order.clear();
         self.relation_cache.clear();
         self.relation_queue.clear();
         // Relations for the selected symbol are re-fetched in `on_analysis_done`, once the
@@ -1803,9 +1963,26 @@ impl Dispatcher {
         if let Some(guidance) = self.agent_guidance.get(&selection) {
             brief.push_str(&guidance.prompt_section());
         }
-        let research_tools =
-            ScopedResearchTools::new(ctx.toplevel.clone(), &selection, scoped_changeset.clone());
-        let facts = SnapshotFacts::from_lazy(&scoped_changeset, &self.file_semantics, &selection);
+        let queried_lsp = QueriedLspFacts::default();
+        let facts = SnapshotFacts::from_lazy_with_lsp(
+            &scoped_changeset,
+            &self.file_semantics,
+            &selection,
+            queried_lsp.clone(),
+        );
+        let research_tools = match &self.engine {
+            Some(engine) => ScopedResearchTools::with_language_server(
+                ctx.toplevel.clone(),
+                &selection,
+                scoped_changeset.clone(),
+                epoch,
+                engine.clone(),
+                queried_lsp,
+            ),
+            None => {
+                ScopedResearchTools::new(ctx.toplevel.clone(), &selection, scoped_changeset.clone())
+            }
+        };
         let ai = self.ai.clone();
         let tx = self.job_tx.clone();
         let draft_tx = tx.clone();
@@ -2055,6 +2232,7 @@ impl Dispatcher {
         // Epoch + data-epoch gates: a refresh superseded this job or its inputs.
         if epoch != self.epoch || self.data_epoch != self.epoch {
             self.drain_analysis_queue();
+            self.schedule_selected_diff_syntax();
             return;
         }
         // The file must still be in the current changeset (scope switch can drop it).
@@ -2117,6 +2295,7 @@ impl Dispatcher {
             // selection stayed put; its cached AI explanation is no longer current.
             self.retarget_ai_to_current_selection(true);
         }
+        self.schedule_selected_diff_syntax();
         self.publish();
         self.drain_analysis_queue();
     }
@@ -2244,6 +2423,8 @@ impl Dispatcher {
         self.changeset = None;
         self.analysis = None;
         self.file_semantics.clear();
+        self.diff_syntax.clear();
+        self.diff_syntax_order.clear();
         self.ai_revision_cache.clear();
         self.abort_all_ai_requests();
         self.ai_failures.clear();
@@ -2634,6 +2815,11 @@ impl Dispatcher {
             Some((file, name, _, _)) if *file == diff.title => Some(name.clone()),
             _ => None,
         };
+        diff.syntax = self
+            .diff_syntax
+            .get(&diff.title)
+            .cloned()
+            .unwrap_or_default();
         // `semantic` is the AI plan's durable slot: selecting a symbol must never swap it
         // out for deterministic rows. The selected symbol's lazy relations render via
         // `impact.callers`/`impact.downstream` (`build_impact`); the legacy flattened
@@ -3466,6 +3652,7 @@ fn selected_diff(a: &codescope_core::ChangeSet, selected: Option<&str>) -> DiffP
         rows,
         current_hunk: if hunk_no > 0 { 1 } else { 0 },
         total_hunks: hunk_no,
+        syntax: std::sync::Arc::default(),
     }
 }
 
@@ -3517,6 +3704,9 @@ struct SnapshotFacts {
     edges: HashSet<(String, String, PlanEdgeKind)>,
     hunks: std::collections::HashMap<String, usize>,
     diff_lines: HashSet<(String, u32, DiffSide, u32)>,
+    /// Semantic entities and relationships actually returned to the model during this
+    /// generation. Interior mutability lets completion-time validation observe tool evidence.
+    queried_lsp: QueriedLspFacts,
 }
 
 use codescope_ai::Lookup;
@@ -3531,6 +3721,15 @@ impl SnapshotFacts {
         semantics: &std::collections::HashMap<String, FileSemanticState>,
         focus: &AiSelectionKey,
     ) -> Self {
+        Self::from_lazy_with_lsp(changeset, semantics, focus, QueriedLspFacts::default())
+    }
+
+    fn from_lazy_with_lsp(
+        changeset: &codescope_core::ChangeSet,
+        semantics: &std::collections::HashMap<String, FileSemanticState>,
+        focus: &AiSelectionKey,
+        queried_lsp: QueriedLspFacts,
+    ) -> Self {
         let mut facts = SnapshotFacts {
             focus: focus.clone(),
             files: HashSet::new(),
@@ -3538,6 +3737,7 @@ impl SnapshotFacts {
             edges: HashSet::new(),
             hunks: std::collections::HashMap::new(),
             diff_lines: HashSet::new(),
+            queried_lsp,
         };
         for f in &changeset.files {
             let path = f.path.to_string();
@@ -3590,7 +3790,7 @@ impl FactView for SnapshotFacts {
     }
 
     fn file(&self, file: &codescope_core::FileId) -> Lookup<()> {
-        if self.files.contains(&file.to_string()) {
+        if self.files.contains(&file.to_string()) || self.queried_lsp.contains_file(file) {
             Lookup::Present(())
         } else {
             // The changeset is a complete inventory of CHANGED files, not of every repo
@@ -3608,7 +3808,10 @@ impl FactView for SnapshotFacts {
             Some(extent) => Lookup::Present(extent),
             // The lazy cache only surfaces CHANGED symbols, not a file's full outline, so
             // a miss here is "not surfaced by the loaded analysis", never "proven absent".
-            None => Lookup::Unknown,
+            None => self
+                .queried_lsp
+                .symbol(file, name)
+                .map_or(Lookup::Unknown, Lookup::Present),
         }
     }
     fn edge(&self, from: &EntityRef, to: &EntityRef, kind: PlanEdgeKind) -> Lookup<()> {
@@ -3618,9 +3821,7 @@ impl FactView for SnapshotFacts {
         {
             Lookup::Present(())
         } else {
-            // The lazy path never builds a complete edge universe; an absent edge is
-            // "not queried", not "proven absent".
-            Lookup::Unknown
+            self.queried_lsp.edge(from, to, kind)
         }
     }
     fn hunk(&self, file: &codescope_core::FileId, index: u32) -> Lookup<()> {
@@ -4433,6 +4634,59 @@ mod tests {
             AiSummaryState::NotGenerated
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn syntax_completion_is_epoch_gated_and_published_with_the_selected_diff() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(directory_changeset());
+        disp.data_epoch = disp.epoch;
+        disp.selected_file = Some("src/api/handler.rs".to_string());
+        let token = codescope_core::SyntaxToken {
+            range: LineRange::new(0, 0, 0, 2),
+            token_type: "keyword".to_string(),
+            modifiers: Vec::new(),
+        };
+
+        disp.handle(DispatchEvent::DiffSyntaxReady {
+            epoch: disp.epoch,
+            file: "src/api/handler.rs".to_string(),
+            syntax: codescope_core::DiffSyntax {
+                old: Vec::new(),
+                new: vec![token.clone()],
+            },
+        })
+        .await;
+        assert_eq!(snapshot_rx.borrow().diff.syntax.new, [token]);
+
+        disp.handle(DispatchEvent::DiffSyntaxReady {
+            epoch: disp.epoch.next(),
+            file: "src/api/handler.rs".to_string(),
+            syntax: codescope_core::DiffSyntax::default(),
+        })
+        .await;
+        assert_eq!(snapshot_rx.borrow().diff.syntax.new.len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn selected_diff_syntax_cache_is_bounded() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        for index in 0..=Dispatcher::MAX_DIFF_SYNTAX_CACHE {
+            disp.cache_diff_syntax(
+                format!("src/file-{index}.rs"),
+                codescope_core::DiffSyntax::default(),
+            );
+        }
+        assert_eq!(disp.diff_syntax.len(), Dispatcher::MAX_DIFF_SYNTAX_CACHE);
+        assert!(!disp.diff_syntax.contains_key("src/file-0.rs"));
+        assert!(disp.diff_syntax.contains_key(&format!(
+            "src/file-{}.rs",
+            Dispatcher::MAX_DIFF_SYNTAX_CACHE
+        )));
         std::fs::remove_dir_all(&root).ok();
     }
 

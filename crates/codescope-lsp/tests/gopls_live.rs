@@ -109,6 +109,24 @@ async fn gopls_end_to_end() {
         "roots: {names:?}"
     );
 
+    // Syntax is optional at the protocol boundary, but current gopls advertises it when the
+    // client enables semantic tokens. Exercise the same language-neutral service call used by
+    // the diff viewer when available so position decoding is covered against a real server.
+    if svc
+        .features()
+        .is_supported(codescope_core::Feature::SemanticTokens)
+    {
+        let syntax = tokio::time::timeout(Duration::from_secs(60), svc.semantic_tokens(&file))
+            .await
+            .expect("semantic_tokens timed out")
+            .expect("semantic_tokens failed")
+            .value;
+        assert!(!syntax.is_empty(), "expected gopls syntax tokens");
+        assert!(syntax
+            .iter()
+            .all(|token| token.range.start_line == token.range.end_line));
+    }
+
     // Implementations of Greeter.Greet (interface method at line 6, col 1).
     let impls = tokio::time::timeout(
         Duration::from_secs(30),
@@ -119,6 +137,12 @@ async fn gopls_end_to_end() {
     .expect("implementations failed")
     .value;
     assert!(!impls.is_empty(), "expected at least one implementation");
+    assert!(
+        impls
+            .iter()
+            .all(|implementation| implementation.range.is_some()),
+        "implementation locations should remain available to AI evidence: {impls:?}"
+    );
 
     // Callers of greet (func greet at line 13, col 5): main calls it.
     let callers = tokio::time::timeout(
@@ -133,6 +157,34 @@ async fn gopls_end_to_end() {
         callers.iter().any(|c| c.name == "main"),
         "callers: {callers:?}"
     );
+    assert!(
+        callers.iter().all(|caller| caller.range.is_some()),
+        "call hierarchy should preserve source ranges: {callers:?}"
+    );
+
+    if svc.features().is_supported(codescope_core::Feature::Hover) {
+        let hover = tokio::time::timeout(
+            Duration::from_secs(30),
+            svc.hover(&file, Position::new(13, 5)),
+        )
+        .await
+        .expect("hover timed out")
+        .expect("hover failed");
+        assert!(hover.is_some(), "expected hover text for greet");
+    }
+
+    if svc
+        .features()
+        .is_supported(codescope_core::Feature::TypeHierarchySuper)
+    {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            svc.type_supertypes(&file, Position::new(9, 5)),
+        )
+        .await
+        .expect("type_supertypes timed out")
+        .expect("type_supertypes failed");
+    }
 
     // Clean shutdown.
     tokio::time::timeout(Duration::from_secs(10), svc.shutdown())

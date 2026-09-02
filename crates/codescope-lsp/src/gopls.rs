@@ -17,7 +17,7 @@ use std::time::Duration;
 use camino::{Utf8Path, Utf8PathBuf};
 use codescope_core::{
     Diagnostic, Evidence, FeatureSet, FileId, Location, Position, Revision, SymbolKind, SymbolNode,
-    SymbolRef, SymbolTree,
+    SymbolRef, SymbolTree, SyntaxToken,
 };
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -30,6 +30,10 @@ use crate::detect::go_module_folders;
 use crate::encoding::{line_at, position_from_wire, position_to_wire, PositionEncoding};
 use crate::error::{LspError, SemanticError};
 use crate::options::LanguageServiceOptions;
+use crate::semantic_tokens::{
+    client_capability as semantic_tokens_capability, decode as decode_semantic_tokens,
+    legend_from_capabilities, SemanticTokenLegend,
+};
 use crate::uri::{path_from_uri, uri_from_path};
 
 /// Deadline for the very first request (gopls loads the workspace lazily).
@@ -56,6 +60,8 @@ pub struct GoplsService {
     go_roots: Vec<Utf8PathBuf>,
     features: FeatureSet,
     encoding: PositionEncoding,
+    /// Server-specific index-to-name mapping negotiated for semantic tokens.
+    semantic_token_legend: Option<SemanticTokenLegend>,
     /// Open document versions and content identities by absolute path.
     documents: Mutex<HashMap<Utf8PathBuf, OpenDocumentState>>,
     /// Content-addressed symbol trees survive repository epochs without becoming stale.
@@ -105,6 +111,7 @@ impl GoplsService {
                 json!({ "uri": uri, "name": dir.file_name().unwrap_or("workspace") })
             })
             .collect();
+        let semantic_tokens = semantic_tokens_capability();
         let params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri.as_str(),
@@ -115,17 +122,25 @@ impl GoplsService {
                     "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                     "callHierarchy": { "dynamicRegistration": false },
                     "typeHierarchy": { "dynamicRegistration": false },
-                    "publishDiagnostics": { "relatedInformation": true }
+                    "publishDiagnostics": { "relatedInformation": true },
+                    "semanticTokens": semantic_tokens
                 },
                 "workspace": { "workspaceFolders": true, "symbol": {} }
             },
-            "initializationOptions": {}
+            "initializationOptions": { "semanticTokens": true }
         });
         let init = client
             .request("initialize", params, FIRST_REQUEST_TIMEOUT)
             .await?;
         let _ = parse_text_document_sync(&init["capabilities"]); // gopls: incremental; we close+open instead.
         let mut features = resolve_features(&init["capabilities"])?;
+        let semantic_token_legend = legend_from_capabilities(&init["capabilities"]);
+        if semantic_token_legend.is_none() {
+            features.set(
+                codescope_core::Feature::SemanticTokens,
+                codescope_core::Availability::Unsupported,
+            );
+        }
         // gopls pushes diagnostics (research 01 quirk 6); LSP has no capability key for it.
         features.set(
             codescope_core::Feature::PushDiagnostics,
@@ -142,6 +157,7 @@ impl GoplsService {
             go_roots,
             features,
             encoding,
+            semantic_token_legend,
             documents: Mutex::new(HashMap::new()),
             symbol_cache: Mutex::new(SymbolTreeCache::default()),
             request_count: AtomicU64::new(0),
@@ -275,7 +291,9 @@ impl GoplsService {
         let Ok(uri) = uri_from_path(&abs) else {
             return Vec::new();
         };
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
+        let Ok(text) = std::fs::read_to_string(&abs) else {
+            return Vec::new();
+        };
         self.client
             .diagnostics(uri.as_str())
             .iter()
@@ -408,6 +426,88 @@ impl GoplsService {
             .await
             .insert(abs, Revision::Base, base_hash, tree.clone());
         Ok(tree)
+    }
+
+    /// Semantic syntax tokens for the current worktree content of `file`.
+    #[tracing::instrument(err, skip(self))]
+    pub async fn semantic_tokens(
+        &self,
+        file: &FileId,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        require(&self.features, codescope_core::Feature::SemanticTokens)?;
+        let legend = self
+            .semantic_token_legend
+            .as_ref()
+            .ok_or(SemanticError::Unsupported(
+                codescope_core::Feature::SemanticTokens,
+            ))?;
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let result = self
+            .client
+            .request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri.as_str() } }),
+                self.timeout(),
+            )
+            .await?;
+        Ok(Evidence::complete(decode_semantic_tokens(
+            result,
+            &snapshot.text,
+            self.encoding,
+            legend,
+        )?))
+    }
+
+    /// Semantic syntax tokens for exact snapshot `content` in a temporary overlay.
+    #[tracing::instrument(err, skip(self, content))]
+    pub async fn semantic_tokens_for_content(
+        &self,
+        file: &FileId,
+        content: &str,
+    ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
+        require(&self.features, codescope_core::Feature::SemanticTokens)?;
+        let legend = self
+            .semantic_token_legend
+            .as_ref()
+            .ok_or(SemanticError::Unsupported(
+                codescope_core::Feature::SemanticTokens,
+            ))?;
+        let abs = self.abs_path(file);
+        let base_hash = xxhash_rust::xxh3::xxh3_64(content.as_bytes());
+        let was_open = self.documents.lock().await.contains_key(&abs);
+        let disk = if was_open {
+            std::fs::read_to_string(&abs)
+                .ok()
+                .map(|text| DocumentSnapshot::new(abs.clone(), text))
+        } else {
+            None
+        };
+        self.sync_content(&abs, content, base_hash).await?;
+        let uri = uri_from_path(&abs)?;
+        let result = self
+            .client
+            .request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": uri.as_str() } }),
+                self.timeout(),
+            )
+            .await;
+        let restore = match (was_open, &disk) {
+            (true, Some(snapshot)) => self
+                .sync_content(&abs, &snapshot.text, snapshot.hash)
+                .await
+                .map(|_| ()),
+            _ => self.close(&abs).await,
+        };
+        let result = result?;
+        restore?;
+        Ok(Evidence::complete(decode_semantic_tokens(
+            result,
+            content,
+            self.encoding,
+            legend,
+        )?))
     }
 
     fn symbol_tree(
@@ -628,6 +728,37 @@ impl GoplsService {
         Ok(Evidence::complete(refs))
     }
 
+    /// Supertypes of the type symbol at `pos`.
+    pub async fn type_supertypes(
+        &self,
+        file: &FileId,
+        pos: Position,
+    ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
+        require(&self.features, codescope_core::Feature::TypeHierarchySuper)?;
+        let item = match self.prepare_type_hierarchy(file, pos).await? {
+            Some(i) => i,
+            None => return Ok(Evidence::complete(Vec::new())),
+        };
+        let result = self
+            .client
+            .request(
+                "typeHierarchy/supertypes",
+                json!({ "item": item }),
+                self.timeout(),
+            )
+            .await?;
+        let refs = match serde_json::from_value::<Option<Vec<lsp_types::TypeHierarchyItem>>>(result)
+        {
+            Ok(Some(items)) => items
+                .into_iter()
+                .filter_map(|i| self.type_item_to_ref(i))
+                .collect(),
+            Ok(None) => Vec::new(),
+            Err(e) => return Err(LspError::Protocol(format!("supertypes response: {e}")).into()),
+        };
+        Ok(Evidence::complete(refs))
+    }
+
     /// Subtypes of the type symbol at `pos` (for a Go interface: its implementers).
     pub async fn type_subtypes(
         &self,
@@ -657,6 +788,32 @@ impl GoplsService {
             Err(e) => return Err(LspError::Protocol(format!("subtypes response: {e}")).into()),
         };
         Ok(Evidence::complete(refs))
+    }
+
+    /// Hover text for the symbol at `pos`.
+    pub async fn hover(
+        &self,
+        file: &FileId,
+        pos: Position,
+    ) -> Result<Option<String>, SemanticError> {
+        require(&self.features, codescope_core::Feature::Hover)?;
+        let snapshot = self.sync_worktree(file).await?;
+        let uri = uri_from_path(&snapshot.abs)?;
+        let wire = self.pos_to_wire(&snapshot.text, pos);
+        let result = self
+            .client
+            .request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "position": { "line": wire.line, "character": wire.character }
+                }),
+                self.timeout(),
+            )
+            .await?;
+        let hover: Option<lsp_types::Hover> = serde_json::from_value(result)
+            .map_err(|e| LspError::Protocol(format!("hover response: {e}")))?;
+        Ok(hover.map(|hover| hover_text(&hover.contents)))
     }
 
     // -- prepare helpers ---------------------------------------------------------
@@ -718,7 +875,7 @@ impl GoplsService {
     fn location_from_wire(&self, loc: lsp_types::Location) -> Option<Location> {
         let abs = path_from_uri(&loc.uri).ok()?;
         let file = self.file_id(&abs)?;
-        let text = std::fs::read_to_string(&abs).unwrap_or_default();
+        let text = std::fs::read_to_string(&abs).ok()?;
         Some(Location {
             file,
             range: self.range_from_wire(&text, loc.range),
@@ -728,20 +885,26 @@ impl GoplsService {
     fn call_item_to_ref(&self, item: lsp_types::CallHierarchyItem) -> Option<SymbolRef> {
         let abs = path_from_uri(&item.uri).ok()?;
         let file = self.file_id(&abs)?;
+        let text = std::fs::read_to_string(&abs).ok()?;
         Some(SymbolRef {
             file,
             name: item.name,
             kind: SymbolKind::from(item.kind),
+            range: Some(self.range_from_wire(&text, item.range)),
+            selection: Some(self.range_from_wire(&text, item.selection_range)),
         })
     }
 
     fn type_item_to_ref(&self, item: lsp_types::TypeHierarchyItem) -> Option<SymbolRef> {
         let abs = path_from_uri(&item.uri).ok()?;
         let file = self.file_id(&abs)?;
+        let text = std::fs::read_to_string(&abs).ok()?;
         Some(SymbolRef {
             file,
             name: item.name,
             kind: SymbolKind::from(item.kind),
+            range: Some(self.range_from_wire(&text, item.range)),
+            selection: Some(self.range_from_wire(&text, item.selection_range)),
         })
     }
 
@@ -761,6 +924,8 @@ impl GoplsService {
                     // range-derived placeholder name (enrichment is a later step).
                     name: format!("{}:{}", location.range.start_line, location.range.start_col),
                     kind: SymbolKind::Unknown,
+                    range: Some(location.range),
+                    selection: None,
                 });
             }
         };
@@ -778,12 +943,17 @@ impl GoplsService {
                         Err(_) => continue,
                     };
                     if let Some(file) = self.file_id(&abs) {
-                        let text = std::fs::read_to_string(&abs).unwrap_or_default();
-                        let range = self.range_from_wire(&text, l.target_selection_range);
+                        let Ok(text) = std::fs::read_to_string(&abs) else {
+                            continue;
+                        };
+                        let range = self.range_from_wire(&text, l.target_range);
+                        let selection = self.range_from_wire(&text, l.target_selection_range);
                         out.push(SymbolRef {
                             file,
-                            name: format!("{}:{}", range.start_line, range.start_col),
+                            name: format!("{}:{}", selection.start_line, selection.start_col),
                             kind: SymbolKind::Unknown,
+                            range: Some(range),
+                            selection: Some(selection),
                         });
                     }
                 }
@@ -806,6 +976,24 @@ impl GoplsService {
     /// Graceful teardown.
     pub async fn shutdown(self) {
         let _outcome: ShutdownOutcome = self.client.shutdown().await;
+    }
+}
+
+fn hover_text(contents: &lsp_types::HoverContents) -> String {
+    match contents {
+        lsp_types::HoverContents::Scalar(lsp_types::MarkedString::String(text)) => text.clone(),
+        lsp_types::HoverContents::Scalar(lsp_types::MarkedString::LanguageString(language)) => {
+            language.value.clone()
+        }
+        lsp_types::HoverContents::Markup(markup) => markup.value.clone(),
+        lsp_types::HoverContents::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                lsp_types::MarkedString::String(text) => text.clone(),
+                lsp_types::MarkedString::LanguageString(language) => language.value.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
