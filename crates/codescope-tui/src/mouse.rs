@@ -10,6 +10,7 @@
 use crossterm::event::{MouseButton, MouseEvent};
 
 use crate::action::Action;
+use crate::action::PlanNodeTarget;
 use crate::action::{DiffTextPoint, DiffTextSelection};
 use crate::app::{App, Pane};
 use crate::divider::DividerId;
@@ -33,6 +34,19 @@ pub enum DragState {
         /// The effective extent (width/height) at drag start.
         start_extent: u16,
         /// Whether the pointer has moved since mouse-down.
+        moved: bool,
+    },
+    /// A generated-plan box is armed for click or being dragged to a new order.
+    PlanNode {
+        /// Box being moved.
+        source: PlanNodeTarget,
+        /// Pointer coordinate where the gesture began.
+        start_x: u16,
+        /// Pointer row where the gesture began.
+        start_y: u16,
+        /// Most recent valid drop anchor and insertion side.
+        drop: Option<(PlanNodeTarget, bool)>,
+        /// Whether the pointer has moved.
         moved: bool,
     },
     /// A linear text selection is being dragged across the rendered diff.
@@ -192,13 +206,28 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         };
     }
 
-    // 6. A generated-plan node: click pins/unpins its detail inspector. Placement is
-    // renderer-owned, so nodes are targets rather than draggable world objects.
-    if let Some(target) = geo.plan_node_at(x, y) {
-        return MouseOutcome::action(Action::TogglePlanNode(target), DragState::Idle);
+    // 6. Relationship labels expand independently from their endpoint boxes.
+    if let Some(target) = geo.plan_relationship_at(x, y) {
+        return MouseOutcome::action(Action::TogglePlanRelationship(target), DragState::Idle);
     }
 
-    // 7. Diff text uses native-style drag selection. Release copies the exact retained
+    // 7. A generated-plan node: arm a click-or-drag gesture. A release without motion
+    // toggles details; dragging reorders boxes inside the automatic bounded layout.
+    if let Some(target) = geo.plan_node_at(x, y) {
+        return MouseOutcome {
+            action: None,
+            drag: DragState::PlanNode {
+                source: target,
+                start_x: x,
+                start_y: y,
+                drop: None,
+                moved: false,
+            },
+            dirty: false,
+        };
+    }
+
+    // 8. Diff text uses native-style drag selection. Release copies the exact retained
     // code text, while a click without movement clears the previous selection.
     if let Some(start) = geo.diff_text_point_at(x, y) {
         return MouseOutcome {
@@ -212,7 +241,7 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         };
     }
 
-    // 8. A selectable file/symbol row.
+    // 9. A selectable file/symbol row.
     for (rect, phys) in &geo.file_row_rects {
         if hit(*rect, x, y) {
             let rows = app.projected_file_rows();
@@ -231,7 +260,7 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         }
     }
 
-    // 9. A pane rectangle: focus only. Clicking blank diff space also clears any
+    // 10. A pane rectangle: focus only. Clicking blank diff space also clears any
     // retained text selection, matching a plain click on a rendered code row.
     if let Some(pane) = geo.pane_at(x, y) {
         if pane == Pane::Diff && app.diff_selection.is_some() {
@@ -284,6 +313,51 @@ fn route_drag(event: MouseEvent, _app: &App, geo: &UiGeometry, drag: DragState) 
                             .then(|| extent_action(event.column, event.row)),
                         drag: DragState::Idle,
                         dirty: moved || released_elsewhere,
+                    }
+                }
+                _ => MouseOutcome::inert(DragState::Idle),
+            }
+        }
+        DragState::PlanNode {
+            source,
+            start_x,
+            start_y,
+            drop,
+            moved,
+        } => {
+            let did_move = event.column != start_x || event.row != start_y;
+            let next_drop = geo
+                .plan_node_drop_at(event.column, event.row, &source)
+                .or(drop.clone());
+            match event.kind {
+                K::Drag(MouseButton::Left) => MouseOutcome {
+                    action: next_drop
+                        .as_ref()
+                        .map(|(target, _)| Action::HoverPlanNode(Some(target.clone()))),
+                    drag: DragState::PlanNode {
+                        source,
+                        start_x,
+                        start_y,
+                        drop: next_drop,
+                        moved: moved || did_move,
+                    },
+                    dirty: moved || did_move,
+                },
+                K::Up(MouseButton::Left) => {
+                    let moved = moved || did_move;
+                    let action = if moved {
+                        next_drop.map(|(anchor, after)| Action::ReorderPlanNode {
+                            dragged: source,
+                            anchor,
+                            after,
+                        })
+                    } else {
+                        Some(Action::TogglePlanNode(source))
+                    };
+                    MouseOutcome {
+                        dirty: action.is_some(),
+                        action,
+                        drag: DragState::Idle,
                     }
                 }
                 _ => MouseOutcome::inert(DragState::Idle),
@@ -869,7 +943,9 @@ mod tests {
                 from: "n1".to_string(),
                 to: "n2".to_string(),
                 kind: codescope_core::PlanEdgeKind::Writes,
-                label: Some("writes record".to_string()),
+                label: Some(
+                    "writes a durable record after validating the complete request".to_string(),
+                ),
             }],
         });
         s.semantic.plan = Some(plan);
@@ -902,7 +978,9 @@ mod tests {
         assert!(!steady.dirty, "steady motion cannot force redraws");
 
         app.ai_plan_scroll = 10;
-        let click = map_mouse(down(rect.x, rect.y), &app, &s, &g, DragState::Idle);
+        let armed = map_mouse(down(rect.x, rect.y), &app, &s, &g, DragState::Idle);
+        assert!(matches!(armed.drag, DragState::PlanNode { .. }));
+        let click = map_mouse(up(rect.x, rect.y), &app, &s, &g, armed.drag);
         assert_eq!(click.action, Some(Action::TogglePlanNode(target.clone())));
         app.apply(click.action.expect("node toggle"));
         assert_eq!(app.expanded_plan_nodes, vec![target.clone()]);
@@ -915,12 +993,19 @@ mod tests {
             .find(|(_, candidate)| candidate.id == "n2")
             .expect("second node hitbox remains visible")
             .clone();
-        let second_click = map_mouse(
+        let second_armed = map_mouse(
             down(second_rect.x, second_rect.y),
             &app,
             &s,
             &expanded_geometry,
             DragState::Idle,
+        );
+        let second_click = map_mouse(
+            up(second_rect.x, second_rect.y),
+            &app,
+            &s,
+            &expanded_geometry,
+            second_armed.drag,
         );
         assert_eq!(
             second_click.action,
@@ -940,12 +1025,19 @@ mod tests {
             .find(|(_, candidate)| candidate == &target)
             .expect("first expanded node remains clickable")
             .clone();
-        let collapse_first = map_mouse(
+        let collapse_armed = map_mouse(
             down(first_rect.x, first_rect.y),
             &app,
             &s,
             &both_expanded_geometry,
             DragState::Idle,
+        );
+        let collapse_first = map_mouse(
+            up(first_rect.x, first_rect.y),
+            &app,
+            &s,
+            &both_expanded_geometry,
+            collapse_armed.drag,
         );
         app.apply(collapse_first.action.expect("first node toggle"));
         assert_eq!(
@@ -963,6 +1055,136 @@ mod tests {
             Some("n2"),
             "most recently expanded details pin code links after hover leaves"
         );
+        assert!(
+            crate::render::generated_impact_content(&app, &s, 80)
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.role != crate::diagram::DiagramRole::Hovered),
+            "expanded content stays open without sticky hover styling"
+        );
+
+        let relationship_geometry = geo(&app, &s);
+        let (relationship_rect, relationship_target) = relationship_geometry
+            .plan_relationship_rects
+            .first()
+            .expect("relationship hitbox")
+            .clone();
+        let expand_relationship = map_mouse(
+            down(relationship_rect.x, relationship_rect.y),
+            &app,
+            &s,
+            &relationship_geometry,
+            DragState::Idle,
+        );
+        assert_eq!(
+            expand_relationship.action,
+            Some(Action::TogglePlanRelationship(relationship_target.clone()))
+        );
+        app.apply(expand_relationship.action.expect("relationship toggle"));
+        let expanded_label = crate::render::generated_impact_content(&app, &s, 48)
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.relationship.as_ref() == Some(&relationship_target))
+            })
+            .map(crate::diagram::DiagramLine::text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            expanded_label.contains("complete request"),
+            "click reveals the complete relationship: {expanded_label}"
+        );
+
+        let collapse_geometry = geo(&app, &s);
+        let collapse_rect = collapse_geometry
+            .plan_relationship_rects
+            .first()
+            .expect("expanded relationship hitbox")
+            .0;
+        let collapse_relationship = map_mouse(
+            down(collapse_rect.x, collapse_rect.y),
+            &app,
+            &s,
+            &collapse_geometry,
+            DragState::Idle,
+        );
+        app.apply(collapse_relationship.action.expect("relationship collapse"));
+        assert!(app.expanded_plan_relationships.is_empty());
+
+        let drag_geometry = geo(&app, &s);
+        let source_rect = drag_geometry
+            .plan_node_rects
+            .iter()
+            .find(|(_, candidate)| candidate.id == "n1")
+            .expect("source box")
+            .0;
+        let anchor_rect = drag_geometry
+            .plan_node_rects
+            .iter()
+            .rev()
+            .find(|(_, candidate)| candidate.id == "n2")
+            .expect("anchor box")
+            .0;
+        let armed = map_mouse(
+            down(source_rect.x, source_rect.y),
+            &app,
+            &s,
+            &drag_geometry,
+            DragState::Idle,
+        );
+        let moving = map_mouse(
+            drag(
+                anchor_rect
+                    .x
+                    .saturating_add(anchor_rect.width.saturating_sub(1)),
+                anchor_rect.y,
+            ),
+            &app,
+            &s,
+            &drag_geometry,
+            armed.drag,
+        );
+        let dropped = map_mouse(
+            up(
+                anchor_rect
+                    .x
+                    .saturating_add(anchor_rect.width.saturating_sub(1)),
+                anchor_rect.y,
+            ),
+            &app,
+            &s,
+            &drag_geometry,
+            moving.drag,
+        );
+        assert!(matches!(
+            dropped.action,
+            Some(Action::ReorderPlanNode { ref dragged, ref anchor, after: true })
+                if dragged.id == "n1" && anchor.id == "n2"
+        ));
+        app.apply(dropped.action.expect("box reorder"));
+        assert_eq!(
+            app.plan_node_order
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>(),
+            ["n2", "n1"]
+        );
+        let reordered = crate::render::generated_impact_content(&app, &s, 80);
+        let label_row = |id: &str| {
+            reordered
+                .iter()
+                .position(|line| {
+                    line.spans.iter().any(|span| {
+                        span.target.as_ref().is_some_and(|target| target.id == id)
+                            && span.relationship.is_none()
+                    }) && line
+                        .text()
+                        .contains(if id == "n1" { "Handle" } else { "Store" })
+                })
+                .expect("reordered label row")
+        };
+        assert!(label_row("n2") < label_row("n1"), "drop changes box order");
     }
 
     #[test]

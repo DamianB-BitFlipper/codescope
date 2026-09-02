@@ -21,6 +21,17 @@ pub struct PlanNodeTarget {
     pub id: String,
 }
 
+/// Stable identity of one displayed relationship inside the current AI plan.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlanRelationshipTarget {
+    /// Zero-based form index inside the plan.
+    pub form: usize,
+    /// Source plan-local node id.
+    pub from: String,
+    /// Destination plan-local node id.
+    pub to: String,
+}
+
 /// Display-cell position inside the fully laid-out diff text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiffTextPoint {
@@ -186,6 +197,18 @@ pub enum Action {
     HoverPlanNode(Option<PlanNodeTarget>),
     /// Mouse click: expand or collapse one generated-plan node's detail inspector.
     TogglePlanNode(PlanNodeTarget),
+    /// Mouse drag: place one generated-plan box before or after another box in the same
+    /// form. This changes only the renderer-owned session layout, never the AI plan.
+    ReorderPlanNode {
+        /// Box being moved.
+        dragged: PlanNodeTarget,
+        /// Box used as the drop anchor.
+        anchor: PlanNodeTarget,
+        /// Place after the anchor when true, before it otherwise.
+        after: bool,
+    },
+    /// Mouse click: expand or collapse a truncated relationship label.
+    TogglePlanRelationship(PlanRelationshipTarget),
     /// Mouse drag preview: update the visible diff text selection.
     SetDiffSelection(DiffTextSelection),
     /// Mouse click: clear the retained diff highlight without copying anything.

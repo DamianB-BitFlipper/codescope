@@ -7,7 +7,7 @@
 use ratatui::layout::Rect;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::action::PlanNodeTarget;
+use crate::action::{PlanNodeTarget, PlanRelationshipTarget};
 use crate::app::{App, Pane};
 use crate::divider::{DividerAxis, DividerHandle, DividerId};
 use crate::layout::{
@@ -49,6 +49,8 @@ pub struct UiGeometry {
     /// Visible generated-plan node spans. Several rects may share one target when a box
     /// occupies multiple rows or a compact node has separate label/detail spans.
     pub(crate) plan_node_rects: Vec<(Rect, PlanNodeTarget)>,
+    /// Visible relationship-label spans, used for click-to-expand hit-testing.
+    pub(crate) plan_relationship_rects: Vec<(Rect, PlanRelationshipTarget)>,
     /// Exact laid-out diff text behind mouse selection and clipboard extraction.
     pub(crate) diff_copy: Option<crate::render::DiffCopyFrame>,
 }
@@ -249,6 +251,74 @@ impl UiGeometry {
             .find_map(|(rect, target)| hit(*rect, x, y).then(|| target.clone()))
     }
 
+    /// Generated-plan relationship label under a point.
+    pub(crate) fn plan_relationship_at(&self, x: u16, y: u16) -> Option<PlanRelationshipTarget> {
+        self.plan_relationship_rects
+            .iter()
+            .find_map(|(rect, target)| hit(*rect, x, y).then(|| target.clone()))
+    }
+
+    /// Nearest box and insertion side for a box drag inside the generated viewport.
+    /// Exact coordinates come from retained rendered spans, so expanded boxes and
+    /// scrolling cannot desynchronize the drop target from the frame the user saw.
+    pub(crate) fn plan_node_drop_at(
+        &self,
+        x: u16,
+        y: u16,
+        dragged: &PlanNodeTarget,
+    ) -> Option<(PlanNodeTarget, bool)> {
+        let generated = self
+            .scroll_regions
+            .iter()
+            .find(|region| region.id == ScrollRegionId::GeneratedImpact)?;
+        if !hit(generated.rect, x, y) {
+            return None;
+        }
+
+        let bounds_for = |wanted: &PlanNodeTarget| {
+            self.plan_node_rects
+                .iter()
+                .filter(|(_, target)| target == wanted)
+                .map(|(rect, _)| *rect)
+                .reduce(union)
+        };
+        let dragged_rect = bounds_for(dragged)?;
+        let mut candidates: Vec<(PlanNodeTarget, Rect)> = Vec::new();
+        for (_, target) in &self.plan_node_rects {
+            if target == dragged || candidates.iter().any(|(seen, _)| seen == target) {
+                continue;
+            }
+            if let Some(rect) = bounds_for(target) {
+                candidates.push((target.clone(), rect));
+            }
+        }
+        let (anchor, rect) = candidates.into_iter().min_by_key(|(_, rect)| {
+            let dx = if x < rect.x {
+                rect.x - x
+            } else {
+                x.saturating_sub(rect.x.saturating_add(rect.width.saturating_sub(1)))
+            };
+            let dy = if y < rect.y {
+                rect.y - y
+            } else {
+                y.saturating_sub(rect.y.saturating_add(rect.height.saturating_sub(1)))
+            };
+            u32::from(dx) + u32::from(dy)
+        })?;
+        let source_center_x = dragged_rect.x.saturating_add(dragged_rect.width / 2);
+        let source_center_y = dragged_rect.y.saturating_add(dragged_rect.height / 2);
+        let anchor_center_x = rect.x.saturating_add(rect.width / 2);
+        let anchor_center_y = rect.y.saturating_add(rect.height / 2);
+        let horizontally_separated =
+            source_center_x.abs_diff(anchor_center_x) > source_center_y.abs_diff(anchor_center_y);
+        let after = if horizontally_separated {
+            x >= anchor_center_x
+        } else {
+            y >= anchor_center_y
+        };
+        Some((anchor, after))
+    }
+
     /// Resolve a screen cell to the exact physical diff line/column displayed there.
     pub(crate) fn diff_text_point_at(
         &self,
@@ -431,6 +501,17 @@ impl UiGeometry {
                             target.clone(),
                         ));
                     }
+                    if let Some(target) = &span.relationship {
+                        self.plan_relationship_rects.push((
+                            Rect::new(
+                                x,
+                                generated_inner.y.saturating_add(screen_row as u16),
+                                width,
+                                1,
+                            ),
+                            target.clone(),
+                        ));
+                    }
                     x = x.saturating_add(width);
                 }
                 if x >= right {
@@ -486,6 +567,16 @@ fn inner(r: Rect) -> Rect {
 /// Point-in-rect test.
 fn hit(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+fn union(a: Rect, b: Rect) -> Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = a.x.saturating_add(a.width).max(b.x.saturating_add(b.width));
+    let bottom =
+        a.y.saturating_add(a.height)
+            .max(b.y.saturating_add(b.height));
+    Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
 }
 
 fn slice_display_cells(text: &str, from: usize, to: usize) -> String {

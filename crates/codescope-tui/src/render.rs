@@ -1622,16 +1622,14 @@ pub(crate) fn generated_impact_content(
         .unwrap_or("");
     let diagram = if sem.ai_generated {
         sem.plan.as_ref().map(|plan| {
-            let active = app
-                .hovered_plan_node
-                .as_ref()
-                .or_else(|| app.expanded_plan_nodes.last());
             crate::diagram::interactive_plan_lines(
                 plan,
                 width,
                 selected_label,
-                active,
+                app.hovered_plan_node.as_ref(),
                 &app.expanded_plan_nodes,
+                &app.plan_node_order,
+                &app.expanded_plan_relationships,
             )
         })
     } else {
@@ -2143,9 +2141,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  Space h l       expand / collapse"),
         Line::from("  mouse hover     impact node highlights its linked diff code"),
         Line::from("  click / Space   expand hovered impact-node details"),
+        Line::from("  click arrow     expand / collapse its complete relationship text"),
         Line::from("  mouse wheel     scroll the section under the pointer"),
         Line::from("  drag divider    resize adjacent panes"),
-        Line::from("  drag AI box     move it · drag empty AI space to pan"),
+        Line::from("  drag AI box     reorder boxes in the automatic layout"),
         Line::from("  drag diff code  select code only; release copies · click clears"),
         Line::from("  n / N           next / previous diff hunk"),
         Line::from("  z               zoom the focused pane (Tab still switches)"),
@@ -3636,7 +3635,7 @@ mod tests {
     /// A validated sequence starts in an automatically laid-out vertical flow; the
     /// first causal steps and their complete relationship remain visible immediately.
     #[test]
-    fn default_impact_pane_shows_ladder_steps() {
+    fn default_impact_pane_shows_stacked_boxes() {
         let mut plan = ai_plan_snap(7);
         {
             let viz = plan.semantic.plan.as_mut().unwrap();
@@ -3709,8 +3708,7 @@ mod tests {
         app.update(plan.clone());
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
-        // Five steps cannot fit side by side: the ladder renders, step 3 at the last row
-        // of the default pane.
+        // Five boxes cannot fit side by side, so the automatic layout stacks them.
         let mut highlighted = false;
         for y in 24..38u16 {
             let row = row_text(&t, y);
@@ -3819,7 +3817,7 @@ mod tests {
         );
         assert!(
             !bottom.contains("cited diff"),
-            "the note stays pinned to the top of the ladder: {bottom}"
+            "the note stays pinned to the top of the diagram: {bottom}"
         );
     }
 

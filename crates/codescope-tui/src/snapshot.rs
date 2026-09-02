@@ -367,7 +367,7 @@ pub enum DiffRow {
 #[derive(Debug, Clone, Default)]
 pub struct SemanticPane {
     /// Validated, structured plan. Layout is deliberately deferred until render time so
-    /// diagrams (ladders, trees, adjacency) can respond to the pane's current width.
+    /// boxed diagrams and labeled relationships can respond to the pane's current width.
     pub plan: Option<codescope_core::VisualizationPlan>,
     /// The validation report that produced `plan` (verdict, dropped items, notes).
     /// `Some` only for published AI panes; fallback/stale panes carry `None` so a prior

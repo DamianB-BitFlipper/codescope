@@ -91,10 +91,10 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
 7. **Epoch gate** — the plan carries the epoch it was requested against. If the repository has
    changed since, the plan is **stale**: the last valid render stays on screen with a "stale"
    badge and a new request is issued. A stale plan can never replace a newer state's view.
-8. **Render + interact** — the TUI draws validated plans as width-aware compact diagrams:
-   connected boxes when space permits, numbered ladders and compact trees when it does not,
-   and target-labeled adjacency rows for nonlinear flows. Each node renders once and every edge
-   names its effect/destination. Validator-verified connectors are solid; inferred or
+8. **Render + interact** — the TUI draws validated plans using only boxed nodes and labeled
+   relationship connectors. Chains sit horizontally when they fit and stack vertically when
+   they do not; nonlinear graphs and trees use boxed nodes with target-naming connectors. Each
+   node renders once and every edge names its effect/destination. Validator-verified connectors are solid; inferred or
    hunk-derived links are dashed and visibly labeled. The layout retains semantic node hitboxes
    from the same physical spans that were rendered. Mouse motion only redraws when the hovered
    target changes; it never starts AI/LSP work. Placement is entirely renderer-owned: no model
@@ -102,7 +102,9 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    and content that does not fit grows downward through the one vertical scroll axis. Hover adds
    a non-colour diff-row cue to every
    exact linked logical row (including all wrapped fragments), while click/`Space` pins the node and expands a
-   bounded detail strip with source locators. External assumptions get an upfront warning plus
+   bounded detail strip with source locators without pinning hover styling. Box drag changes the
+   session-local order while preserving automatic placement; clicking a truncated relationship
+   expands its complete label into wrapped connector rows and clicking again collapses it. External assumptions get an upfront warning plus
    the full Review block, and plan-level evidence remains below the map.
 
 ## One diagram API, two agent surfaces

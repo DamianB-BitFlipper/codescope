@@ -121,14 +121,16 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    and never serializing secrets or repository state.
 9. **TUI**: ratatui 0.30 + crossterm 0.29 (pin both; mismatch = duplicate crossterm);
    `ratatui::init/restore` (panic-safe), 4-tier responsive layout, modeless keymap, pure
-   `map_key` for testability. Validated AI plans render as width-aware compact diagrams —
-   connected boxes where space permits, numbered ladders, compact trees, and document-order
-   target-labeled adjacency lines for nonlinear flows (each node once, edges naming effect and
-   destination, cycles explicit). Layout owns placement and constrains every row to the live pane
+   `map_key` for testability. Validated AI plans use one width-aware visual grammar: boxed nodes
+   and labeled relationship connectors. Chains may sit side by side when they fit; otherwise all
+   forms stack their boxes vertically (each node once, edges naming effect and destination, cycles
+   explicit). Layout owns placement and constrains every row to the live pane
    width; overflow grows vertically through one scroll axis, never into a horizontal canvas.
    Dashed labeled connectors mark inferred/hunk-derived links.
    Hovering a node highlights its validated logical diff rows without erasing add/delete meaning;
-   click/`Space` opens a bounded details/source strip. External assumptions remain above the full
+   click/`Space` expands its details without pinning hover styling, dragging a box reorders the
+   automatic layout, and clicking a truncated relationship wraps its complete label in place.
+   External assumptions remain above the full
    Review block. (research 04)
 10. **Fixture + tests**: shell-regenerable Go fixture with deterministic OIDs; hand-rolled fake
    LSP server for negative tests; ScriptedProvider fake AI; live AI behind #[ignore] + env.

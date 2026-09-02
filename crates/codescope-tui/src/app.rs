@@ -5,7 +5,9 @@ use std::collections::HashSet;
 
 use codescope_core::ChangeScope;
 
-use crate::action::{next_scope, Action, DiffTextSelection, PlanNodeTarget};
+use crate::action::{
+    next_scope, Action, DiffTextSelection, PlanNodeTarget, PlanRelationshipTarget,
+};
 use crate::divider::DividerSizes;
 use crate::file_rows::ProjectedRow;
 use crate::scroll::ScrollRegionId;
@@ -75,6 +77,11 @@ pub struct App {
     /// Generated-plan nodes whose deeper details are open, in expansion order. The most
     /// recently expanded node pins diff highlighting when nothing is hovered.
     pub expanded_plan_nodes: Vec<PlanNodeTarget>,
+    /// User-defined box order, grouped by plan form. Empty means the automatic placer's
+    /// semantic order. It is session-only and resets when the generated plan changes.
+    pub plan_node_order: Vec<PlanNodeTarget>,
+    /// Relationship labels currently expanded to their complete wrapped text.
+    pub expanded_plan_relationships: Vec<PlanRelationshipTarget>,
     /// Independent offset for the deterministic incoming-callers list.
     pub callers_scroll: usize,
     /// Independent offset for the deterministic downstream-relationships list.
@@ -171,6 +178,8 @@ impl App {
             self.ai_plan_scroll = 0;
             self.hovered_plan_node = None;
             self.expanded_plan_nodes.clear();
+            self.plan_node_order.clear();
+            self.expanded_plan_relationships.clear();
         }
         if impact_retargeted {
             self.callers_scroll = 0;
@@ -258,6 +267,29 @@ impl App {
                 self.focused = Pane::Impact;
                 self.hovered_plan_node = Some(target.clone());
                 self.toggle_plan_node(target);
+            }
+            Action::ReorderPlanNode {
+                dragged,
+                anchor,
+                after,
+            } => {
+                self.focused = Pane::Impact;
+                self.reorder_plan_node(dragged, anchor, after);
+            }
+            Action::TogglePlanRelationship(target) => {
+                self.focused = Pane::Impact;
+                if self.plan_relationship_exists(&target) {
+                    if let Some(index) = self
+                        .expanded_plan_relationships
+                        .iter()
+                        .position(|expanded| expanded == &target)
+                    {
+                        self.expanded_plan_relationships.remove(index);
+                    } else {
+                        self.expanded_plan_relationships.push(target);
+                    }
+                    self.ai_plan_scroll = 0;
+                }
             }
             Action::SetDiffSelection(selection) => {
                 self.focused = Pane::Diff;
@@ -425,6 +457,8 @@ impl App {
         self.ai_plan_scroll = 0;
         self.hovered_plan_node = None;
         self.expanded_plan_nodes.clear();
+        self.plan_node_order.clear();
+        self.expanded_plan_relationships.clear();
         self.current_hunk = usize::from(self.snapshot.diff.total_hunks > 0);
     }
 
@@ -482,6 +516,85 @@ impl App {
             self.expanded_plan_nodes.push(target);
             self.ai_plan_scroll = 0;
         }
+    }
+
+    fn reorder_plan_node(&mut self, dragged: PlanNodeTarget, anchor: PlanNodeTarget, after: bool) {
+        if dragged == anchor || dragged.form != anchor.form {
+            return;
+        }
+        let Some(form) = self
+            .snapshot
+            .semantic
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.forms.get(dragged.form))
+        else {
+            return;
+        };
+        if !form.nodes.iter().any(|node| node.id == dragged.id)
+            || !form.nodes.iter().any(|node| node.id == anchor.id)
+        {
+            return;
+        }
+
+        let mut order = form
+            .nodes
+            .iter()
+            .map(|node| PlanNodeTarget {
+                form: dragged.form,
+                id: node.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        if self
+            .plan_node_order
+            .iter()
+            .any(|target| target.form == dragged.form)
+        {
+            order.sort_by_key(|target| {
+                self.plan_node_order
+                    .iter()
+                    .position(|ordered| ordered == target)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let Some(from) = order.iter().position(|target| target == &dragged) else {
+            return;
+        };
+        order.remove(from);
+        let Some(anchor_index) = order.iter().position(|target| target == &anchor) else {
+            return;
+        };
+        order.insert(anchor_index + usize::from(after), dragged);
+        self.plan_node_order
+            .retain(|target| target.form != anchor.form);
+        self.plan_node_order.extend(order);
+        self.ai_plan_scroll = 0;
+        self.hovered_plan_node = None;
+    }
+
+    fn plan_relationship_exists(&self, target: &PlanRelationshipTarget) -> bool {
+        let Some(form) = self
+            .snapshot
+            .semantic
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.forms.get(target.form))
+        else {
+            return false;
+        };
+        form.edges
+            .iter()
+            .any(|edge| edge.from == target.from && edge.to == target.to)
+            || form.nodes.iter().any(|node| {
+                node.id == target.from && node.children.iter().any(|child| child == &target.to)
+            })
+            || (form.kind == codescope_core::FormKind::BeforeAfter
+                && form.edges.is_empty()
+                && form
+                    .nodes
+                    .first()
+                    .is_some_and(|node| node.id == target.from)
+                && form.nodes.get(1).is_some_and(|node| node.id == target.to))
     }
 
     /// Model candidates matching the picker's filter query (the visible list).
