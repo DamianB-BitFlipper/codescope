@@ -122,7 +122,9 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    `map_key` for testability. Validated AI plans render as width-aware compact diagrams —
    connected boxes where space permits, numbered ladders, compact trees, and document-order
    target-labeled adjacency lines for nonlinear flows (each node once, edges naming effect and
-   destination, cycles explicit). Dashed labeled connectors mark inferred/hunk-derived links.
+   destination, cycles explicit). Layout owns placement and constrains every row to the live pane
+   width; overflow grows vertically through one scroll axis, never into a horizontal canvas.
+   Dashed labeled connectors mark inferred/hunk-derived links.
    Hovering a node highlights its validated logical diff rows without erasing add/delete meaning;
    click/`Space` opens a bounded details/source strip. External assumptions remain above the full
    Review block. (research 04)
@@ -155,11 +157,11 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 
 ## Explicit non-goals for v0
 
-- tree-sitter fallback, runtime data flow, multi-language beyond Go, plan streaming renders,
+- tree-sitter fallback, runtime data flow, multi-language beyond Go,
   `$/cancelRequest` to gopls, writing anything to the repo.
 
 ## Lead decisions recorded during implementation
 
-- schemars lives in codescope-ai (schema generated there from core plan types); core stays serde-only.
+- Incremental diagram commands are the only model output protocol; core stays serde-only.
 - UiSnapshot is owned by codescope-tui (renders it); binary crate assembles it from subsystems.
-- core Epoch is u64; the AI plan "epoch" field echoes the same integer in JSON (e.g. 2).
+- core Epoch is u64 and server-owned; models cannot inject or override it.

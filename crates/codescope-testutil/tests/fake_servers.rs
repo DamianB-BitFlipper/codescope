@@ -1,8 +1,10 @@
 //! Integration tests for the fake LSP server and the scripted fake AI provider, driven
 //! through their public APIs with hand-rolled test clients (no client frameworks).
 
-use codescope_core::{Epoch, VisualizationPlan};
-use codescope_testutil::fake_ai::{AiScriptStep, ScriptedProvider, FAKE_MODEL, PLAN_TOOL_NAME};
+use codescope_core::Epoch;
+use codescope_testutil::fake_ai::{
+    AiScriptStep, ScriptedProvider, DIAGRAM_FINISH_TOOL_NAME, FAKE_MODEL,
+};
 use codescope_testutil::fake_lsp::{
     read_frame, spawn_in_process, write_frame, FakeLspConfig, ScriptedResponse, METHOD_NOT_FOUND,
 };
@@ -297,7 +299,10 @@ fn chat_request() -> Value {
     json!({
         "model": "gpt-fake",
         "messages": [{"role": "user", "content": "visualize the change set"}],
-        "tools": [{"type": "function", "function": {"name": PLAN_TOOL_NAME}}]
+        "tools": [
+            {"type": "function", "function": {"name": "edit_visualization"}},
+            {"type": "function", "function": {"name": DIAGRAM_FINISH_TOOL_NAME}}
+        ]
     })
 }
 
@@ -315,18 +320,18 @@ async fn ai_valid_plan_round_trips_through_core_types() {
     assert_eq!(completion["model"], FAKE_MODEL);
     let choice = &completion["choices"][0];
     assert_eq!(choice["finish_reason"], "tool_calls");
-    let call = &choice["message"]["tool_calls"][0];
-    assert_eq!(call["type"], "function");
-    assert_eq!(call["function"]["name"], PLAN_TOOL_NAME);
-
-    let plan: VisualizationPlan =
-        serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    let calls = choice["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "edit_visualization");
     assert_eq!(
-        plan.epoch,
-        Epoch(9),
-        "provider must echo the scripted epoch"
+        calls.last().unwrap()["function"]["name"],
+        DIAGRAM_FINISH_TOOL_NAME
     );
-    assert!(!plan.forms.is_empty());
+    assert!(calls.iter().any(|call| {
+        call["function"]["arguments"]
+            .as_str()
+            .is_some_and(|arguments| arguments.contains("LoggingMiddleware"))
+    }));
 
     // The client's request was recorded.
     let requests = provider.requests();
@@ -367,24 +372,16 @@ async fn ai_scripted_failure_modes_in_order() {
         .unwrap();
     assert!(serde_json::from_str::<Value>(arguments).is_err());
 
-    // 2. Hallucinated entities parse fine — catching them is the validator's job.
+    // 2. Hallucinated entities are still carried by incremental node edits — catching
+    // them is the validator's job.
     let response = post_chat(&provider, &chat_request()).await;
     let completion: Value = serde_json::from_str(&response.body).unwrap();
-    let plan: VisualizationPlan = serde_json::from_str(
-        completion["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        plan.forms[0].nodes[0]
-            .entity
-            .as_ref()
-            .unwrap()
-            .file
-            .to_string(),
-        "internal/api/quantum_flux.go"
-    );
+    let calls = completion["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert!(calls.iter().any(|call| call["function"]["arguments"]
+        .as_str()
+        .is_some_and(|arguments| arguments.contains("internal/api/quantum_flux.go"))));
 
     // 3. Plain text instead of a tool call.
     let response = post_chat(&provider, &chat_request()).await;

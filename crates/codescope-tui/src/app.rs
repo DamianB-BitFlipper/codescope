@@ -1,12 +1,11 @@
 //! Application state and pure `Action` transitions. No I/O — the run loop feeds it
 //! [`UiSnapshot`]s and [`Action`]s; rendering reads it.
 
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::HashSet;
 
 use codescope_core::ChangeScope;
 
-use crate::action::{next_scope, Action, DiffTextSelection, PlanCanvasPoint, PlanNodeTarget};
+use crate::action::{next_scope, Action, DiffTextSelection, PlanNodeTarget};
 use crate::divider::DividerSizes;
 use crate::file_rows::ProjectedRow;
 use crate::scroll::ScrollRegionId;
@@ -35,25 +34,6 @@ pub struct UiPreferences {
     pub diff_wrap: bool,
     /// Requested extent of every structural divider.
     pub dividers: DividerSizes,
-}
-
-/// Session-only placement and viewport state for one generated plan.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PlanCanvasView {
-    /// Absolute positions assigned by node dragging; absent nodes use automatic layout.
-    pub positions: HashMap<PlanNodeTarget, PlanCanvasPoint>,
-    /// World coordinate displayed at the canvas viewport's top-left cell.
-    pub origin: PlanCanvasPoint,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PlanCanvasKey {
-    scope: u8,
-    file: String,
-    label: String,
-    position: Option<(u32, u32)>,
-    epoch: codescope_core::Epoch,
-    fingerprint: u64,
 }
 
 /// View-state for the running app.
@@ -95,8 +75,6 @@ pub struct App {
     /// Generated-plan nodes whose deeper details are open, in expansion order. The most
     /// recently expanded node pins diff highlighting when nothing is hovered.
     pub expanded_plan_nodes: Vec<PlanNodeTarget>,
-    /// Per-selection manual canvas arrangements retained for this process only.
-    canvas_views: HashMap<PlanCanvasKey, PlanCanvasView>,
     /// Independent offset for the deterministic incoming-callers list.
     pub callers_scroll: usize,
     /// Independent offset for the deterministic downstream-relationships list.
@@ -277,21 +255,6 @@ impl App {
                 self.focused = Pane::Impact;
                 self.hovered_plan_node = Some(target.clone());
                 self.toggle_plan_node(target);
-            }
-            Action::MovePlanNode { target, position } => {
-                self.focused = Pane::Impact;
-                self.hovered_plan_node = Some(target.clone());
-                if self.plan_node(&target).is_some() {
-                    if let Some(view) = self.active_canvas_view_mut() {
-                        view.positions.insert(target, position);
-                    }
-                }
-            }
-            Action::PanPlanCanvas { origin } => {
-                self.focused = Pane::Impact;
-                if let Some(view) = self.active_canvas_view_mut() {
-                    view.origin = origin;
-                }
             }
             Action::SetDiffSelection(selection) => {
                 self.focused = Pane::Diff;
@@ -516,44 +479,6 @@ impl App {
             self.expanded_plan_nodes.push(target);
             self.ai_plan_scroll = 0;
         }
-    }
-
-    /// Current generated-plan canvas state. A missing entry is the automatic layout at
-    /// origin `(0, 0)`.
-    pub(crate) fn active_canvas_view(&self) -> Option<&PlanCanvasView> {
-        self.active_canvas_key()
-            .and_then(|key| self.canvas_views.get(&key))
-    }
-
-    fn active_canvas_view_mut(&mut self) -> Option<&mut PlanCanvasView> {
-        let key = self.active_canvas_key()?;
-        Some(self.canvas_views.entry(key).or_default())
-    }
-
-    fn active_canvas_key(&self) -> Option<PlanCanvasKey> {
-        let plan = self.snapshot.semantic.plan.as_ref()?;
-        let selected = self.snapshot.impact.selected_change.as_ref();
-        let mut hasher = DefaultHasher::new();
-        format!("{plan:?}").hash(&mut hasher);
-        Some(PlanCanvasKey {
-            scope: match self.snapshot.scope {
-                ChangeScope::Branch => 0,
-                ChangeScope::Staged => 1,
-                ChangeScope::Unstaged => 2,
-                ChangeScope::Working => 3,
-            },
-            file: selected
-                .map(|selected| selected.file.clone())
-                .unwrap_or_else(|| self.snapshot.diff.title.clone()),
-            label: selected
-                .map(|selected| selected.label.clone())
-                .unwrap_or_default(),
-            position: self
-                .selected_file_symbol()
-                .and_then(|(_, symbol)| symbol.and_then(|symbol| symbol.position)),
-            epoch: plan.epoch,
-            fingerprint: hasher.finish(),
-        })
     }
 
     /// Model candidates matching the picker's filter query (the visible list).
@@ -1688,56 +1613,6 @@ mod tests {
         assert_eq!(app.ai_plan_scroll, 1);
         app.apply(Action::Bottom);
         assert_eq!(app.ai_plan_scroll, 10_000);
-    }
-
-    #[test]
-    fn canvas_arrangement_returns_with_selection_and_new_plan_starts_fresh() {
-        let mut first = ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 2);
-        first.impact.selected_change = Some(crate::snapshot::SelectedChange {
-            file: "a.go".to_string(),
-            label: "step0".to_string(),
-            change: "modified",
-            interpretation: "Changes step zero.".to_string(),
-            interpretation_source: Default::default(),
-        });
-        let mut app = App::new();
-        app.update(first.clone());
-        let target = PlanNodeTarget {
-            form: 0,
-            id: "n0".to_string(),
-        };
-        let position = PlanCanvasPoint { x: 48, y: 12 };
-        app.apply(Action::MovePlanNode {
-            target: target.clone(),
-            position,
-        });
-        app.apply(Action::PanPlanCanvas {
-            origin: PlanCanvasPoint { x: 20, y: 4 },
-        });
-        assert_eq!(
-            app.active_canvas_view().unwrap().positions.get(&target),
-            Some(&position)
-        );
-
-        let mut second = first.clone();
-        second.impact.selected_change.as_mut().unwrap().file = "b.go".to_string();
-        second.impact.selected_change.as_mut().unwrap().label = "other".to_string();
-        app.update(second);
-        assert!(app.active_canvas_view().is_none());
-
-        app.update(first.clone());
-        let restored = app.active_canvas_view().expect("first selection layout");
-        assert_eq!(restored.positions.get(&target), Some(&position));
-        assert_eq!(restored.origin, PlanCanvasPoint { x: 20, y: 4 });
-
-        let mut regenerated = first;
-        regenerated.epoch = Epoch(2);
-        regenerated.semantic.plan.as_mut().unwrap().epoch = Epoch(2);
-        app.update(regenerated);
-        assert!(
-            app.active_canvas_view().is_none(),
-            "new plan epoch gets automatic placement"
-        );
     }
 
     #[test]

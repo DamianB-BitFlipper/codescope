@@ -1,9 +1,9 @@
 //! Provider-neutral OpenAI-compatible chat-completions client (research 05 §5, 07 §4).
 //!
 //! One endpoint: `POST {base_url}/chat/completions` with the configured tool choice
-//! (`required` by default). Legacy callers receive `submit_visualization_plan`; incremental
-//! callers provide `finish_visualization` and draft-editor tools instead. Streaming is off
-//! (`"stream": false`); draft mutations are ordinary tool turns and final publication is atomic.
+//! (`required` by default). Callers provide the incremental `finish_visualization` and
+//! draft-editor tools. Streaming is off (`"stream": false`); draft mutations are ordinary
+//! tool turns and final publication is atomic.
 //!
 //! Local protections (all before/around the network call):
 //!
@@ -24,8 +24,7 @@
 
 use crate::config::{AiConfig, ProviderKind, ReasoningEffort, ToolChoice};
 use crate::error::AiError;
-use crate::plan::plan_tool;
-use crate::tools::{ToolDef, DIAGRAM_FINISH_TOOL_NAME, PLAN_TOOL_NAME};
+use crate::tools::ToolDef;
 use governor::clock::{Clock, QuantaClock};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -130,9 +129,7 @@ pub struct RawToolCall {
 
 /// A parsed chat completion: the raw assistant message plus its tool calls.
 ///
-/// The plan, when submitted, is the `submit_visualization_plan` call's arguments
-/// ([`RawPlanResponse::plan_arguments`]); any other calls are read-only tool requests the
-/// service must execute and answer.
+/// The service interprets these as research or incremental diagram operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawPlanResponse {
     /// The assistant message exactly as received (echo it into the conversation when
@@ -142,26 +139,6 @@ pub struct RawPlanResponse {
     pub tool_calls: Vec<RawToolCall>,
     /// Model the provider reports having used.
     pub model: Option<String>,
-}
-
-impl RawPlanResponse {
-    /// First `submit_visualization_plan` call, when present.
-    #[must_use]
-    pub fn plan_call(&self) -> Option<&RawToolCall> {
-        self.tool_calls.iter().find(|c| c.name == PLAN_TOOL_NAME)
-    }
-
-    /// Arguments of the first `submit_visualization_plan` call, if present: the JSON plan
-    /// text.
-    #[must_use]
-    pub fn plan_arguments(&self) -> Option<&str> {
-        self.plan_call().map(|c| c.arguments.as_str())
-    }
-
-    /// Tool calls other than plan submission (the read-only surface).
-    pub fn read_only_calls(&self) -> impl Iterator<Item = &RawToolCall> {
-        self.tool_calls.iter().filter(|c| c.name != PLAN_TOOL_NAME)
-    }
 }
 
 /// Client knobs beyond [`AiConfig`], with production defaults; tests tighten/loosen them.
@@ -498,12 +475,10 @@ impl AiClient {
             .is_some_and(|until| Instant::now() < until)
     }
 
-    /// One chat turn with configured tool choice and streaming off. Legacy callers get an
-    /// automatically attached `submit_visualization_plan`; incremental callers advertise
-    /// `finish_visualization`, which suppresses that legacy tool.
+    /// One chat turn with configured tool choice and streaming off.
     ///
-    /// Returns the parsed completion; the caller decides whether it is a plan submission
-    /// or a batch of read-only tool calls. Fails with [`AiError::NoToolCall`] when the
+    /// Returns the parsed completion; the service interprets its research and diagram calls.
+    /// Fails with [`AiError::NoToolCall`] when the
     /// provider returned an answer without selecting a tool.
     #[tracing::instrument(level = "debug", skip_all, fields(messages = messages.len(), tools = tools.len()))]
     pub async fn chat_with_plan(
@@ -529,7 +504,7 @@ impl AiClient {
 
     /// Scheduler path: wait asynchronously for token-bucket capacity instead of turning
     /// normal background pacing into a user-visible throttle failure. Unlike the public
-    /// one-shot method, this keeps a tool-less assistant message so the service can spend one
+    /// public method, this keeps a tool-less assistant message so the service can spend one
     /// bounded repair turn asking an auto-choice model for the required structured call.
     pub(crate) async fn chat_with_plan_waiting(
         &self,
@@ -553,13 +528,7 @@ impl AiClient {
         messages: &[ChatMessage],
         tools: &[ToolDef],
     ) -> Result<RawPlanResponse, AiError> {
-        let mut tool_values: Vec<Value> = tools.iter().map(ToolDef::to_openai).collect();
-        if !tools
-            .iter()
-            .any(|t| matches!(t.name, PLAN_TOOL_NAME | DIAGRAM_FINISH_TOOL_NAME))
-        {
-            tool_values.push(plan_tool().to_openai());
-        }
+        let tool_values: Vec<Value> = tools.iter().map(ToolDef::to_openai).collect();
         let body = self.build_body(messages, &tool_values);
 
         let mut request = self
@@ -1105,14 +1074,14 @@ mod tests {
                     {"id": "c1", "type": "function",
                      "function": {"name": "get_hunk", "arguments": "{\"file\":\"a.go\",\"hunk_index\":0}"}},
                     {"id": "c2", "type": "function",
-                     "function": {"name": PLAN_TOOL_NAME, "arguments": "{\"plan_version\":1}"}}
+                     "function": {"name": "finish_visualization", "arguments": "{}"}}
                 ]
             }}]
         });
         let parsed = parse_completion(completion).unwrap();
         assert_eq!(parsed.tool_calls.len(), 2);
-        assert_eq!(parsed.plan_arguments(), Some("{\"plan_version\":1}"));
-        assert_eq!(parsed.read_only_calls().count(), 1);
+        assert_eq!(parsed.tool_calls[1].name, "finish_visualization");
+        assert_eq!(parsed.tool_calls[1].arguments, "{}");
         assert_eq!(parsed.model.as_deref(), Some("m"));
     }
 
@@ -1121,11 +1090,11 @@ mod tests {
         let completion = serde_json::json!({
             "choices": [{"message": {"tool_calls": [
                 {"id": "c1", "type": "function",
-                 "function": {"name": PLAN_TOOL_NAME, "arguments": {"plan_version": 1}}}
+                 "function": {"name": "edit_visualization", "arguments": {"op": "reset"}}}
             ]}}]
         });
         let parsed = parse_completion(completion).unwrap();
-        assert_eq!(parsed.plan_arguments(), Some("{\"plan_version\":1}"));
+        assert_eq!(parsed.tool_calls[0].arguments, "{\"op\":\"reset\"}");
     }
 
     #[test]
@@ -1287,13 +1256,13 @@ mod tests {
             "model": "claude-x",
             "content": [
                 {"type": "text", "text": "thinking"},
-                {"type": "tool_use", "id": "t1", "name": "submit_visualization_plan",
+                {"type": "tool_use", "id": "t1", "name": "finish_visualization",
                  "input": {"plan_version": 1}},
             ],
         });
         let res = parse_anthropic_response(body).unwrap();
         assert_eq!(res.tool_calls.len(), 1);
-        assert_eq!(res.tool_calls[0].name, "submit_visualization_plan");
+        assert_eq!(res.tool_calls[0].name, "finish_visualization");
         assert!(res.tool_calls[0].arguments.contains("plan_version"));
     }
 

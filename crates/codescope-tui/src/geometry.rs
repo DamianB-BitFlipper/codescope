@@ -7,9 +7,8 @@
 use ratatui::layout::Rect;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::action::{PlanCanvasPoint, PlanNodeTarget};
+use crate::action::PlanNodeTarget;
 use crate::app::{App, Pane};
-use crate::canvas::{CanvasNodeFrame, CanvasRect};
 use crate::divider::{DividerAxis, DividerHandle, DividerId};
 use crate::layout::{
     choose_tier, files_width, impact_left_width, impact_section_heights, Tier, MIN_DIFF_WIDTH,
@@ -50,19 +49,8 @@ pub struct UiGeometry {
     /// Visible generated-plan node spans. Several rects may share one target when a box
     /// occupies multiple rows or a compact node has separate label/detail spans.
     pub(crate) plan_node_rects: Vec<(Rect, PlanNodeTarget)>,
-    /// Retained generated-plan canvas geometry, present only for validated AI visuals.
-    pub(crate) plan_canvas: Option<PlanCanvasGeometry>,
     /// Exact laid-out diff text behind mouse selection and clipboard extraction.
     pub(crate) diff_copy: Option<crate::render::DiffCopyFrame>,
-}
-
-/// Canvas viewport and world geometry from the retained frame.
-#[derive(Debug, Clone)]
-pub(crate) struct PlanCanvasGeometry {
-    pub(crate) rect: Rect,
-    pub(crate) origin: PlanCanvasPoint,
-    pub(crate) bounds: CanvasRect,
-    pub(crate) nodes: Vec<CanvasNodeFrame>,
 }
 
 impl UiGeometry {
@@ -261,13 +249,6 @@ impl UiGeometry {
             .find_map(|(rect, target)| hit(*rect, x, y).then(|| target.clone()))
     }
 
-    /// Whether a point is inside the generated-plan canvas viewport.
-    pub(crate) fn plan_canvas_at(&self, x: u16, y: u16) -> bool {
-        self.plan_canvas
-            .as_ref()
-            .is_some_and(|canvas| hit(canvas.rect, x, y))
-    }
-
     /// Resolve a screen cell to the exact physical diff line/column displayed there.
     pub(crate) fn diff_text_point_at(
         &self,
@@ -326,77 +307,6 @@ impl UiGeometry {
             selected.push(slice_display_cells(line, from, to));
         }
         selected.join("\n")
-    }
-
-    /// World position and collision footprint of one node in the retained frame.
-    pub(crate) fn plan_node_geometry(&self, target: &PlanNodeTarget) -> Option<&CanvasNodeFrame> {
-        self.plan_canvas
-            .as_ref()?
-            .nodes
-            .iter()
-            .find(|node| &node.target == target)
-    }
-
-    /// Clamp a proposed node position to the nearest non-overlapping point along the
-    /// movement vector from its current retained position.
-    pub(crate) fn clamp_plan_node_position(
-        &self,
-        target: &PlanNodeTarget,
-        proposed: PlanCanvasPoint,
-    ) -> PlanCanvasPoint {
-        let Some(canvas) = &self.plan_canvas else {
-            return proposed;
-        };
-        let Some(node) = canvas.nodes.iter().find(|node| &node.target == target) else {
-            return proposed;
-        };
-        let clear = |position: PlanCanvasPoint| {
-            let candidate = CanvasRect {
-                x: position.x,
-                y: position.y,
-                ..node.footprint
-            };
-            canvas
-                .nodes
-                .iter()
-                .all(|other| &other.target == target || !candidate.intersects(other.footprint))
-        };
-        if clear(proposed) {
-            return proposed;
-        }
-        let dx = proposed.x - node.position.x;
-        let dy = proposed.y - node.position.y;
-        let steps = dx.abs().max(dy.abs()).max(1);
-        for step in 1..=steps {
-            let position = PlanCanvasPoint {
-                x: proposed.x - dx * step / steps,
-                y: proposed.y - dy * step / steps,
-            };
-            if clear(position) {
-                return position;
-            }
-        }
-        node.position
-    }
-
-    /// Keep a panned origin within one viewport of the current content bounds, allowing
-    /// moved nodes to grow the reachable canvas in every direction without infinite drift.
-    pub(crate) fn clamp_plan_canvas_origin(&self, proposed: PlanCanvasPoint) -> PlanCanvasPoint {
-        let Some(canvas) = &self.plan_canvas else {
-            return proposed;
-        };
-        let width = i32::from(canvas.rect.width).max(1);
-        let height = i32::from(canvas.rect.height).max(1);
-        PlanCanvasPoint {
-            x: proposed.x.clamp(
-                canvas.bounds.x - width + 1,
-                canvas.bounds.right().saturating_sub(1),
-            ),
-            y: proposed.y.clamp(
-                canvas.bounds.y - height + 1,
-                canvas.bounds.bottom().saturating_sub(1),
-            ),
-        }
     }
 
     fn register_scroll_region(
@@ -475,40 +385,6 @@ impl UiGeometry {
             generated.width.saturating_sub(2),
             generated.height,
         );
-        if let Some(mut canvas) = crate::render::generated_plan_canvas(
-            app,
-            snap,
-            generated_inner.width,
-            generated_inner.height,
-        ) {
-            for node in &mut canvas.nodes {
-                if let Some(rect) = &mut node.screen_rect {
-                    rect.x = rect.x.saturating_add(generated_inner.x);
-                    rect.y = rect.y.saturating_add(generated_inner.y);
-                    self.plan_node_rects.push((*rect, node.target.clone()));
-                }
-            }
-            self.plan_canvas = Some(PlanCanvasGeometry {
-                rect: generated_inner,
-                origin: canvas.origin,
-                bounds: canvas.bounds,
-                nodes: canvas.nodes,
-            });
-            register_horizontal_sectional(
-                &mut self.dividers,
-                DividerId::SelectedCallers,
-                rows[0],
-                rows[1],
-            );
-            register_horizontal_sectional(
-                &mut self.dividers,
-                DividerId::CallersDownstream,
-                rows[1],
-                rows[2],
-            );
-            return;
-        }
-
         let generated_lines =
             crate::render::generated_impact_content(app, snap, generated_inner.width);
         let viewport = usize::from(generated_inner.height);

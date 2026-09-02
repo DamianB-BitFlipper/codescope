@@ -7,7 +7,7 @@ use codescope_ai::{
     diagram_tools, research_tools, AiClient, AiClientOptions, AiConfig, AiError, AiOutcome,
     AiService, ChatMessage, DiagramObserver, FactView, Lookup, NoToolExecutor, ReasoningEffort,
     RetryPolicy, ToolChoice, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
-    DIAGRAM_FINISH_TOOL_NAME, PLAN_TOOL_NAME,
+    DIAGRAM_FINISH_TOOL_NAME,
 };
 use codescope_core::{
     DiagramCommand, DiagramDraft, DiffSide, EntityRef, Epoch, FileId, FormKind, LineRange,
@@ -36,7 +36,7 @@ fn config_for(provider: &ScriptedProvider, timeout: Duration) -> AiConfig {
         api_key: Some(SecretString::from("sk-test".to_string())),
         timeout,
         tool_choice: ToolChoice::Required,
-        max_tool_calls: 8,
+        max_tool_calls: 48,
         prime_team_id: None,
     }
 }
@@ -362,7 +362,8 @@ async fn valid_plan_end_to_end_with_redaction_and_wire_shape() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
-    assert!(tool_names.contains(&PLAN_TOOL_NAME));
+    assert!(tool_names.contains(&DIAGRAM_EDIT_TOOL_NAME));
+    assert!(tool_names.contains(&DIAGRAM_FINISH_TOOL_NAME));
     for expected in [
         "get_file_outline",
         "get_symbol",
@@ -382,7 +383,7 @@ async fn valid_plan_end_to_end_with_redaction_and_wire_shape() {
     assert!(!user.contains(REPO_ROOT), "absolute root leaked: {user}");
     // Epoch echo contract present in the system prompt.
     let system = body["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("\"epoch\": 7"));
+    assert!(system.contains("epoch 7"));
 }
 
 #[tokio::test]
@@ -424,7 +425,7 @@ async fn previous_validated_design_is_sent_as_a_non_evidentiary_revision_seed() 
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.contains("previous validated design"));
     assert!(system.contains("current research always wins"));
-    assert!(system.contains("Preserve useful structure for an incremental revision"));
+    assert!(system.contains("live draft is already preseeded"));
     assert!(system.contains("never copy its old epoch"));
 }
 
@@ -455,7 +456,7 @@ async fn auto_tool_choice_is_sent_to_openai_compatible_providers() {
 }
 
 #[tokio::test]
-async fn no_tool_executor_advertises_only_plan_submission() {
+async fn no_tool_executor_advertises_only_incremental_diagram_tools() {
     let provider = ScriptedProvider::start([AiScriptStep::valid_plan(Epoch(7)).unwrap()])
         .await
         .unwrap();
@@ -477,16 +478,26 @@ async fn no_tool_executor_advertises_only_plan_submission() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tool_names, [PLAN_TOOL_NAME]);
+    assert_eq!(
+        tool_names,
+        [
+            DIAGRAM_EDIT_TOOL_NAME,
+            codescope_ai::DIAGRAM_INSPECT_TOOL_NAME,
+            DIAGRAM_FINISH_TOOL_NAME,
+        ]
+    );
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.contains("No read-only tools are available"));
 }
 
 #[tokio::test]
-async fn malformed_plan_json_fails_without_retry() {
-    let provider = ScriptedProvider::start([AiScriptStep::malformed_json()])
-        .await
-        .unwrap();
+async fn malformed_diagram_command_gets_tool_feedback_then_recovers() {
+    let provider = ScriptedProvider::start([
+        AiScriptStep::malformed_json(),
+        AiScriptStep::valid_plan(Epoch(1)).unwrap(),
+    ])
+    .await
+    .unwrap();
     let service = service_for(&provider);
     let outcome = service
         .request_plan(
@@ -496,15 +507,22 @@ async fn malformed_plan_json_fails_without_retry() {
             Epoch(1),
         )
         .await;
-    let AiOutcome::Failed(reason) = outcome else {
-        panic!("expected failure, got {outcome:?}");
-    };
-    assert!(reason.contains("plan malformed"), "{reason}");
-    assert_eq!(provider.requests().len(), 1, "parse errors must not retry");
+    assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let feedback = requests[1].body_json().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(feedback.contains("not valid JSON"), "{feedback}");
 }
 
 #[tokio::test]
-async fn syntactically_valid_incomplete_plan_gets_one_schema_repair() {
+async fn syntactically_valid_incomplete_edit_gets_one_protocol_repair() {
     let provider = ScriptedProvider::start([
         AiScriptStep::ToolCallRaw {
             arguments: r#"{"epoch":5}"#.into(),
@@ -531,25 +549,14 @@ async fn syntactically_valid_incomplete_plan_gets_one_schema_repair() {
         .unwrap()
         .clone();
     let feedback = messages.last().unwrap()["content"].as_str().unwrap();
-    assert!(feedback.contains("missing field `plan_version`"));
-    assert!(feedback.contains(&format!("plan_version: {}", codescope_core::PLAN_VERSION)));
-    assert!(feedback.contains("epoch: 5"));
-    // Type errors get explicit element-shape guidance (a live GLM run submitted a bare
-    // string "detail" where a node object was expected).
-    assert!(
-        feedback.contains("Every array element must be an object"),
-        "element-shape clause: {feedback}"
-    );
-    assert!(
-        feedback.contains("never a bare string or field name"),
-        "bare-string prohibition: {feedback}"
-    );
+    assert!(feedback.contains("missing field `op`"), "{feedback}");
+    assert!(feedback.contains("shared editor API"), "{feedback}");
 }
 
 /// Under automatic tool choice a provider may answer in plain text instead of calling the
-/// plan tool. That turn now costs one bounded repair — the assistant text is preserved and
-/// a user turn asks for the required `submit_visualization_plan` call — and the corrected
-/// structured submission validates. Repeated plain-text answers exhaust the repair
+/// diagram tools. That turn costs one bounded repair — the assistant text is preserved and
+/// a user turn asks for `finish_visualization` — and the corrected incremental tool batch
+/// validates. Repeated plain-text answers exhaust the repair
 /// allowance and terminate with the bounded no-tool-call failure instead of looping.
 #[tokio::test]
 async fn plain_text_response_gets_structured_repair_then_validates() {
@@ -603,19 +610,13 @@ async fn plain_text_response_gets_structured_repair_then_validates() {
     );
     let repair = messages[3]["content"].as_str().unwrap();
     assert!(
-        repair.contains("did not call the required tool"),
-        "named failure: {repair}"
-    );
-    assert!(
-        repair.contains("submit_visualization_plan"),
+        repair.contains(DIAGRAM_FINISH_TOOL_NAME),
         "the required tool is named: {repair}"
     );
     assert!(
-        repair.contains("Return no plain text"),
+        repair.contains("Return no prose"),
         "plain text prohibited: {repair}"
     );
-    assert!(repair.contains("for epoch 1"), "epoch echoed: {repair}");
-    assert!(repair.contains("code_refs"), "v4 refs contract: {repair}");
 
     // Boundedness: a provider that keeps answering in plain text exhausts the three
     // repairs and terminates with the no-tool-call failure (4 requests, never a loop).
@@ -838,13 +839,13 @@ async fn circuit_probe_allowed_after_cooldown() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     // Half-open probe goes through and the success closes the breaker.
     let response = client.chat_with_plan(&messages, &[]).await.unwrap();
-    assert!(response.plan_arguments().is_some());
+    assert!(!response.tool_calls.is_empty());
     assert!(!client.is_circuit_open());
     assert_eq!(provider.requests().len(), 4);
 }
 
 #[tokio::test]
-async fn tool_loop_executes_reads_and_submits_plan() {
+async fn tool_loop_executes_reads_and_finishes_diagram() {
     let provider = ScriptedProvider::start([
         tool_call_step(&["get_file_outline", "get_symbol"]),
         AiScriptStep::valid_plan(Epoch(5)).unwrap(),
@@ -956,7 +957,6 @@ async fn incremental_tools_build_and_publish_the_observed_live_draft() {
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&DIAGRAM_EDIT_TOOL_NAME));
     assert!(tool_names.contains(&DIAGRAM_FINISH_TOOL_NAME));
-    assert!(!tool_names.contains(&PLAN_TOOL_NAME));
 }
 
 #[tokio::test]
@@ -985,7 +985,7 @@ async fn research_executor_rejects_a_plan_until_one_tool_succeeds() {
     assert!(feedback["content"]
         .as_str()
         .unwrap()
-        .contains("submitted before inspecting"));
+        .contains("cannot be published before inspecting"));
 }
 
 #[tokio::test]
@@ -1032,10 +1032,15 @@ async fn two_validation_repair_turns_can_cross_schema_and_fact_boundaries() {
         .iter()
         .map(|message| message["role"].as_str().unwrap())
         .collect();
-    assert_eq!(roles, ["system", "user", "assistant", "tool"]);
-    let feedback = messages[3]["content"].as_str().unwrap();
+    assert_eq!(&roles[..3], ["system", "user", "assistant"]);
+    assert!(roles[3..].iter().all(|role| *role == "tool"));
+    let feedback = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .find(|content| content.contains("node has no reviewer-facing detail"))
+        .expect("finish feedback");
     assert!(feedback.contains("node has no reviewer-facing detail"));
-    assert!(feedback.contains("corrected complete plan"));
+    assert!(feedback.contains("Edit the current draft"));
 
     let third_messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
@@ -1172,8 +1177,15 @@ async fn unqueried_symbol_entity_gets_entity_repair_then_validates() {
         .iter()
         .map(|message| message["role"].as_str().unwrap())
         .collect();
-    assert_eq!(roles, ["system", "user", "assistant", "tool"]);
-    let feedback = messages.last().unwrap()["content"].as_str().unwrap();
+    assert_eq!(&roles[..3], ["system", "user", "assistant"]);
+    assert!(roles[3..].iter().all(|role| *role == "tool"));
+    let feedback = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .find(|content| {
+            content.contains("not queried") && content.contains("exact current fact or tool result")
+        })
+        .expect("entity-specific finish feedback");
     assert!(
         feedback.contains("not queried"),
         "reason echoes the unqueried symbol: {feedback}"
@@ -1357,7 +1369,7 @@ async fn third_repair_succeeds_and_fourth_rejection_terminates() {
     let AiOutcome::Failed(reason) = outcome else {
         panic!("expected failure, got {outcome:?}");
     };
-    assert!(reason.contains("plan rejected"), "{reason}");
+    assert!(reason.contains("diagram rejected"), "{reason}");
     assert_eq!(
         provider.requests().len(),
         4,
@@ -1365,10 +1377,8 @@ async fn third_repair_succeeds_and_fourth_rejection_terminates() {
     );
 }
 
-/// Round-3 live failure 1: a 7-node sequence is valid JSON and passes serde, but exceeds
-/// the schema's advertised 6-node cap. The parse boundary must reject it as a repairable
-/// error with observed/allowed counts (never silent truncation — the final lifecycle node
-/// may be the point of the diagram), and the repaired <=5 plan validates.
+/// Atomic edits reject a seventh node at the draft cap; finish then reports that the six
+/// accepted nodes still exceed the renderer's five-node contract, and a compact repair wins.
 #[tokio::test]
 async fn seven_node_plan_gets_cap_repair_then_five_node_plan_validates() {
     let mut oversized = drain_plan(Epoch(9), false);
@@ -1415,7 +1425,7 @@ async fn seven_node_plan_gets_cap_repair_then_five_node_plan_validates() {
         .clone();
     let feedback = messages.last().unwrap()["content"].as_str().unwrap();
     assert!(
-        feedback.contains("has 7 nodes"),
+        feedback.contains("has 6 nodes"),
         "observed count in feedback: {feedback}"
     );
     assert!(
@@ -1428,12 +1438,10 @@ async fn seven_node_plan_gets_cap_repair_then_five_node_plan_validates() {
     );
 }
 
-/// The final2-attempt1 live failure: GLM's first submission put a bare string ("detail")
-/// where a node object was expected inside `nodes`. Serde rejects it as a repairable
-/// MalformedPlan; the repair feedback must teach the element shape, and the corrected
-/// plan validates.
+/// A whole plan blob is no longer a hidden alternate protocol. It is rejected as an
+/// invalid atomic editor command, after which proper incremental calls can recover.
 #[tokio::test]
-async fn bare_string_node_element_gets_shape_repair_then_validates() {
+async fn whole_plan_blob_is_not_accepted_as_a_diagram_command() {
     // A valid plan, then corrupt it the way the live run did: one nodes element becomes
     // the bare string "detail".
     let plan = drain_plan(Epoch(12), false);
@@ -1465,29 +1473,20 @@ async fn bare_string_node_element_gets_shape_repair_then_validates() {
     );
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one schema repair");
+    assert_eq!(requests.len(), 2, "one protocol repair");
     let messages = requests[1].body_json().unwrap()["messages"]
         .as_array()
         .unwrap()
         .clone();
     let feedback = messages.last().unwrap()["content"].as_str().unwrap();
     assert!(
-        feedback.contains("expected struct PlanNode"),
-        "serde reason echoed: {feedback}"
-    );
-    assert!(
-        feedback.contains("Every array element must be an object"),
-        "element-shape clause: {feedback}"
-    );
-    assert!(
-        feedback.contains("never a bare string or field name"),
-        "bare-string prohibition: {feedback}"
+        feedback.contains("missing field `op`") && feedback.contains("shared editor API"),
+        "atomic protocol feedback: {feedback}"
     );
 }
 
-/// The boundedness caps are enforced at the parse boundary with count feedback: a
-/// 9-edge form triggers one repair, and a plan with empty evidence triggers one repair;
-/// each corrected submission validates.
+/// The atomic editor refuses edges beyond its cap before finish; missing evidence still
+/// receives finish-time feedback and can be repaired incrementally.
 #[tokio::test]
 async fn edges_and_evidence_cap_violations_get_count_repair_then_validate() {
     // 9 edges: fixture 2 + 7 extra = 9 > MAX_AI_FORM_EDGES (8).
@@ -1510,19 +1509,12 @@ async fn edges_and_evidence_cap_violations_get_count_repair_then_validate() {
     let outcome = service
         .request_plan("digest", &NoToolExecutor, &LazyFacts, Epoch(13))
         .await;
-    assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
+    let AiOutcome::Plan(plan, _) = outcome else {
+        panic!("expected bounded plan");
+    };
+    assert!(plan.forms[0].edges.len() <= 8);
     let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one edges-cap repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
-        .as_array()
-        .unwrap()
-        .clone();
-    let feedback = messages.last().unwrap()["content"].as_str().unwrap();
-    assert!(
-        feedback.contains("has 9 edges"),
-        "observed count: {feedback}"
-    );
-    assert!(feedback.contains("at most 8"), "allowed: {feedback}");
+    assert_eq!(requests.len(), 1, "edge overflow is rejected atomically");
 
     // Empty evidence: the parse boundary rejects with the no-evidence reason.
     let mut no_evidence = drain_plan(Epoch(14), false);
@@ -1761,17 +1753,7 @@ async fn repeated_invalid_evidence_stays_bounded() {
 /// fails with the parse error instead of looping.
 #[tokio::test]
 async fn repeated_contract_violations_terminate_within_repair_bound() {
-    let mut oversized = drain_plan(Epoch(11), false);
-    for i in 3..7 {
-        let node = PlanNode::new(
-            format!("n{i}"),
-            format!("step {i}"),
-            PlanNodeChange::Unchanged,
-        )
-        .with_detail("an intermediate mechanics step that should be merged");
-        oversized.forms[0].nodes.push(node);
-    }
-    let step = AiScriptStep::from_plan(&oversized).unwrap();
+    let step = AiScriptStep::tool_call(DIAGRAM_FINISH_TOOL_NAME, json!({}));
     let provider =
         ScriptedProvider::start([step.clone(), step.clone(), step.clone(), step.clone()])
             .await
@@ -1784,7 +1766,7 @@ async fn repeated_contract_violations_terminate_within_repair_bound() {
     let AiOutcome::Failed(reason) = outcome else {
         panic!("expected bounded failure, got {outcome:?}");
     };
-    assert!(reason.contains("has 7 nodes"), "{reason}");
+    assert!(reason.contains("no forms"), "{reason}");
     assert_eq!(
         provider.requests().len(),
         4,
@@ -1794,8 +1776,8 @@ async fn repeated_contract_violations_terminate_within_repair_bound() {
 
 #[tokio::test]
 async fn tool_call_budget_enforced() {
-    // One message requesting 9 tool calls: the 9th exceeds the budget of 8.
-    let names: Vec<&str> = std::iter::repeat_n("get_file_outline", 9).collect();
+    // One message requesting 49 calls: the 49th exceeds the configured budget of 48.
+    let names: Vec<&str> = std::iter::repeat_n("get_file_outline", 49).collect();
     let provider = ScriptedProvider::start([tool_call_step(&names)])
         .await
         .unwrap();
@@ -1810,7 +1792,7 @@ async fn tool_call_budget_enforced() {
     assert!(reason.contains("budget exceeded"), "{reason}");
     assert_eq!(
         executor.count.load(Ordering::SeqCst),
-        8,
+        48,
         "exactly the budget may execute"
     );
     assert_eq!(provider.requests().len(), 1);
@@ -1818,10 +1800,10 @@ async fn tool_call_budget_enforced() {
 
 #[tokio::test]
 async fn budget_spans_multiple_turns() {
-    // 5 calls, then 4 more: the 9th call (4th of turn two) must trip the budget.
+    // 25 calls, then 24 more: the final call must trip the 48-operation budget.
     let provider = ScriptedProvider::start([
-        tool_call_step(&["get_file_outline"; 5]),
-        tool_call_step(&["get_symbol"; 4]),
+        tool_call_step(&["get_file_outline"; 25]),
+        tool_call_step(&["get_symbol"; 24]),
     ])
     .await
     .unwrap();
@@ -1831,12 +1813,12 @@ async fn budget_spans_multiple_turns() {
         .request_plan("digest", &executor, &FixtureFacts, Epoch(1))
         .await;
     assert!(matches!(outcome, AiOutcome::Failed(_)), "got {outcome:?}");
-    assert_eq!(executor.count.load(Ordering::SeqCst), 8);
+    assert_eq!(executor.count.load(Ordering::SeqCst), 48);
     assert_eq!(provider.requests().len(), 2);
 }
 
 #[tokio::test]
-async fn stale_epoch_yields_stale_outcome() {
+async fn model_cannot_override_the_repository_owned_epoch() {
     let provider = ScriptedProvider::start([AiScriptStep::valid_plan(Epoch(1)).unwrap()])
         .await
         .unwrap();
@@ -1849,7 +1831,10 @@ async fn stale_epoch_yields_stale_outcome() {
             Epoch(2),
         )
         .await;
-    assert_eq!(outcome, AiOutcome::Stale);
+    let AiOutcome::Plan(plan, _) = outcome else {
+        panic!("expected repository-owned plan epoch");
+    };
+    assert_eq!(plan.epoch, Epoch(2));
 }
 
 #[tokio::test]
@@ -1875,7 +1860,7 @@ async fn hallucinated_plan_is_rejected_by_validation() {
     let AiOutcome::Failed(reason) = outcome else {
         panic!("expected failure, got {outcome:?}");
     };
-    assert!(reason.contains("plan rejected"), "{reason}");
+    assert!(reason.contains("diagram rejected"), "{reason}");
     assert_eq!(
         provider.requests().len(),
         4,

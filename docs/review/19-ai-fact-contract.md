@@ -318,12 +318,9 @@ instead of reducing `Evidence<SymbolTree>` to `SymbolTree` plus strings. In
 visible symbol/hunk/relation endpoint. Apply the existing token/hunk/symbol caps before
 computing capabilities, so every enabled capability has at least one prompt-visible fact.
 
-In `crates/codescope-ai/src/plan.rs`, change `plan_tool()` to
-`plan_tool(&PlanCapabilities)` and narrow its form and edge enums. The client already
-avoids appending a second submit tool when one is supplied
-(`crates/codescope-ai/src/client.rs:383-401`), so the service can pass the dynamic submit
-tool explicitly. In `crates/codescope-ai/src/service.rs`, build the system prompt from the
-same capabilities.
+Superseded implementation note: the runtime now always exposes the shared incremental diagram
+editor and finish operation. It no longer appends or accepts a whole-plan submission tool.
+Capabilities should narrow the research and edit guidance passed to that single protocol.
 
 In `crates/codescope-ai/src/tools.rs`, add an availability method, for example:
 

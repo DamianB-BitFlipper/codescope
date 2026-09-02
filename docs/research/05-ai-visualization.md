@@ -163,10 +163,10 @@ OpenAI (`https://api.openai.com/v1`) and Prime Inference (`https://api.pinferenc
 models like `openai/gpt-5.4`, `openai/gpt-5-mini` — confirmed via `prime inference models`).
 Also covers Ollama/vLLM/LM Studio for free.
 
-Plan return mechanism: **a single required tool `submit_visualization_plan(plan_json)` with
-`tool_choice: required`** — more portable than `response_format: json_schema` (strict
-structured outputs are not uniformly supported across compatible providers). JSON-schema the
-tool parameters with `schemars` 1.2.2 derive so schema and Rust types can't drift.
+Plan construction uses the shared incremental diagram tools with `tool_choice: required`:
+atomic edits mutate a bounded draft, inspection returns its current state, and finish requests
+deterministic validation/publication. The service always advertises this protocol; there is no
+whole-plan tool fallback.
 
 **Crate choice: `reqwest` 0.13.4 + `serde` 1.0.229 + `serde_json` 1.0.151** (features:
 `json`, `stream`, `rustls-tls`). One endpoint, ~150 lines of types; full control over the
@@ -176,9 +176,8 @@ the whole OpenAI API surface — churn without payoff for one endpoint. Pitfall:
 `reqwest-eventsource` 0.6.0 pins `reqwest ^0.12`, so on reqwest 0.13 use `eventsource-stream`
 0.2.3 directly over `response.bytes_stream()` and parse `data:` frames yourself ([DONE] sentinel).
 
-Streaming: optional, off by default. A plan is atomic — it must be complete and validated
-before render, so streaming only feeds a progress spinner (chars received), never partial
-renders. Non-streaming first; add SSE later behind a config flag.
+HTTP streaming remains off. Accepted draft edits can render immediately between ordinary tool
+turns, while publication is atomic after validation.
 
 Config (env-first, all optional unless enabled; AI disabled = full functionality):
 - `CODESCOPE_AI=off|on` (default: auto = on iff an API key is found)
@@ -194,8 +193,8 @@ paths and env values from the payload.
 
 ## Recommended decisions
 
-1. AI selects from a fixed 8-form enum; plans are JSON via a required `submit_visualization_plan`
-   tool call; TUI owns all rendering; every AI form has a deterministic fallback.
+1. AI selects from the structural form enum and incrementally describes boxes and relationships;
+   the TUI owns all placement/rendering and every AI form has a deterministic fallback.
 2. Adopt Show Me's rules as plan constraints: one focus question, ≤12 nodes, depth ≤3, ≤3-line
    summary, structural diffs over text diffs.
 3. Validate everything: epoch gate, entity resolution, edge existence in the impact graph,
@@ -203,7 +202,6 @@ paths and env values from the payload.
    broken flow/sequence forms outright, fall back silently-ish with a status notice.
 4. Prompt digest of 5 tiers, ~4–8k tokens, hard cap 12k; 8 read-only tools, ≤8 calls/plan;
    tool outputs carry ready-to-echo `entity` JSON.
-5. Client: reqwest 0.13.4 + serde, OpenAI-compatible chat completions, SSE via
-   eventsource-stream 0.2.3 (not reqwest-eventsource — version pin conflict); schemars for
-   the plan schema; `CODESCOPE_AI_*` env config with `PRIME_API_KEY` auto-detection; AI off by
+5. Client: reqwest + serde, OpenAI-compatible chat completions and the shared incremental
+   diagram tools; `CODESCOPE_AI_*` env config with `PRIME_API_KEY` auto-detection; AI off by
    default when no key exists.

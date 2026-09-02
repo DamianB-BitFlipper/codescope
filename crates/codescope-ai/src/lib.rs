@@ -42,12 +42,12 @@ pub use config::{
     PRIME_BASE_URL,
 };
 pub use error::AiError;
-pub use plan::{parse_plan, plan_tool, PlanParams};
+pub use plan::parse_plan;
 pub use scrub::{scrub_secrets, REDACTED};
 pub use service::{redact_repo_root, AiOutcome, AiService, DiagramObserver, RetryPolicy};
 pub use tools::{
     diagram_tools, is_diagram_tool, is_read_only_tool, read_only_tools, research_tools,
     NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
-    DIAGRAM_FINISH_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, MAX_TOOL_CALLS, PLAN_TOOL_NAME,
+    DIAGRAM_FINISH_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
 };
 pub use validator::{validate, FactView, Lookup, IMPACT_SUMMARY_MAX_BULLETS};

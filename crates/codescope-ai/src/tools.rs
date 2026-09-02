@@ -16,9 +16,6 @@ use serde_json::{json, Value};
 /// into a terminal failure.
 pub const MAX_TOOL_CALLS: u32 = 48;
 
-/// Name of the required plan-submission tool (research 05 §5).
-pub const PLAN_TOOL_NAME: &str = "submit_visualization_plan";
-
 /// Mutate the in-progress renderer-native diagram with one [`codescope_core::DiagramCommand`].
 pub const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
 /// Read the complete in-progress diagram draft.
@@ -338,7 +335,7 @@ pub fn diagram_tools() -> Vec<ToolDef> {
     ]
 }
 
-/// `true` when `name` is one of the read-only tools (not the plan-submission tool).
+/// `true` when `name` is one of the read-only research tools.
 #[must_use]
 pub fn is_read_only_tool(name: &str) -> bool {
     read_only_tools()
@@ -397,7 +394,7 @@ pub trait ToolExecutor: Send + Sync {
     }
 
     /// Whether this executor represents a research workflow that must inspect at least one
-    /// fact before a plan can be submitted. This is `false` for legacy fact stores and tests;
+    /// fact before a diagram can be finished. This is `false` for minimal fact stores and tests;
     /// the scoped diff executor enables it so the small initial brief cannot be guessed from.
     fn requires_research(&self) -> bool {
         false
@@ -411,8 +408,8 @@ pub trait ToolExecutor: Send + Sync {
     ) -> BoxFuture<'a, Result<String, ToolExecError>>;
 }
 
-/// A [`ToolExecutor`] that fails every call; useful when no fact store is wired (the
-/// model is told tools are unavailable and should plan from the digest alone).
+/// A [`ToolExecutor`] that fails every research call; the service still supplies its own
+/// incremental diagram editor, so the model can build from the brief alone.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoToolExecutor;
 
@@ -428,7 +425,7 @@ impl ToolExecutor for NoToolExecutor {
     ) -> BoxFuture<'a, Result<String, ToolExecError>> {
         Box::pin(async move {
             Err(ToolExecError::new(format!(
-                "tool {name} unavailable: no fact store wired; compose the plan from the digest"
+                "tool {name} unavailable: no fact store wired; compose the diagram from the brief"
             )))
         })
     }
@@ -513,7 +510,7 @@ mod tests {
         assert!(is_read_only_tool("get_hunk"));
         assert!(is_read_only_tool("read_file"));
         assert!(is_read_only_tool("git_status_file"));
-        assert!(!is_read_only_tool(PLAN_TOOL_NAME));
+        assert!(!is_read_only_tool(DIAGRAM_FINISH_TOOL_NAME));
         assert!(!is_read_only_tool("rm_rf"));
         assert!(is_diagram_tool(DIAGRAM_EDIT_TOOL_NAME));
         assert!(is_diagram_tool(DIAGRAM_INSPECT_TOOL_NAME));

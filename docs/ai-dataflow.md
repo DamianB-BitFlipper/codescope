@@ -94,7 +94,10 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    names its effect/destination. Validator-verified connectors are solid; inferred or
    hunk-derived links are dashed and visibly labeled. The layout retains semantic node hitboxes
    from the same physical spans that were rendered. Mouse motion only redraws when the hovered
-   target changes; it never starts AI/LSP work. Hover adds a non-colour diff-row cue to every
+   target changes; it never starts AI/LSP work. Placement is entirely renderer-owned: no model
+   or retained node coordinates exist, every physical line is bounded to the current pane width,
+   and content that does not fit grows downward through the one vertical scroll axis. Hover adds
+   a non-colour diff-row cue to every
    exact linked logical row (including all wrapped fragments), while click/`Space` pins the node and expands a
    bounded detail strip with source locators. External assumptions get an upfront warning plus
    the full Review block, and plan-level evidence remains below the map.

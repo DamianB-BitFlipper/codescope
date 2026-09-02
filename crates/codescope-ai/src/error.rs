@@ -68,11 +68,13 @@ pub enum AiError {
     #[error("ai provider response malformed: {0}")]
     MalformedResponse(String),
 
-    /// The completion carried no tool call at all, so no visualization plan was submitted.
-    #[error("ai provider returned no tool call (visualization plan tool was not selected)")]
+    /// The completion carried no research or diagram tool call.
+    #[error(
+        "ai provider returned no tool call (incremental visualization tools were not selected)"
+    )]
     NoToolCall,
 
-    /// The `submit_visualization_plan` arguments were not a valid plan document.
+    /// The incremental draft did not project to a valid renderer plan document.
     #[error("visualization plan malformed: {0}")]
     MalformedPlan(String),
 

@@ -4,9 +4,8 @@
 //! framework — and answers each incoming HTTP request by consuming the next
 //! [`AiScriptStep`] from its queue (research 08 §3):
 //!
-//! - [`AiScriptStep::valid_plan`] — a schema-valid `submit_visualization_plan` tool call
-//!   built from [`codescope_core`] plan types, echoing **any** epoch you script (so stale
-//!   / arbitrary-epoch handling is testable);
+//! - [`AiScriptStep::valid_plan`] — a schema-valid batch of incremental diagram edits and
+//!   `finish_visualization`, built from [`codescope_core`] plan types;
 //! - [`AiScriptStep::hallucinated_plan`] — same shape, but every entity points at files
 //!   and symbols that exist nowhere (the validator must drop them);
 //! - [`AiScriptStep::malformed_json`] — a tool call whose `arguments` string is not valid
@@ -35,8 +34,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
-/// Tool name the provider's plan responses call (research 05).
-pub const PLAN_TOOL_NAME: &str = "submit_visualization_plan";
+/// Final incremental diagram tool called by generated provider responses.
+pub const DIAGRAM_FINISH_TOOL_NAME: &str = "finish_visualization";
+const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
 
 /// Model name reported in fake completions.
 pub const FAKE_MODEL: &str = "codescope-fake";
@@ -54,9 +54,8 @@ const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AiScriptStep {
-    /// `200`: completion whose single tool call carries `plan` (serialized) as the
-    /// `arguments` string of [`PLAN_TOOL_NAME`].
-    ToolCallPlan {
+    /// `200`: completion carrying the edits needed to build and finish `plan`.
+    DiagramPlan {
         /// The plan JSON value to serialize into `function.arguments`.
         plan: Value,
     },
@@ -66,8 +65,7 @@ pub enum AiScriptStep {
         /// Raw `function.arguments` string.
         arguments: String,
     },
-    /// `200`: a named tool call with JSON arguments, used to script research turns before
-    /// a final plan submission.
+    /// `200`: a named tool call with JSON arguments, used to script research or diagram turns.
     ToolCall {
         /// Tool name exactly as advertised by the client.
         name: String,
@@ -103,7 +101,7 @@ impl AiScriptStep {
     /// A tool-call step from a typed plan. Fails only if the plan fails to serialize
     /// (structurally impossible for [`VisualizationPlan`], but surfaced honestly).
     pub fn from_plan(plan: &VisualizationPlan) -> Result<Self> {
-        Ok(AiScriptStep::ToolCallPlan {
+        Ok(AiScriptStep::DiagramPlan {
             plan: serde_json::to_value(plan)?,
         })
     }
@@ -400,12 +398,12 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
     let call = state.calls.fetch_add(1, Ordering::Relaxed);
 
     match step {
-        Some(AiScriptStep::ToolCallPlan { plan }) => {
-            let completion = tool_call_completion(call, plan.to_string());
+        Some(AiScriptStep::DiagramPlan { plan }) => {
+            let completion = diagram_plan_completion(call, plan);
             write_json(&mut stream, 200, "OK", &completion).await
         }
         Some(AiScriptStep::ToolCallRaw { arguments }) => {
-            let completion = tool_call_completion(call, arguments);
+            let completion = named_tool_call_completion(call, DIAGRAM_EDIT_TOOL_NAME, arguments);
             write_json(&mut stream, 200, "OK", &completion).await
         }
         Some(AiScriptStep::ToolCall { name, arguments }) => {
@@ -461,9 +459,62 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
     }
 }
 
-/// OpenAI-shaped completion with a single [`PLAN_TOOL_NAME`] tool call.
-fn tool_call_completion(call: u64, arguments: String) -> Value {
-    named_tool_call_completion(call, PLAN_TOOL_NAME, arguments)
+/// OpenAI-shaped completion that reconstructs a typed plan through the public incremental
+/// editor protocol. This keeps service tests representative without a one-shot back door.
+fn diagram_plan_completion(call: u64, plan: Value) -> Value {
+    let mut operations = vec![(DIAGRAM_EDIT_TOOL_NAME, json!({"op": "reset"}))];
+    operations.push((
+        DIAGRAM_EDIT_TOOL_NAME,
+        json!({"op": "set_intent", "intent": plan["intent"]}),
+    ));
+    if let Some(forms) = plan["forms"].as_array() {
+        for (form_index, form) in forms.iter().enumerate() {
+            let form_id = format!("form-{form_index}");
+            operations.push((
+                DIAGRAM_EDIT_TOOL_NAME,
+                json!({"op": "create_form", "form_id": form_id, "kind": form["kind"]}),
+            ));
+            if let Some(nodes) = form["nodes"].as_array() {
+                for node in nodes {
+                    operations.push((
+                        DIAGRAM_EDIT_TOOL_NAME,
+                        json!({"op": "create_node", "form_id": form_id, "node": node}),
+                    ));
+                }
+            }
+            if let Some(edges) = form["edges"].as_array() {
+                for edge in edges {
+                    operations.push((
+                        DIAGRAM_EDIT_TOOL_NAME,
+                        json!({"op": "create_edge", "form_id": form_id, "edge": edge}),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(evidence) = plan["evidence"].as_array() {
+        for item in evidence {
+            operations.push((
+                DIAGRAM_EDIT_TOOL_NAME,
+                json!({"op": "add_evidence", "evidence": item}),
+            ));
+        }
+    }
+    operations.push((DIAGRAM_FINISH_TOOL_NAME, json!({})));
+
+    let tool_calls = operations
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| {
+            json!({
+                "id": format!("call_fake_{call}_{index}"),
+                "type": "function",
+                "function": {"name": name, "arguments": arguments.to_string()}
+            })
+        })
+        .collect::<Vec<_>>();
+    let message = json!({"role": "assistant", "content": null, "tool_calls": tool_calls});
+    chat_completion(call, message, "tool_calls")
 }
 
 /// OpenAI-shaped completion with one arbitrarily named tool call.
@@ -710,15 +761,14 @@ mod tests {
 
     #[test]
     fn valid_and_hallucinated_plans_differ_in_entities() {
-        let AiScriptStep::ToolCallPlan { plan: valid } =
-            AiScriptStep::valid_plan(Epoch(1)).unwrap()
+        let AiScriptStep::DiagramPlan { plan: valid } = AiScriptStep::valid_plan(Epoch(1)).unwrap()
         else {
-            panic!("expected ToolCallPlan");
+            panic!("expected DiagramPlan");
         };
-        let AiScriptStep::ToolCallPlan { plan: ghost } =
+        let AiScriptStep::DiagramPlan { plan: ghost } =
             AiScriptStep::hallucinated_plan(Epoch(1)).unwrap()
         else {
-            panic!("expected ToolCallPlan");
+            panic!("expected DiagramPlan");
         };
         let valid_files: Vec<&str> = valid["forms"][0]["nodes"]
             .as_array()
@@ -766,17 +816,25 @@ mod tests {
 
     #[test]
     fn completion_envelope_shape() {
-        let completion = tool_call_completion(7, "{}".to_string());
+        let completion =
+            diagram_plan_completion(7, serde_json::to_value(sample_plan(Epoch(1))).unwrap());
         assert_eq!(completion["object"], "chat.completion");
         assert_eq!(completion["created"], FAKE_CREATED);
         assert_eq!(completion["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(
             completion["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-            PLAN_TOOL_NAME
+            DIAGRAM_EDIT_TOOL_NAME
         );
         assert_eq!(
             completion["choices"][0]["message"]["tool_calls"][0]["id"],
-            "call_fake_7"
+            "call_fake_7_0"
+        );
+        let calls = completion["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            calls.last().unwrap()["function"]["name"],
+            DIAGRAM_FINISH_TOOL_NAME
         );
     }
 

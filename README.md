@@ -177,7 +177,9 @@ the live draft; a final `finish_visualization` call publishes it only after vali
 known repository facts. The model can inspect, update, and delete existing boxes and relationships
 instead of repeatedly returning the whole plan. Each node also carries one or two exact, side-aware
 `code_refs` copied from annotated `git_diff_file` tool results plus optional
-`expanded_detail`. Hovering a rendered
+`expanded_detail`. The model describes semantics, not coordinates: the renderer chooses a
+responsive horizontal or vertical arrangement, bounds every line to the pane width, and uses a
+single vertical scroll axis when the result is taller than the viewport. Hovering a rendered
 node highlights those old/new rows in the main diff; clicking it (or pressing `Space` while it is
 hovered) pins its code highlight and opens its deeper explanation and source locators. Every cited file, hunk, source line,
 symbol, or typed graph edge must resolve against the fact store; conceptual entityless nodes and

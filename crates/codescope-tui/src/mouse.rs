@@ -10,7 +10,7 @@
 use crossterm::event::{MouseButton, MouseEvent};
 
 use crate::action::Action;
-use crate::action::{DiffTextPoint, DiffTextSelection, PlanCanvasPoint, PlanNodeTarget};
+use crate::action::{DiffTextPoint, DiffTextSelection};
 use crate::app::{App, Pane};
 use crate::divider::DividerId;
 use crate::geometry::UiGeometry;
@@ -33,30 +33,6 @@ pub enum DragState {
         /// The effective extent (width/height) at drag start.
         start_extent: u16,
         /// Whether the pointer has moved since mouse-down.
-        moved: bool,
-    },
-    /// A generated-plan node is armed for click or being moved.
-    PlanNode {
-        /// Stable node target.
-        target: PlanNodeTarget,
-        /// Pointer coordinate where the gesture began.
-        start_x: u16,
-        /// Pointer row where the gesture began.
-        start_y: u16,
-        /// Node's world position at gesture start.
-        start_position: PlanCanvasPoint,
-        /// Whether a real drag sample has occurred.
-        moved: bool,
-    },
-    /// Empty generated-plan canvas space is being panned.
-    PlanCanvas {
-        /// Pointer coordinate where the gesture began.
-        start_x: u16,
-        /// Pointer row where the gesture began.
-        start_y: u16,
-        /// Viewport world origin at gesture start.
-        start_origin: PlanCanvasPoint,
-        /// Whether a real drag sample has occurred.
         moved: bool,
     },
     /// A linear text selection is being dragged across the rendered diff.
@@ -170,16 +146,6 @@ fn route_hover(x: u16, y: u16, app: &App, geo: &UiGeometry) -> MouseOutcome {
 
 /// Wheel routing is hover-only: it neither focuses a pane nor changes a row selection.
 fn route_wheel(x: u16, y: u16, delta: i32, geo: &UiGeometry) -> MouseOutcome {
-    if geo.plan_canvas_at(x, y) {
-        let Some(canvas) = &geo.plan_canvas else {
-            return MouseOutcome::inert(DragState::Idle);
-        };
-        let origin = geo.clamp_plan_canvas_origin(PlanCanvasPoint {
-            x: canvas.origin.x,
-            y: canvas.origin.y.saturating_add(delta),
-        });
-        return MouseOutcome::action(Action::PanPlanCanvas { origin }, DragState::Idle);
-    }
     let Some(region) = geo.scroll_region_at(x, y) else {
         return MouseOutcome::inert(DragState::Idle);
     };
@@ -226,43 +192,13 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         };
     }
 
-    // 6. A generated-plan node: click pins/unpins its detail inspector. Hover itself
-    // remains transient and never dispatches backend work.
+    // 6. A generated-plan node: click pins/unpins its detail inspector. Placement is
+    // renderer-owned, so nodes are targets rather than draggable world objects.
     if let Some(target) = geo.plan_node_at(x, y) {
-        if let Some(node) = geo.plan_node_geometry(&target) {
-            return MouseOutcome {
-                action: None,
-                drag: DragState::PlanNode {
-                    target,
-                    start_x: x,
-                    start_y: y,
-                    start_position: node.position,
-                    moved: false,
-                },
-                dirty: false,
-            };
-        }
         return MouseOutcome::action(Action::TogglePlanNode(target), DragState::Idle);
     }
 
-    // 7. Empty generated-plan space pans the retained world canvas. A plain Down/Up
-    // without movement remains a focus-only click.
-    if let Some(canvas) = &geo.plan_canvas {
-        if geo.plan_canvas_at(x, y) {
-            return MouseOutcome {
-                action: None,
-                drag: DragState::PlanCanvas {
-                    start_x: x,
-                    start_y: y,
-                    start_origin: canvas.origin,
-                    moved: false,
-                },
-                dirty: false,
-            };
-        }
-    }
-
-    // 8. Diff text uses native-style drag selection. Release copies the exact retained
+    // 7. Diff text uses native-style drag selection. Release copies the exact retained
     // code text, while a click without movement clears the previous selection.
     if let Some(start) = geo.diff_text_point_at(x, y) {
         return MouseOutcome {
@@ -276,7 +212,7 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         };
     }
 
-    // 9. A selectable file/symbol row.
+    // 8. A selectable file/symbol row.
     for (rect, phys) in &geo.file_row_rects {
         if hit(*rect, x, y) {
             let rows = app.projected_file_rows();
@@ -295,7 +231,7 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         }
     }
 
-    // 10. A pane rectangle: focus only. Clicking blank diff space also clears any
+    // 9. A pane rectangle: focus only. Clicking blank diff space also clears any
     // retained text selection, matching a plain click on a rendered code row.
     if let Some(pane) = geo.pane_at(x, y) {
         if pane == Pane::Diff && app.diff_selection.is_some() {
@@ -350,87 +286,6 @@ fn route_drag(event: MouseEvent, _app: &App, geo: &UiGeometry, drag: DragState) 
                         dirty: moved || released_elsewhere,
                     }
                 }
-                _ => MouseOutcome::inert(DragState::Idle),
-            }
-        }
-        DragState::PlanNode {
-            target,
-            start_x,
-            start_y,
-            start_position,
-            moved,
-        } => {
-            let did_move = event.column != start_x || event.row != start_y;
-            let proposed = PlanCanvasPoint {
-                x: start_position
-                    .x
-                    .saturating_add(i32::from(event.column) - i32::from(start_x)),
-                y: start_position
-                    .y
-                    .saturating_add(i32::from(event.row) - i32::from(start_y)),
-            };
-            let position = geo.clamp_plan_node_position(&target, proposed);
-            match event.kind {
-                K::Drag(MouseButton::Left) => MouseOutcome {
-                    action: did_move.then(|| Action::MovePlanNode {
-                        target: target.clone(),
-                        position,
-                    }),
-                    drag: DragState::PlanNode {
-                        target,
-                        start_x,
-                        start_y,
-                        start_position,
-                        moved: moved || did_move,
-                    },
-                    dirty: did_move,
-                },
-                K::Up(MouseButton::Left) => MouseOutcome {
-                    action: if moved || did_move {
-                        Some(Action::MovePlanNode { target, position })
-                    } else {
-                        Some(Action::TogglePlanNode(target))
-                    },
-                    drag: DragState::Idle,
-                    dirty: true,
-                },
-                _ => MouseOutcome::inert(DragState::Idle),
-            }
-        }
-        DragState::PlanCanvas {
-            start_x,
-            start_y,
-            start_origin,
-            moved,
-        } => {
-            let did_move = event.column != start_x || event.row != start_y;
-            let proposed = PlanCanvasPoint {
-                x: start_origin
-                    .x
-                    .saturating_sub(i32::from(event.column) - i32::from(start_x)),
-                y: start_origin
-                    .y
-                    .saturating_sub(i32::from(event.row) - i32::from(start_y)),
-            };
-            let origin = geo.clamp_plan_canvas_origin(proposed);
-            match event.kind {
-                K::Drag(MouseButton::Left) => MouseOutcome {
-                    action: did_move.then_some(Action::PanPlanCanvas { origin }),
-                    drag: DragState::PlanCanvas {
-                        start_x,
-                        start_y,
-                        start_origin,
-                        moved: moved || did_move,
-                    },
-                    dirty: did_move,
-                },
-                K::Up(MouseButton::Left) => MouseOutcome {
-                    action: (moved || did_move)
-                        .then_some(Action::PanPlanCanvas { origin })
-                        .or(Some(Action::Focus(Pane::Impact))),
-                    drag: DragState::Idle,
-                    dirty: true,
-                },
                 _ => MouseOutcome::inert(DragState::Idle),
             }
         }
@@ -1047,9 +902,7 @@ mod tests {
         assert!(!steady.dirty, "steady motion cannot force redraws");
 
         app.ai_plan_scroll = 10;
-        let armed = map_mouse(down(rect.x, rect.y), &app, &s, &g, DragState::Idle);
-        assert!(matches!(armed.drag, DragState::PlanNode { .. }));
-        let click = map_mouse(up(rect.x, rect.y), &app, &s, &g, armed.drag);
+        let click = map_mouse(down(rect.x, rect.y), &app, &s, &g, DragState::Idle);
         assert_eq!(click.action, Some(Action::TogglePlanNode(target.clone())));
         app.apply(click.action.expect("node toggle"));
         assert_eq!(app.expanded_plan_nodes, vec![target.clone()]);
@@ -1062,19 +915,12 @@ mod tests {
             .find(|(_, candidate)| candidate.id == "n2")
             .expect("second node hitbox remains visible")
             .clone();
-        let second_armed = map_mouse(
+        let second_click = map_mouse(
             down(second_rect.x, second_rect.y),
             &app,
             &s,
             &expanded_geometry,
             DragState::Idle,
-        );
-        let second_click = map_mouse(
-            up(second_rect.x, second_rect.y),
-            &app,
-            &s,
-            &expanded_geometry,
-            second_armed.drag,
         );
         assert_eq!(
             second_click.action,
@@ -1094,19 +940,12 @@ mod tests {
             .find(|(_, candidate)| candidate == &target)
             .expect("first expanded node remains clickable")
             .clone();
-        let collapse_armed = map_mouse(
+        let collapse_first = map_mouse(
             down(first_rect.x, first_rect.y),
             &app,
             &s,
             &both_expanded_geometry,
             DragState::Idle,
-        );
-        let collapse_first = map_mouse(
-            up(first_rect.x, first_rect.y),
-            &app,
-            &s,
-            &both_expanded_geometry,
-            collapse_armed.drag,
         );
         app.apply(collapse_first.action.expect("first node toggle"));
         assert_eq!(
@@ -1127,12 +966,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_node_drag_moves_without_expanding_and_empty_canvas_pans() {
+    fn generated_diagram_is_renderer_placed_and_wheel_scrolls_vertically() {
         let mut s = snap();
         let mut plan = codescope_core::VisualizationPlan::new(codescope_core::Epoch(1));
         plan.intent = "A handler passes work to storage.".to_string();
         plan.forms.push(codescope_core::VizForm {
-            kind: codescope_core::FormKind::BeforeAfter,
+            kind: codescope_core::FormKind::Sequence,
             nodes: vec![
                 codescope_core::PlanNode::new(
                     "before",
@@ -1163,57 +1002,47 @@ mod tests {
             interpretation: "Changes behavior.".to_string(),
             interpretation_source: crate::snapshot::InterpretationSource::Deterministic,
         });
-        let mut app = app_with(&s);
+        for index in 2..10 {
+            let previous = if index == 2 {
+                "after".to_string()
+            } else {
+                format!("extra-{}", index - 1)
+            };
+            s.semantic.plan.as_mut().unwrap().forms[0].nodes.push(
+                codescope_core::PlanNode::new(
+                    format!("extra-{index}"),
+                    format!("Extra step {index}"),
+                    codescope_core::PlanNodeChange::Modified,
+                )
+                .with_detail("additional vertically placed behavior"),
+            );
+            s.semantic.plan.as_mut().unwrap().forms[0]
+                .edges
+                .push(codescope_core::PlanEdge {
+                    from: previous,
+                    to: format!("extra-{index}"),
+                    kind: codescope_core::PlanEdgeKind::Contains,
+                    label: Some("continues vertically".to_string()),
+                });
+        }
+        let app = app_with(&s);
         let g = geo(&app, &s);
-        let first = g.plan_canvas.as_ref().unwrap().nodes[0].clone();
-        let second = g.plan_canvas.as_ref().unwrap().nodes[1].clone();
-        let blocked = g.clamp_plan_node_position(&first.target, second.position);
-        let blocked_rect = crate::canvas::CanvasRect {
-            x: blocked.x,
-            y: blocked.y,
-            ..first.footprint
-        };
-        assert_ne!(blocked, second.position, "drop cannot overlap another box");
-        assert!(!blocked_rect.intersects(second.footprint));
-        let rect = first.screen_rect.expect("first node visible");
-        let armed = map_mouse(down(rect.x + 1, rect.y + 1), &app, &s, &g, DragState::Idle);
-        let moved = map_mouse(drag(rect.x + 5, rect.y + 2), &app, &s, &g, armed.drag);
-        let Action::MovePlanNode { target, position } = moved.action.expect("move action") else {
-            panic!("expected node move");
-        };
-        assert_eq!(target, first.target);
-        assert_ne!(position, first.position);
-        app.apply(Action::MovePlanNode { target, position });
-        assert!(app.expanded_plan_nodes.is_empty(), "drag never expands");
-
-        let moved_geo = geo(&app, &s);
-        let canvas = moved_geo.plan_canvas.as_ref().unwrap();
-        let blank_x = canvas.rect.x + canvas.rect.width.saturating_sub(1);
-        let blank_y = canvas.rect.y + canvas.rect.height.saturating_sub(1);
-        let armed = map_mouse(
-            down(blank_x, blank_y),
-            &app,
-            &s,
-            &moved_geo,
-            DragState::Idle,
+        let generated = g
+            .scroll_regions
+            .iter()
+            .find(|region| region.id == crate::scroll::ScrollRegionId::GeneratedImpact)
+            .expect("generated pane scroll region");
+        assert!(generated.max_offset > 0, "tall diagram scrolls vertically");
+        let x = generated.rect.x + 1;
+        let y = generated.rect.y + 1;
+        let wheeled = map_mouse(wheel_down(x, y), &app, &s, &g, DragState::Idle);
+        assert_eq!(
+            wheeled.action,
+            Some(Action::ScrollRegion {
+                region: crate::scroll::ScrollRegionId::GeneratedImpact,
+                offset: 3,
+            })
         );
-        assert!(matches!(armed.drag, DragState::PlanCanvas { .. }));
-        let panned = map_mouse(
-            drag(blank_x.saturating_sub(4), blank_y.saturating_sub(2)),
-            &app,
-            &s,
-            &moved_geo,
-            armed.drag,
-        );
-        assert!(matches!(panned.action, Some(Action::PanPlanCanvas { .. })));
-        let wheeled = map_mouse(
-            wheel_down(blank_x, blank_y),
-            &app,
-            &s,
-            &moved_geo,
-            DragState::Idle,
-        );
-        assert!(matches!(wheeled.action, Some(Action::PanPlanCanvas { .. })));
     }
 
     #[test]

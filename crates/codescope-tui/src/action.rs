@@ -21,15 +21,6 @@ pub struct PlanNodeTarget {
     pub id: String,
 }
 
-/// Signed world-coordinate position inside the generated-plan canvas.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PlanCanvasPoint {
-    /// Horizontal terminal-cell coordinate.
-    pub x: i32,
-    /// Vertical terminal-cell coordinate.
-    pub y: i32,
-}
-
 /// Display-cell position inside the fully laid-out diff text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiffTextPoint {
@@ -195,18 +186,6 @@ pub enum Action {
     HoverPlanNode(Option<PlanNodeTarget>),
     /// Mouse click: expand or collapse one generated-plan node's detail inspector.
     TogglePlanNode(PlanNodeTarget),
-    /// Mouse drag: place one generated-plan node at an absolute canvas coordinate.
-    MovePlanNode {
-        /// Stable node being moved.
-        target: PlanNodeTarget,
-        /// New top-left world coordinate after collision clamping.
-        position: PlanCanvasPoint,
-    },
-    /// Mouse drag/wheel: pan the generated-plan viewport to an absolute world origin.
-    PanPlanCanvas {
-        /// World coordinate displayed at the viewport's top-left cell.
-        origin: PlanCanvasPoint,
-    },
     /// Mouse drag preview: update the visible diff text selection.
     SetDiffSelection(DiffTextSelection),
     /// Mouse click: clear the retained diff highlight without copying anything.

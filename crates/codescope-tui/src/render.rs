@@ -1573,15 +1573,6 @@ fn render_impact_body(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsho
 /// If AI is unavailable, the same visual grammar renders a deterministic relationship
 /// fallback from the selected change, callers, and downstream facts.
 fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
-    if let Some(canvas) = generated_plan_canvas(app, snap, area.width, area.height) {
-        let rendered = canvas
-            .lines
-            .into_iter()
-            .map(render_diagram_line)
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(rendered), area);
-        return;
-    }
     let lines = generated_impact_content(app, snap, area.width);
     let height = usize::from(area.height);
     let max_scroll = lines.len().saturating_sub(height);
@@ -1593,77 +1584,6 @@ fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSn
         .map(render_diagram_line)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(rendered), area);
-}
-
-/// Render-ready canvas frame for a validated AI plan. The validator warning remains a
-/// fixed first row while the world-coordinate diagram pans beneath it.
-pub(crate) fn generated_plan_canvas(
-    app: &App,
-    snap: &UiSnapshot,
-    width: u16,
-    height: u16,
-) -> Option<crate::canvas::CanvasFrame> {
-    let sem = &snap.semantic;
-    let plan = sem.ai_generated.then_some(sem.plan.as_ref())??;
-    let selected_label = snap
-        .impact
-        .selected_change
-        .as_ref()
-        .map(|selected| selected.label.as_str())
-        .unwrap_or("");
-    let warning = sem.report.as_ref().and_then(|report| {
-        (report.verdict == ValidationVerdict::ValidWithDrops || !report.dropped.is_empty()).then(
-            || {
-                let removed = report.dropped.len();
-                let items = if removed == 1 { "item" } else { "items" };
-                crate::diagram::DiagramLine::plain(
-                    truncate_cells(
-                        &format!("⚠ sanitized AI plan · {removed} {items} removed"),
-                        width.into(),
-                    ),
-                    DiagramRole::Warning,
-                )
-            },
-        )
-    });
-    let agent_note =
-        (sem.note.starts_with("Agent ") || sem.note.starts_with("AI draft")).then(|| {
-            crate::diagram::DiagramLine::plain(
-                truncate_cells(&sem.note, width.into()),
-                DiagramRole::Title,
-            )
-        });
-    let banner_height = u16::from(warning.is_some()) + u16::from(agent_note.is_some());
-    let active = app
-        .hovered_plan_node
-        .as_ref()
-        .or_else(|| app.expanded_plan_nodes.last());
-    let mut canvas = crate::canvas::render_canvas(
-        plan,
-        width,
-        height.saturating_sub(banner_height),
-        selected_label,
-        active,
-        &app.expanded_plan_nodes,
-        app.active_canvas_view(),
-    );
-    let mut banners = Vec::new();
-    if let Some(agent_note) = agent_note {
-        banners.push(agent_note);
-    }
-    if let Some(warning) = warning {
-        banners.push(warning);
-    }
-    if !banners.is_empty() {
-        let banner_count = banners.len() as u16;
-        canvas.lines.splice(0..0, banners);
-        for node in &mut canvas.nodes {
-            if let Some(rect) = &mut node.screen_rect {
-                rect.y = rect.y.saturating_add(banner_count);
-            }
-        }
-    }
-    Some(canvas)
 }
 
 /// The generated pane's semantic line layout, shared by rendering and retained mouse
@@ -1741,7 +1661,10 @@ pub(crate) fn generated_impact_content(
             AiStatus::Ready { .. } => None,
         };
         if let Some((text, role)) = status {
-            lines.push(crate::diagram::DiagramLine::plain(text, role));
+            lines.push(crate::diagram::DiagramLine::plain(
+                truncate_cells(&text, width.into()),
+                role,
+            ));
         }
     } else if let Some(report) = &sem.report {
         // A sanitized plan (the validator dropped content) gets one concise WARN line
@@ -3602,7 +3525,7 @@ mod tests {
         );
     }
 
-    /// A validated sequence starts in an automatically laid-out vertical canvas; the
+    /// A validated sequence starts in an automatically laid-out vertical flow; the
     /// first causal steps and their complete relationship remain visible immediately.
     #[test]
     fn default_impact_pane_shows_ladder_steps() {
@@ -3744,7 +3667,7 @@ mod tests {
     }
 
     #[test]
-    fn ai_plan_canvas_pans_over_world_coordinates() {
+    fn ai_plan_uses_one_vertical_scroll_axis() {
         let plan = ai_plan_snap(8);
         let app = app_after_ai_landed(&plan);
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
@@ -3759,12 +3682,11 @@ mod tests {
             !initial.contains("inferred from cited diff"),
             "no legend: {initial}"
         );
-        // Canvas panning changes the world origin rather than mutating the fallback's
-        // line-scroll state.
+        // The placer owns horizontal position. Ordinary Impact scrolling reaches later
+        // content without a second canvas origin or horizontal pan state.
         let mut app = app_after_ai_landed(&plan);
-        app.apply(crate::action::Action::PanPlanCanvas {
-            origin: crate::action::PlanCanvasPoint { x: 100, y: 0 },
-        });
+        app.apply(crate::action::Action::Focus(Pane::Impact));
+        app.apply(crate::action::Action::PageDown);
         t.draw(|f| render(f, &app, &plan)).unwrap();
         let moved: String = (24..38).map(|y| row_text(&t, y)).collect();
         assert!(
@@ -3779,15 +3701,13 @@ mod tests {
             moved.contains("PlanStep3") || moved.contains("PlanStep4"),
             "later steps enter view: {moved}"
         );
-        app.apply(crate::action::Action::PanPlanCanvas {
-            origin: crate::action::PlanCanvasPoint { x: 330, y: 0 },
-        });
+        app.apply(crate::action::Action::Bottom);
         t.draw(|f| render(f, &app, &plan)).unwrap();
         let bottom: String = (24..38).map(|y| row_text(&t, y)).collect();
         assert!(bottom.contains("PlanStep7"), "last step: {bottom}");
         assert!(
             bottom.contains("PlanStep6") || bottom.contains("PlanStep7"),
-            "the canvas reaches deep into the sequence: {bottom}"
+            "vertical scrolling reaches deep into the sequence: {bottom}"
         );
         assert!(
             !bottom.contains("cited diff"),
@@ -3832,6 +3752,24 @@ mod tests {
         assert!(!text.contains("Impact"), "79x40 title removed: {text}");
         assert!(!text.contains("AI Plan"), "79x40 retired tab: {text}");
         assert!(text.contains("PlanStep0"), "79x40 rows: {text}");
+    }
+
+    #[test]
+    fn generated_impact_content_never_exceeds_the_viewport_width() {
+        let plan = ai_plan_snap(8);
+        let app = app_after_ai_landed(&plan);
+        for width in 1..=120u16 {
+            for (row, line) in generated_impact_content(&app, &plan, width)
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    line.text().width() <= usize::from(width),
+                    "width {width}, row {row}: {:?}",
+                    line.text()
+                );
+            }
+        }
     }
 
     #[test]

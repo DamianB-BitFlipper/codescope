@@ -9,7 +9,6 @@
 
 pub mod action;
 pub mod app;
-mod canvas;
 pub mod diagram;
 pub mod divider;
 pub mod elide;
