@@ -494,12 +494,20 @@ async fn malformed_diagram_command_gets_tool_feedback_then_recovers() {
     .await
     .unwrap();
     let service = service_for(&provider);
+    let activities = Arc::new(Mutex::new(Vec::<AiActivityUpdate>::new()));
+    let observed = activities.clone();
+    let activity_observer: AiActivityObserver = Arc::new(move |activity| {
+        observed.lock().unwrap().push(activity);
+    });
     let outcome = service
-        .request_plan(
+        .request_plan_with_observers(
             "digest",
+            None,
             &RecordingExecutor::default(),
             &FixtureFacts,
             Epoch(1),
+            None,
+            Some(activity_observer),
         )
         .await;
     assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
@@ -514,6 +522,14 @@ async fn malformed_diagram_command_gets_tool_feedback_then_recovers() {
         .unwrap()
         .to_string();
     assert!(feedback.contains("not valid JSON"), "{feedback}");
+    assert!(activities.lock().unwrap().iter().any(|activity| matches!(
+        activity,
+        AiActivityUpdate::ToolCall {
+            state: AiToolActivityState::Failed,
+            error: Some(error),
+            ..
+        } if error.contains("not valid JSON")
+    )));
 }
 
 #[tokio::test]

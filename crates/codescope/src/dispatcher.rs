@@ -2365,6 +2365,7 @@ impl Dispatcher {
                 id,
                 name,
                 detail,
+                error,
                 state,
             } => {
                 activity.waiting_for_model = false;
@@ -2376,17 +2377,16 @@ impl Dispatcher {
                 if let Some(call) = activity.calls.iter_mut().find(|call| call.id == id) {
                     call.name = name;
                     call.detail = detail;
+                    call.error = error;
                     call.state = state;
                 } else {
                     activity.calls.push(AiToolCallActivity {
                         id,
                         name,
                         detail,
+                        error,
                         state,
                     });
-                    if activity.calls.len() > codescope_ai::MAX_TOOL_CALLS as usize {
-                        activity.calls.remove(0);
-                    }
                 }
             }
         }
@@ -4830,6 +4830,7 @@ mod tests {
                     id: "call-1".to_string(),
                     name: "git_diff_file".to_string(),
                     detail: "a.txt · hunk 0".to_string(),
+                    error: None,
                     state,
                 },
             })

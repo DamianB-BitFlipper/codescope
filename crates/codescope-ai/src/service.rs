@@ -70,6 +70,8 @@ pub enum AiActivityUpdate {
         name: String,
         /// Short, scrubbed path/symbol/diagram-operation context.
         detail: String,
+        /// Short, scrubbed failure reason, present only for rejected or failed calls.
+        error: Option<String>,
         /// Current execution state.
         state: AiToolActivityState,
     },
@@ -412,34 +414,34 @@ impl AiService {
                         let command = match serde_json::from_str::<DiagramCommand>(&call.arguments)
                         {
                             Ok(DiagramCommand::Finish) => {
+                                let reason =
+                                    "finish is not an edit; end the tool sequence when the \
+                                              draft is complete";
                                 tool_messages.push(ChatMessage::tool(
                                     call.id.clone(),
-                                    error_result(
-                                        "finish is not an edit; end the tool sequence when the \
-                                         draft is complete"
-                                            .to_string(),
-                                    ),
+                                    error_result(reason.to_string()),
                                 ));
-                                observe_tool_activity(
+                                observe_tool_failure(
                                     activity_observer,
                                     call,
-                                    AiToolActivityState::Failed,
+                                    reason,
                                     &self.repo_root,
                                 );
                                 continue;
                             }
                             Ok(command) => command,
                             Err(error) => {
+                                let reason = format!(
+                                    "diagram command is not valid JSON for the shared editor API: {error}"
+                                );
                                 tool_messages.push(ChatMessage::tool(
                                     call.id.clone(),
-                                    error_result(format!(
-                                        "diagram command is not valid JSON for the shared editor API: {error}"
-                                    )),
+                                    error_result(reason.clone()),
                                 ));
-                                observe_tool_activity(
+                                observe_tool_failure(
                                     activity_observer,
                                     call,
-                                    AiToolActivityState::Failed,
+                                    &reason,
                                     &self.repo_root,
                                 );
                                 continue;
@@ -483,14 +485,15 @@ impl AiService {
                                 );
                             }
                             Err(error) => {
+                                let reason = error.to_string();
                                 tool_messages.push(ChatMessage::tool(
                                     call.id.clone(),
-                                    error_result(error.to_string()),
+                                    error_result(reason.clone()),
                                 ));
-                                observe_tool_activity(
+                                observe_tool_failure(
                                     activity_observer,
                                     call,
-                                    AiToolActivityState::Failed,
+                                    &reason,
                                     &self.repo_root,
                                 );
                             }
@@ -511,44 +514,51 @@ impl AiService {
                                 &self.repo_root,
                             )),
                         ));
-                        observe_tool_activity(
-                            activity_observer,
-                            call,
-                            if succeeded {
-                                AiToolActivityState::Succeeded
-                            } else {
-                                AiToolActivityState::Failed
-                            },
-                            &self.repo_root,
-                        );
+                        if succeeded {
+                            observe_tool_activity(
+                                activity_observer,
+                                call,
+                                AiToolActivityState::Succeeded,
+                                &self.repo_root,
+                            );
+                        } else {
+                            observe_tool_failure(
+                                activity_observer,
+                                call,
+                                &tool_error_detail(&result),
+                                &self.repo_root,
+                            );
+                        }
                     }
                     _ if is_read_only_tool(&call.name) => {
                         let (result, researched) =
                             self.execute_tool(tools, &call.name, &call.arguments).await;
                         research_calls += usize::from(researched);
+                        let failure = (!researched).then(|| tool_error_detail(&result));
                         tool_messages.push(ChatMessage::tool(call.id.clone(), result));
-                        observe_tool_activity(
-                            activity_observer,
-                            call,
-                            if researched {
-                                AiToolActivityState::Succeeded
-                            } else {
-                                AiToolActivityState::Failed
-                            },
-                            &self.repo_root,
-                        );
+                        if researched {
+                            observe_tool_activity(
+                                activity_observer,
+                                call,
+                                AiToolActivityState::Succeeded,
+                                &self.repo_root,
+                            );
+                        } else {
+                            observe_tool_failure(
+                                activity_observer,
+                                call,
+                                failure.as_deref().unwrap_or("tool call failed"),
+                                &self.repo_root,
+                            );
+                        }
                     }
                     _ => {
+                        let reason = format!("unknown tool {:?}", call.name);
                         tool_messages.push(ChatMessage::tool(
                             call.id.clone(),
-                            error_result(format!("unknown tool {:?}", call.name)),
+                            error_result(reason.clone()),
                         ));
-                        observe_tool_activity(
-                            activity_observer,
-                            call,
-                            AiToolActivityState::Failed,
-                            &self.repo_root,
-                        );
+                        observe_tool_failure(activity_observer, call, &reason, &self.repo_root);
                     }
                 }
             }
@@ -718,8 +728,41 @@ fn observe_tool_activity(
         id: call.id.clone(),
         name: call.name.clone(),
         detail: cap_activity_detail(&detail, 96),
+        error: None,
         state,
     });
+}
+
+fn observe_tool_failure(
+    observer: Option<&AiActivityObserver>,
+    call: &RawToolCall,
+    error: &str,
+    repo_root: &Utf8Path,
+) {
+    let Some(observe) = observer else { return };
+    let detail = tool_activity_detail(call);
+    let detail = crate::scrub::scrub_secrets(&redact_repo_root(&detail, repo_root));
+    let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let error = crate::scrub::scrub_secrets(&redact_repo_root(&error, repo_root));
+    observe(AiActivityUpdate::ToolCall {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        detail: cap_activity_detail(&detail, 96),
+        error: Some(cap_activity_detail(&error, 320)),
+        state: AiToolActivityState::Failed,
+    });
+}
+
+fn tool_error_detail(result: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| result.to_owned())
 }
 
 fn tool_activity_detail(call: &RawToolCall) -> String {
@@ -1049,10 +1092,11 @@ fn build_system_prompt(
     let research = if read_only_tools_available {
         format!(
             "Research before planning. You have a virtual cwd and may make at most {max_tool_calls} total research and diagram operations. For a directory, use list_directory to find \
-             changed files. Use git_status_file for exact status and hunk headers, then \
+             changed files. File tools accept paths relative to that cwd, exact repo_path values, \
+             or an unambiguous repo-path suffix. Use git_status_file for exact status and hunk headers, then \
              git_diff_file for the relevant changed lines. Use read_file or \
-             search_changed_files only when surrounding context is necessary. Tool paths are \
-             cwd-relative; copy repo_path, hunk_id, side, and line numbers from results exactly. \
+             search_changed_files only when surrounding context is necessary. Copy repo_path, \
+             hunk_id, side, and line numbers from results exactly. \
              You must call at least one research tool before completing the draft."
         )
     } else {
@@ -1378,7 +1422,8 @@ mod tests {
         assert!(prompt.contains("You must call at least one research tool"));
         assert!(prompt.contains("git_status_file"));
         assert!(prompt.contains("git_diff_file"));
-        assert!(prompt.contains("Tool paths are cwd-relative"));
+        assert!(prompt.contains("File tools accept paths relative to that cwd"));
+        assert!(prompt.contains("unambiguous repo-path suffix"));
         assert!(prompt.contains("owns all placement, wrapping"));
         assert!(prompt.contains("never reason about viewport dimensions"));
         assert!(prompt.contains("Every node has 1-2 code_refs"));

@@ -146,7 +146,9 @@ The changed-files pane is a directory → file → symbol tree. Selecting a dire
 module-level summary over only the changed files below it; selecting a file or symbol narrows the
 summary to that entry. Every selectable row carries an AI state marker: `◆` ready, `◇` not
 generated, `◌` generating, or `!` failed. Directories are expanded by default and collapse
-locally without starting or cancelling inference.
+locally without starting or cancelling inference. Directory-only chains are combined into one
+path row and split only at real branch points; directory totals show a bare file count followed
+by added/deleted lines.
 
 ## Refresh mode
 
@@ -180,7 +182,8 @@ instead of repeatedly returning the whole plan. Each node also carries one or tw
 responsive horizontal or vertical arrangement, bounds every line to the pane width, and uses a
 single vertical scroll axis when the result is taller than the viewport. While an internal request
 is running, the generated pane shows only `AI in progress` and its research/diagram tool calls
-progressing from running to succeeded/failed. Draft boxes never render. A terminal failure
+progressing from running to succeeded/failed. The complete call history remains vertically
+scrollable, and failed calls include their scrubbed error reason. Draft boxes never render. A terminal failure
 shows one clickable `AI failed` banner; it does not replace the unfinished draft with known
 relationships. Hovering a rendered
 node highlights those old/new rows in the main diff; clicking it (or pressing `Space` while it is
@@ -200,8 +203,9 @@ Only the current directory, file, or function is sent for AI generation, after a
 debounce; there is no prompt prefetch or background generation. The first turn is a small research
 brief rather than a source dump. A bounded agentic loop can list the selection, read sections of
 changed files, search changed files, and inspect captured per-file Git status/diffs. These tools
-use a virtual cwd, reject absolute paths and `..`, cannot execute commands or leave the selection,
-and return capped results. A plan is accepted only after at least one research call succeeds.
+use a virtual cwd; file tools also accept exact repo-relative paths or an unambiguous repo-path suffix.
+They reject absolute paths and `..`, cannot execute commands or leave the selection, and return
+capped results. A plan is accepted only after at least one research call succeeds.
 Moving focus cancels the unsent debounce,
 while an already-started plan finishes into its original row cache. Up to 16 requests may remain
 active; starting request 17 aborts the oldest active request. The local provider limiter primarily

@@ -53,14 +53,16 @@ remain explicit rather than being replaced by deterministic summary content.
    flow, before/after, or sequence; the legacy `impact_summary` and `focused_diff` forms
    are not accepted as AI plans. The dispatcher exposes a selection-scoped mini-shell:
    `list_directory`, `read_file`, `search_changed_files`, `git_status_file`, and
-   `git_diff_file`. Paths are relative to a virtual cwd (the selected directory or selected
-   file's parent), absolute/parent-traversal paths are rejected, file reads cannot leave the
+   `git_diff_file`. Directory paths are relative to a virtual cwd (the selected directory or
+   selected file's parent); file tools additionally accept an exact repo-relative path or an unambiguous
+   repo-path suffix. Absolute/parent-traversal paths are rejected, file reads cannot leave the
    selected changed files, and results are line/byte capped. Git status/diff results come from
    the immutable captured `ChangeSet`, so exact evidence cannot drift during the loop. Diff rows
    carry copyable one-based `[old:… new:…]` coordinates. Completion before one successful research
    call is rejected and the model is sent back to research. Each accepted draft edit is retained
    in the shared snapshot/controller state, while the in-flight TUI view shows the
-   ordered tool-call lifecycle (`running`, `succeeded`, or `failed`) rather than unfinished boxes.
+   complete, vertically scrollable tool-call lifecycle (`running`, `succeeded`, or `failed`)
+   rather than unfinished boxes. Failed rows include a bounded, scrubbed error reason.
    Final diagram publication still requires full validation. No shell command is executed and no
    repository state is mutated.
    A completed,

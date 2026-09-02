@@ -420,11 +420,16 @@ fn resolve_focus(
     if let Some(directory) = directory {
         let directory = directory.trim().trim_end_matches('/');
         anyhow::ensure!(!directory.is_empty(), "directory must not be empty");
-        let exists = snapshot.files.iter().any(|file| {
-            codescope_tui::file_rows::directory_prefixes(&file.path)
+        let exists =
+            codescope_tui::file_rows::project(&snapshot.files, &std::collections::HashSet::new())
                 .iter()
-                .any(|candidate| candidate == directory)
-        });
+                .any(|row| {
+                    matches!(
+                        row,
+                        codescope_tui::file_rows::ProjectedRow::Directory { path, .. }
+                            if path == directory
+                    )
+                });
         anyhow::ensure!(
             exists,
             "{directory:?} is not a changed directory in the live tree"
@@ -552,6 +557,7 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
                 "calls": snapshot.ai_activity.calls.iter().map(|call| json!({
                     "name": call.name,
                     "detail": call.detail,
+                    "error": call.error,
                     "state": match call.state {
                         AiToolCallActivityState::Running => "running",
                         AiToolCallActivityState::Succeeded => "succeeded",
@@ -849,6 +855,30 @@ mod tests {
     }
 
     #[test]
+    fn resolves_only_the_visible_combined_directory_identity() {
+        let mut snapshot = live_snapshot();
+        let mut first = snapshot.files[0].clone();
+        first.path = "sandbox/vm/pkg/internal/a.rs".to_string();
+        let mut second = first.clone();
+        second.path = "sandbox/vm/pkg/worker/b.rs".to_string();
+        snapshot.files = vec![first, second];
+
+        let target = resolve_focus(
+            &snapshot,
+            Some("sandbox/vm/pkg".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            target,
+            AiSummaryKey::Directory("sandbox/vm/pkg".to_string())
+        );
+        assert!(resolve_focus(&snapshot, Some("sandbox".to_string()), None, None, None,).is_err());
+    }
+
+    #[test]
     fn context_is_live_bounded_and_documents_agent_workflow() {
         let view = context_view(
             camino::Utf8Path::new("/tmp/example/repo"),
@@ -860,6 +890,26 @@ mod tests {
         assert_eq!(view["ai"]["activity"]["active"], false);
         assert!(view["ai"]["activity"]["calls"].is_array());
         assert!(view["capabilities"]["workflow"].as_array().unwrap().len() >= 4);
+    }
+
+    #[test]
+    fn context_exposes_the_scrubbed_tool_failure_reason() {
+        let mut snapshot = live_snapshot();
+        snapshot
+            .ai_activity
+            .calls
+            .push(codescope_tui::snapshot::AiToolCallActivity {
+                id: "call-1".to_string(),
+                name: "git_status_file".to_string(),
+                detail: "api.rs".to_string(),
+                error: Some("not a changed file".to_string()),
+                state: AiToolCallActivityState::Failed,
+            });
+        let view = context_view(camino::Utf8Path::new("/tmp/example/repo"), &snapshot, 20);
+        assert_eq!(
+            view["ai"]["activity"]["calls"][0]["error"],
+            "not a changed file"
+        );
     }
 
     #[tokio::test]

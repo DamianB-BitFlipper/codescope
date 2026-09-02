@@ -389,10 +389,11 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     for row in &projected {
         let active = row.logical_index() == Some(app.file_sel);
         let line = match row {
-            crate::file_rows::ProjectedRow::Directory { path, depth, .. } => {
-                let prefix = format!("{}/", basename(path));
+            crate::file_rows::ProjectedRow::Directory {
+                path, label, depth, ..
+            } => {
                 let (files, added, removed) = directory_stats(snap, path);
-                let right = format!("{files}f +{added} -{removed}");
+                let right = format!("{files} +{added} -{removed}");
                 tree_row_line(
                     *depth,
                     if app.collapsed_directories.contains(path) {
@@ -400,7 +401,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                     } else {
                         "▾"
                     },
-                    &prefix,
+                    label,
                     &right,
                     snap.ai_summary_state(&crate::snapshot::AiSummaryKey::Directory(path.clone())),
                     active,
@@ -1572,8 +1573,8 @@ fn render_impact_body(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsho
 }
 
 /// The generated explanation is laid out from validated structure at the current width.
-/// If AI is unavailable, the same visual grammar renders a deterministic relationship
-/// fallback from the selected change, callers, and downstream facts.
+/// While it is being built, this same vertically scrollable region contains the complete
+/// tool-call history.
 fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let lines = generated_impact_content(app, snap, area.width);
     let height = usize::from(area.height);
@@ -1656,23 +1657,11 @@ pub(crate) fn generated_impact_content(
 }
 
 fn ai_progress_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::DiagramLine> {
-    const MAX_VISIBLE_CALLS: usize = 9;
     let mut lines = vec![crate::diagram::DiagramLine::plain(
         truncate_cells("AI in progress", width.into()),
         DiagramRole::Title,
     )];
-    let hidden = snap
-        .ai_activity
-        .calls
-        .len()
-        .saturating_sub(MAX_VISIBLE_CALLS);
-    if hidden > 0 {
-        lines.push(crate::diagram::DiagramLine::plain(
-            truncate_cells(&format!("… {hidden} earlier tool calls"), width.into()),
-            DiagramRole::Muted,
-        ));
-    }
-    for call in snap.ai_activity.calls.iter().skip(hidden) {
+    for call in &snap.ai_activity.calls {
         let (marker, role) = match call.state {
             AiToolCallActivityState::Running => ("…", DiagramRole::Warning),
             AiToolCallActivityState::Succeeded => ("✓", DiagramRole::Evidence),
@@ -1687,6 +1676,11 @@ fn ai_progress_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::Diagr
             truncate_cells(&format!("{marker} {}{detail}", call.name), width.into()),
             role,
         ));
+        if call.state == AiToolCallActivityState::Failed {
+            if let Some(error) = call.error.as_deref().filter(|error| !error.is_empty()) {
+                lines.extend(ai_tool_error_lines(error, width));
+            }
+        }
     }
     if snap.ai_activity.waiting_for_model {
         lines.push(crate::diagram::DiagramLine::plain(
@@ -1710,6 +1704,21 @@ fn ai_progress_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::Diagr
         ));
     }
     lines
+}
+
+fn ai_tool_error_lines(error: &str, width: u16) -> Vec<crate::diagram::DiagramLine> {
+    const PREFIX: &str = "  ↳ ";
+    let width = usize::from(width);
+    let body_width = width.saturating_sub(measured_cells(PREFIX)).max(1);
+    wrap_body(error, body_width)
+        .into_iter()
+        .map(|part| {
+            crate::diagram::DiagramLine::plain(
+                truncate_cells(&format!("{PREFIX}{part}"), width),
+                DiagramRole::Warning,
+            )
+        })
+        .collect()
 }
 
 fn render_diagram_line(line: crate::diagram::DiagramLine) -> Line<'static> {
@@ -2703,7 +2712,7 @@ mod tests {
             symbols: vec![],
         });
         let mut app = app_with(&snap);
-        app.file_sel = 2; // internal/ → service/ → service.go
+        app.file_sel = 1; // internal/service/ → service.go
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &snap)).unwrap();
         let files_top = row_text(&t, 1);
@@ -2723,16 +2732,21 @@ mod tests {
             "count right-aligned before the border: {files_top:?}"
         );
         // Tree rows precede their changed files. Status colors remain M=WARN, A=ADD_FG.
-        assert_eq!(cell(&t, 9, 4).0, "M");
-        assert_eq!(cell(&t, 9, 4).1, WARN);
+        let service_y = (2..28u16)
+            .find(|&y| row_text(&t, y).contains("M service.go"))
+            .expect("modified service file row");
+        let status_x = (0..41u16)
+            .find(|&x| cell(&t, x, service_y).0 == "M")
+            .expect("modified status");
+        assert_eq!(cell(&t, status_x, service_y).1, WARN);
         let plus_x = (0..41u16)
-            .find(|&x| cell(&t, x, 4).0 == "+" && cell(&t, x + 1, 4).0 == "1")
+            .find(|&x| cell(&t, x, service_y).0 == "+" && cell(&t, x + 1, service_y).0 == "1")
             .expect("added LoC");
         let minus_x = (0..41u16)
-            .find(|&x| cell(&t, x, 4).0 == "-" && cell(&t, x + 1, 4).0 == "1")
+            .find(|&x| cell(&t, x, service_y).0 == "-" && cell(&t, x + 1, service_y).0 == "1")
             .expect("removed LoC");
-        assert_eq!(cell(&t, plus_x, 4).1, ADD_FG, "added LoC is green");
-        assert_eq!(cell(&t, minus_x, 4).1, DEL_FG, "removed LoC is red");
+        assert_eq!(cell(&t, plus_x, service_y).1, ADD_FG, "added LoC is green");
+        assert_eq!(cell(&t, minus_x, service_y).1, DEL_FG, "removed LoC is red");
         // Find the root-level added file row after the expanded service file/symbol.
         let y_a = (2..28u16)
             .find(|&y| row_text(&t, y).contains("A README.md"))
@@ -2741,9 +2755,13 @@ mod tests {
         assert_eq!(cell(&t, a_x, y_a).1, ADD_FG);
         // Selected background fills the service.go file row.
         // the SELECTED_BG fills the whole inner row.
-        assert_eq!(cell(&t, 10, 4).2, SELECTED_BG, "selected row bg");
         assert_eq!(
-            cell(&t, 39, 4).2,
+            cell(&t, status_x + 1, service_y).2,
+            SELECTED_BG,
+            "selected row bg"
+        );
+        assert_eq!(
+            cell(&t, 39, service_y).2,
             SELECTED_BG,
             "selected row bg to the row end"
         );
@@ -2755,17 +2773,17 @@ mod tests {
         t.draw(|f| render(f, &app_with(&sample()), &sample()))
             .unwrap();
         let root = row_text(&t, 2);
-        let nested = row_text(&t, 3);
-        let file = row_text(&t, 4);
-        let symbol = row_text(&t, 5);
-        assert!(root.contains("▾ ◇ internal/"), "root directory: {root:?}");
+        let file = row_text(&t, 3);
+        let symbol = row_text(&t, 4);
         assert!(
-            nested.contains("  ▾ ◇ service/"),
-            "nested directory: {nested:?}"
+            root.contains("▾ ◇ internal/service/"),
+            "combined directory: {root:?}"
         );
-        assert!(file.contains("    ▾ ◇ M service.go"), "file: {file:?}");
+        assert!(root.contains("1 +1 -1"), "directory stats: {root:?}");
+        assert!(!root.contains("1f"), "no file-count suffix: {root:?}");
+        assert!(file.contains("  ▾ ◇ M service.go"), "file: {file:?}");
         assert!(
-            symbol.contains("      ~ ◇ GetDisplayName"),
+            symbol.contains("    ~ ◇ GetDisplayName"),
             "symbol: {symbol:?}"
         );
     }
@@ -2775,20 +2793,16 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let snap = sample();
         let mut app = app_with(&snap);
-        // Select the symbol row after two directories and its owning file.
-        app.file_sel = 3;
+        // Select the symbol row after the combined directory and its owning file.
+        app.file_sel = 2;
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert_eq!(
-            cell(&t, 7, 5).0,
+            cell(&t, 5, 4).0,
             "~",
-            "change glyph after the 6-cell tree indent"
+            "change glyph after the 4-cell tree indent"
         );
-        assert_eq!(cell(&t, 7, 5).2, SELECTED_BG, "active symbol row bg");
-        assert_eq!(
-            cell(&t, 10, 4).2,
-            OWNER_BG,
-            "owning file row keeps OWNER_BG"
-        );
+        assert_eq!(cell(&t, 5, 4).2, SELECTED_BG, "active symbol row bg");
+        assert_eq!(cell(&t, 8, 3).2, OWNER_BG, "owning file row keeps OWNER_BG");
     }
 
     #[test]
@@ -2797,7 +2811,7 @@ mod tests {
 
         let mut snap = sample();
         snap.ai_summaries.insert(
-            AiSummaryKey::Directory("internal".to_string()),
+            AiSummaryKey::Directory("internal/service".to_string()),
             AiSummaryState::Ready,
         );
         snap.ai_summaries.insert(
@@ -2815,10 +2829,9 @@ mod tests {
 
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app_with(&snap), &snap)).unwrap();
-        assert!(row_text(&t, 2).contains("◆ internal/"));
-        assert!(row_text(&t, 3).contains("◇ service/"));
-        assert!(row_text(&t, 4).contains("◌ M service.go"));
-        assert!(row_text(&t, 5).contains("! GetDisplayName"));
+        assert!(row_text(&t, 2).contains("◆ internal/service/"));
+        assert!(row_text(&t, 3).contains("◌ M service.go"));
+        assert!(row_text(&t, 4).contains("! GetDisplayName"));
     }
 
     // -- §3.4 / §7.8/§7.9/§7.10: diff pane --------------------------------------------
@@ -3398,13 +3411,25 @@ mod tests {
                     id: "call-1".to_string(),
                     name: "git_status_file".to_string(),
                     detail: "service.go".to_string(),
+                    error: None,
                     state: crate::snapshot::AiToolCallActivityState::Succeeded,
                 },
                 crate::snapshot::AiToolCallActivity {
                     id: "call-2".to_string(),
                     name: "git_diff_file".to_string(),
                     detail: "service.go · hunk 0".to_string(),
+                    error: None,
                     state: crate::snapshot::AiToolCallActivityState::Running,
+                },
+                crate::snapshot::AiToolCallActivity {
+                    id: "call-3".to_string(),
+                    name: "git_status_file".to_string(),
+                    detail: "src/service.go".to_string(),
+                    error: Some(
+                        "path is not a changed file in the current selection; call list_directory first"
+                            .to_string(),
+                    ),
+                    state: crate::snapshot::AiToolCallActivityState::Failed,
                 },
             ],
         };
@@ -3419,6 +3444,15 @@ mod tests {
         assert!(
             text.contains("… git_diff_file · service.go · hunk 0"),
             "running: {text}"
+        );
+        assert!(
+            text.contains("× git_status_file · src/service.go"),
+            "failed call: {text}"
+        );
+        assert!(
+            text.contains("path is not a changed file")
+                && text.contains("call list_directory first"),
+            "wrapped failure reason: {text}"
         );
         assert!(
             !text.contains("waiting for model"),
@@ -3438,6 +3472,41 @@ mod tests {
             "completed: {text}"
         );
         assert!(text.contains("… waiting for model"), "next turn: {text}");
+    }
+
+    #[test]
+    fn generated_progress_keeps_every_tool_call_for_vertical_scrolling() {
+        let mut snap = sample();
+        snap.ai = AiStatus::Loading {
+            since_epoch: codescope_core::Epoch(3),
+        };
+        snap.ai_activity = crate::snapshot::AiActivity {
+            active: true,
+            waiting_for_model: false,
+            calls: (0..24)
+                .map(|index| crate::snapshot::AiToolCallActivity {
+                    id: format!("call-{index}"),
+                    name: "git_diff_file".to_string(),
+                    detail: format!("service.go · hunk {index}"),
+                    error: None,
+                    state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                })
+                .collect(),
+        };
+
+        let lines = generated_impact_content(&App::new(), &snap, 80);
+        let text = lines
+            .iter()
+            .map(crate::diagram::DiagramLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(lines.len(), 25, "title plus all 24 calls");
+        assert!(text.contains("service.go · hunk 0"), "first call: {text}");
+        assert!(text.contains("service.go · hunk 23"), "last call: {text}");
+        assert!(
+            !text.contains("earlier tool calls"),
+            "no collapsed history: {text}"
+        );
     }
 
     #[test]

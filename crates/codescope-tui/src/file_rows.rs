@@ -4,7 +4,7 @@
 //! local view state and never starts work. File expansion remains snapshot-owned because
 //! it exposes asynchronously loaded symbol rows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::snapshot::{AiSummaryKey, FileRow, FileSemanticLoad};
 
@@ -15,6 +15,8 @@ pub enum ProjectedRow {
     Directory {
         /// Repo-relative directory path without a trailing slash.
         path: String,
+        /// Visible path segment, combining unbranched directory ancestors.
+        label: String,
         /// Zero-based tree depth.
         depth: usize,
         /// Logical selectable index.
@@ -99,6 +101,61 @@ pub fn directory_prefixes(path: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DirectoryChild {
+    Directory(String),
+    File(String),
+}
+
+fn directory_children(files: &[FileRow]) -> HashMap<String, HashSet<DirectoryChild>> {
+    let mut children = HashMap::<String, HashSet<DirectoryChild>>::new();
+    for file in files {
+        let directories = directory_prefixes(&file.path);
+        let mut parent = String::new();
+        for directory in &directories {
+            children
+                .entry(parent.clone())
+                .or_default()
+                .insert(DirectoryChild::Directory(directory.clone()));
+            parent.clone_from(directory);
+        }
+        children
+            .entry(parent)
+            .or_default()
+            .insert(DirectoryChild::File(file.path.clone()));
+    }
+    children
+}
+
+/// Display directory rows for one file. Consecutive directories are one row while every
+/// directory in the run has exactly one child and that child is the next directory.
+fn display_directories(
+    path: &str,
+    children: &HashMap<String, HashSet<DirectoryChild>>,
+) -> Vec<(String, String)> {
+    let prefixes = directory_prefixes(path);
+    let components = path.split('/').collect::<Vec<_>>();
+    let mut displayed = Vec::new();
+    let mut start = 0usize;
+    while start < prefixes.len() {
+        let mut end = start;
+        while end + 1 < prefixes.len()
+            && children.get(&prefixes[end]).is_some_and(|direct| {
+                direct.len() == 1
+                    && direct.contains(&DirectoryChild::Directory(prefixes[end + 1].clone()))
+            })
+        {
+            end += 1;
+        }
+        displayed.push((
+            prefixes[end].clone(),
+            format!("{}/", components[start..=end].join("/")),
+        ));
+        start = end + 1;
+    }
+    displayed
+}
+
 /// Physical rows in display order. Changed files are already path-sorted by the git
 /// boundary, so emitting unseen directory prefixes produces a stable tree walk.
 #[must_use]
@@ -106,17 +163,19 @@ pub fn project(files: &[FileRow], collapsed_directories: &HashSet<String>) -> Ve
     let mut out = Vec::new();
     let mut emitted_directories = HashSet::new();
     let mut logical = 0usize;
+    let children = directory_children(files);
 
     for (file_index, file) in files.iter().enumerate() {
-        let directories = directory_prefixes(&file.path);
+        let directories = display_directories(&file.path, &children);
         let mut hidden = false;
-        for (depth, directory) in directories.iter().enumerate() {
+        for (depth, (directory, label)) in directories.iter().enumerate() {
             if hidden {
                 break;
             }
             if emitted_directories.insert(directory.clone()) {
                 out.push(ProjectedRow::Directory {
                     path: directory.clone(),
+                    label: label.clone(),
                     depth,
                     logical_index: logical,
                 });
@@ -241,8 +300,17 @@ mod tests {
             .collect();
         assert_eq!(
             directories,
-            ["crates", "crates/api", "crates/api/src", "crates/api/tests"]
+            ["crates/api", "crates/api/src", "crates/api/tests"]
         );
+
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                ProjectedRow::Directory { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["crates/api/", "src/", "tests/"]);
 
         let collapsed = HashSet::from(["crates/api".to_string()]);
         let rows = project(&files, &collapsed);
@@ -260,5 +328,41 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| matches!(row, ProjectedRow::File { file_index: 2, .. })));
+    }
+
+    #[test]
+    fn unbranched_directory_chains_are_one_selectable_row() {
+        let files = vec![
+            file("sandbox/vm/packages/module/internal/network/a.go"),
+            file("sandbox/vm/packages/module/internal/network/b.go"),
+            file("sandbox/vm/packages/module/worker/run.go"),
+            file("sandbox/vm/packages/module/main.go"),
+        ];
+        let rows = project(&files, &HashSet::new());
+        let directories = rows
+            .iter()
+            .filter_map(|row| match row {
+                ProjectedRow::Directory {
+                    path, label, depth, ..
+                } => Some((path.as_str(), label.as_str(), *depth)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            directories,
+            [
+                (
+                    "sandbox/vm/packages/module",
+                    "sandbox/vm/packages/module/",
+                    0
+                ),
+                (
+                    "sandbox/vm/packages/module/internal/network",
+                    "internal/network/",
+                    1
+                ),
+                ("sandbox/vm/packages/module/worker", "worker/", 1),
+            ]
+        );
     }
 }

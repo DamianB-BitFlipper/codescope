@@ -172,7 +172,7 @@ pub struct AiActivity {
     pub waiting_for_model: bool,
 }
 
-/// One bounded tool-call row shown while an AI explanation is generated.
+/// One tool-call row shown while an AI explanation is generated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiToolCallActivity {
     /// Provider call id used to join start and finish updates.
@@ -181,6 +181,8 @@ pub struct AiToolCallActivity {
     pub name: String,
     /// Short path, symbol, or diagram operation supplied to the call.
     pub detail: String,
+    /// Scrubbed failure reason, present only when the call failed.
+    pub error: Option<String>,
     /// Current call lifecycle.
     pub state: AiToolCallActivityState,
 }

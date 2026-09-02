@@ -170,13 +170,18 @@ pub fn read_only_tools() -> Vec<ToolDef> {
 
 /// Bash-like research tools used by the interactive diff summarizer.
 ///
-/// Paths are relative to the executor's virtual working directory. Implementations decide
-/// the exact selection boundary and return canonical repo-relative paths in their results.
+/// Directory paths are relative to the executor's virtual working directory. File tools also
+/// accept exact or uniquely identifiable repo-relative paths. Implementations decide the exact
+/// selection boundary and return canonical repo-relative paths in their results.
 #[must_use]
 pub fn research_tools() -> Vec<ToolDef> {
     let path_prop = json!({
         "type": "string",
         "description": "Path relative to the virtual current working directory. Absolute paths and parent traversal are forbidden."
+    });
+    let file_path_prop = json!({
+        "type": "string",
+        "description": "Changed-file path. Accepts a virtual-cwd-relative path, an exact repo_path returned by a tool, or an unambiguous repo-path suffix. Absolute paths and parent traversal are forbidden."
     });
     vec![
         ToolDef {
@@ -195,7 +200,7 @@ pub fn research_tools() -> Vec<ToolDef> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": path_prop,
+                    "path": file_path_prop,
                     "start_line": {"type": "integer", "minimum": 1, "default": 1,
                                    "description": "One-based first line."},
                     "end_line": {"type": "integer", "minimum": 1,
@@ -225,7 +230,7 @@ pub fn research_tools() -> Vec<ToolDef> {
             description: "Show the captured Git status for one changed file: comparison scope, status, rename source, binary flag, line counts, and every hunk header.".into(),
             parameters: json!({
                 "type": "object",
-                "properties": {"path": path_prop},
+                "properties": {"path": file_path_prop},
                 "required": ["path"],
                 "additionalProperties": false
             }),
@@ -236,7 +241,7 @@ pub fn research_tools() -> Vec<ToolDef> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": path_prop,
+                    "path": file_path_prop,
                     "hunk_index": {"type": "integer", "minimum": 0,
                                    "description": "Optional zero-based hunk index from git_status_file."}
                 },

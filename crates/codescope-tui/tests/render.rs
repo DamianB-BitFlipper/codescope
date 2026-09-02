@@ -197,6 +197,7 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
             id: "call-1".to_string(),
             name: "git_diff_file".to_string(),
             detail: "service.go · hunk 0".to_string(),
+            error: None,
             state: codescope_tui::snapshot::AiToolCallActivityState::Succeeded,
         }],
     };
