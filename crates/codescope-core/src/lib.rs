@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod diagram_draft;
 mod epoch;
 mod error;
 mod file;
@@ -36,6 +37,7 @@ mod semantic;
 mod status;
 mod viz;
 
+pub use diagram_draft::*;
 pub use epoch::*;
 pub use error::*;
 pub use file::*;

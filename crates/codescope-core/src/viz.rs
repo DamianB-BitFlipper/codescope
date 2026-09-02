@@ -1,9 +1,9 @@
 //! AI-assisted visualization: plan schema, validation report, AI status (research 05).
 //!
 //! The AI only *chooses and parameterizes* views; codescope owns facts, validation, and
-//! rendering. Plans arrive as JSON via a single required `submit_visualization_plan` tool
-//! call and must pass the deterministic validation boundary (epoch gate, entity resolution,
-//! edge existence, hunks by reference) before render.
+//! rendering. Agents may build plans incrementally through [`DiagramDraft`](crate::DiagramDraft)
+//! commands, but every finished projection passes the deterministic validation boundary (epoch
+//! gate, entity resolution, edge existence, hunks by reference) before publication.
 //!
 //! Field names and enum values serialize exactly as in the research 05 §2 schema
 //! (`snake_case` kinds, flat [`LineRange`](crate::LineRange) entities).
@@ -492,17 +492,10 @@ pub enum AiStatus {
         /// Repo-state epoch whose symbols are being analyzed.
         epoch: Epoch,
     },
-    /// The selected symbol's callers/downstream context is still being resolved.
-    WaitingForRelations {
-        /// Repo-state epoch whose relationships are being resolved.
+    /// The current selection is waiting for its navigation debounce to settle.
+    Debouncing {
+        /// Repo-state epoch the eventual request will explain.
         epoch: Epoch,
-    },
-    /// The selected plan is eligible but waiting for coordinator capacity.
-    Queued {
-        /// Repo-state epoch the queued plan will explain.
-        epoch: Epoch,
-        /// One-based priority order among pending plans (`1` is the first waiter).
-        position: u32,
     },
     /// A plan request is in flight (started at `since_epoch`).
     Loading {

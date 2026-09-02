@@ -21,9 +21,36 @@ pub struct PlanNodeTarget {
     pub id: String,
 }
 
+/// Signed world-coordinate position inside the generated-plan canvas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlanCanvasPoint {
+    /// Horizontal terminal-cell coordinate.
+    pub x: i32,
+    /// Vertical terminal-cell coordinate.
+    pub y: i32,
+}
+
+/// Display-cell position inside the fully laid-out diff text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffTextPoint {
+    /// Physical wrapped/raw display row.
+    pub row: usize,
+    /// Display-cell column, including the dual line-number gutter.
+    pub column: usize,
+}
+
+/// One retained linear selection in the rendered diff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffTextSelection {
+    /// Gesture anchor.
+    pub start: DiffTextPoint,
+    /// Current/released endpoint.
+    pub end: DiffTextPoint,
+}
+
 /// A user intent. The dispatcher turns these into work; [`crate::app::App::apply`] turns
 /// them into view state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Quit (terminal restored by the caller).
     Quit,
@@ -32,6 +59,10 @@ pub enum Action {
     /// Open/close the full status-message detail overlay. Mouse clicks produce this;
     /// `Esc` closes the overlay once open.
     ToggleStatusDetail,
+    /// Open a particular frozen diagnostic, such as the retained AI failure behind the
+    /// deterministic fallback banner. Unlike `ToggleStatusDetail`, this does not depend
+    /// on whichever transient message currently occupies the footer.
+    OpenStatusDetail(crate::snapshot::StatusMessage),
     /// Focus a pane directly (`1`/`2`/`3`; Tab no longer cycles panes).
     Focus(Pane),
     /// Tab on the files pane: set the expansion of the file the selection is on RIGHT
@@ -44,6 +75,14 @@ pub enum Action {
         /// Repo-relative path of the file row.
         path: String,
         /// The desired expansion state.
+        expanded: bool,
+    },
+    /// Expand or collapse a synthesized changed-directory row. This is local view state;
+    /// it never asks the dispatcher to scan the filesystem or generate summaries.
+    SetDirectoryExpanded {
+        /// Repo-relative directory without a trailing slash.
+        path: String,
+        /// Desired expansion state.
         expanded: bool,
     },
     /// Move the selection/scroll down / up by one.
@@ -75,6 +114,22 @@ pub enum Action {
         /// on a symbol row with a position; `None` on file rows and unmapped symbols.
         symbol: Option<(String, u32, u32)>,
     },
+    /// The files-pane selection moved to a directory summary scope.
+    DirectorySelectionChanged {
+        /// Repo-relative directory without a trailing slash.
+        directory: String,
+    },
+    /// A local control client asked the running UI to focus a changed-tree entity.
+    /// The TUI resolves this stable identity into its current projected row, then its
+    /// normal selection tracker emits the corresponding backend selection action.
+    AgentFocus(crate::snapshot::AiSummaryKey),
+    /// Ask the AI reviewer a selection-scoped question. The dispatcher treats this as
+    /// presentation guidance, never as repository evidence.
+    AgentAsk(String),
+    /// Revise the current generated explanation using selection-scoped feedback.
+    AgentFeedback(String),
+    /// Apply one atomic command to the same diagram draft used by the internal AI tools.
+    AgentDiagram(codescope_core::DiagramCommand),
     /// The user selected a changed symbol; the dispatcher lazily expands its callers/callees.
     SelectSymbol {
         /// Repo-relative file of the symbol.
@@ -140,6 +195,29 @@ pub enum Action {
     HoverPlanNode(Option<PlanNodeTarget>),
     /// Mouse click: expand or collapse one generated-plan node's detail inspector.
     TogglePlanNode(PlanNodeTarget),
+    /// Mouse drag: place one generated-plan node at an absolute canvas coordinate.
+    MovePlanNode {
+        /// Stable node being moved.
+        target: PlanNodeTarget,
+        /// New top-left world coordinate after collision clamping.
+        position: PlanCanvasPoint,
+    },
+    /// Mouse drag/wheel: pan the generated-plan viewport to an absolute world origin.
+    PanPlanCanvas {
+        /// World coordinate displayed at the viewport's top-left cell.
+        origin: PlanCanvasPoint,
+    },
+    /// Mouse drag preview: update the visible diff text selection.
+    SetDiffSelection(DiffTextSelection),
+    /// Mouse click: clear the retained diff highlight without copying anything.
+    ClearDiffSelection,
+    /// Mouse release: retain the selection and copy this exact visible text.
+    CommitDiffSelection {
+        /// Final selection range.
+        selection: DiffTextSelection,
+        /// Text extracted from the same retained diff frame.
+        text: String,
+    },
     /// Mouse: select the file/symbol row at this logical index (and focus Files).
     /// The selection tracker emits the same SelectionChanged a keyboard move would.
     SelectFileRow {
@@ -223,10 +301,9 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Esc => Action::None,
         // Tab controls file expansion, not focus cycling. Symbol analysis runs
         // asynchronously regardless of expansion.
-        KeyCode::Tab if app.focused == Pane::Files => match app.file_toggle_target() {
-            Some((path, expanded)) => Action::SetFileExpanded { path, expanded },
-            None => Action::None,
-        },
+        KeyCode::Tab if app.focused == Pane::Files => {
+            app.tree_toggle_action().unwrap_or(Action::None)
+        }
         KeyCode::Tab | KeyCode::BackTab => Action::None,
         KeyCode::Char('1') => Action::Focus(Pane::Files),
         KeyCode::Char('2') => Action::Focus(Pane::Diff),

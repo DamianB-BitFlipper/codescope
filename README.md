@@ -124,7 +124,7 @@ count. Branch diffs always run from that resolved merge-base toward the checked-
 |---|---|
 | `q` / `Ctrl-C` | quit |
 | `?` | help modal |
-| `Tab` (files pane) | expand / collapse the selected file; symbols load automatically |
+| `Tab` (files pane) | expand / collapse the selected directory or file; symbols load automatically |
 | `1` `2` `3` | focus files / diff / impact pane |
 | `j`/`k` · `↑`/`↓` | move selection / scroll |
 | `Ctrl-d`/`Ctrl-u`, `PgDn`/`PgUp` | half / full page in diff |
@@ -140,6 +140,14 @@ count. Branch diffs always run from that resolved merge-base toward the checked-
 | click / `Space` (AI node) | expand or collapse deeper details and code locators |
 | mouse wheel | scroll the section under the pointer without focusing/selecting it |
 | mouse drag | resize any pane divider |
+| drag diff code | select code without line-number gutters; release copies it |
+| click diff | clear the retained text selection |
+
+The changed-files pane is a directory → file → symbol tree. Selecting a directory produces a
+module-level summary over only the changed files below it; selecting a file or symbol narrows the
+summary to that entry. Every selectable row carries an AI state marker: `◆` ready, `◇` not
+generated, `◌` generating, or `!` failed. Directories are expanded by default and collapse
+locally without starting or cancelling inference.
 
 ## Refresh mode
 
@@ -163,27 +171,81 @@ optionally use the global `[ai]` table, `CODESCOPE_AI_BASE_URL`, `--model <model
 the global file. The app runs identically without it.
 Press `m` in the TUI to switch models at runtime (fetches the provider's model list); use
 left/right in that picker to stage reasoning effort, then Enter to apply both settings once.
-AI output is a reviewer-first *visualization plan* — a title, intent, review focus, evidence, and at most two structural forms made of typed nodes and relationships — that the app validates against
-known repository facts before rendering. Each node also carries one or two exact, side-aware
-`code_refs` copied from annotated rows in the selected diff plus optional `expanded_detail`. Hovering a rendered
+AI incrementally builds a reviewer-first *visualization draft* — an intent, evidence, and at
+most two structural forms made of typed boxes and relationships. Each accepted tool edit updates
+the live draft; a final `finish_visualization` call publishes it only after validation against
+known repository facts. The model can inspect, update, and delete existing boxes and relationships
+instead of repeatedly returning the whole plan. Each node also carries one or two exact, side-aware
+`code_refs` copied from annotated `git_diff_file` tool results plus optional
+`expanded_detail`. Hovering a rendered
 node highlights those old/new rows in the main diff; clicking it (or pressing `Space` while it is
 hovered) pins its code highlight and opens its deeper explanation and source locators. Every cited file, hunk, source line,
 symbol, or typed graph edge must resolve against the fact store; conceptual entityless nodes and
 hunk-derived links are allowed as interpretation, rendered dashed and clearly marked inferred,
 never as verified graph facts.
-Changed-file symbols load asynchronously in the background. For the selected file/function,
-AI generation starts automatically after its symbol inventory is complete and regenerates
-after the refreshed change-set differs. With default manual refresh mode, press `R` after an
-underlying file change; with `--watch`, that refresh happens automatically. Validated results
-are cached per file/function. A regeneration receives the prior design as a continuity seed,
+Changed-file symbols load asynchronously in the background. For a selected file/function,
+AI generation starts automatically after its symbol inventory is complete; a selected directory
+can start after the same navigation debounce because its summary does not require every child
+symbol inventory to finish. Both regenerate after the refreshed change-set differs. With default
+manual refresh mode, press `R` after an underlying file change; with `--watch`, that refresh
+happens automatically. Validated results are cached per directory/file/function. A regeneration receives the prior design as a continuity seed,
 preserving useful structure for incremental edits while rebuilding when the change is
 substantial; current repository facts are always revalidated and win over cached content.
-Generation uses one provider lane and a priority queue: the focused row runs first, then
-symbols in focused/expanded files, then file summaries for the remaining change-set. Moving
-focus reprioritizes unsent work; an already-running plan finishes into its own row cache. Local
-rate capacity is awaited asynchronously, and repeated failures pause background warming without
-blocking a newly focused row. `debug-ai` uses the same pipeline in focused-only mode.
+Only the current directory, file, or function is sent for AI generation, after a 250 ms selection
+debounce; there is no prompt prefetch or background generation. The first turn is a small research
+brief rather than a source dump. A bounded agentic loop can list the selection, read sections of
+changed files, search changed files, and inspect captured per-file Git status/diffs. These tools
+use a virtual cwd, reject absolute paths and `..`, cannot execute commands or leave the selection,
+and return capped results. A plan is accepted only after at least one research call succeeds.
+Moving focus cancels the unsent debounce,
+while an already-started plan finishes into its original row cache. Up to 16 requests may remain
+active; starting request 17 aborts the oldest active request. The local provider limiter primarily
+bounds actual HTTP work to 8 concurrent requests; a 600-requests/minute token bucket with burst
+100 remains only as a high safety ceiling, and capacity is awaited asynchronously. `debug-ai`
+uses the same selection-only pipeline.
 See [docs/ai-dataflow.md](docs/ai-dataflow.md).
+
+### Live agent control
+
+On Unix platforms, every running TUI exposes a repository-specific local socket. The `codescope agent`
+client lets another coding agent inspect the exact backend snapshot, move the visible tree
+selection, ask a selection-scoped question, give feedback, incrementally edit the exact same
+diagram draft used by the internal AI, or refresh the repository:
+
+```bash
+# Read the live tree, selected diff, relationships, and validated AI plan/report.
+codescope agent . context
+
+# Move the selection shown by the TUI. Loaded symbols can be targeted by name.
+codescope agent . focus --directory crates/codescope
+codescope agent . focus --file crates/codescope/src/main.rs --symbol main
+
+# Generate an answer in the visible Impact pane, then refine it.
+codescope agent . ask 'How does this change alter request routing?'
+codescope agent . feedback 'Make the queue boundary and failure path more prominent'
+
+# Inspect and edit the live renderer-native draft with the shared DiagramCommand JSON API.
+codescope agent . diagram show
+codescope agent . diagram apply '{"op":"update_edge","form_id":"main","from":"n1","to":"n2","patch":{"label":"passes parsed request"}}'
+codescope agent . diagram apply '{"op":"delete_edge","form_id":"main","from":"n1","to":"n3"}'
+codescope agent . diagram finish
+
+codescope agent . refresh
+```
+
+Focus, generation, and refresh are asynchronous; call `context` again to observe the next
+snapshot and check `live.epoch`, `live.refreshing`, `ai.status`, and `ai.plan`. Commands enter
+the same typed action/selection path as keyboard and mouse input, so a CLI focus updates the
+actual visible cursor. Questions and feedback are bounded, explicitly labelled as presentation
+guidance rather than source evidence. `diagram apply` accepts the same tagged command objects as
+the model's `edit_visualization` tool (`set_intent`, form/node/edge create-update-delete, and
+evidence add/delete); `diagram finish` runs the same fact and visualization validators used by
+internal inference.
+
+The socket lives in the platform temporary directory, is derived from the canonical repository
+root, and is permissioned for its owner only. The protocol has no shell, file-write, Git-write,
+or raw UI-injection operation. `codescope agent . socket` prints its path; `--compact` produces
+single-line JSON for tool integrations.
 
 ### Headless backend debugging
 

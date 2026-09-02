@@ -11,6 +11,7 @@
 //!   and symbols that exist nowhere (the validator must drop them);
 //! - [`AiScriptStep::malformed_json`] — a tool call whose `arguments` string is not valid
 //!   JSON;
+//! - [`AiScriptStep::ToolCall`] — any named read-only research call;
 //! - [`AiScriptStep::RateLimited`] — HTTP 429 with a `Retry-After` header;
 //! - [`AiScriptStep::Hang`] — accepts the request and never responds until the provider
 //!   is aborted/dropped;
@@ -65,6 +66,14 @@ pub enum AiScriptStep {
         /// Raw `function.arguments` string.
         arguments: String,
     },
+    /// `200`: a named tool call with JSON arguments, used to script research turns before
+    /// a final plan submission.
+    ToolCall {
+        /// Tool name exactly as advertised by the client.
+        name: String,
+        /// JSON value serialized into `function.arguments`.
+        arguments: Value,
+    },
     /// `200`: assistant message with plain text `content` and no tool call (a provider
     /// that ignored `tool_choice`).
     AssistantText {
@@ -116,6 +125,15 @@ impl AiScriptStep {
     pub fn malformed_json() -> Self {
         AiScriptStep::ToolCallRaw {
             arguments: r#"{"plan_version":1,"epoch":"#.to_string(),
+        }
+    }
+
+    /// A named read-only tool call for an agentic research turn.
+    #[must_use]
+    pub fn tool_call(name: impl Into<String>, arguments: Value) -> Self {
+        AiScriptStep::ToolCall {
+            name: name.into(),
+            arguments,
         }
     }
 }
@@ -390,6 +408,10 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
             let completion = tool_call_completion(call, arguments);
             write_json(&mut stream, 200, "OK", &completion).await
         }
+        Some(AiScriptStep::ToolCall { name, arguments }) => {
+            let completion = named_tool_call_completion(call, &name, arguments.to_string());
+            write_json(&mut stream, 200, "OK", &completion).await
+        }
         Some(AiScriptStep::AssistantText { content }) => {
             let message = json!({"role": "assistant", "content": content});
             let completion = chat_completion(call, message, "stop");
@@ -441,13 +463,18 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
 
 /// OpenAI-shaped completion with a single [`PLAN_TOOL_NAME`] tool call.
 fn tool_call_completion(call: u64, arguments: String) -> Value {
+    named_tool_call_completion(call, PLAN_TOOL_NAME, arguments)
+}
+
+/// OpenAI-shaped completion with one arbitrarily named tool call.
+fn named_tool_call_completion(call: u64, name: &str, arguments: String) -> Value {
     let message = json!({
         "role": "assistant",
         "content": null,
         "tool_calls": [{
             "id": format!("call_fake_{call}"),
             "type": "function",
-            "function": {"name": PLAN_TOOL_NAME, "arguments": arguments}
+            "function": {"name": name, "arguments": arguments}
         }]
     });
     chat_completion(call, message, "tool_calls")

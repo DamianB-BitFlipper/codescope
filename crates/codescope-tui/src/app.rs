@@ -1,12 +1,16 @@
 //! Application state and pure `Action` transitions. No I/O — the run loop feeds it
 //! [`UiSnapshot`]s and [`Action`]s; rendering reads it.
 
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+
 use codescope_core::ChangeScope;
 
-use crate::action::{next_scope, Action, PlanNodeTarget};
+use crate::action::{next_scope, Action, DiffTextSelection, PlanCanvasPoint, PlanNodeTarget};
 use crate::divider::DividerSizes;
+use crate::file_rows::ProjectedRow;
 use crate::scroll::ScrollRegionId;
-use crate::snapshot::{DiffRow, StatusMessage, UiSnapshot};
+use crate::snapshot::{AiSummaryKey, DiffRow, StatusMessage, UiSnapshot};
 
 /// The three focusable panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,6 +37,25 @@ pub struct UiPreferences {
     pub dividers: DividerSizes,
 }
 
+/// Session-only placement and viewport state for one generated plan.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlanCanvasView {
+    /// Absolute positions assigned by node dragging; absent nodes use automatic layout.
+    pub positions: HashMap<PlanNodeTarget, PlanCanvasPoint>,
+    /// World coordinate displayed at the canvas viewport's top-left cell.
+    pub origin: PlanCanvasPoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PlanCanvasKey {
+    scope: u8,
+    file: String,
+    label: String,
+    position: Option<(u32, u32)>,
+    epoch: codescope_core::Epoch,
+    fingerprint: u64,
+}
+
 /// View-state for the running app.
 #[derive(Debug, Default)]
 pub struct App {
@@ -42,6 +65,8 @@ pub struct App {
     pub focused: Pane,
     /// Selected row in the files pane (flattened file+symbol index).
     pub file_sel: usize,
+    /// Directory rows are expanded by default; this set records only user-collapsed paths.
+    pub collapsed_directories: HashSet<String>,
     /// Independent physical-row viewport used after wheel-scrolling Files.
     pub files_scroll: usize,
     /// `false` keeps keyboard selection visible; `true` lets the wheel inspect rows without
@@ -52,6 +77,8 @@ pub struct App {
     pub diff_scroll: u16,
     /// Horizontal scroll of the diff pane (raw mode: long lines are clipped + scrolled).
     pub diff_hscroll: u16,
+    /// Mouse-selected display cells in the diff, retained after clipboard copy.
+    pub diff_selection: Option<DiffTextSelection>,
     /// 1-based hunk under the diff scroll anchor; 0 when the diff has no hunks. App-owned
     /// view state (docs/review/15 §4): the snapshot's `total_hunks` is immutable data, but
     /// the current hunk follows navigation, so it must survive snapshot publishes.
@@ -65,8 +92,11 @@ pub struct App {
     /// Generated-plan node currently under the mouse. This is transient view state and
     /// drives both node emphasis and linked diff-row highlighting.
     pub hovered_plan_node: Option<PlanNodeTarget>,
-    /// Generated-plan node whose deeper detail/code-reference inspector is open.
-    pub expanded_plan_node: Option<PlanNodeTarget>,
+    /// Generated-plan nodes whose deeper details are open, in expansion order. The most
+    /// recently expanded node pins diff highlighting when nothing is hovered.
+    pub expanded_plan_nodes: Vec<PlanNodeTarget>,
+    /// Per-selection manual canvas arrangements retained for this process only.
+    canvas_views: HashMap<PlanCanvasKey, PlanCanvasView>,
     /// Independent offset for the deterministic incoming-callers list.
     pub callers_scroll: usize,
     /// Independent offset for the deterministic downstream-relationships list.
@@ -130,10 +160,14 @@ impl App {
         // offset computed against the old one. `DiffPane::title` is the file path today
         // (MERGE: the dispatcher half renames it to `file_path`; the comparison stays).
         let retargeted = self.snapshot.diff.title != snapshot.diff.title;
+        let diff_content_changed = retargeted || self.snapshot.diff.rows != snapshot.diff.rows;
         let generated_retargeted = self.snapshot.semantic.note != snapshot.semantic.note
             || self.snapshot.semantic.plan != snapshot.semantic.plan;
         let impact_retargeted =
             self.snapshot.impact.selected_change != snapshot.impact.selected_change;
+        if diff_content_changed {
+            self.diff_selection = None;
+        }
         if retargeted {
             self.diff_scroll = 0;
             self.diff_hscroll = 0;
@@ -142,57 +176,43 @@ impl App {
             // First diff for this path (hunks just arrived): start at hunk 1.
             self.current_hunk = 1;
         }
-        // Selection identity survives the swap (review 18 M5): an expanded file filling
-        // in its symbol rows shifts flat indices; without re-resolving by (file, symbol)
-        // the cursor would slide onto whatever row now holds the old ordinal.
-        let keep = self
-            .selected_file_symbol()
-            .map(|(f, sym)| (f.path.clone(), sym.map(|s| (s.name.clone(), s.position))));
+        // Selection identity survives the swap: directory insertion and asynchronously
+        // arriving symbols both shift flat indices.
+        let keep = self.selected_summary_key();
         self.snapshot = snapshot;
+        self.collapsed_directories.retain(|directory| {
+            self.snapshot
+                .files
+                .iter()
+                .any(|file| file.path.starts_with(&format!("{directory}/")))
+        });
         if generated_retargeted {
             self.ai_plan_scroll = 0;
             self.hovered_plan_node = None;
-            self.expanded_plan_node = None;
+            self.expanded_plan_nodes.clear();
         }
         if impact_retargeted {
             self.callers_scroll = 0;
             self.downstream_scroll = 0;
         }
         self.clamp();
-        if let Some((file, sym)) = keep {
-            self.restore_selection(&file, sym.as_ref());
+        if let Some(key) = keep {
+            self.restore_selection(&key);
         }
     }
 
-    /// Re-resolve a previously selected (file, symbol) against the current snapshot:
-    /// the symbol row when it still exists, else the owning file row, else the nearest
-    /// row that survived (clamp).
-    fn restore_selection(&mut self, file: &str, sym: Option<&(String, Option<(u32, u32)>)>) {
-        let mut flat = 0usize;
-        let mut file_row_idx: Option<usize> = None;
-        let mut sym_row_idx: Option<usize> = None;
-        for f in &self.snapshot.files {
-            if f.path == file {
-                file_row_idx = Some(flat);
-                if let Some((name, pos)) = sym {
-                    if f.expanded {
-                        for (si, s) in f.symbols.iter().enumerate() {
-                            let same = s.name == *name
-                                && (pos.is_none() || s.position == *pos || s.position.is_none());
-                            if same {
-                                sym_row_idx = Some(flat + 1 + si);
-                                break;
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-            flat += 1 + if f.expanded { f.symbols.len() } else { 0 };
+    /// Re-resolve a directory/file/symbol identity against the current tree projection.
+    fn restore_selection(&mut self, key: &AiSummaryKey) {
+        if let Some(index) = self
+            .projected_file_rows()
+            .iter()
+            .find(|row| row.summary_key(&self.snapshot.files).as_ref() == Some(key))
+            .and_then(ProjectedRow::logical_index)
+        {
+            self.file_sel = index;
+        } else {
+            self.file_sel = self.file_sel.min(self.flat_file_rows().saturating_sub(1));
         }
-        self.file_sel = sym_row_idx
-            .or(file_row_idx)
-            .unwrap_or_else(|| self.file_sel.min(self.flat_file_rows().saturating_sub(1)));
     }
 
     /// Apply an action to the view state. I/O actions (RefreshGit/Ai*) only toggle flags
@@ -209,8 +229,18 @@ impl App {
                         Some(self.snapshot.status.clone())
                     };
             }
+            Action::OpenStatusDetail(status) => self.status_detail = Some(status),
             Action::SetFileExpanded { path, expanded } => {
                 self.set_file_expanded(&path, expanded);
+            }
+            Action::SetDirectoryExpanded { path, expanded } => {
+                if expanded {
+                    self.collapsed_directories.remove(&path);
+                } else {
+                    self.collapsed_directories.insert(path);
+                }
+                self.files_scroll_detached = false;
+                self.clamp();
             }
             // Files expansion is dispatcher-owned and resolved in run.rs. In Impact,
             // Space toggles the node currently under the pointer; no hover means no-op.
@@ -232,8 +262,14 @@ impl App {
             Action::Bottom => self.bottom(),
             Action::Activate => self.activate(),
             Action::ToggleZoom => self.zoomed = !self.zoomed,
-            Action::ToggleWrap => self.diff_wrap = !self.diff_wrap,
-            Action::ResetHScroll => self.diff_hscroll = 0,
+            Action::ToggleWrap => {
+                self.diff_wrap = !self.diff_wrap;
+                self.diff_selection = None;
+            }
+            Action::ResetHScroll => {
+                self.diff_hscroll = 0;
+                self.diff_selection = None;
+            }
             Action::HoverPlanNode(target) => {
                 self.hovered_plan_node = target.filter(|target| self.plan_node(target).is_some());
             }
@@ -242,11 +278,57 @@ impl App {
                 self.hovered_plan_node = Some(target.clone());
                 self.toggle_plan_node(target);
             }
+            Action::MovePlanNode { target, position } => {
+                self.focused = Pane::Impact;
+                self.hovered_plan_node = Some(target.clone());
+                if self.plan_node(&target).is_some() {
+                    if let Some(view) = self.active_canvas_view_mut() {
+                        view.positions.insert(target, position);
+                    }
+                }
+            }
+            Action::PanPlanCanvas { origin } => {
+                self.focused = Pane::Impact;
+                if let Some(view) = self.active_canvas_view_mut() {
+                    view.origin = origin;
+                }
+            }
+            Action::SetDiffSelection(selection) => {
+                self.focused = Pane::Diff;
+                self.diff_selection = Some(selection);
+            }
+            Action::ClearDiffSelection => {
+                self.focused = Pane::Diff;
+                self.diff_selection = None;
+            }
+            Action::CommitDiffSelection { selection, .. } => {
+                self.focused = Pane::Diff;
+                self.diff_selection = Some(selection);
+            }
             // Mouse: select a file/symbol row by logical index and focus Files. The
             // selection tracker emits the same SelectionChanged a keyboard move would.
             Action::SelectFileRow { logical_index } => {
                 self.focused = Pane::Files;
                 self.file_sel = logical_index.min(self.flat_file_rows().saturating_sub(1));
+                self.files_scroll_detached = false;
+            }
+            Action::AgentFocus(target) => {
+                self.focused = Pane::Files;
+                let file = match &target {
+                    AiSummaryKey::Directory(path) => Some(path.as_str()),
+                    AiSummaryKey::File(path) | AiSummaryKey::Symbol { file: path, .. } => {
+                        Some(path.as_str())
+                    }
+                };
+                if let Some(file) = file {
+                    for directory in crate::file_rows::directory_prefixes(file) {
+                        self.collapsed_directories.remove(&directory);
+                    }
+                }
+                if let AiSummaryKey::Symbol { file, .. } = &target {
+                    self.set_file_expanded(file, true);
+                }
+                self.restore_selection(&target);
                 self.files_scroll_detached = false;
             }
             Action::ScrollRegion { region, offset } => self.set_scroll_region(region, offset),
@@ -256,8 +338,18 @@ impl App {
             Action::Collapse => match self.focused {
                 // Wrapped mode has no hidden horizontal state: h must not move it.
                 Pane::Diff if self.diff_wrap => {}
-                Pane::Diff => self.diff_hscroll = self.diff_hscroll.saturating_sub(8),
-                Pane::Impact => self.expanded_plan_node = None,
+                Pane::Diff => {
+                    self.diff_hscroll = self.diff_hscroll.saturating_sub(8);
+                    self.diff_selection = None;
+                }
+                Pane::Impact => {
+                    if let Some(target) = self.hovered_plan_node.as_ref() {
+                        self.expanded_plan_nodes
+                            .retain(|expanded| expanded != target);
+                    } else {
+                        self.expanded_plan_nodes.pop();
+                    }
+                }
                 // Files-pane expansion is dispatcher-owned: run.rs routes Space/h/l to
                 // the targeted SetFileExpanded command; App applies no local tree
                 // mutation for them (review 18 m4).
@@ -265,11 +357,14 @@ impl App {
             },
             Action::Expand => match self.focused {
                 Pane::Diff if self.diff_wrap => {}
-                Pane::Diff => self.diff_hscroll = self.diff_hscroll.saturating_add(8),
+                Pane::Diff => {
+                    self.diff_hscroll = self.diff_hscroll.saturating_add(8);
+                    self.diff_selection = None;
+                }
                 Pane::Impact => {
                     if let Some(target) = self.hovered_plan_node.clone() {
                         if self.plan_node(&target).is_some() {
-                            self.expanded_plan_node = Some(target);
+                            self.expand_plan_node(target);
                         }
                     }
                 }
@@ -342,6 +437,10 @@ impl App {
             | Action::PersistUiPreferences(_)
             | Action::SelectSymbol { .. }
             | Action::SelectionChanged { .. }
+            | Action::DirectorySelectionChanged { .. }
+            | Action::AgentAsk(_)
+            | Action::AgentFeedback(_)
+            | Action::AgentDiagram(_)
             | Action::RefreshGit
             | Action::None => {}
         }
@@ -359,7 +458,7 @@ impl App {
         self.downstream_scroll = 0;
         self.ai_plan_scroll = 0;
         self.hovered_plan_node = None;
-        self.expanded_plan_node = None;
+        self.expanded_plan_nodes.clear();
         self.current_hunk = usize::from(self.snapshot.diff.total_hunks > 0);
     }
 
@@ -385,14 +484,15 @@ impl App {
             .and_then(|target| self.plan_node(target))
     }
 
-    /// Node whose code links are active. Transient hover wins; an expanded node remains
-    /// pinned while the pointer moves into the diff so the reviewer can inspect its rows.
+    /// Node whose code links are active. Transient hover wins; otherwise the most recently
+    /// expanded node remains pinned while the pointer moves into the diff.
     #[must_use]
     pub fn active_code_node(&self) -> Option<&codescope_core::PlanNode> {
         self.hovered_node().or_else(|| {
-            self.expanded_plan_node
-                .as_ref()
-                .and_then(|target| self.plan_node(target))
+            self.expanded_plan_nodes
+                .iter()
+                .rev()
+                .find_map(|target| self.plan_node(target))
         })
     }
 
@@ -400,14 +500,60 @@ impl App {
         if self.plan_node(&target).is_none() {
             return;
         }
-        if self.expanded_plan_node.as_ref() == Some(&target) {
-            self.expanded_plan_node = None;
+        if let Some(index) = self
+            .expanded_plan_nodes
+            .iter()
+            .position(|expanded| expanded == &target)
+        {
+            self.expanded_plan_nodes.remove(index);
         } else {
-            self.expanded_plan_node = Some(target);
-            // Expanded details render in a fixed strip above the form, so pinning always
-            // reveals them even when the generated pane had been scrolled.
+            self.expand_plan_node(target);
+        }
+    }
+
+    fn expand_plan_node(&mut self, target: PlanNodeTarget) {
+        if !self.expanded_plan_nodes.contains(&target) {
+            self.expanded_plan_nodes.push(target);
             self.ai_plan_scroll = 0;
         }
+    }
+
+    /// Current generated-plan canvas state. A missing entry is the automatic layout at
+    /// origin `(0, 0)`.
+    pub(crate) fn active_canvas_view(&self) -> Option<&PlanCanvasView> {
+        self.active_canvas_key()
+            .and_then(|key| self.canvas_views.get(&key))
+    }
+
+    fn active_canvas_view_mut(&mut self) -> Option<&mut PlanCanvasView> {
+        let key = self.active_canvas_key()?;
+        Some(self.canvas_views.entry(key).or_default())
+    }
+
+    fn active_canvas_key(&self) -> Option<PlanCanvasKey> {
+        let plan = self.snapshot.semantic.plan.as_ref()?;
+        let selected = self.snapshot.impact.selected_change.as_ref();
+        let mut hasher = DefaultHasher::new();
+        format!("{plan:?}").hash(&mut hasher);
+        Some(PlanCanvasKey {
+            scope: match self.snapshot.scope {
+                ChangeScope::Branch => 0,
+                ChangeScope::Staged => 1,
+                ChangeScope::Unstaged => 2,
+                ChangeScope::Working => 3,
+            },
+            file: selected
+                .map(|selected| selected.file.clone())
+                .unwrap_or_else(|| self.snapshot.diff.title.clone()),
+            label: selected
+                .map(|selected| selected.label.clone())
+                .unwrap_or_default(),
+            position: self
+                .selected_file_symbol()
+                .and_then(|(_, symbol)| symbol.and_then(|symbol| symbol.position)),
+            epoch: plan.epoch,
+            fingerprint: hasher.finish(),
+        })
     }
 
     /// Model candidates matching the picker's filter query (the visible list).
@@ -617,32 +763,74 @@ impl App {
     /// The full repo-relative path of the file under the files-pane selection (symbol rows
     /// map to their file). The footer shows this unelided path when no message is pending.
     #[must_use]
-    /// The `(path, desired expanded)` pair a Tab press right now would command: the file
-    /// under the selection (symbol rows map to their file) and the inverse of its current
-    /// expansion. Resolved against the app's snapshot — the same flattened rows the user
-    /// sees (review 18 M4).
+    /// The `(path, desired expanded)` pair for a selected file or symbol. Directory rows
+    /// return `None`; use [`App::tree_toggle_action`] when both kinds are accepted.
     pub fn file_toggle_target(&self) -> Option<(String, bool)> {
-        let mut idx = self.file_sel;
-        for f in &self.snapshot.files {
-            if idx == 0 {
-                return Some((f.path.clone(), !f.expanded));
-            }
-            idx -= 1;
-            if f.expanded {
-                if idx < f.symbols.len() {
-                    return Some((f.path.clone(), false)); // on a symbol row: collapse
-                }
-                idx -= f.symbols.len();
-            }
+        match self.selected_projected_row()? {
+            ProjectedRow::File { file_index, .. } => self
+                .snapshot
+                .files
+                .get(file_index)
+                .map(|file| (file.path.clone(), !file.expanded)),
+            ProjectedRow::Symbol { file_index, .. } => self
+                .snapshot
+                .files
+                .get(file_index)
+                .map(|file| (file.path.clone(), false)),
+            ProjectedRow::Directory { .. } | ProjectedRow::Note { .. } => None,
         }
-        None
+    }
+
+    /// Expansion command for the selected directory, file, or symbol owner.
+    #[must_use]
+    pub fn tree_toggle_action(&self) -> Option<Action> {
+        match self.selected_projected_row()? {
+            ProjectedRow::Directory { path, .. } => Some(Action::SetDirectoryExpanded {
+                expanded: self.collapsed_directories.contains(&path),
+                path,
+            }),
+            ProjectedRow::File { file_index, .. } => {
+                let file = self.snapshot.files.get(file_index)?;
+                Some(Action::SetFileExpanded {
+                    path: file.path.clone(),
+                    expanded: !file.expanded,
+                })
+            }
+            ProjectedRow::Symbol { file_index, .. } => {
+                let file = self.snapshot.files.get(file_index)?;
+                Some(Action::SetFileExpanded {
+                    path: file.path.clone(),
+                    expanded: false,
+                })
+            }
+            ProjectedRow::Note { .. } => None,
+        }
     }
 
     /// The selected file's repo-relative path (symbol rows map to their owning file).
     pub fn selected_file_path(&self) -> Option<&str> {
-        // The shared projection decides what is selectable (review 24 M4).
-        crate::file_rows::resolve_logical(&self.snapshot.files, self.file_sel)
-            .map(|(f, _)| f.path.as_str())
+        match self.selected_projected_row()? {
+            ProjectedRow::File { file_index, .. } | ProjectedRow::Symbol { file_index, .. } => self
+                .snapshot
+                .files
+                .get(file_index)
+                .map(|file| file.path.as_str()),
+            ProjectedRow::Directory { .. } | ProjectedRow::Note { .. } => None,
+        }
+    }
+
+    /// Repo-relative directory or file path represented by the selected tree row.
+    #[must_use]
+    pub fn selected_tree_path(&self) -> Option<String> {
+        match self.selected_projected_row()? {
+            ProjectedRow::Directory { path, .. } => Some(path),
+            ProjectedRow::File { file_index, .. } | ProjectedRow::Symbol { file_index, .. } => self
+                .snapshot
+                .files
+                .get(file_index)
+                .map(|file| file.path.clone()),
+            ProjectedRow::Note { .. } => None,
+        }
     }
 
     /// The symbol name when the files-pane selection sits on a symbol row (the diff
@@ -650,40 +838,32 @@ impl App {
     /// publishes `DiffPane::focused_symbol` (docs/review/15 §4).
     #[must_use]
     pub fn selected_symbol_name(&self) -> Option<&str> {
-        let mut idx = self.file_sel;
-        for f in &self.snapshot.files {
-            if idx == 0 {
-                return None;
-            }
-            idx -= 1;
-            if f.expanded {
-                if idx < f.symbols.len() {
-                    return Some(f.symbols[idx].name.as_str());
-                }
-                idx -= f.symbols.len();
-            }
-        }
-        None
+        let ProjectedRow::Symbol {
+            file_index,
+            symbol_index,
+            ..
+        } = self.selected_projected_row()?
+        else {
+            return None;
+        };
+        self.snapshot
+            .files
+            .get(file_index)?
+            .symbols
+            .get(symbol_index)
+            .map(|symbol| symbol.name.as_str())
     }
 
     /// The index into `snapshot.files` of the file under the flattened files-pane
     /// selection (symbol rows map to their file's index).
     #[must_use]
     pub fn selected_file_index(&self) -> Option<usize> {
-        let mut idx = self.file_sel;
-        for (i, f) in self.snapshot.files.iter().enumerate() {
-            if idx == 0 {
-                return Some(i);
+        match self.selected_projected_row()? {
+            ProjectedRow::File { file_index, .. } | ProjectedRow::Symbol { file_index, .. } => {
+                Some(file_index)
             }
-            idx -= 1;
-            if f.expanded {
-                if idx < f.symbols.len() {
-                    return Some(i);
-                }
-                idx -= f.symbols.len();
-            }
+            ProjectedRow::Directory { .. } | ProjectedRow::Note { .. } => None,
         }
-        None
     }
 
     /// The file row and the symbol row (when the selection is on a symbol) under the
@@ -695,18 +875,49 @@ impl App {
         &crate::snapshot::FileRow,
         Option<&crate::snapshot::SymbolRow>,
     )> {
-        // The shared projection decides what is selectable (review 24 M4).
-        crate::file_rows::resolve_logical(&self.snapshot.files, self.file_sel)
+        match self.selected_projected_row()? {
+            ProjectedRow::File { file_index, .. } => {
+                self.snapshot.files.get(file_index).map(|file| (file, None))
+            }
+            ProjectedRow::Symbol {
+                file_index,
+                symbol_index,
+                ..
+            } => {
+                let file = self.snapshot.files.get(file_index)?;
+                file.symbols
+                    .get(symbol_index)
+                    .map(|symbol| (file, Some(symbol)))
+            }
+            ProjectedRow::Directory { .. } | ProjectedRow::Note { .. } => None,
+        }
     }
 
-    /// Flattened file+symbol row count (expanded symbols included).
+    /// Stable summary identity of the selected directory/file/symbol row.
+    #[must_use]
+    pub fn selected_summary_key(&self) -> Option<AiSummaryKey> {
+        self.selected_projected_row()?
+            .summary_key(&self.snapshot.files)
+    }
+
+    /// Current physical changed-tree projection.
+    #[must_use]
+    pub fn projected_file_rows(&self) -> Vec<ProjectedRow> {
+        crate::file_rows::project(&self.snapshot.files, &self.collapsed_directories)
+    }
+
+    fn selected_projected_row(&self) -> Option<ProjectedRow> {
+        crate::file_rows::resolve_logical(
+            &self.snapshot.files,
+            &self.collapsed_directories,
+            self.file_sel,
+        )
+    }
+
+    /// Flattened directory+file+symbol row count.
     #[must_use]
     pub fn flat_file_rows(&self) -> usize {
-        self.snapshot
-            .files
-            .iter()
-            .map(|f| 1 + if f.expanded { f.symbols.len() } else { 0 })
-            .sum()
+        crate::file_rows::logical_row_count(&self.snapshot.files, &self.collapsed_directories)
     }
 
     /// Physical first row for the files viewport. Keyboard navigation follows selection;
@@ -714,23 +925,23 @@ impl App {
     #[must_use]
     pub fn files_first_visible(&self, capacity: usize) -> usize {
         if self.files_scroll_detached {
-            self.files_scroll.min(
-                crate::file_rows::project(&self.snapshot.files)
-                    .len()
-                    .saturating_sub(capacity),
-            )
+            self.files_scroll
+                .min(self.projected_file_rows().len().saturating_sub(capacity))
         } else {
-            crate::file_rows::first_visible(&self.snapshot.files, self.file_sel, capacity)
+            crate::file_rows::first_visible(
+                &self.snapshot.files,
+                &self.collapsed_directories,
+                self.file_sel,
+                capacity,
+            )
         }
     }
 
     fn clamp(&mut self) {
         self.file_sel = self.file_sel.min(self.flat_file_rows().saturating_sub(1));
-        self.files_scroll = self.files_scroll.min(
-            crate::file_rows::project(&self.snapshot.files)
-                .len()
-                .saturating_sub(1),
-        );
+        self.files_scroll = self
+            .files_scroll
+            .min(self.projected_file_rows().len().saturating_sub(1));
         let max_scroll = self.snapshot.diff.rows.len().saturating_sub(1) as u16;
         self.diff_scroll = self.diff_scroll.min(max_scroll);
         // Keep the hunk cursor inside the snapshot's (immutable) total.
@@ -832,6 +1043,26 @@ mod tests {
             app.apply(Action::Up);
         }
         assert_eq!(app.file_sel, 0);
+    }
+
+    #[test]
+    fn agent_focus_expands_and_selects_the_visible_symbol_row() {
+        let mut app = app_with_files();
+        app.apply(Action::AgentFocus(AiSummaryKey::Symbol {
+            file: "b.go".to_string(),
+            name: "sym2".to_string(),
+            position: None,
+        }));
+        assert!(app.snapshot.files[1].expanded);
+        assert_eq!(app.focused, Pane::Files);
+        assert_eq!(
+            app.selected_summary_key(),
+            Some(AiSummaryKey::Symbol {
+                file: "b.go".to_string(),
+                name: "sym2".to_string(),
+                position: None,
+            })
+        );
     }
 
     #[test]
@@ -1345,9 +1576,7 @@ mod tests {
     fn status_epoch(ai: &AiStatus) -> Epoch {
         match ai {
             AiStatus::Loading { since_epoch } => *since_epoch,
-            AiStatus::WaitingForSymbols { epoch }
-            | AiStatus::WaitingForRelations { epoch }
-            | AiStatus::Queued { epoch, .. } => *epoch,
+            AiStatus::WaitingForSymbols { epoch } | AiStatus::Debouncing { epoch } => *epoch,
             AiStatus::Ready { epoch } | AiStatus::Stale { epoch } => *epoch,
             AiStatus::Disabled | AiStatus::Idle | AiStatus::Failed { .. } => Epoch(1),
         }
@@ -1459,6 +1688,56 @@ mod tests {
         assert_eq!(app.ai_plan_scroll, 1);
         app.apply(Action::Bottom);
         assert_eq!(app.ai_plan_scroll, 10_000);
+    }
+
+    #[test]
+    fn canvas_arrangement_returns_with_selection_and_new_plan_starts_fresh() {
+        let mut first = ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 2);
+        first.impact.selected_change = Some(crate::snapshot::SelectedChange {
+            file: "a.go".to_string(),
+            label: "step0".to_string(),
+            change: "modified",
+            interpretation: "Changes step zero.".to_string(),
+            interpretation_source: Default::default(),
+        });
+        let mut app = App::new();
+        app.update(first.clone());
+        let target = PlanNodeTarget {
+            form: 0,
+            id: "n0".to_string(),
+        };
+        let position = PlanCanvasPoint { x: 48, y: 12 };
+        app.apply(Action::MovePlanNode {
+            target: target.clone(),
+            position,
+        });
+        app.apply(Action::PanPlanCanvas {
+            origin: PlanCanvasPoint { x: 20, y: 4 },
+        });
+        assert_eq!(
+            app.active_canvas_view().unwrap().positions.get(&target),
+            Some(&position)
+        );
+
+        let mut second = first.clone();
+        second.impact.selected_change.as_mut().unwrap().file = "b.go".to_string();
+        second.impact.selected_change.as_mut().unwrap().label = "other".to_string();
+        app.update(second);
+        assert!(app.active_canvas_view().is_none());
+
+        app.update(first.clone());
+        let restored = app.active_canvas_view().expect("first selection layout");
+        assert_eq!(restored.positions.get(&target), Some(&position));
+        assert_eq!(restored.origin, PlanCanvasPoint { x: 20, y: 4 });
+
+        let mut regenerated = first;
+        regenerated.epoch = Epoch(2);
+        regenerated.semantic.plan.as_mut().unwrap().epoch = Epoch(2);
+        app.update(regenerated);
+        assert!(
+            app.active_canvas_view().is_none(),
+            "new plan epoch gets automatic placement"
+        );
     }
 
     #[test]

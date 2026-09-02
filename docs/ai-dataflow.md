@@ -9,7 +9,7 @@ visibly marked inferred. Typed entity and graph claims remain deterministic and 
 
 - invent repository entities — every cited file, symbol, range, or hunk must resolve in the
   fact store — or present an interpreted link as a graph-verified fact
-- get a shell, the filesystem, or the network
+- execute a shell command, access the network, or read outside the selected changed-file scope
 - write to the repository
 - replace the deterministic visualization with unverified content
 
@@ -26,48 +26,54 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    background file warms alongside it. Expansion only controls whether completed symbols
    are visible.
 3. **Deterministic first** — the TUI immediately renders the deterministic impact view.
-4. **Digest** — a compact description (changed symbols, diagnostics, hunk summaries, 1-hop
-   relationships, repo sketch; ~4–8k tokens, hard-capped) is assembled. The whole repository is
-   never sent; absolute paths are stripped.
-5. **Schedule + request** — once a row's symbol inventory (and, for symbols, its bounded
-   caller/callee lookup) is complete, it becomes eligible for automatic generation. A central
-   coordinator continuously reprioritizes the focused row first, then sibling symbols in the
-   focused or expanded files, then one file-level summary for every other changed file.
-   Untouched/collapsed symbols are deferred. Normal concurrency targets 4 requests; interactive
-   work may burst to 12, with 64 as an absolute safety ceiling. At the burst boundary a newly
-   focused row cancels the oldest lower-priority overflow request FIFO, and still-valid cancelled
-   work returns to the queue tail. Focus changes also reclassify active work, so an old selection
-   cannot retain focused protection. The headless backend disables all prefetch and requests only
-   its explicit selection. Each job returns a reviewer-first `VisualizationPlan` via a
-   single required
-   `submit_visualization_plan` tool call (tool choice required by default;
-   `CODESCOPE_AI_TOOL_CHOICE=auto` supports providers that reject forced tool calls).
-   `title`, `intent`, `review_focus`, and `evidence` are all required, and the primary form
+4. **Research brief** — the initial request contains only the selection kind/target, virtual
+   working directory, comparison scope, changed-file count, and the review assignment. It does
+   not proactively include source bodies, hunks, diagnostics, symbols, or relationship lists.
+   Absolute paths are stripped.
+5. **Schedule + request** — only the current directory, file, or symbol can start automatic
+   generation. Selection changes use a 250 ms debounce. File/symbol requests wait for that
+   file's symbol inventory; directory requests can proceed from the changed-file/hunk facts
+   already available and include only files below the selected directory. There is no prompt
+   prefetch, background generation, sibling warming, or file-summary queue. Moving away cancels
+   only the unsent debounce: a provider request that has started keeps running and caches its
+   result under the original selection. The coordinator retains at most 16 active requests; a
+   17th request aborts the oldest active generation and takes its place. Aborted work is not
+   requeued. The TUI and headless backend use this same selection-only policy. Each job returns
+   a reviewer-first `DiagramDraft` through a bounded agentic loop (at most 48 total research and
+   diagram operations). `edit_visualization` applies atomic intent/form/node/edge/evidence
+   create-update-delete commands, `inspect_visualization` returns the current draft, and
+   `finish_visualization` asks the validator to publish it. The model never needs to resend the
+   complete plan after each correction. Tool choice is required by default;
+   `CODESCOPE_AI_TOOL_CHOICE=auto` supports providers that reject forced tool calls.
+   `intent`, `forms`, and `evidence` are required, and the primary form
    must be structural — one of changed-symbol tree, call tree, type/impl tree, relationship
    flow, before/after, or sequence; the legacy `impact_summary` and `focused_diff` forms
-   are not accepted as AI plans. Alongside the digest, the request proactively carries a
-   selection-scoped packet of the exact changed lines: at most 8 hunks, balanced head/tail
-   selection, fair totals of 160 lines / 20 KB. Every packet row carries copyable,
-   one-based `[old:… new:…]` coordinates, so the model never has to calculate source lines.
-   Read-only tools are advertised only when
-   an executor can serve them; the dispatcher currently wires none (TUI and debug-ai
-   alike), so everything the AI can cite comes from the request itself. A completed,
-   validated plan is cached by stable file/symbol identity. After that file changes, its
+   are not accepted as AI plans. The dispatcher exposes a selection-scoped mini-shell:
+   `list_directory`, `read_file`, `search_changed_files`, `git_status_file`, and
+   `git_diff_file`. Paths are relative to a virtual cwd (the selected directory or selected
+   file's parent), absolute/parent-traversal paths are rejected, file reads cannot leave the
+   selected changed files, and results are line/byte capped. Git status/diff results come from
+   the immutable captured `ChangeSet`, so exact evidence cannot drift during the loop. Diff rows
+   carry copyable one-based `[old:… new:…]` coordinates. A finish requested before one successful
+   research call is rejected and the model is sent back to research. Each accepted draft edit can
+   be published to the TUI immediately; only renderable projections are shown, and final publication
+   still requires full validation. No shell command is executed and no repository state is mutated.
+   A completed,
+   validated plan is cached by stable directory/file/symbol identity. After that selection changes, its
    old plan is sent as an explicitly untrusted design seed: incremental revisions preserve
    useful structure, while substantial behavioral/topological changes rebuild it. The old
    plan is never evidence and never bypasses current-epoch validation. Exact-epoch results are
-   cached per row, so navigating back is instant. The client also enforces a 10-request/minute
-   token bucket (burst 10); scheduled jobs wait asynchronously for capacity instead of turning
-   normal pacing into a false provider failure. Three consecutive provider failures pause only
-   background warming—focused requests remain eligible.
+   cached per row, so navigating back is instant. Provider admission primarily uses an 8-permit
+   in-flight semaphore. A 600-request/minute token bucket (burst 100) remains as a high safety
+   ceiling; active jobs wait asynchronously for both capacities instead of turning normal pacing
+   into a false provider failure.
 6. **Validate** — every cited entity must resolve against the fact store (file exists,
    symbol resolves, hunk index valid), and a typed edge between two fact-backed entities must
-   exist in the impact graph. Plan schema v4 also requires every AI node to carry one or two
-   exact `code_refs` (`file`, zero-based hunk, old/new side, inclusive one-based lines). Node refs must stay in the selected diff; cross-file context remains plan-level evidence. Every
+   exist in the impact graph. Plan schema v5 also requires every AI node to carry one or two
+   exact `code_refs` (`file`, zero-based hunk, old/new side, inclusive one-based lines). Node refs
+   must stay in the selected research scope: one file for file/symbol selection, or any changed
+   file below a directory selection. Every
    referenced line is checked against the actual parsed hunk before it can drive highlighting.
-   If `review_focus` fences an external or out-of-diff outcome, parse-time validation also requires
-   `title` to begin `Implemented change:` and `intent` to begin `Implemented behavior:`; both must
-   stop before that unshown handoff.
    Entityless conceptual nodes and their hunk-derived links need no entity check but always
    render inferred. Hallucinated entities are dropped (tree forms) or
    the form is rejected (flow/sequence). The AI-facing caps are nonempty 1–2 forms, ≤5
@@ -93,6 +99,16 @@ The app is fully functional with AI disabled, unavailable, slow, or rate-limited
    bounded detail strip with source locators. External assumptions get an upfront warning plus
    the full Review block, and plan-level evidence remains below the map.
 
+## One diagram API, two agent surfaces
+
+`codescope-core::DiagramCommand` is the common mutation contract. Internal inference receives it
+as `edit_visualization`; an external coding agent sends the identical tagged JSON through
+`codescope agent . diagram apply '<json>'`. Both edit the dispatcher-owned `DiagramDraft`, and
+both finish through the same parser, epoch gate, fact validator, and renderer. The controller can
+also use `diagram show`, `diagram reset`, and `diagram finish`. A controller edit cancels only an
+older internal writer for that same selection so two agents cannot race one draft; ordinary tree
+navigation still leaves started requests running under the 16-entry queue policy.
+
 ## Headless debugging
 
 `codescope debug-ai` runs this same dispatcher pipeline without initializing Ratatui. The
@@ -100,8 +116,8 @@ dispatcher publishes `UiSnapshot` through a shared `BackendOutput` abstraction: 
 implementation feeds the interactive TUI, while an mpsc implementation feeds the debug command.
 The command selects a changed file/function using normal `Action`s and prints the validated plan
 and its full validation report from `UiSnapshot.semantic.plan` / `.report`, so it cannot
-silently drift into a second prompt or validator. Its dispatcher uses the focused-only scheduler
-policy, so a one-shot debug run never spends requests on sibling symbols or other files.
+silently drift into a second prompt or validator. A one-shot debug run requests only that
+explicit selection.
 Serialized plans omit fields that only carry defaults (summary, change badge, hints), keeping
 the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` remain visible in
 `debug-ai`, which makes live prompt/schema inspection possible without starting a terminal.
@@ -110,8 +126,8 @@ the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` re
 
 - **No API key** → AI status "off"; deterministic views only.
 - **Timeout / rate limit** — configurable per-request timeout, `Retry-After` honored,
-  exponential backoff, and local token-bucket admission awaited asynchronously; a circuit
-  breaker (3 transport failures in 60 s) cools down for 60 s.
+  exponential backoff, an 8-request in-flight cap, and the high 600 rpm local safety ceiling
+  awaited asynchronously; a circuit breaker (3 transport failures in 60 s) cools down for 60 s.
 - **Malformed / hallucinated plan** — validation drops or rejects; deterministic fallback shows;
   the status line notes it.
 - **Rapid edits** — changes are coalesced. The selected file's symbols are invalidated and
@@ -133,10 +149,9 @@ structured, so they don't need a frontier model.
   `ANTHROPIC_API_KEY`; first found wins, provider inferred from the key); a literal key in a
   config file is a hard error.
 - Keys are wrapped in `secrecy::SecretString`; never logged, never shown.
-- What leaves the machine is the digest (repo-relative paths, symbol names, hunk summaries),
-  the selection-scoped packet of exact changed lines for the current selection (≤8 hunks,
-  160 lines / 20 KB), and, after a regeneration, that selection's prior validated plan as a
-  revision seed. All paths in both current and cached material are repo-relative. Read-only
-  file-body tools are advertised only when an executor can serve them; the dispatcher
-  currently wires none, so no file body is fetched on demand.
-- The status bar always shows whether AI is on, loading, ready, stale, or failed.
+- What leaves initially is the compact research brief. On later turns, only the bounded tool
+  results the model requested leave the machine: selection-scoped changed-file sections, literal
+  search matches, or captured per-file status/diff facts. Results and any prior validated revision
+  seed use repo-relative paths, have absolute roots removed, and pass through secret scrubbing.
+- The status bar shows the active AI service state. The changed tree independently marks each
+  directory/file/symbol summary as `◆` ready, `◇` not generated, `◌` generating, or `!` failed.

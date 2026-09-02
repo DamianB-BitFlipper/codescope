@@ -19,11 +19,13 @@ use crate::snapshot::UiSnapshot;
 /// - `tx` receives Actions that require work the TUI cannot do itself
 ///   (RefreshGit, model/base selection, scope changes); view-only actions are applied
 ///   locally.
+/// - `control_rx` receives the same typed actions from a local control-protocol server.
 pub async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
     mut rx: watch::Receiver<UiSnapshot>,
     tx: mpsc::Sender<Action>,
+    mut control_rx: mpsc::Receiver<Action>,
 ) -> std::io::Result<()> {
     // Defensive: ensure the terminal is in raw mode so key events are delivered. Idempotent;
     // ratatui::init already does this, but a missed enable leaves the app unresponsive.
@@ -39,6 +41,7 @@ pub async fn run(
     // Drag setters are previews: coalesce any number of motion samples into one write on
     // mouse-up (or flush when the interaction is cancelled/exits).
     let mut preferences_dirty = false;
+    let mut control_open = true;
     // Draw only when state changed. Mouse `Moved`/no-op events do not force a redraw, and a
     // steady mouse stream cannot starve snapshot delivery (review 24 B2).
     let mut dirty = true; // first frame draws
@@ -56,6 +59,22 @@ pub async fn run(
         }
 
         tokio::select! {
+            command = control_rx.recv(), if control_open => {
+                match command {
+                    Some(action) => {
+                        preferences_dirty |= dispatch(
+                            &mut app,
+                            action,
+                            &tx,
+                            &mut pending_scope,
+                            &mut selection,
+                        )
+                        .await;
+                        dirty = true;
+                    }
+                    None => control_open = false,
+                }
+            }
             // Keyboard/mouse input first — never starve interactivity.
             maybe = events.next() => {
                 match maybe {
@@ -79,7 +98,7 @@ pub async fn run(
                         // Route against the retained frame plan. Row clicks reuse the
                         // existing SelectionTracker: the returned action is dispatched
                         // through the same path as a keypress.
-                        let previous_drag = drag;
+                        let previous_drag = drag.clone();
                         let outcome = crate::mouse::map_mouse(
                             mouse,
                             &app,
@@ -177,8 +196,16 @@ impl PendingScope {
     }
 }
 
-/// The resolved files-pane selection target, as sent to the dispatcher.
-type SelectionTarget = (Option<String>, Option<(String, u32, u32)>);
+/// Resolved changed-tree selection sent to the dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectionTarget {
+    Empty,
+    Directory(String),
+    File {
+        path: String,
+        symbol: Option<(String, u32, u32)>,
+    },
+}
 
 /// Tracks what the dispatcher was last told is selected, so [`Action::SelectionChanged`]
 /// is sent only when the selection actually moves (a selection send per keypress would be
@@ -200,17 +227,25 @@ impl SelectionTracker {
         // The dispatcher starts with no selection; the first sync only reports once a real
         // row exists. (An empty list AFTER a real selection IS reported, so the dispatcher
         // can drop the now-gone target.)
-        if self.0.is_none() && target == (None, None) {
+        if self.0.is_none() && target == SelectionTarget::Empty {
             self.0 = Some(target);
             return;
         }
         self.0 = Some(target.clone());
-        let _ = tx
-            .send(Action::SelectionChanged {
-                file: target.0,
-                symbol: target.1,
-            })
-            .await;
+        let action = match target {
+            SelectionTarget::Empty => Action::SelectionChanged {
+                file: None,
+                symbol: None,
+            },
+            SelectionTarget::Directory(directory) => {
+                Action::DirectorySelectionChanged { directory }
+            }
+            SelectionTarget::File { path, symbol } => Action::SelectionChanged {
+                file: Some(path),
+                symbol,
+            },
+        };
+        let _ = tx.send(action).await;
     }
 }
 
@@ -218,22 +253,21 @@ impl SelectionTracker {
 /// yields `(Some(path), None)`; a symbol row with a position yields the symbol too (an
 /// unmapped symbol row degrades to its file). `(None, None)` when the file list is empty.
 fn selection_target(app: &App) -> SelectionTarget {
-    let mut idx = app.file_sel;
-    for f in &app.snapshot.files {
-        if idx == 0 {
-            return (Some(f.path.clone()), None);
+    match app.selected_summary_key() {
+        Some(crate::snapshot::AiSummaryKey::Directory(path)) => SelectionTarget::Directory(path),
+        Some(crate::snapshot::AiSummaryKey::File(path)) => {
+            SelectionTarget::File { path, symbol: None }
         }
-        idx -= 1;
-        if f.expanded {
-            if idx < f.symbols.len() {
-                let s = &f.symbols[idx];
-                let symbol = s.position.map(|(line, col)| (s.name.clone(), line, col));
-                return (Some(f.path.clone()), symbol);
-            }
-            idx -= f.symbols.len();
-        }
+        Some(crate::snapshot::AiSummaryKey::Symbol {
+            file,
+            name,
+            position,
+        }) => SelectionTarget::File {
+            path: file,
+            symbol: position.map(|(line, col)| (name, line, col)),
+        },
+        None => SelectionTarget::Empty,
     }
-    (None, None)
 }
 
 /// Apply view-only actions locally and forward work actions to the dispatcher.
@@ -297,6 +331,33 @@ async fn dispatch(
         Action::RefreshGit => {
             let _ = tx.send(action).await;
         }
+        Action::AgentFocus(target) => {
+            // Symbol rows only exist in the projection while their file is expanded.
+            // Keep the dispatcher-owned expansion bit aligned with the optimistic local
+            // tree update before the ordinary selection tracker reports the new target.
+            if let crate::snapshot::AiSummaryKey::Symbol { file, .. } = &target {
+                let _ = tx
+                    .send(Action::SetFileExpanded {
+                        path: file.clone(),
+                        expanded: true,
+                    })
+                    .await;
+            }
+            app.apply(Action::AgentFocus(target));
+        }
+        Action::AgentAsk(_) | Action::AgentFeedback(_) | Action::AgentDiagram(_) => {
+            let _ = tx.send(action).await;
+        }
+        Action::CommitDiffSelection {
+            selection,
+            ref text,
+        } => {
+            app.apply(Action::CommitDiffSelection {
+                selection,
+                text: text.clone(),
+            });
+            copy_osc52(text);
+        }
         Action::SetFileExpanded { .. } => {
             // Optimistic local apply (responsive expand/collapse), then the dispatcher
             // reconciles: it owns expansion state. The path is part of
@@ -304,12 +365,18 @@ async fn dispatch(
             app.apply(action.clone());
             let _ = tx.send(action).await;
         }
+        Action::SetDirectoryExpanded { .. } => {
+            // Directory disclosure is pure local view state and must not start work.
+            app.apply(action);
+        }
         // Space/h/l are expansion aliases and resolve the same targeted command.
         Action::ToggleExpand | Action::Collapse | Action::Expand if app.focused == Pane::Files => {
-            if let Some((path, expanded)) = app.file_toggle_target() {
-                let cmd = Action::SetFileExpanded { path, expanded };
+            if let Some(cmd) = app.tree_toggle_action() {
+                let forward = matches!(cmd, Action::SetFileExpanded { .. });
                 app.apply(cmd.clone());
-                let _ = tx.send(cmd).await;
+                if forward {
+                    let _ = tx.send(cmd).await;
+                }
             }
         }
         Action::ModelPicker => {
@@ -367,6 +434,38 @@ async fn dispatch(
     preferences_changed && drag_preview
 }
 
+/// Copy without a platform dependency. OSC 52 is understood by modern local terminals
+/// and multiplexers; unsupported terminals safely ignore the control sequence.
+fn copy_osc52(text: &str) {
+    use std::io::Write as _;
+    let encoded = base64(text.as_bytes());
+    let _ = write!(std::io::stdout(), "\x1b]52;c;{encoded}\x07");
+    let _ = std::io::stdout().flush();
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[usize::from(a >> 2)] as char);
+        out.push(TABLE[usize::from((a & 0x03) << 4 | b >> 4)] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[usize::from((b & 0x0f) << 2 | c >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[usize::from(c & 0x3f)] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Forward one coalesced global-preference snapshot to the dispatcher/config writer.
 async fn persist_preferences(app: &App, tx: &mpsc::Sender<Action>) {
     let _ = tx
@@ -380,31 +479,32 @@ fn selected_symbol(app: &App) -> Option<Action> {
     if app.focused != crate::app::Pane::Files {
         return None;
     }
-    let mut idx = app.file_sel;
-    for f in &app.snapshot.files {
-        if idx == 0 {
-            return None; // a file row, not a symbol
-        }
-        idx -= 1;
-        if f.expanded {
-            if idx < f.symbols.len() {
-                let s = &f.symbols[idx];
-                return s.position.map(|(line, col)| Action::SelectSymbol {
-                    file: f.path.clone(),
-                    name: s.name.clone(),
-                    line,
-                    col,
-                });
-            }
-            idx -= f.symbols.len();
-        }
-    }
-    None
+    let crate::snapshot::AiSummaryKey::Symbol {
+        file,
+        name,
+        position: Some((line, col)),
+    } = app.selected_summary_key()?
+    else {
+        return None;
+    };
+    Some(Action::SelectSymbol {
+        file,
+        name,
+        line,
+        col,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osc52_payload_uses_standard_base64() {
+        assert_eq!(base64(b"copy this"), "Y29weSB0aGlz");
+        assert_eq!(base64(b"a"), "YQ==");
+        assert_eq!(base64(b"ab"), "YWI=");
+    }
 
     /// Bug 2 regression: a scope set via action must persist across refresh snapshots,
     /// including one published before the dispatcher processed the forwarded action.
@@ -700,7 +800,7 @@ mod tests {
                     removed_lines: 0,
                     symbols: vec![symbol("sym0", Some((10, 4))), symbol("sym1", Some((20, 4)))],
                     expanded: true,
-                    semantic: Default::default(),
+                    semantic: crate::snapshot::FileSemanticLoad::Ready,
                 },
                 FileRow {
                     path: "b.go".to_string(),

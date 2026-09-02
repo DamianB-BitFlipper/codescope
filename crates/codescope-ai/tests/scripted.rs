@@ -4,14 +4,15 @@
 //! local throttle) without any real network dependency.
 
 use codescope_ai::{
-    AiClient, AiClientOptions, AiConfig, AiError, AiOutcome, AiService, ChatMessage, FactView,
-    Lookup, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolChoice, ToolExecError, ToolExecutor,
-    PLAN_TOOL_NAME,
+    diagram_tools, research_tools, AiClient, AiClientOptions, AiConfig, AiError, AiOutcome,
+    AiService, ChatMessage, DiagramObserver, FactView, Lookup, NoToolExecutor, ReasoningEffort,
+    RetryPolicy, ToolChoice, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
+    DIAGRAM_FINISH_TOOL_NAME, PLAN_TOOL_NAME,
 };
 use codescope_core::{
-    DiffSide, EntityRef, Epoch, FileId, FormKind, LineRange, PlanCodeRef, PlanEdge, PlanEdgeKind,
-    PlanEvidence, PlanNode, PlanNodeChange, ValidationVerdict, VisualizationPlan, VizForm,
-    MAX_NODE_CODE_REFS,
+    DiagramCommand, DiagramDraft, DiffSide, EntityRef, Epoch, FileId, FormKind, LineRange,
+    PlanCodeRef, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode, PlanNodeChange, ValidationVerdict,
+    VisualizationPlan, VizForm, MAX_NODE_CODE_REFS,
 };
 use codescope_testutil::fake_ai::{
     hallucinated_sample_plan, sample_plan, AiScriptStep, ScriptedProvider,
@@ -21,7 +22,7 @@ use futures::future::BoxFuture;
 use secrecy::SecretString;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const REPO_ROOT: &str = "/abs/fixture/root";
@@ -192,6 +193,54 @@ impl ToolExecutor for RecordingExecutor {
     }
 }
 
+#[derive(Default)]
+struct RequiredResearchExecutor(RecordingExecutor);
+
+impl ToolExecutor for RequiredResearchExecutor {
+    fn requires_research(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: &'a Value,
+    ) -> BoxFuture<'a, Result<String, ToolExecError>> {
+        self.0.execute(name, arguments)
+    }
+}
+
+#[derive(Default)]
+struct IncrementalExecutor(RecordingExecutor);
+
+impl ToolExecutor for IncrementalExecutor {
+    fn available_tools(&self) -> Vec<ToolDef> {
+        research_tools()
+            .into_iter()
+            .chain(diagram_tools())
+            .collect()
+    }
+
+    fn requires_research(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: &'a Value,
+    ) -> BoxFuture<'a, Result<String, ToolExecError>> {
+        self.0.execute(name, arguments)
+    }
+}
+
+fn diagram_step(command: &DiagramCommand) -> AiScriptStep {
+    AiScriptStep::tool_call(
+        DIAGRAM_EDIT_TOOL_NAME,
+        serde_json::to_value(command).unwrap(),
+    )
+}
+
 /// A raw 200 chat completion whose message calls `calls` read-only tools.
 fn tool_call_step(names: &[&str]) -> AiScriptStep {
     let tool_calls: Vec<Value> = names
@@ -359,7 +408,7 @@ async fn previous_validated_design_is_sent_as_a_non_evidentiary_revision_seed() 
     let body = provider.requests()[0].body_json().unwrap();
     let user = body["messages"][1]["content"].as_str().unwrap();
     assert!(user.contains("current epoch: 7"));
-    assert!(user.contains("## current revision facts"));
+    assert!(user.contains("## current research brief"));
     assert!(user.contains("previous validated design"));
     assert!(user.contains("Earlier cached design"));
     assert!(user.contains("\"epoch\": 6"));
@@ -373,11 +422,10 @@ async fn previous_validated_design_is_sent_as_a_non_evidentiary_revision_seed() 
     );
 
     let system = body["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("Revision continuity"));
-    assert!(system.contains("Current revision facts always win"));
-    assert!(system.contains("Unless current evidence demonstrates a substantial change"));
-    assert!(system.contains("discard the seed and rebuild"));
-    assert!(system.contains("Never copy the seed's old epoch"));
+    assert!(system.contains("previous validated design"));
+    assert!(system.contains("current research always wins"));
+    assert!(system.contains("Preserve useful structure for an incremental revision"));
+    assert!(system.contains("never copy its old epoch"));
 }
 
 #[tokio::test]
@@ -837,6 +885,110 @@ async fn tool_loop_executes_reads_and_submits_plan() {
 }
 
 #[tokio::test]
+async fn incremental_tools_build_and_publish_the_observed_live_draft() {
+    let expected = sample_plan(Epoch(5));
+    let commands = [
+        DiagramCommand::SetIntent {
+            intent: expected.intent.clone(),
+        },
+        DiagramCommand::CreateForm {
+            form_id: "main".to_string(),
+            kind: expected.forms[0].kind,
+        },
+        DiagramCommand::CreateNode {
+            form_id: "main".to_string(),
+            node: expected.forms[0].nodes[0].clone(),
+        },
+        DiagramCommand::CreateNode {
+            form_id: "main".to_string(),
+            node: expected.forms[0].nodes[1].clone(),
+        },
+        DiagramCommand::AddEvidence {
+            evidence: expected.evidence[0].clone(),
+        },
+    ];
+    let mut script = vec![AiScriptStep::tool_call(
+        "git_diff_file",
+        json!({"path": MIDDLEWARE_FILE, "hunk_index": 0}),
+    )];
+    script.extend(commands.iter().map(diagram_step));
+    script.push(AiScriptStep::tool_call(DIAGRAM_FINISH_TOOL_NAME, json!({})));
+    let provider = ScriptedProvider::start(script).await.unwrap();
+    let service = service_for(&provider);
+    let observed = Arc::new(Mutex::new(Vec::<DiagramDraft>::new()));
+    let observed_for_callback = observed.clone();
+    let observer: DiagramObserver = Arc::new(move |draft| {
+        observed_for_callback.lock().unwrap().push(draft);
+    });
+
+    let outcome = service
+        .request_plan_with_previous_observer(
+            "small research brief",
+            None,
+            &IncrementalExecutor::default(),
+            &FixtureFacts,
+            Epoch(5),
+            Some(observer),
+        )
+        .await;
+    let AiOutcome::Plan(plan, report) = outcome else {
+        panic!("expected incrementally built plan, got {outcome:?}");
+    };
+    assert_eq!(plan, expected);
+    assert_eq!(report.verdict, ValidationVerdict::Valid);
+
+    let drafts = observed.lock().unwrap();
+    assert!(drafts.len() >= commands.len() + 2);
+    assert!(drafts.iter().any(|draft| draft.forms.len() == 1));
+    assert!(drafts.iter().any(|draft| {
+        draft
+            .forms
+            .first()
+            .is_some_and(|form| form.nodes.len() == 2)
+    }));
+
+    let first_request = provider.requests()[0].body_json().unwrap();
+    let tool_names = first_request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&DIAGRAM_EDIT_TOOL_NAME));
+    assert!(tool_names.contains(&DIAGRAM_FINISH_TOOL_NAME));
+    assert!(!tool_names.contains(&PLAN_TOOL_NAME));
+}
+
+#[tokio::test]
+async fn research_executor_rejects_a_plan_until_one_tool_succeeds() {
+    let provider = ScriptedProvider::start([
+        AiScriptStep::valid_plan(Epoch(5)).unwrap(),
+        tool_call_step(&["get_file_outline"]),
+        AiScriptStep::valid_plan(Epoch(5)).unwrap(),
+    ])
+    .await
+    .unwrap();
+    let service = service_for(&provider);
+    let executor = RequiredResearchExecutor::default();
+
+    let outcome = service
+        .request_plan("small research brief", &executor, &FixtureFacts, Epoch(5))
+        .await;
+    assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
+    assert_eq!(executor.0.count.load(Ordering::SeqCst), 1);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let second = requests[1].body_json().unwrap();
+    let feedback = second["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(feedback["role"], "tool");
+    assert!(feedback["content"]
+        .as_str()
+        .unwrap()
+        .contains("submitted before inspecting"));
+}
+
+#[tokio::test]
 async fn two_validation_repair_turns_can_cross_schema_and_fact_boundaries() {
     let mut incomplete = sample_plan(Epoch(5));
     incomplete.forms[0].nodes[0].detail = None;
@@ -1010,7 +1162,7 @@ async fn unqueried_symbol_entity_gets_entity_repair_then_validates() {
     let system = first_body["messages"][0]["content"].as_str().unwrap();
     assert!(system.contains("No read-only tools are available"));
     assert!(system.contains("hunk-derived"));
-    assert!(system.contains("changed-symbol catalog"));
+    assert!(system.contains("current symbol catalog"));
     // The repair feedback is entity-specific.
     let messages = requests[1].body_json().unwrap()["messages"]
         .as_array()
@@ -1027,7 +1179,7 @@ async fn unqueried_symbol_entity_gets_entity_repair_then_validates() {
         "reason echoes the unqueried symbol: {feedback}"
     );
     assert!(
-        feedback.contains("changed-symbol catalog"),
+        feedback.contains("exact current fact or tool result"),
         "catalog rule in guidance: {feedback}"
     );
     assert!(
@@ -1035,7 +1187,9 @@ async fn unqueried_symbol_entity_gets_entity_repair_then_validates() {
         "entity omission taught: {feedback}"
     );
     assert!(
-        feedback.contains("never attach a symbol or range merely because"),
+        feedback
+            .to_ascii_lowercase()
+            .contains("never attach a symbol or range merely because"),
         "spelling-in-diff trap named: {feedback}"
     );
 }
@@ -1442,7 +1596,7 @@ async fn invalid_evidence_gets_citation_repair_then_validates() {
         "evidence failure named: {feedback}"
     );
     assert!(
-        feedback.contains("exact supplied file"),
+        feedback.contains("exact repo_path"),
         "citation guidance: {feedback}"
     );
 }
@@ -1508,7 +1662,7 @@ async fn missing_code_refs_gets_named_repair_and_refs_survive_the_loop() {
         "count contract taught: {feedback}"
     );
     assert!(
-        feedback.contains("annotated focused diff"),
+        feedback.contains("git_diff_file"),
         "source of truth taught: {feedback}"
     );
 }

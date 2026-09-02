@@ -1,65 +1,34 @@
-//! Central admission and cancellation policy for asynchronous AI plan requests.
+//! FIFO lifetime management for active AI requests.
 //!
-//! The target is intentionally soft: interactive work may burst above it, and focused
-//! work may preempt the oldest lower-priority overflow request. The absolute ceiling is a
-//! final process-safety bound, not the normal operating concurrency.
+//! Only the debounced current selection starts inference. Moving to another selection does
+//! not cancel work already sent to the provider: completed plans are cached under their
+//! original selection. The active window is bounded to 16 requests; admitting another
+//! request aborts the oldest active generation.
 
 use std::collections::HashMap;
 
 use tokio::task::AbortHandle;
 
-/// Lower values are more important.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum RequestPriority {
-    Focused = 0,
-    Interactive = 1,
-    Background = 2,
-}
-
-/// Normal concurrency, interactive burst capacity, and the absolute process ceiling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RequestLimits {
-    pub(crate) target_in_flight: usize,
-    pub(crate) overflow_in_flight: usize,
-    pub(crate) absolute_max: usize,
-}
-
-impl Default for RequestLimits {
-    fn default() -> Self {
-        Self {
-            target_in_flight: 4,
-            overflow_in_flight: 12,
-            absolute_max: 64,
-        }
-    }
-}
+/// Maximum number of provider requests that may remain active at once.
+const DEFAULT_MAX_ACTIVE: usize = 16;
 
 #[derive(Debug)]
 struct ActiveRequest {
-    priority: RequestPriority,
     order: u64,
-    overflow: bool,
     abort: AbortHandle,
 }
 
-/// Result of asking the coordinator for capacity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Admission {
-    Admitted { preempted: Option<u64> },
-    Queued,
-}
-
-/// One coordinator owns all active AI requests and their cancellation handles.
+/// One coordinator owns every active AI request and its cancellation handle.
 #[derive(Debug)]
 pub(crate) struct RequestCoordinator {
-    limits: RequestLimits,
+    max_active: usize,
     active: HashMap<u64, ActiveRequest>,
     next_order: u64,
 }
 
 impl Default for RequestCoordinator {
     fn default() -> Self {
-        Self::new(RequestLimits::default())
+        Self::new(DEFAULT_MAX_ACTIVE)
     }
 }
 
@@ -70,15 +39,9 @@ impl Drop for RequestCoordinator {
 }
 
 impl RequestCoordinator {
-    pub(crate) fn new(mut limits: RequestLimits) -> Self {
-        limits.target_in_flight = limits.target_in_flight.max(1);
-        limits.absolute_max = limits.absolute_max.max(limits.target_in_flight);
-        limits.overflow_in_flight = limits
-            .overflow_in_flight
-            .max(limits.target_in_flight)
-            .min(limits.absolute_max);
+    fn new(max_active: usize) -> Self {
         Self {
-            limits,
+            max_active: max_active.max(1),
             active: HashMap::new(),
             next_order: 0,
         }
@@ -93,65 +56,42 @@ impl RequestCoordinator {
         self.active.is_empty()
     }
 
-    /// Reserve capacity conceptually. If focused work reaches the burst boundary, cancel
-    /// the oldest lower-priority request that was itself admitted as overflow (FIFO
-    /// dequeue). Only an all-focused workload may grow beyond that boundary, up to 64.
-    pub(crate) fn admit(&mut self, priority: RequestPriority) -> Admission {
-        let active = self.active.len();
-        if active < self.limits.target_in_flight {
-            return Admission::Admitted { preempted: None };
+    /// Make room for one new request. Returns the generation cancelled when the active
+    /// window was already full. Requests below the cap are never cancelled merely because
+    /// focus moved elsewhere.
+    pub(crate) fn admit(&mut self) -> Option<u64> {
+        if self.active.len() < self.max_active {
+            return None;
         }
-        if priority <= RequestPriority::Interactive && active < self.limits.overflow_in_flight {
-            return Admission::Admitted { preempted: None };
+        let oldest = self
+            .active
+            .iter()
+            .min_by_key(|(_, request)| request.order)
+            .map(|(generation, _)| *generation);
+        if let Some(generation) = oldest {
+            self.abort(generation);
         }
-        if priority != RequestPriority::Focused {
-            return Admission::Queued;
-        }
-
-        if let Some(victim) = self.oldest_lower_priority(priority, true) {
-            self.abort(victim);
-            return Admission::Admitted {
-                preempted: Some(victim),
-            };
-        }
-        if active < self.limits.absolute_max {
-            return Admission::Admitted { preempted: None };
-        }
-        if let Some(victim) = self.oldest_lower_priority(priority, false) {
-            self.abort(victim);
-            return Admission::Admitted {
-                preempted: Some(victim),
-            };
-        }
-        Admission::Queued
+        oldest
     }
 
-    pub(crate) fn register(&mut self, id: u64, priority: RequestPriority, abort: AbortHandle) {
-        debug_assert!(self.active.len() < self.limits.absolute_max);
+    pub(crate) fn register(&mut self, generation: u64, abort: AbortHandle) {
+        debug_assert!(self.active.len() < self.max_active);
         self.next_order = self.next_order.saturating_add(1);
         self.active.insert(
-            id,
+            generation,
             ActiveRequest {
-                priority,
                 order: self.next_order,
-                overflow: self.active.len() >= self.limits.target_in_flight,
                 abort,
             },
         );
     }
 
-    pub(crate) fn reprioritize(&mut self, id: u64, priority: RequestPriority) {
-        if let Some(active) = self.active.get_mut(&id) {
-            active.priority = priority;
-        }
+    pub(crate) fn complete(&mut self, generation: u64) {
+        self.active.remove(&generation);
     }
 
-    pub(crate) fn complete(&mut self, id: u64) {
-        self.active.remove(&id);
-    }
-
-    pub(crate) fn abort(&mut self, id: u64) {
-        if let Some(active) = self.active.remove(&id) {
+    pub(crate) fn abort(&mut self, generation: u64) {
+        if let Some(active) = self.active.remove(&generation) {
             active.abort.abort();
         }
     }
@@ -161,113 +101,65 @@ impl RequestCoordinator {
             active.abort.abort();
         }
     }
-
-    fn oldest_lower_priority(&self, priority: RequestPriority, overflow_only: bool) -> Option<u64> {
-        self.active
-            .iter()
-            .filter(|(_, request)| {
-                request.priority > priority && (!overflow_only || request.overflow)
-            })
-            .min_by_key(|(_, request)| request.order)
-            .map(|(id, _)| *id)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn active_handle() -> AbortHandle {
-        tokio::spawn(std::future::pending::<()>()).abort_handle()
+    fn pending_task() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(std::future::pending::<()>())
     }
 
     #[tokio::test]
-    async fn background_stops_at_target_and_interactive_bursts_to_three_times_target() {
+    async fn focus_changes_do_not_cancel_requests_below_the_cap() {
+        let mut coordinator = RequestCoordinator::new(3);
+        let first = pending_task();
+        assert_eq!(coordinator.admit(), None);
+        coordinator.register(1, first.abort_handle());
+
+        let second = pending_task();
+        assert_eq!(coordinator.admit(), None);
+        coordinator.register(2, second.abort_handle());
+
+        assert_eq!(coordinator.len(), 2);
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        coordinator.abort_all();
+    }
+
+    #[tokio::test]
+    async fn seventeenth_request_cancels_the_oldest_active_generation() {
         let mut coordinator = RequestCoordinator::default();
-        for id in 1..=4 {
-            assert_eq!(
-                coordinator.admit(RequestPriority::Background),
-                Admission::Admitted { preempted: None }
-            );
-            coordinator.register(id, RequestPriority::Background, active_handle());
+        let mut tasks = Vec::new();
+        for generation in 1..=16 {
+            let task = pending_task();
+            assert_eq!(coordinator.admit(), None);
+            coordinator.register(generation, task.abort_handle());
+            tasks.push(task);
         }
-        assert_eq!(
-            coordinator.admit(RequestPriority::Background),
-            Admission::Queued
-        );
-        for id in 5..=12 {
-            assert_eq!(
-                coordinator.admit(RequestPriority::Interactive),
-                Admission::Admitted { preempted: None }
-            );
-            coordinator.register(id, RequestPriority::Interactive, active_handle());
+
+        assert_eq!(coordinator.admit(), Some(1));
+        assert_eq!(coordinator.len(), 15);
+        let newest = pending_task();
+        coordinator.register(17, newest.abort_handle());
+        assert_eq!(coordinator.len(), 16);
+        assert!(tasks.remove(0).await.unwrap_err().is_cancelled());
+        for task in tasks {
+            assert!(!task.is_finished());
         }
-        assert_eq!(coordinator.len(), 12);
-        assert_eq!(
-            coordinator.admit(RequestPriority::Interactive),
-            Admission::Queued
-        );
         coordinator.abort_all();
     }
 
     #[tokio::test]
-    async fn focused_request_dequeues_oldest_lower_priority_overflow() {
-        let mut coordinator = RequestCoordinator::default();
-        for id in 1..=4 {
-            assert!(matches!(
-                coordinator.admit(RequestPriority::Background),
-                Admission::Admitted { .. }
-            ));
-            coordinator.register(id, RequestPriority::Background, active_handle());
-        }
-        let oldest_overflow = tokio::spawn(std::future::pending::<()>());
-        assert!(matches!(
-            coordinator.admit(RequestPriority::Interactive),
-            Admission::Admitted { .. }
-        ));
-        coordinator.register(
-            5,
-            RequestPriority::Interactive,
-            oldest_overflow.abort_handle(),
-        );
-        for id in 6..=12 {
-            assert!(matches!(
-                coordinator.admit(RequestPriority::Interactive),
-                Admission::Admitted { .. }
-            ));
-            coordinator.register(id, RequestPriority::Interactive, active_handle());
-        }
-        assert_eq!(
-            coordinator.admit(RequestPriority::Focused),
-            Admission::Admitted { preempted: Some(5) }
-        );
-        assert_eq!(coordinator.len(), 11);
-        assert!(
-            oldest_overflow.await.unwrap_err().is_cancelled(),
-            "dequeue must abort the provider task, not merely discard its metadata"
-        );
-        coordinator.abort_all();
-    }
+    async fn completion_frees_capacity_without_cancelling_anything() {
+        let mut coordinator = RequestCoordinator::new(2);
+        let first = pending_task();
+        coordinator.register(1, first.abort_handle());
+        coordinator.complete(1);
 
-    #[tokio::test]
-    async fn all_focused_work_can_burst_but_never_exceed_absolute_max() {
-        let mut coordinator = RequestCoordinator::new(RequestLimits {
-            target_in_flight: 1,
-            overflow_in_flight: 3,
-            absolute_max: 4,
-        });
-        for id in 1..=4 {
-            assert!(matches!(
-                coordinator.admit(RequestPriority::Focused),
-                Admission::Admitted { .. }
-            ));
-            coordinator.register(id, RequestPriority::Focused, active_handle());
-        }
-        assert_eq!(
-            coordinator.admit(RequestPriority::Focused),
-            Admission::Queued
-        );
-        coordinator.abort_all();
+        assert_eq!(coordinator.admit(), None);
         assert!(coordinator.is_empty());
+        first.abort();
     }
 }

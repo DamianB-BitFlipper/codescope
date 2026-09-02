@@ -7,23 +7,27 @@
 
 use std::collections::HashSet;
 
-use codescope_ai::{AiOutcome, AiService, FactView, NoToolExecutor, ReasoningEffort};
+use codescope_ai::{
+    parse_plan, validate, AiOutcome, AiService, DiagramObserver, FactView, ReasoningEffort,
+};
 use codescope_analysis::{AnalysisEngine, AnalysisSnapshot};
 use codescope_core::{
-    AiStatus, ChangeScope, DiffSide, EntityRef, Epoch, LineRange, LsStatus, PlanEdgeKind,
+    AiStatus, ChangeScope, DiagramCommand, DiagramDraft, DiffSide, EntityRef, Epoch, LineRange,
+    LsStatus, PlanEdgeKind,
 };
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
 use codescope_tui::snapshot::{
-    AiTokenUsage, DiffPane, DiffRow, FileRow, ImpactList, ImpactLoadState, ImpactPane, ImpactRow,
-    InterpretationSource, RepoBar, ScopeCounts, SelectedChange, SemanticPane, StatusLevel,
-    StatusMessage, SymbolRow, UiSnapshot,
+    AiSummaryKey, AiSummaryState, AiTokenUsage, DiffPane, DiffRow, FileRow, ImpactList,
+    ImpactLoadState, ImpactPane, ImpactRow, InterpretationSource, RepoBar, ScopeCounts,
+    SelectedChange, SemanticPane, StatusLevel, StatusMessage, SymbolRow, UiSnapshot,
 };
 use codescope_tui::Action;
 use codescope_tui::UiPreferences;
 use tokio::sync::{mpsc, watch};
 
-use crate::request_coordinator::{Admission, RequestCoordinator, RequestPriority};
+use crate::request_coordinator::RequestCoordinator;
+use crate::research_tools::{research_brief, ScopedResearchTools};
 
 /// Publication boundary between the backend dispatcher and a state consumer.
 ///
@@ -138,7 +142,7 @@ pub enum DispatchEvent {
     AiDone {
         /// Epoch the plan was requested against.
         epoch: Epoch,
-        /// Exact file/function row the plan explains. Completion is cached for this row
+        /// Exact directory/file/function row the plan explains. Completion is cached for this row
         /// even when focus moved while the provider was answering.
         selection: AiSelectionKey,
         /// The AI request generation (monotonic per dispatcher): distinguishes two
@@ -148,7 +152,18 @@ pub enum DispatchEvent {
         /// The validated outcome.
         outcome: AiOutcome,
     },
-    /// The selection stayed on one changed file/symbol long enough to request its AI plan.
+    /// One atomic internal-agent diagram edit landed before the overall request finished.
+    AiDraft {
+        /// Repository epoch owned by the draft.
+        epoch: Epoch,
+        /// Stable selection whose diagram is being built.
+        selection: AiSelectionKey,
+        /// Request generation, used to reject edits from evicted/obsolete writers.
+        generation: u64,
+        /// Complete bounded draft after the accepted edit.
+        draft: DiagramDraft,
+    },
+    /// The selection stayed on one changed directory/file/symbol long enough to request its AI plan.
     /// Navigation increments `generation`, so earlier debounce events become inert before
     /// they can spend a provider request.
     AiSelectionSettled {
@@ -236,6 +251,30 @@ fn ai_failure_footer_reason(reason: &str) -> String {
     concise
 }
 
+const MAX_AGENT_GUIDANCE_CHARS: usize = 2_000;
+
+fn normalize_agent_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
+        .take(MAX_AGENT_GUIDANCE_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.replace(['\n', '\t'], " ");
+    }
+    let mut shortened = text
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>()
+        .replace(['\n', '\t'], " ");
+    shortened.push('…');
+    shortened
+}
+
 /// Lazy per-file semantic state (the interactive counterpart of the eager
 /// `AnalysisSnapshot.files`). The files pane renders this directly.
 #[derive(Debug, Clone)]
@@ -259,19 +298,56 @@ struct SelectedRelations {
     callees: RelationRows,
 }
 
-/// Stable identity of the changed-file/function row an AI plan explains.
+/// Stable identity of the directory/file/function row an AI plan explains.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct AiSelectionKey {
-    file: String,
-    symbol: Option<(String, u32, u32)>,
+pub(crate) enum AiSelectionKey {
+    Directory(String),
+    File(String),
+    Symbol {
+        file: String,
+        name: String,
+        line: u32,
+        col: u32,
+    },
 }
 
 impl AiSelectionKey {
     fn label(&self) -> &str {
-        self.symbol
-            .as_ref()
-            .map(|(name, _, _)| name.as_str())
-            .unwrap_or(self.file.as_str())
+        match self {
+            Self::Directory(path) | Self::File(path) => path,
+            Self::Symbol { name, .. } => name,
+        }
+    }
+
+    fn file(&self) -> Option<&str> {
+        match self {
+            Self::Directory(_) => None,
+            Self::File(path) | Self::Symbol { file: path, .. } => Some(path),
+        }
+    }
+
+    fn contains_file(&self, file: &str) -> bool {
+        match self {
+            Self::Directory(directory) => file.starts_with(&format!("{directory}/")),
+            Self::File(path) | Self::Symbol { file: path, .. } => file == path,
+        }
+    }
+
+    fn summary_key(&self) -> AiSummaryKey {
+        match self {
+            Self::Directory(path) => AiSummaryKey::Directory(path.clone()),
+            Self::File(path) => AiSummaryKey::File(path.clone()),
+            Self::Symbol {
+                file,
+                name,
+                line,
+                col,
+            } => AiSummaryKey::Symbol {
+                file: file.clone(),
+                name: name.clone(),
+                position: Some((*line, *col)),
+            },
+        }
     }
 }
 
@@ -281,16 +357,21 @@ impl AiSelectionKey {
 /// without changing the behavior the prior diagram explains. Revision entries are prompt
 /// seeds only; they are never rendered as facts for a newer epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AiRevisionKey {
-    file: String,
-    symbol: Option<String>,
+enum AiRevisionKey {
+    Directory(String),
+    File(String),
+    Symbol { file: String, name: String },
 }
 
 impl From<&AiSelectionKey> for AiRevisionKey {
     fn from(selection: &AiSelectionKey) -> Self {
-        Self {
-            file: selection.file.clone(),
-            symbol: selection.symbol.as_ref().map(|(name, _, _)| name.clone()),
+        match selection {
+            AiSelectionKey::Directory(path) => Self::Directory(path.clone()),
+            AiSelectionKey::File(path) => Self::File(path.clone()),
+            AiSelectionKey::Symbol { file, name, .. } => Self::Symbol {
+                file: file.clone(),
+                name: name.clone(),
+            },
         }
     }
 }
@@ -305,38 +386,44 @@ struct CachedAiPlan {
     report: codescope_core::ValidationReport,
 }
 
-/// How broadly a dispatcher warms AI plans. The interactive TUI uses `Adaptive`; the
-/// one-shot debug backend uses `FocusedOnly` so it never spends requests on unrelated rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AiPrefetchPolicy {
-    Adaptive,
-    FocusedOnly,
+/// Agent-supplied presentation intent for one stable selection. This text can steer what
+/// the reviewer explains, but is explicitly labelled as untrusted guidance in the prompt.
+#[derive(Debug, Clone, Default)]
+struct AgentGuidance {
+    question: Option<String>,
+    feedback: Option<String>,
 }
 
-/// Lower values run first. Queue entries are reclassified whenever focus/expansion moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum AiJobPriority {
-    Focused = 0,
-    ExpandedSymbol = 1,
-    FileSummary = 2,
-}
-
-impl From<AiJobPriority> for RequestPriority {
-    fn from(priority: AiJobPriority) -> Self {
-        match priority {
-            AiJobPriority::Focused => RequestPriority::Focused,
-            AiJobPriority::ExpandedSymbol => RequestPriority::Interactive,
-            AiJobPriority::FileSummary => RequestPriority::Background,
+impl AgentGuidance {
+    fn prompt_section(&self) -> String {
+        let mut section = String::new();
+        if let Some(question) = &self.question {
+            section.push_str("\n## Agent question (presentation goal, not repository evidence)\n");
+            section.push_str(question);
+            section.push_str(
+                "\nResearch the repository facts needed to answer this question through the validated intent and diagram. Do not treat the question as evidence.\n",
+            );
         }
+        if let Some(feedback) = &self.feedback {
+            section.push_str(
+                "\n## Agent feedback on the previous design (presentation goal, not evidence)\n",
+            );
+            section.push_str(feedback);
+            section.push_str(
+                "\nRevise the explanation where the current repository evidence supports it. Current evidence always wins.\n",
+            );
+        }
+        section
     }
-}
 
-#[derive(Debug, Clone)]
-struct AiQueuedJob {
-    selection: AiSelectionKey,
-    epoch: Epoch,
-    priority: AiJobPriority,
-    order: u64,
+    fn display(&self) -> Option<String> {
+        let (prefix, text) = if let Some(feedback) = &self.feedback {
+            ("Agent feedback", feedback)
+        } else {
+            ("Agent question", self.question.as_ref()?)
+        };
+        Some(format!("{prefix}: {}", truncate_chars(text, 180)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -344,10 +431,6 @@ struct AiRunningJob {
     selection: AiSelectionKey,
     epoch: Epoch,
     generation: u64,
-    priority: AiJobPriority,
-    /// Model and fact changes can make an answer ineligible before its task observes
-    /// cancellation. The generation ledger still rejects a completion already in flight.
-    accept_result: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,39 +455,45 @@ pub struct Dispatcher {
     ls_status: LsStatus,
     ai_status: AiStatus,
     analysis: Option<AnalysisSnapshot>,
-    /// The plan currently displayed, scoped to exactly one changed-file/function row.
+    /// The plan currently displayed, scoped to exactly one changed directory/file/function row.
     ai_rows: Option<(Epoch, AiSelectionKey, CachedAiPlan)>,
     /// Per-selection plan cache for this epoch. Arrowing back to a previously visited row
     /// restores its plan without another provider request.
     ai_cache: std::collections::HashMap<AiSelectionKey, CachedAiPlan>,
-    /// Last validated design for a stable file/symbol identity. Unlike `ai_cache`, this
+    /// Latest editable diagram per selection, shared with internal tools and controllers.
+    ai_drafts: std::collections::HashMap<AiSelectionKey, DiagramDraft>,
+    /// Last renderable projection of a draft while construction continues.
+    ai_previews: std::collections::HashMap<AiSelectionKey, CachedAiPlan>,
+    /// Drafts currently owned by the controller CLI rather than an internal provider job.
+    agent_owned_drafts: HashSet<AiSelectionKey>,
+    /// Last validated design for a stable directory/file/symbol identity. Unlike `ai_cache`, this
     /// survives repository epochs and is supplied only as a continuity seed to the next
     /// request. Current git/LSP facts still own validation and rendering.
     ai_revision_cache: std::collections::HashMap<AiRevisionKey, CachedAiPlan>,
-    /// Deduplicated priority queue of eligible plan generations.
-    ai_queue: Vec<AiQueuedJob>,
-    ai_queue_order: u64,
+    /// Selection-scoped questions and revision feedback received through the local agent
+    /// protocol. Kept separate from evidence and from the generated-plan cache.
+    agent_guidance: std::collections::HashMap<AiSelectionKey, AgentGuidance>,
     /// Active AI requests, indexed by their unique generation.
     ai_running: std::collections::HashMap<u64, AiRunningJob>,
-    /// Central admission, burst, and FIFO overflow-cancellation policy for AI work.
+    /// FIFO window of active requests. Selection changes do not cancel work; starting a
+    /// seventeenth request cancels the oldest active generation.
     ai_requests: RequestCoordinator,
     /// Per-selection terminal failures, surfaced when that row is focused.
     ai_failures: std::collections::HashMap<AiSelectionKey, String>,
-    ai_consecutive_failures: u8,
-    ai_background_paused: bool,
-    ai_prefetch: AiPrefetchPolicy,
     /// Monotonic debounce generation for selection-follow requests.
     ai_selection_seq: u64,
     /// The file the diff pane is aimed at (the files-pane selection; falls back to the
     /// changeset's first file when unset or absent from the set).
     selected_file: Option<String>,
+    /// Repo-relative directory selected as an aggregate AI summary scope.
+    selected_directory: Option<String>,
     /// Identity of the selected symbol (file, name, line, col), when the selection sits on
     /// a symbol row; gates stale relations jobs.
     selected_symbol: Option<(String, String, u32, u32)>,
     /// The selected symbol's lazily-expanded callers/callees, kept as separate lists so
     /// the impact pane can show both columns.
     selected_relations: Option<SelectedRelations>,
-    /// Per-symbol relationship facts shared by the focused pane and adaptive AI prefetch.
+    /// Per-symbol relationship facts cached for rows the user has selected.
     relation_cache: std::collections::HashMap<AiSelectionKey, SelectedRelations>,
     relation_in_flight: std::collections::HashMap<AiSelectionKey, SemanticRunningJob>,
     relation_queue: std::collections::VecDeque<AiSelectionKey>,
@@ -489,21 +578,21 @@ impl Dispatcher {
             analysis: None,
             ai_rows: None,
             ai_cache: std::collections::HashMap::new(),
+            ai_drafts: std::collections::HashMap::new(),
+            ai_previews: std::collections::HashMap::new(),
+            agent_owned_drafts: HashSet::new(),
             ai_revision_cache: std::collections::HashMap::new(),
-            ai_queue: Vec::new(),
-            ai_queue_order: 0,
+            agent_guidance: std::collections::HashMap::new(),
             ai_running: std::collections::HashMap::new(),
             ai_requests: RequestCoordinator::default(),
             ai_failures: std::collections::HashMap::new(),
-            ai_consecutive_failures: 0,
-            ai_background_paused: false,
-            ai_prefetch: AiPrefetchPolicy::Adaptive,
             ai_selection_seq: 0,
             available_models: Vec::new(),
             model_list_loading: false,
             model_list_error: None,
             model_list_seq: 0,
             selected_file: None,
+            selected_directory: None,
             selected_symbol: None,
             selected_relations: None,
             relation_cache: std::collections::HashMap::new(),
@@ -526,12 +615,6 @@ impl Dispatcher {
             config_write_tx: None,
             config_writer: None,
         }
-    }
-
-    /// Select the background warm-up policy while retaining the same scheduler/cache path.
-    pub(crate) fn with_ai_prefetch_policy(mut self, policy: AiPrefetchPolicy) -> Self {
-        self.ai_prefetch = policy;
-        self
     }
 
     /// Attach global config persistence without making it a requirement for dispatcher
@@ -658,11 +741,17 @@ impl Dispatcher {
                 generation,
                 outcome,
             } => self.on_ai_done(epoch, selection, generation, outcome),
+            DispatchEvent::AiDraft {
+                epoch,
+                selection,
+                generation,
+                draft,
+            } => self.on_ai_draft(epoch, selection, generation, draft),
             DispatchEvent::AiSelectionSettled { epoch, generation } => {
                 if epoch == self.epoch && generation == self.ai_selection_seq {
                     if let Some(selection) = self.current_ai_selection() {
-                        self.enqueue_ai_job(selection, AiJobPriority::Focused);
-                        self.pump_ai_queue();
+                        self.spawn_ai_job(selection);
+                        self.refresh_current_ai_status();
                         self.publish();
                     }
                 }
@@ -713,9 +802,11 @@ impl Dispatcher {
                 callers,
                 callees,
             } => {
-                let selection = AiSelectionKey {
+                let selection = AiSelectionKey::Symbol {
                     file,
-                    symbol: Some((name, line, col)),
+                    name,
+                    line,
+                    col,
                 };
                 if self
                     .relation_in_flight
@@ -734,29 +825,8 @@ impl Dispatcher {
                 let current = self.current_ai_selection();
                 if current.as_ref() == Some(&selection) {
                     self.selected_relations = Some(relations);
-                    // The short relation grace period may have elapsed while the LSP was
-                    // still answering. Cancel requests built from incomplete Impact facts;
-                    // their replacement is immediately eligible for focused capacity.
-                    let incomplete: Vec<u64> = self
-                        .ai_running
-                        .iter()
-                        .filter(|(_, running)| {
-                            running.epoch == self.epoch && running.selection == selection
-                        })
-                        .map(|(generation, _)| *generation)
-                        .collect();
-                    for generation in incomplete {
-                        self.abort_ai_request(generation, false);
-                    }
-                    self.enqueue_ai_job(selection, AiJobPriority::Focused);
-                } else if self.ai_prefetch == AiPrefetchPolicy::Adaptive
-                    && (self.selected_file.as_deref() == Some(selection.file.as_str())
-                        || self.expanded_files.contains(&selection.file))
-                {
-                    self.enqueue_ai_job(selection, AiJobPriority::ExpandedSymbol);
                 }
                 self.drain_relation_queue();
-                self.pump_ai_queue();
                 self.publish();
             }
             DispatchEvent::BaseLoaded { bases, truncated } => {
@@ -803,27 +873,13 @@ impl Dispatcher {
         if self.current_ai_selection().is_some() {
             self.retarget_ai_to_current_selection(true);
         }
-        let paths: Vec<String> = self
-            .changeset
-            .as_ref()
-            .map(|changeset| {
-                changeset
-                    .files
-                    .iter()
-                    .map(|file| file.path.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for path in paths {
-            self.enqueue_adaptive_prefetch_for_file(&path);
-        }
-        self.pump_ai_queue();
     }
 
     fn on_action(&mut self, action: Action) {
         match action {
             Action::RefreshGit => self.spawn_refresh(),
             Action::SetFileExpanded { path, expanded } => self.set_file_expanded(&path, expanded),
+            Action::SetDirectoryExpanded { .. } => {}
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
             Action::ScopeUnstaged => self.set_scope(ChangeScope::Unstaged),
             Action::ScopeBranch => self.set_scope(ChangeScope::Branch),
@@ -853,11 +909,18 @@ impl Dispatcher {
             } => {
                 // Enter re-centers on the selection: record it as the current target (so
                 // the result is not dropped as stale) and expand its relations.
+                self.selected_directory = None;
                 self.selected_file = Some(file.clone());
                 self.selected_symbol = Some((file.clone(), name.clone(), line, col));
                 self.spawn_expand(file, name, line, col);
             }
             Action::SelectionChanged { file, symbol } => self.on_selection_changed(file, symbol),
+            Action::DirectorySelectionChanged { directory } => {
+                self.on_directory_selection_changed(directory)
+            }
+            Action::AgentAsk(question) => self.apply_agent_guidance(question, false),
+            Action::AgentFeedback(feedback) => self.apply_agent_guidance(feedback, true),
+            Action::AgentDiagram(command) => self.apply_agent_diagram(command),
             Action::BasePicker => self.spawn_list_bases(),
             Action::BaseSelected(name) => self.set_base(name),
             _ => {}
@@ -957,11 +1020,11 @@ impl Dispatcher {
     /// with the previous request settings, then prioritizes the current selection again.
     fn reset_ai_for_settings_change(&mut self) {
         self.ai_cache.clear();
+        self.ai_drafts.clear();
+        self.ai_previews.clear();
+        self.agent_owned_drafts.clear();
         self.ai_revision_cache.clear();
-        self.ai_queue.clear();
         self.ai_failures.clear();
-        self.ai_consecutive_failures = 0;
-        self.ai_background_paused = false;
         self.abort_all_ai_requests();
         self.ai_rows = None;
         if self.ai.is_some() {
@@ -1016,6 +1079,7 @@ impl Dispatcher {
     /// the automatically generated plan.
     fn on_selection_changed(&mut self, file: Option<String>, symbol: Option<(String, u32, u32)>) {
         let previous_ai_selection = self.current_ai_selection();
+        self.selected_directory = None;
         self.selected_file = file.clone();
         self.selected_symbol = match (file, symbol) {
             (Some(file), Some((name, line, col))) => Some((file, name, line, col)),
@@ -1034,34 +1098,249 @@ impl Dispatcher {
             }
         }
         if self.current_ai_selection() != previous_ai_selection {
-            self.reprioritize_ai_queue();
             self.retarget_ai_to_current_selection(false);
         }
-        if let Some(file) = self.selected_file.clone() {
-            // Loading may mean queued rather than running. Reprioritization has already
-            // moved this file to the front; draining lets it claim the focused lane now.
+        if self.selected_file.is_some() {
+            // Loading may mean queued rather than running. Semantic reprioritization has
+            // already moved this file to the front; draining lets it claim the focused lane.
             self.drain_analysis_queue();
-            self.enqueue_adaptive_prefetch_for_file(&file);
         }
         self.drain_relation_queue();
-        self.pump_ai_queue();
         self.publish();
     }
 
-    fn current_ai_selection(&self) -> Option<AiSelectionKey> {
-        if let Some((file, name, line, col)) = &self.selected_symbol {
-            return Some(AiSelectionKey {
-                file: file.clone(),
-                symbol: Some((name.clone(), *line, *col)),
-            });
+    fn on_directory_selection_changed(&mut self, directory: String) {
+        let previous_ai_selection = self.current_ai_selection();
+        self.selected_directory = Some(directory);
+        self.selected_file = None;
+        self.selected_symbol = None;
+        self.selected_relations = None;
+        self.reprioritize_semantic_work();
+        if self.current_ai_selection() != previous_ai_selection {
+            self.retarget_ai_to_current_selection(false);
         }
-        self.selected_file.as_ref().map(|file| AiSelectionKey {
-            file: file.clone(),
-            symbol: None,
-        })
+        self.publish();
     }
 
-    /// Move the generated pane to the current changed-file/function row. `invalidate_cache`
+    fn apply_agent_guidance(&mut self, text: String, feedback: bool) {
+        let Some(selection) = self.current_ai_selection() else {
+            self.set_status(
+                "agent request needs a selected directory, file, or function",
+                StatusLevel::Warning,
+            );
+            self.publish();
+            return;
+        };
+        let text = normalize_agent_text(&text);
+        if text.is_empty() {
+            self.set_status("agent request was empty", StatusLevel::Warning);
+            self.publish();
+            return;
+        }
+        let guidance = self.agent_guidance.entry(selection.clone()).or_default();
+        if feedback {
+            guidance.feedback = Some(text.clone());
+        } else {
+            guidance.question = Some(text.clone());
+            guidance.feedback = None;
+        }
+
+        // A replacement instruction for the same target supersedes its in-flight answer.
+        // Ordinary navigation still never cancels provider work; this is the one explicit
+        // revision path where allowing the old answer to win would ignore the command.
+        let generations = self
+            .ai_running
+            .iter()
+            .filter_map(|(generation, running)| {
+                (running.epoch == self.epoch && running.selection == selection)
+                    .then_some(*generation)
+            })
+            .collect::<Vec<_>>();
+        for generation in generations {
+            self.ai_requests.abort(generation);
+            self.ai_running.remove(&generation);
+        }
+        self.retarget_ai_to_current_selection(true);
+        self.set_status(
+            format!(
+                "agent: {} {}",
+                if feedback {
+                    "revising from"
+                } else {
+                    "answering"
+                },
+                truncate_chars(&text, 120)
+            ),
+            StatusLevel::Info,
+        );
+        self.publish();
+    }
+
+    /// Apply the controller's command to the exact same draft model exposed to the
+    /// provider. A controller mutation takes ownership of this selection's writer, so an
+    /// older internal request cannot subsequently overwrite it.
+    fn apply_agent_diagram(&mut self, command: DiagramCommand) {
+        let Some(selection) = self.current_ai_selection() else {
+            self.set_status(
+                "diagram edit needs a selected directory, file, or function",
+                StatusLevel::Warning,
+            );
+            self.publish();
+            return;
+        };
+        if self.data_epoch != self.epoch || self.changeset.is_none() {
+            self.set_status(
+                "diagram edit is waiting for the current Git snapshot",
+                StatusLevel::Warning,
+            );
+            self.publish();
+            return;
+        }
+
+        self.cancel_ai_for_selection(&selection);
+        let mut draft = self
+            .ai_drafts
+            .get(&selection)
+            .cloned()
+            .or_else(|| {
+                self.ai_cache
+                    .get(&selection)
+                    .map(|cached| DiagramDraft::from_plan(&cached.plan))
+            })
+            .unwrap_or_else(|| DiagramDraft::new(self.epoch));
+        draft.epoch = self.epoch;
+        let summary = match draft.apply(&command) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.set_status(
+                    format!("diagram edit rejected: {error}"),
+                    StatusLevel::Warning,
+                );
+                self.publish();
+                return;
+            }
+        };
+
+        self.ai_drafts.insert(selection.clone(), draft.clone());
+        self.agent_owned_drafts.insert(selection.clone());
+        self.ai_failures.remove(&selection);
+        if matches!(command, DiagramCommand::Finish) {
+            match self.validated_draft(&selection, &draft) {
+                Ok(cached) => {
+                    self.ai_cache.insert(selection.clone(), cached.clone());
+                    self.ai_previews.insert(selection.clone(), cached.clone());
+                    self.ai_revision_cache
+                        .insert(AiRevisionKey::from(&selection), cached.clone());
+                    self.agent_owned_drafts.remove(&selection);
+                    self.ai_rows = Some((self.epoch, selection, cached));
+                    self.ai_status = AiStatus::Ready { epoch: self.epoch };
+                    self.set_status("agent diagram validated and published", StatusLevel::Info);
+                }
+                Err(error) => {
+                    self.ai_status = AiStatus::Failed {
+                        reason: error.clone(),
+                    };
+                    self.set_status_with_detail(
+                        format!(
+                            "agent diagram needs another edit: {}",
+                            truncate_chars(&error, 140)
+                        ),
+                        error,
+                        StatusLevel::Warning,
+                    );
+                }
+            }
+        } else {
+            self.ai_cache.remove(&selection);
+            self.ai_rows = None;
+            if draft.forms.is_empty() {
+                self.ai_previews.remove(&selection);
+            } else if let Ok(preview) = self.validated_draft(&selection, &draft) {
+                self.ai_previews.insert(selection.clone(), preview);
+            }
+            self.ai_status = AiStatus::Loading {
+                since_epoch: self.epoch,
+            };
+            self.set_status(format!("agent diagram: {summary}"), StatusLevel::Info);
+        }
+        self.publish();
+    }
+
+    fn cancel_ai_for_selection(&mut self, selection: &AiSelectionKey) {
+        let generations = self
+            .ai_running
+            .iter()
+            .filter_map(|(generation, running)| {
+                (running.epoch == self.epoch && running.selection == *selection)
+                    .then_some(*generation)
+            })
+            .collect::<Vec<_>>();
+        for generation in generations {
+            self.ai_requests.abort(generation);
+            self.ai_running.remove(&generation);
+        }
+    }
+
+    fn validated_draft(
+        &self,
+        selection: &AiSelectionKey,
+        draft: &DiagramDraft,
+    ) -> Result<CachedAiPlan, String> {
+        if draft.epoch != self.epoch {
+            return Err(format!(
+                "draft epoch {} does not match current epoch {}",
+                draft.epoch, self.epoch
+            ));
+        }
+        let changeset = self
+            .changeset
+            .as_ref()
+            .ok_or_else(|| "current Git facts are unavailable".to_string())?;
+        let scoped = changeset_for_selection(changeset, selection);
+        if scoped.files.is_empty() {
+            return Err("the current selection has no changed files".to_string());
+        }
+        let serialized = serde_json::to_string(&draft.plan())
+            .map_err(|error| format!("could not serialize the draft: {error}"))?;
+        let mut plan = parse_plan(&serialized).map_err(|error| error.to_string())?;
+        let facts = SnapshotFacts::from_lazy(&scoped, &self.file_semantics, selection);
+        let report = validate(&mut plan, &facts, self.epoch);
+        if report.is_renderable() {
+            Ok(CachedAiPlan { plan, report })
+        } else {
+            let detail = report
+                .dropped
+                .iter()
+                .map(|item| format!("{}: {}", item.subject, item.reason))
+                .chain(report.notes.iter().cloned())
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(if detail.is_empty() {
+                "the draft has no renderable diagram".to_string()
+            } else {
+                detail
+            })
+        }
+    }
+
+    fn current_ai_selection(&self) -> Option<AiSelectionKey> {
+        if let Some(directory) = &self.selected_directory {
+            return Some(AiSelectionKey::Directory(directory.clone()));
+        }
+        if let Some((file, name, line, col)) = &self.selected_symbol {
+            return Some(AiSelectionKey::Symbol {
+                file: file.clone(),
+                name: name.clone(),
+                line: *line,
+                col: *col,
+            });
+        }
+        self.selected_file
+            .as_ref()
+            .map(|file| AiSelectionKey::File(file.clone()))
+    }
+
+    /// Move the generated pane to the current changed directory/file/function row. `invalidate_cache`
     /// is used when its symbols or file contents changed; navigation reuses cached plans.
     fn retarget_ai_to_current_selection(&mut self, invalidate_cache: bool) {
         // Invalidate only the pending navigation debounce. An already-sent provider request
@@ -1072,18 +1351,25 @@ impl Dispatcher {
         let Some(selection) = self.current_ai_selection() else {
             self.ai_status = AiStatus::Idle;
             self.set_status(
-                "select a changed file or function before generating Impact",
+                "select a changed directory, file, or function before generating Impact",
                 StatusLevel::Warning,
             );
             return;
         };
         if invalidate_cache {
             self.ai_cache.remove(&selection);
+            self.ai_drafts.remove(&selection);
+            self.ai_previews.remove(&selection);
+            self.agent_owned_drafts.remove(&selection);
             self.ai_failures.remove(&selection);
-            self.ai_queue.retain(|job| job.selection != selection);
         } else if let Some(plan) = self.ai_cache.get(&selection).cloned() {
             self.ai_rows = Some((self.epoch, selection, plan));
             self.ai_status = AiStatus::Ready { epoch: self.epoch };
+            return;
+        } else if self.agent_owned_drafts.contains(&selection) {
+            self.ai_status = AiStatus::Loading {
+                since_epoch: self.epoch,
+            };
             return;
         }
         if self.ai.is_none() {
@@ -1094,7 +1380,12 @@ impl Dispatcher {
         // The plan must never race the selected file's symbol inventory. `Unsupported`
         // is terminal and honest (there are no loadable symbols), while Failed remains
         // non-ready until the next repository refresh retries it.
-        match self.file_semantics.get(&selection.file) {
+        let Some(file) = selection.file() else {
+            self.ai_status = AiStatus::Debouncing { epoch: self.epoch };
+            self.schedule_ai_selection();
+            return;
+        };
+        match self.file_semantics.get(file) {
             Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Unsupported) => {}
             Some(FileSemanticState::Failed) => {
                 self.ai_status = AiStatus::Idle;
@@ -1102,38 +1393,15 @@ impl Dispatcher {
             }
             Some(FileSemanticState::Loading) | None => {
                 self.ai_status = AiStatus::WaitingForSymbols { epoch: self.epoch };
-                self.spawn_file_analysis(&selection.file);
+                self.spawn_file_analysis(file);
                 return;
             }
         }
 
-        // A symbol's AI breakdown should include the same caller/downstream evidence as
-        // Impact. Wait for the already-spawned relation fetch; file rows have no such wait.
-        if self.selection_waits_for_relations() {
-            self.ai_status = AiStatus::WaitingForRelations { epoch: self.epoch };
-            // Do not hang forever on a slow/unsupported call hierarchy request. A later
-            // RelationsLoaded event supersedes this generation; otherwise the fallback
-            // composes from the selected change after a short grace period.
-            self.schedule_ai_selection_after(750);
-        } else {
-            self.ai_status = AiStatus::Queued {
-                epoch: self.epoch,
-                position: 1,
-            };
-            self.schedule_ai_selection();
-        }
-    }
-
-    fn selection_waits_for_relations(&self) -> bool {
-        let Some((file, _, _, _)) = &self.selected_symbol else {
-            return false;
-        };
-        self.engine.is_some()
-            && matches!(
-                self.file_semantics.get(file),
-                Some(FileSemanticState::Ready(_))
-            )
-            && self.selected_relations.is_none()
+        // Relation loading continues independently. If it finishes inside this debounce,
+        // the prompt includes it; a late result never delays, cancels, or restarts inference.
+        self.ai_status = AiStatus::Debouncing { epoch: self.epoch };
+        self.schedule_ai_selection();
     }
 
     /// Debounce arrow navigation so holding Up/Down does not issue—and bill—one request
@@ -1155,184 +1423,9 @@ impl Dispatcher {
         });
     }
 
-    fn enqueue_ai_job(&mut self, selection: AiSelectionKey, priority: AiJobPriority) {
-        if self.ai.is_none()
-            || self.ai_cache.contains_key(&selection)
-            || self.ai_running.values().any(|job| {
-                job.epoch == self.epoch && job.selection == selection && job.accept_result
-            })
-        {
-            return;
-        }
-        if let Some(existing) = self
-            .ai_queue
-            .iter_mut()
-            .find(|job| job.epoch == self.epoch && job.selection == selection)
-        {
-            existing.priority = existing.priority.min(priority);
-            return;
-        }
-        self.ai_queue_order = self.ai_queue_order.saturating_add(1);
-        self.ai_queue.push(AiQueuedJob {
-            selection,
-            epoch: self.epoch,
-            priority,
-            order: self.ai_queue_order,
-        });
-    }
-
-    fn ai_priority_for_selection(&self, selection: &AiSelectionKey) -> AiJobPriority {
-        if self.current_ai_selection().as_ref() == Some(selection) {
-            return AiJobPriority::Focused;
-        }
-        if selection.symbol.is_some()
-            && self.ai_prefetch == AiPrefetchPolicy::Adaptive
-            && (self.selected_file.as_deref() == Some(selection.file.as_str())
-                || self.expanded_files.contains(&selection.file))
-        {
-            return AiJobPriority::ExpandedSymbol;
-        }
-        AiJobPriority::FileSummary
-    }
-
-    /// Active work follows focus too. This prevents a request that used to be focused
-    /// from retaining focused protection after the pointer moves elsewhere.
-    fn reprioritize_ai_running(&mut self) {
-        let updates: Vec<(u64, AiJobPriority)> = self
-            .ai_running
-            .iter()
-            .map(|(generation, running)| {
-                (
-                    *generation,
-                    self.ai_priority_for_selection(&running.selection),
-                )
-            })
-            .collect();
-        for (generation, priority) in updates {
-            if let Some(running) = self.ai_running.get_mut(&generation) {
-                running.priority = priority;
-            }
-            self.ai_requests.reprioritize(generation, priority.into());
-        }
-    }
-
-    fn abort_ai_request(&mut self, generation: u64, requeue: bool) {
-        self.ai_requests.abort(generation);
-        let Some(running) = self.ai_running.remove(&generation) else {
-            return;
-        };
-        tracing::debug!(
-            generation,
-            file = %running.selection.file,
-            ?running.priority,
-            requeue,
-            "cancelled AI request"
-        );
-        if requeue
-            && running.accept_result
-            && running.epoch == self.epoch
-            && !self.ai_cache.contains_key(&running.selection)
-        {
-            self.enqueue_ai_job(running.selection, running.priority);
-        }
-    }
-
     fn abort_all_ai_requests(&mut self) {
         self.ai_requests.abort_all();
         self.ai_running.clear();
-    }
-
-    /// Reclassify or remove unsent work after focus/expansion changes. File summaries are
-    /// always useful in adaptive mode; symbol work remains only for the current or an
-    /// explicitly expanded file.
-    fn reprioritize_ai_queue(&mut self) {
-        let current = self.current_ai_selection();
-        let selected_file = self.selected_file.as_deref();
-        let expanded = &self.expanded_files;
-        self.ai_queue.retain_mut(|job| {
-            if job.epoch != self.epoch {
-                return false;
-            }
-            if current.as_ref() == Some(&job.selection) {
-                job.priority = AiJobPriority::Focused;
-                return true;
-            }
-            if job.selection.symbol.is_some() {
-                if self.ai_prefetch == AiPrefetchPolicy::FocusedOnly {
-                    return false;
-                }
-                let eligible = selected_file == Some(job.selection.file.as_str())
-                    || expanded.contains(&job.selection.file);
-                if eligible {
-                    job.priority = AiJobPriority::ExpandedSymbol;
-                }
-                return eligible;
-            }
-            if self.ai_prefetch == AiPrefetchPolicy::Adaptive {
-                job.priority = AiJobPriority::FileSummary;
-                true
-            } else {
-                false
-            }
-        });
-    }
-
-    fn ai_queue_position(&self, selection: &AiSelectionKey) -> Option<u32> {
-        let mut pending: Vec<&AiQueuedJob> = self
-            .ai_queue
-            .iter()
-            .filter(|job| job.epoch == self.epoch)
-            .collect();
-        pending.sort_by_key(|job| (job.priority, job.order));
-        pending
-            .iter()
-            .position(|job| &job.selection == selection)
-            .map(|index| u32::try_from(index + 1).unwrap_or(u32::MAX))
-    }
-
-    fn pump_ai_queue(&mut self) {
-        if self.ai.is_none() {
-            self.refresh_current_ai_status();
-            return;
-        }
-        self.ai_queue.retain(|job| job.epoch == self.epoch);
-        self.reprioritize_ai_queue();
-        self.reprioritize_ai_running();
-
-        while let Some(index) = self
-            .ai_queue
-            .iter()
-            .enumerate()
-            .filter(|(_, job)| !self.ai_background_paused || job.priority == AiJobPriority::Focused)
-            .min_by_key(|(_, job)| (job.priority, job.order))
-            .map(|(index, _)| index)
-        {
-            let priority = self.ai_queue[index].priority;
-            let Admission::Admitted { preempted } = self.ai_requests.admit(priority.into()) else {
-                break;
-            };
-            if let Some(generation) = preempted {
-                // `admit` already aborted and removed the task handle. Remove its
-                // dispatcher metadata and put still-valid work at the queue tail.
-                if let Some(running) = self.ai_running.remove(&generation) {
-                    tracing::debug!(
-                        generation,
-                        file = %running.selection.file,
-                        ?running.priority,
-                        "focused AI request dequeued oldest overflow request"
-                    );
-                    if running.accept_result
-                        && running.epoch == self.epoch
-                        && !self.ai_cache.contains_key(&running.selection)
-                    {
-                        self.enqueue_ai_job(running.selection, running.priority);
-                    }
-                }
-            }
-            let job = self.ai_queue.swap_remove(index);
-            self.spawn_ai_job(job);
-        }
-        self.refresh_current_ai_status();
     }
 
     fn refresh_current_ai_status(&mut self) {
@@ -1355,20 +1448,28 @@ impl Dispatcher {
             self.ai_status = AiStatus::Failed { reason };
             return;
         }
+        if self.agent_owned_drafts.contains(&selection) {
+            self.ai_status = AiStatus::Loading {
+                since_epoch: self.epoch,
+            };
+            return;
+        }
         if self.ai.is_none() {
             self.ai_status = AiStatus::Disabled;
             return;
         }
-        match self.file_semantics.get(&selection.file) {
-            Some(FileSemanticState::Loading) | None => {
-                self.ai_status = AiStatus::WaitingForSymbols { epoch: self.epoch };
-                return;
+        if let Some(file) = selection.file() {
+            match self.file_semantics.get(file) {
+                Some(FileSemanticState::Loading) | None => {
+                    self.ai_status = AiStatus::WaitingForSymbols { epoch: self.epoch };
+                    return;
+                }
+                Some(FileSemanticState::Failed) => {
+                    self.ai_status = AiStatus::Idle;
+                    return;
+                }
+                Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Unsupported) => {}
             }
-            Some(FileSemanticState::Failed) => {
-                self.ai_status = AiStatus::Idle;
-                return;
-            }
-            Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Unsupported) => {}
         }
         if self
             .ai_running
@@ -1380,78 +1481,16 @@ impl Dispatcher {
             };
             return;
         }
-        if let Some(position) = self.ai_queue_position(&selection) {
-            self.ai_status = AiStatus::Queued {
-                epoch: self.epoch,
-                position,
-            };
-            return;
-        }
-        if self.selection_waits_for_relations() {
-            self.ai_status = AiStatus::WaitingForRelations { epoch: self.epoch };
-        } else {
-            self.ai_status = AiStatus::Queued {
-                epoch: self.epoch,
-                position: 1,
-            };
-        }
+        self.ai_status = AiStatus::Debouncing { epoch: self.epoch };
     }
 
-    fn enqueue_adaptive_prefetch_for_file(&mut self, file: &str) {
-        if self.ai_prefetch != AiPrefetchPolicy::Adaptive || self.ai.is_none() {
-            return;
-        }
-        if !matches!(
-            self.file_semantics.get(file),
-            Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Unsupported)
-        ) {
-            return;
-        }
-        let file_selection = AiSelectionKey {
-            file: file.to_string(),
-            symbol: None,
-        };
-        if self.current_ai_selection().as_ref() != Some(&file_selection) {
-            self.enqueue_ai_job(file_selection, AiJobPriority::FileSummary);
-        }
-        let symbols_eligible =
-            self.selected_file.as_deref() == Some(file) || self.expanded_files.contains(file);
-        if !symbols_eligible {
-            return;
-        }
-        let symbols: Vec<AiSelectionKey> = match self.file_semantics.get(file) {
-            Some(FileSemanticState::Ready(result)) => result
-                .changed
-                .iter()
-                .map(|symbol| AiSelectionKey {
-                    file: file.to_string(),
-                    symbol: Some((
-                        symbol.name.clone(),
-                        symbol.selection.start_line,
-                        symbol.selection.start_col,
-                    )),
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        let current = self.current_ai_selection();
-        for selection in symbols {
-            if current.as_ref() != Some(&selection) {
-                self.enqueue_relation_job(selection.clone());
-                if self.relation_cache.contains_key(&selection) || self.engine.is_none() {
-                    self.enqueue_ai_job(selection, AiJobPriority::ExpandedSymbol);
-                }
-            }
-        }
-        self.drain_relation_queue();
-    }
-
-    /// Queue a symbol's callers/callees through the same bounded prerequisite path used by
-    /// focused navigation and adaptive sibling prefetch.
+    /// Queue a selected symbol's callers/callees through the bounded prerequisite path.
     fn spawn_expand(&mut self, file: String, name: String, line: u32, col: u32) {
-        let selection = AiSelectionKey {
+        let selection = AiSelectionKey::Symbol {
             file,
-            symbol: Some((name, line, col)),
+            name,
+            line,
+            col,
         };
         self.enqueue_relation_job(selection);
         self.drain_relation_queue();
@@ -1528,8 +1567,10 @@ impl Dispatcher {
     }
 
     fn enqueue_relation_job(&mut self, selection: AiSelectionKey) {
-        if selection.symbol.is_none()
-            || self.engine.is_none()
+        let AiSelectionKey::Symbol { file, .. } = &selection else {
+            return;
+        };
+        if self.engine.is_none()
             || self.relation_cache.contains_key(&selection)
             || self.relation_in_flight.contains_key(&selection)
             || self
@@ -1537,7 +1578,7 @@ impl Dispatcher {
                 .iter()
                 .any(|queued| queued == &selection)
             || !matches!(
-                self.file_semantics.get(&selection.file),
+                self.file_semantics.get(file),
                 Some(FileSemanticState::Ready(_))
             )
         {
@@ -1580,10 +1621,15 @@ impl Dispatcher {
         let Some(engine) = self.engine.clone() else {
             return;
         };
-        let Some((name, line, col)) = selection.symbol.clone() else {
+        let AiSelectionKey::Symbol {
+            file,
+            name,
+            line,
+            col,
+        } = selection.clone()
+        else {
             return;
         };
-        let file = selection.file.clone();
         let epoch = self.epoch;
         let tx = self.job_tx.clone();
         let file_id = match codescope_core::FileId::new(file.clone()) {
@@ -1647,16 +1693,16 @@ impl Dispatcher {
         self.epoch = self.epoch.next();
         let epoch = self.epoch;
         self.ai_selection_seq = self.ai_selection_seq.saturating_add(1);
-        self.ai_queue.clear();
         self.abort_all_ai_requests();
         self.ai_failures.clear();
-        self.ai_consecutive_failures = 0;
-        self.ai_background_paused = false;
         self.ai_rows = None;
         // Epoch-exact plans may no longer render after any repository refresh. Preserve
         // their stable revision counterparts: once fresh facts land they become prompt
         // seeds, never current UI state.
         self.ai_cache.clear();
+        self.ai_drafts.clear();
+        self.ai_previews.clear();
+        self.agent_owned_drafts.clear();
         if self.ai.is_some() {
             self.ai_status = AiStatus::Stale { epoch };
         }
@@ -1700,18 +1746,35 @@ impl Dispatcher {
         self.selected_relations = None;
     }
 
-    fn spawn_ai_job(&mut self, job: AiQueuedJob) {
-        let selection = job.selection;
-        let priority = job.priority;
+    fn spawn_ai_job(&mut self, selection: AiSelectionKey) {
         let (Some(_ai), Some(changeset)) = (&self.ai, &self.changeset) else {
             return;
         };
         let Some(ctx) = &self.repo_ctx else { return };
-        if job.epoch != self.epoch || self.data_epoch != self.epoch {
+        if self.data_epoch != self.epoch
+            || self.ai_cache.contains_key(&selection)
+            || self
+                .ai_running
+                .values()
+                .any(|running| running.epoch == self.epoch && running.selection == selection)
+        {
             return;
         }
+        let scoped_changeset = changeset_for_selection(changeset, &selection);
+        if scoped_changeset.files.is_empty() {
+            return;
+        }
+        if let Some(generation) = self.ai_requests.admit() {
+            if let Some(running) = self.ai_running.remove(&generation) {
+                tracing::debug!(
+                    generation,
+                    selection = %running.selection.label(),
+                    "cancelled oldest AI request after active window reached 16"
+                );
+            }
+        }
         // A validated plan from an older epoch is not current UI state, but it is a useful
-        // design draft for the same file/symbol. The AI service labels it as untrusted
+        // design draft for the same directory/file/symbol. The AI service labels it as untrusted
         // continuity context and requires the new facts to win.
         let previous_plan = self
             .ai_revision_cache
@@ -1720,88 +1783,41 @@ impl Dispatcher {
         let epoch = self.epoch;
         self.ai_request_seq = self.ai_request_seq.saturating_add(1);
         let generation = self.ai_request_seq;
-        // Digest from the git changeset + the symbols of files the user explicitly
-        // analyzed (Ready), in CHANGESET order (deterministic). Unloaded files contribute
-        // hunks only; Loading/Failed/Unsupported are reported separately. Never triggers
-        // analysis. The global relation graph was not queried — `Unknown`, not a partial
-        // answer. Selection-scoped callers/callees are appended separately below when ready.
-        let mut changed: Vec<codescope_analysis::ChangedSymbolInfo> = Vec::new();
-        let mut diags: Vec<codescope_core::Diagnostic> = Vec::new();
-        let (mut loading, mut failed, mut unsupported) = (0usize, 0usize, 0usize);
-        for f in &changeset.files {
-            match self.file_semantics.get(f.path.as_str()) {
-                Some(FileSemanticState::Ready(res)) => {
-                    changed.extend(res.changed.clone());
-                    diags.extend(res.diagnostics.clone());
-                }
-                Some(FileSemanticState::Loading) => loading += 1,
-                Some(FileSemanticState::Failed) => failed += 1,
-                Some(FileSemanticState::Unsupported) => unsupported += 1,
-                None => {}
-            }
+        // The initial turn is intentionally an inventory, not an evidence dump. A scoped
+        // mini-shell serves the captured Git snapshot and selected worktree files on demand;
+        // its virtual cwd is the selected directory or the selected file's parent.
+        let mut brief = research_brief(&selection, &scoped_changeset);
+        if let Some(guidance) = self.agent_guidance.get(&selection) {
+            brief.push_str(&guidance.prompt_section());
         }
-        let mut digest_model = codescope_analysis::change_digest(
-            &changed,
-            changeset,
-            &codescope_core::Evidence {
-                value: codescope_core::ImpactGraph::default(),
-                completeness: codescope_core::Completeness::Unknown,
-                notes: vec!["relations not queried (asynchronous per-file semantics)".to_string()],
-            },
-            &diags,
-            ctx,
-        );
-        // Reserve half the normal prompt budget for exact, selection-scoped source.
-        // Branch context remains useful, but it must not crowd out the code the diagram
-        // is actually expected to explain.
-        digest_model.truncate_to_budget(4_000);
-        let mut digest = digest_model.render();
-        let without_symbol_catalog = changeset
-            .files
-            .iter()
-            .filter(|f| {
-                !matches!(
-                    self.file_semantics.get(f.path.as_str()),
-                    Some(FileSemanticState::Ready(_))
-                )
-            })
-            .count();
-        if without_symbol_catalog > 0 {
-            let mut parts = vec![format!(
-                "{without_symbol_catalog} without a loaded symbol catalog"
-            )];
-            if loading > 0 {
-                parts.push(format!("{loading} analyzing"));
-            }
-            if failed > 0 {
-                parts.push(format!("{failed} failed"));
-            }
-            if unsupported > 0 {
-                parts.push(format!("{unsupported} unsupported"));
-            }
-            digest.push_str(&format!(
-                "\nnote: {}. Only exact entries in `## changed symbols` are usable as symbols; for every other file omit symbol/range metadata and cite exact file+hunk evidence",
-                parts.join(", ")
-            ));
-        }
-        // The repo digest supplies validation facts, while this section makes the model's
-        // one required question selection-scoped and mirrors the deterministic Impact pane.
-        append_impact_focus(&mut digest, &self.build_impact_for_selection(&selection));
-        append_selected_evidence_contract(&mut digest, &selection, &self.file_semantics);
-        append_focused_source_packet(&mut digest, &selection, changeset, &self.file_semantics);
-        let facts = SnapshotFacts::from_lazy(changeset, &self.file_semantics, &selection.file);
+        let research_tools =
+            ScopedResearchTools::new(ctx.toplevel.clone(), &selection, scoped_changeset.clone());
+        let facts = SnapshotFacts::from_lazy(&scoped_changeset, &self.file_semantics, &selection);
         let ai = self.ai.clone();
         let tx = self.job_tx.clone();
+        let draft_tx = tx.clone();
+        let draft_selection = selection.clone();
+        let observer: DiagramObserver = std::sync::Arc::new(move |draft| {
+            // Draft mutations are bounded and frequent. Never make the provider loop wait
+            // behind rendering; a later complete-draft event supersedes a full channel.
+            let _ = draft_tx.try_send(DispatchEvent::AiDraft {
+                epoch,
+                selection: draft_selection.clone(),
+                generation,
+                draft,
+            });
+        });
         let running_selection = selection.clone();
         let task = tokio::spawn(async move {
             let outcome = match &ai {
                 Some(ai) => {
-                    ai.request_plan_with_previous(
-                        &digest,
+                    ai.request_plan_with_previous_observer(
+                        &brief,
                         previous_plan.as_ref(),
-                        &NoToolExecutor,
+                        &research_tools,
                         &facts,
                         epoch,
+                        Some(observer),
                     )
                     .await
                 }
@@ -1816,22 +1832,18 @@ impl Dispatcher {
                 })
                 .await;
         });
-        self.ai_requests
-            .register(generation, priority.into(), task.abort_handle());
+        self.ai_requests.register(generation, task.abort_handle());
         self.ai_running.insert(
             generation,
             AiRunningJob {
                 selection: running_selection.clone(),
                 epoch,
                 generation,
-                priority,
-                accept_result: true,
             },
         );
         tracing::debug!(
             generation,
-            file = %running_selection.file,
-            ?priority,
+            selection = %running_selection.label(),
             active = self.ai_requests.len(),
             "started AI request"
         );
@@ -1997,7 +2009,8 @@ impl Dispatcher {
     ) {
         let selected_ai_file_changed = self
             .current_ai_selection()
-            .is_some_and(|selection| selection.file == file);
+            .and_then(|selection| selection.file().map(str::to_string))
+            .is_some_and(|selected| selected == file);
         // Ledger removal is epoch-exact: a stale completion never disturbs a newer job's
         // entry for the same path (review 18 M2).
         if self
@@ -2072,8 +2085,6 @@ impl Dispatcher {
             // selection stayed put; its cached AI explanation is no longer current.
             self.retarget_ai_to_current_selection(true);
         }
-        self.enqueue_adaptive_prefetch_for_file(&file);
-        self.pump_ai_queue();
         self.publish();
         self.drain_analysis_queue();
     }
@@ -2129,9 +2140,6 @@ impl Dispatcher {
             if !self.expanded_files.insert(path.to_string()) {
                 return; // already expanded
             }
-            self.enqueue_adaptive_prefetch_for_file(path);
-            self.reprioritize_ai_queue();
-            self.pump_ai_queue();
             self.publish();
             return;
         }
@@ -2149,8 +2157,6 @@ impl Dispatcher {
             self.selected_relations = None;
             self.retarget_ai_to_current_selection(false);
         }
-        self.reprioritize_ai_queue();
-        self.pump_ai_queue();
         self.publish();
     }
 
@@ -2175,32 +2181,22 @@ impl Dispatcher {
         if let Some(cs) = &self.changeset {
             self.expanded_files
                 .retain(|path| cs.files.iter().any(|file| file.path.as_str() == path));
-            self.ai_revision_cache.retain(|selection, _| {
-                cs.files
-                    .iter()
-                    .any(|file| file.path.as_str() == selection.file)
-            });
+            self.ai_revision_cache
+                .retain(|selection, _| match selection {
+                    AiRevisionKey::Directory(directory) => cs
+                        .files
+                        .iter()
+                        .any(|file| file.path.as_str().starts_with(&format!("{directory}/"))),
+                    AiRevisionKey::File(path) | AiRevisionKey::Symbol { file: path, .. } => {
+                        cs.files.iter().any(|file| file.path.as_str() == path)
+                    }
+                });
         }
         self.schedule_all_file_analysis();
         self.drain_analysis_queue();
         if self.current_ai_selection().is_some() {
             self.retarget_ai_to_current_selection(false);
         }
-        let prefetch_paths: Vec<String> = self
-            .changeset
-            .as_ref()
-            .map(|changeset| {
-                changeset
-                    .files
-                    .iter()
-                    .map(|file| file.path.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for path in prefetch_paths {
-            self.enqueue_adaptive_prefetch_for_file(&path);
-        }
-        self.pump_ai_queue();
         // Analysis is still in flight: keep the refreshing marker on.
         self.publish_refreshing();
     }
@@ -2217,14 +2213,12 @@ impl Dispatcher {
         self.analysis = None;
         self.file_semantics.clear();
         self.ai_revision_cache.clear();
-        self.ai_queue.clear();
         self.abort_all_ai_requests();
         self.ai_failures.clear();
         self.relation_cache.clear();
         self.relation_queue.clear();
-        self.ai_consecutive_failures = 0;
-        self.ai_background_paused = false;
         self.selected_file = None;
+        self.selected_directory = None;
         self.selected_symbol = None;
         self.selected_relations = None;
         self.set_status(
@@ -2284,6 +2278,39 @@ impl Dispatcher {
         self.publish();
     }
 
+    fn on_ai_draft(
+        &mut self,
+        epoch: Epoch,
+        selection: AiSelectionKey,
+        generation: u64,
+        draft: DiagramDraft,
+    ) {
+        let Some(running) = self.ai_running.get(&generation) else {
+            return;
+        };
+        if epoch != self.epoch
+            || draft.epoch != epoch
+            || running.epoch != epoch
+            || running.generation != generation
+            || running.selection != selection
+        {
+            return;
+        }
+
+        let preview = self.validated_draft(&selection, &draft).ok();
+        if draft.forms.is_empty() {
+            self.ai_previews.remove(&selection);
+        } else if let Some(preview) = preview {
+            self.ai_previews.insert(selection.clone(), preview);
+        }
+        self.ai_drafts.insert(selection.clone(), draft);
+        self.agent_owned_drafts.remove(&selection);
+        if self.current_ai_selection().as_ref() == Some(&selection) {
+            self.ai_status = AiStatus::Loading { since_epoch: epoch };
+            self.publish();
+        }
+    }
+
     fn on_ai_done(
         &mut self,
         epoch: Epoch,
@@ -2293,7 +2320,7 @@ impl Dispatcher {
     ) {
         self.ai_requests.complete(generation);
         let Some(running) = self.ai_running.remove(&generation) else {
-            // A completion may already be queued when a focused request cancels this
+            // A completion may already be queued when the 16-request window evicts this
             // generation. Its ledger entry is gone, so it cannot publish stale output.
             return;
         };
@@ -2305,18 +2332,18 @@ impl Dispatcher {
             // not affect any of the other concurrently running requests.
             return;
         }
-        let accept_result = running.accept_result;
         let is_current_epoch = epoch == self.epoch;
         let is_focused = self.current_ai_selection().as_ref() == Some(&selection);
         match outcome {
-            AiOutcome::Plan(plan, report) if accept_result && report.is_renderable() => {
-                self.ai_consecutive_failures = 0;
-                self.ai_background_paused = false;
+            AiOutcome::Plan(plan, report) if report.is_renderable() => {
+                let final_draft = DiagramDraft::from_plan(&plan);
                 let cached = CachedAiPlan { plan, report };
                 self.ai_revision_cache
                     .insert(AiRevisionKey::from(&selection), cached.clone());
                 if is_current_epoch {
                     self.ai_cache.insert(selection.clone(), cached.clone());
+                    self.ai_drafts.insert(selection.clone(), final_draft);
+                    self.ai_previews.insert(selection.clone(), cached.clone());
                     self.ai_failures.remove(&selection);
                     if is_focused {
                         self.ai_rows = Some((epoch, selection.clone(), cached));
@@ -2326,11 +2353,7 @@ impl Dispatcher {
             AiOutcome::Stale if is_current_epoch && is_focused => {
                 self.ai_status = AiStatus::Stale { epoch }
             }
-            AiOutcome::Failed(reason) if accept_result && is_current_epoch => {
-                self.ai_consecutive_failures = self.ai_consecutive_failures.saturating_add(1);
-                if self.ai_consecutive_failures >= 3 {
-                    self.ai_background_paused = true;
-                }
+            AiOutcome::Failed(reason) if is_current_epoch => {
                 self.ai_failures.insert(selection.clone(), reason.clone());
                 // Every AI failure carries the recovery suffix (spec §3.6); the
                 // deterministic impact pane is unaffected by the failure.
@@ -2345,8 +2368,7 @@ impl Dispatcher {
                     );
                 }
             }
-            AiOutcome::Unavailable if accept_result && is_current_epoch => {
-                self.ai_background_paused = true;
+            AiOutcome::Unavailable if is_current_epoch => {
                 self.ai_failures.insert(
                     selection.clone(),
                     "AI provider is temporarily unavailable".to_string(),
@@ -2354,8 +2376,14 @@ impl Dispatcher {
             }
             _ => {}
         }
-        self.pump_ai_queue();
         self.refresh_current_ai_status();
+        if is_current_epoch && is_focused && self.ai_cache.contains_key(&selection) {
+            if let Some(guidance) = self.agent_guidance.get(&selection) {
+                if let Some(display) = guidance.display() {
+                    self.set_status(format!("{display} · answer ready"), StatusLevel::Info);
+                }
+            }
+        }
         self.publish();
     }
 
@@ -2374,6 +2402,7 @@ impl Dispatcher {
             .as_ref()
             .map(|cs| file_rows(cs, &self.file_semantics, &self.expanded_files))
             .unwrap_or_default();
+        let ai_summaries = self.build_ai_summary_states(&files);
         let (diff, semantic) = self.panes();
         let impact = self.build_impact();
         // The base shown in the top bar: the latest repo context's base (which already
@@ -2394,13 +2423,18 @@ impl Dispatcher {
                 output: usage.output,
             })
             .unwrap_or_default();
+        let diagram_draft = self
+            .current_ai_selection()
+            .and_then(|selection| self.ai_drafts.get(&selection).cloned());
         UiSnapshot {
             repo: repo_bar,
             scope: self.scope,
             scope_counts: counts,
             files,
+            ai_summaries,
             diff,
             semantic,
+            diagram_draft,
             impact,
             ls: self.ls_status,
             ai: self.ai_status.clone(),
@@ -2433,12 +2467,67 @@ impl Dispatcher {
         }
     }
 
+    fn build_ai_summary_states(
+        &self,
+        files: &[FileRow],
+    ) -> std::collections::HashMap<AiSummaryKey, AiSummaryState> {
+        let mut selections = HashSet::new();
+        for file in files {
+            selections.insert(AiSelectionKey::File(file.path.clone()));
+            for directory in codescope_tui::file_rows::directory_prefixes(&file.path) {
+                selections.insert(AiSelectionKey::Directory(directory));
+            }
+            for symbol in &file.symbols {
+                if let Some((line, col)) = symbol.position {
+                    selections.insert(AiSelectionKey::Symbol {
+                        file: file.path.clone(),
+                        name: symbol.name.clone(),
+                        line,
+                        col,
+                    });
+                }
+            }
+        }
+        selections
+            .into_iter()
+            .map(|selection| {
+                let state = if self.ai_cache.contains_key(&selection) {
+                    AiSummaryState::Ready
+                } else if self.ai_failures.contains_key(&selection) {
+                    AiSummaryState::Failed
+                } else if self.ai_drafts.contains_key(&selection)
+                    || self.ai_running.values().any(|running| {
+                        running.epoch == self.epoch && running.selection == selection
+                    })
+                    || (self.current_ai_selection().as_ref() == Some(&selection)
+                        && matches!(
+                            self.ai_status,
+                            AiStatus::WaitingForSymbols { .. }
+                                | AiStatus::Debouncing { .. }
+                                | AiStatus::Loading { .. }
+                        ))
+                {
+                    AiSummaryState::Generating
+                } else {
+                    AiSummaryState::NotGenerated
+                };
+                (selection.summary_key(), state)
+            })
+            .collect()
+    }
+
     fn panes(&self) -> (DiffPane, SemanticPane) {
-        let mut diff = self
-            .changeset
-            .as_ref()
-            .map(|cs| selected_diff(cs, self.selected_file.as_deref()))
-            .unwrap_or_default();
+        let mut diff = if let Some(directory) = &self.selected_directory {
+            DiffPane {
+                title: format!("{directory}/"),
+                ..DiffPane::default()
+            }
+        } else {
+            self.changeset
+                .as_ref()
+                .map(|cs| selected_diff(cs, self.selected_file.as_deref()))
+                .unwrap_or_default()
+        };
         // Publish the selected symbol's label for the diff title (spec §5.2) — only when
         // the diff actually shows that symbol's file; the first-file fallback and file
         // rows have no focused symbol. The full path stays the identity in `title`.
@@ -2452,6 +2541,10 @@ impl Dispatcher {
         // relation rows are gone.
         // AI rows render only while their epoch matches the current repo state (H3).
         let current_ai_selection = self.current_ai_selection();
+        let guidance_note = current_ai_selection
+            .as_ref()
+            .and_then(|selection| self.agent_guidance.get(selection))
+            .and_then(AgentGuidance::display);
         let semantic = match &self.ai_rows {
             Some((ep, selection, plan))
                 if *ep == self.epoch && current_ai_selection.as_ref() == Some(selection) =>
@@ -2461,7 +2554,7 @@ impl Dispatcher {
                     // The report travels with the plan: sanitized content keeps its
                     // verdict/dropped-items trail in every publish, cache hit included.
                     report: Some(plan.report.clone()),
-                    note: selection.label().to_string(),
+                    note: guidance_note.unwrap_or_else(|| selection.label().to_string()),
                     ai_generated: true,
                 }
             }
@@ -2473,7 +2566,69 @@ impl Dispatcher {
             },
             // A selection mismatch must never display the previous row's explanation —
             // or its validation report.
-            _ => SemanticPane::default(),
+            _ => {
+                let preview = current_ai_selection
+                    .as_ref()
+                    .and_then(|selection| self.ai_previews.get(selection));
+                if let Some(preview) = preview {
+                    SemanticPane {
+                        plan: Some(preview.plan.clone()),
+                        report: Some(preview.report.clone()),
+                        note: if current_ai_selection
+                            .as_ref()
+                            .is_some_and(|selection| self.agent_owned_drafts.contains(selection))
+                        {
+                            "Agent diagram draft · edit or finish through the controller"
+                                .to_string()
+                        } else {
+                            "AI draft · building boxes and relationships…".to_string()
+                        },
+                        ai_generated: true,
+                    }
+                } else {
+                    let draft = current_ai_selection
+                        .as_ref()
+                        .and_then(|selection| self.ai_drafts.get(selection));
+                    if let Some(draft) =
+                        draft.filter(|draft| draft.forms.iter().any(|form| !form.nodes.is_empty()))
+                    {
+                        // A draft must be visibly incremental, but it has not crossed the
+                        // fact validator yet. Strip entity claims so draft connectors render
+                        // inferred/dashed; final publication restores only validated facts.
+                        let mut plan = draft.plan();
+                        for node in plan.forms.iter_mut().flat_map(|form| &mut form.nodes) {
+                            node.entity = None;
+                        }
+                        SemanticPane {
+                            plan: Some(plan),
+                            report: None,
+                            note: if current_ai_selection.as_ref().is_some_and(|selection| {
+                                self.agent_owned_drafts.contains(selection)
+                            }) {
+                                "Agent diagram draft · unvalidated boxes; edit or finish"
+                                    .to_string()
+                            } else {
+                                "AI draft · unvalidated boxes; building relationships…".to_string()
+                            },
+                            ai_generated: true,
+                        }
+                    } else {
+                        SemanticPane {
+                            note: current_ai_selection
+                                .as_ref()
+                                .and_then(|selection| {
+                                    self.ai_drafts.contains_key(selection).then_some(
+                                        "AI draft · researching and building the first box…"
+                                            .to_string(),
+                                    )
+                                })
+                                .or(guidance_note)
+                                .unwrap_or_default(),
+                            ..SemanticPane::default()
+                        }
+                    }
+                }
+            }
         };
         (diff, semantic)
     }
@@ -2488,9 +2643,7 @@ impl Dispatcher {
         self.build_impact_for_selection(&selection)
     }
 
-    /// Selection-scoped Impact packet used by both the focused UI and background AI jobs.
-    /// Off-focus symbol prefetch intentionally has no selected-only relation rows; its
-    /// source/symbol facts remain complete and deterministic.
+    /// Selection-scoped Impact packet used by the focused UI and its AI request.
     fn build_impact_for_selection(&self, selection: &AiSelectionKey) -> ImpactPane {
         // Selected change: the symbol's per-file cache entry carries its change kind and
         // interpretation; a file row falls back to the file-level summary.
@@ -2498,10 +2651,9 @@ impl Dispatcher {
             selected_change: self.selected_change_for(selection),
             ..Default::default()
         };
-        let Some((name, _, _)) = &selection.symbol else {
+        let AiSelectionKey::Symbol { file, name, .. } = selection else {
             return impact;
         };
-        let file = &selection.file;
         // Relations only make sense for a symbol whose file analysis is Ready (the
         // identity is verified against that result).
         let file_ready = matches!(
@@ -2556,8 +2708,42 @@ impl Dispatcher {
     }
 
     fn selected_change_for(&self, selection: &AiSelectionKey) -> Option<SelectedChange> {
-        if let Some((name, line, col)) = &selection.symbol {
-            let file = &selection.file;
+        if let AiSelectionKey::Directory(directory) = selection {
+            let files: Vec<_> = self
+                .changeset
+                .as_ref()?
+                .files
+                .iter()
+                .filter(|file| file.path.as_str().starts_with(&format!("{directory}/")))
+                .collect();
+            let symbols = files
+                .iter()
+                .filter_map(|file| self.file_semantics.get(file.path.as_str()))
+                .filter_map(|state| match state {
+                    FileSemanticState::Ready(result) => Some(result.changed.len()),
+                    _ => None,
+                })
+                .sum::<usize>();
+            return Some(SelectedChange {
+                file: directory.clone(),
+                label: format!("{directory}/"),
+                change: "modified",
+                interpretation: format!(
+                    "{} changed file{} and {symbols} mapped symbol{} in this directory.",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" },
+                    if symbols == 1 { "" } else { "s" }
+                ),
+                interpretation_source: InterpretationSource::Deterministic,
+            });
+        }
+        if let AiSelectionKey::Symbol {
+            file,
+            name,
+            line,
+            col,
+        } = selection
+        {
             let info = self
                 .file_semantics
                 .get(file)
@@ -2595,7 +2781,10 @@ impl Dispatcher {
                 interpretation_source: InterpretationSource::Deterministic,
             });
         }
-        let file = selection.file.as_str();
+        let AiSelectionKey::File(file) = selection else {
+            return None;
+        };
+        let file = file.as_str();
         // The numeric count is real only for Ready; other states describe themselves
         // (review 18 m6).
         let interpretation = match self.file_semantics.get(file) {
@@ -2631,15 +2820,38 @@ impl Dispatcher {
     }
 }
 
+/// Restrict every prompt and validator fact to the selected directory or exact file.
+fn changeset_for_selection(
+    changeset: &codescope_core::ChangeSet,
+    selection: &AiSelectionKey,
+) -> codescope_core::ChangeSet {
+    codescope_core::ChangeSet {
+        scope: changeset.scope,
+        files: changeset
+            .files
+            .iter()
+            .filter(|file| selection.contains_file(file.path.as_str()))
+            .cloned()
+            .collect(),
+        fallback: changeset.fallback,
+    }
+}
+
 /// Append the current deterministic Impact view as the AI plan's required focus. The
-/// branch-wide digest remains available for validation/context, but the model is explicitly
-/// forbidden from turning a neighboring file/function into the plan's subject.
-fn append_impact_focus(digest: &mut String, impact: &ImpactPane) {
+/// already-scoped digest supplies only this directory/file's validation context, and this
+/// contract keeps the model from turning one sibling into the whole plan's subject.
+#[cfg(test)]
+fn append_impact_focus(digest: &mut String, impact: &ImpactPane, selection: &AiSelectionKey) {
     let Some(selected) = &impact.selected_change else {
         return;
     };
     digest.push_str("\n## current impact selection\n");
-    digest.push_str(&format!("file: {}\n", one_line(&selected.file)));
+    match selection {
+        AiSelectionKey::Directory(path) => {
+            digest.push_str(&format!("directory: {}/\n", one_line(path)));
+        }
+        _ => digest.push_str(&format!("file: {}\n", one_line(&selected.file))),
+    }
     digest.push_str(&format!("label: {}\n", one_line(&selected.label)));
     digest.push_str(&format!("change: {}\n", selected.change));
     if !selected.interpretation.is_empty() {
@@ -2653,30 +2865,62 @@ fn append_impact_focus(digest: &mut String, impact: &ImpactPane) {
     if !impact.note.is_empty() {
         digest.push_str(&format!("impact caveat: {}\n", one_line(&impact.note)));
     }
-    digest.push_str(
-        "request: Visually explain this selected change to a reviewer seeing it for the first time. Show its intent, the most important runtime/data/control relationship, and the direct code-owned implication. The main pane already shows the raw diff, so do not restate a list of modified symbols. The plan MUST be about this file/function only; every node code_ref MUST use this selected file, and other digest files are plan-level evidence only. If this diff publishes input to an external system, end the visual at that publication and omit any unshown actor, mapping, or outcome.\n",
-    );
+    if matches!(selection, AiSelectionKey::Directory(_)) {
+        digest.push_str(
+            "request: Summarize this changed directory as a module for a reviewer seeing it for the first time. Show the common purpose of the changes, how the changed files relate, and the most important implemented behavior. The plan MUST stay within this directory; every node code_ref MUST use one of its supplied changed files. Prefer a changed_symbol_tree or relationship_flow over a flat file list.\n",
+        );
+    } else {
+        digest.push_str(
+            "request: Visually explain this selected change to a reviewer seeing it for the first time. Show its intent, the most important runtime/data/control relationship, and the direct code-owned implication. The main pane already shows the raw diff, so do not restate a list of modified symbols. The plan MUST be about this file/function only; every node code_ref MUST use this selected file. If this diff publishes input to an external system, end the visual at that publication and omit any unshown actor, mapping, or outcome.\n",
+        );
+    }
 }
 
-/// State the selected file's semantic capabilities next to the exact focused hunks. A
-/// branch-wide digest may contain symbols from neighboring files, so the model needs an
-/// explicit local contract—especially for YAML and other files no language server owns.
+/// State the selection's semantic capabilities next to its exact focused hunks. The explicit
+/// contract is especially important for directories and files no language server owns.
+#[cfg(test)]
 fn append_selected_evidence_contract(
     digest: &mut String,
     selection: &AiSelectionKey,
+    changeset: &codescope_core::ChangeSet,
     semantics: &std::collections::HashMap<String, FileSemanticState>,
 ) {
-    let available_symbols = match semantics.get(&selection.file) {
+    if let AiSelectionKey::Directory(directory) = selection {
+        let available_symbols = changeset
+            .files
+            .iter()
+            .filter_map(|file| semantics.get(file.path.as_str()))
+            .filter_map(|state| match state {
+                FileSemanticState::Ready(result) => Some(result.changed.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        digest.push_str("\n## selected directory evidence contract (mandatory)\n");
+        digest.push_str(&format!(
+            "directory scope: {directory}/ ({} changed files; {available_symbols} mapped symbols)\n",
+            changeset.files.len()
+        ));
+        digest.push_str(
+            "- Every node code_ref and evidence file MUST be copied from this scoped digest and focused source packet; all supplied files are inside the selected directory.\n\
+             - Use symbol metadata only when that exact file+symbol appears in `## changed symbols`; otherwise use conceptual nodes grounded by exact file+hunk lines.\n\
+             - Describe the directory as one module-level change, not as unrelated repository-wide work.\n",
+        );
+        return;
+    }
+    let file = selection
+        .file()
+        .expect("non-directory selection has a file");
+    let available_symbols = match semantics.get(file) {
         Some(FileSemanticState::Ready(result)) => result
             .changed
             .iter()
-            .filter(|changed| changed.file.as_path().as_str() == selection.file)
+            .filter(|changed| changed.file.as_path().as_str() == file)
             .count(),
         _ => 0,
     };
     digest.push_str("\n## selected file evidence contract (mandatory)\n");
     if available_symbols == 0 {
-        let state = match semantics.get(&selection.file) {
+        let state = match semantics.get(file) {
             Some(FileSemanticState::Unsupported) => {
                 "unavailable: this file type has no semantic analyzer"
             }
@@ -2708,17 +2952,34 @@ fn append_selected_evidence_contract(
 /// `FOCUSED_MAX_HUNKS` bounds how many hunks a selection may cover; the line/byte caps
 /// are hard totals, sliced fairly across the selected hunks so a huge early hunk cannot
 /// starve the final one of its header and body evidence.
+#[cfg(test)]
 const FOCUSED_MAX_HUNKS: usize = 8;
+#[cfg(test)]
 const FOCUSED_MAX_LINES: usize = 160;
+#[cfg(test)]
 const FOCUSED_MAX_BYTES: usize = 20_000;
 
-/// Append exact changed lines for the selected file/symbol. This is intentionally capped
-/// and selection-scoped: the AI needs the actual control/data change to draw a useful
-/// relationship, while the compact digest supplies branch-wide context and validation ids.
+#[cfg(test)]
+fn balanced_slice<T>(mut values: Vec<T>, max: usize) -> Vec<T> {
+    if values.len() <= max {
+        return values;
+    }
+    let tail_count = max / 2;
+    let head_count = max - tail_count;
+    let tail = values.split_off(values.len() - tail_count);
+    values.truncate(head_count);
+    values.extend(tail);
+    values
+}
+
+/// Append exact changed lines for the selected directory/file/symbol. This is intentionally
+/// capped and selection-scoped: the AI needs the actual control/data change to draw a useful
+/// relationship, while the compact digest supplies validation ids for the same scope.
 /// File-level selections cover every hunk while the file fits the hunk cap and balance
 /// head/tail coverage beyond it; the line and byte budgets are sliced fairly across the
 /// selected hunks, so late finalization edits keep their evidence even when early hunks
 /// are huge.
+#[cfg(test)]
 fn append_focused_source_packet(
     digest: &mut String,
     selection: &AiSelectionKey,
@@ -2741,71 +3002,60 @@ fn append_focused_source_packet(
         format!("[old:{old} new:{new}] {marker}{text}\n")
     }
 
-    let Some(file) = changeset
-        .files
-        .iter()
-        .find(|file| file.path.as_str() == selection.file)
-    else {
-        return;
-    };
-
-    let mut wanted: Vec<u32> = selection
-        .symbol
-        .as_ref()
-        .and_then(|(name, _, _)| match semantics.get(&selection.file) {
-            Some(FileSemanticState::Ready(result)) => Some(
-                result
-                    .changed
-                    .iter()
-                    .filter(|changed| changed.name == *name)
-                    .flat_map(|changed| changed.record.hunks.iter().map(|hunk| hunk.index))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default();
-    if wanted.is_empty() {
-        if let Some((_, line, _)) = &selection.symbol {
-            let line = line.saturating_add(1);
-            wanted.extend(file.hunks.iter().enumerate().filter_map(|(index, hunk)| {
-                let (start, end) = hunk.new_span();
-                (line >= start && line < end).then_some(index as u32)
-            }));
-        }
-    }
-    if wanted.is_empty() {
-        // File-level fallback: every hunk while the file fits the cap. Beyond the cap
-        // balance head and tail coverage — leading hunks carry entry-point changes
-        // while trailing ones carry shutdown/finalization edits, and dropping the
-        // tail hid the close-last shutdown behavior in the six-hunk
-        // vm-sandboxes/packages/api/main.go case.
-        let len = file.hunks.len();
-        if len > FOCUSED_MAX_HUNKS {
-            let tail = FOCUSED_MAX_HUNKS / 2;
-            let head = FOCUSED_MAX_HUNKS - tail;
-            wanted.extend(0..head as u32);
-            wanted.extend((len - tail) as u32..len as u32);
+    let selected: Vec<(&codescope_core::FileChange, u32, &codescope_core::Hunk)> =
+        if matches!(selection, AiSelectionKey::Directory(_)) {
+            let all: Vec<_> = changeset
+                .files
+                .iter()
+                .flat_map(|file| {
+                    file.hunks
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, hunk)| (file, index as u32, hunk))
+                })
+                .collect();
+            balanced_slice(all, FOCUSED_MAX_HUNKS)
         } else {
-            wanted.extend(0..len as u32);
-        }
-    }
-    wanted.sort_unstable();
-    wanted.dedup();
-    if wanted.len() > FOCUSED_MAX_HUNKS {
-        let tail = FOCUSED_MAX_HUNKS / 2;
-        let head = FOCUSED_MAX_HUNKS - tail;
-        let mut balanced = wanted[..head].to_vec();
-        balanced.extend_from_slice(&wanted[wanted.len() - tail..]);
-        wanted = balanced;
-    }
-    if wanted.is_empty() {
-        return;
-    }
-
-    let selected: Vec<(u32, &codescope_core::Hunk)> = wanted
-        .iter()
-        .filter_map(|index| Some((*index, file.hunks.get(*index as usize)?)))
-        .collect();
+            let file_path = selection.file().expect("file or symbol selection");
+            let Some(file) = changeset
+                .files
+                .iter()
+                .find(|file| file.path.as_str() == file_path)
+            else {
+                return;
+            };
+            let mut wanted: Vec<u32> = match selection {
+                AiSelectionKey::Symbol { name, .. } => match semantics.get(file_path) {
+                    Some(FileSemanticState::Ready(result)) => result
+                        .changed
+                        .iter()
+                        .filter(|changed| changed.name == *name)
+                        .flat_map(|changed| changed.record.hunks.iter().map(|hunk| hunk.index))
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if wanted.is_empty() {
+                if let AiSelectionKey::Symbol { line, .. } = selection {
+                    let line = line.saturating_add(1);
+                    wanted.extend(file.hunks.iter().enumerate().filter_map(|(index, hunk)| {
+                        let (start, end) = hunk.new_span();
+                        (line >= start && line < end).then_some(index as u32)
+                    }));
+                }
+            }
+            if wanted.is_empty() {
+                wanted.extend(0..file.hunks.len() as u32);
+            }
+            wanted.sort_unstable();
+            wanted.dedup();
+            let wanted = balanced_slice(wanted, FOCUSED_MAX_HUNKS);
+            wanted
+                .into_iter()
+                .filter_map(|index| Some((file, index, file.hunks.get(index as usize)?)))
+                .collect()
+        };
     if selected.is_empty() {
         return;
     }
@@ -2818,10 +3068,10 @@ fn append_focused_source_packet(
     let fair_lines = FOCUSED_MAX_LINES / count;
     let mut line_allowance: Vec<usize> = selected
         .iter()
-        .map(|(_, hunk)| hunk.lines.len().min(fair_lines))
+        .map(|(_, _, hunk)| hunk.lines.len().min(fair_lines))
         .collect();
     let mut spare = FOCUSED_MAX_LINES - line_allowance.iter().sum::<usize>();
-    for (allowance, (_, hunk)) in line_allowance.iter_mut().zip(&selected) {
+    for (allowance, (_, _, hunk)) in line_allowance.iter_mut().zip(&selected) {
         let extra = spare.min(hunk.lines.len() - *allowance);
         *allowance += extra;
         spare -= extra;
@@ -2831,7 +3081,7 @@ fn append_focused_source_packet(
     let intro = "\n## focused source evidence (exact selected hunks; hunk ids are zero-based; body annotations use one-based old/new lines)\n";
     let headers: Vec<String> = selected
         .iter()
-        .map(|(index, hunk)| {
+        .map(|(file, index, hunk)| {
             format!(
                 "hunk_id: {index}  file: {}  @@ -{},{} +{},{} @@ {}\n",
                 file.path,
@@ -2846,7 +3096,7 @@ fn append_focused_source_packet(
     let bodies: Vec<Vec<String>> = selected
         .iter()
         .zip(&line_allowance)
-        .map(|((_, hunk), share)| hunk.lines.iter().take(*share).map(rendered_line).collect())
+        .map(|((_, _, hunk), share)| hunk.lines.iter().take(*share).map(rendered_line).collect())
         .collect();
 
     // Fair byte slice over the rendered hunks, same forward flow: a wide early hunk can
@@ -2893,7 +3143,7 @@ fn append_focused_source_packet(
             packet.push_str(rendered);
             hunk_bytes += rendered.len();
         }
-        if selected[k].1.lines.len() > line_allowance[k] {
+        if selected[k].2.lines.len() > line_allowance[k] {
             truncated = true;
         }
     }
@@ -2903,6 +3153,7 @@ fn append_focused_source_packet(
     digest.push_str(&packet);
 }
 
+#[cfg(test)]
 fn append_impact_rows(digest: &mut String, heading: &str, list: &ImpactList) {
     const MAX_PROMPT_ROWS: usize = 20;
     digest.push_str(&format!("{heading} (state {:?}):\n", list.state));
@@ -2929,6 +3180,7 @@ fn append_impact_rows(digest: &mut String, heading: &str, list: &ImpactList) {
     }
 }
 
+#[cfg(test)]
 fn one_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -3224,7 +3476,7 @@ fn file_change_label(status: &codescope_core::FileStatus) -> &'static str {
 // -- FactView over the current analysis snapshot ------------------------------
 
 struct SnapshotFacts {
-    focus_file: String,
+    focus: AiSelectionKey,
     files: HashSet<String>,
     symbols: std::collections::HashMap<(String, String), LineRange>,
     edges: HashSet<(String, String, PlanEdgeKind)>,
@@ -3242,10 +3494,10 @@ impl SnapshotFacts {
     fn from_lazy(
         changeset: &codescope_core::ChangeSet,
         semantics: &std::collections::HashMap<String, FileSemanticState>,
-        focus_file: &str,
+        focus: &AiSelectionKey,
     ) -> Self {
         let mut facts = SnapshotFacts {
-            focus_file: focus_file.to_string(),
+            focus: focus.clone(),
             files: HashSet::new(),
             symbols: std::collections::HashMap::new(),
             edges: HashSet::new(),
@@ -3277,7 +3529,9 @@ impl SnapshotFacts {
         for res in semantics.values() {
             if let FileSemanticState::Ready(res) = res {
                 for c in &res.changed {
-                    facts.files.insert(c.file.to_string());
+                    if !facts.files.contains(&c.file.to_string()) {
+                        continue;
+                    }
                     facts
                         .symbols
                         .insert((c.file.to_string(), c.name.clone()), c.range);
@@ -3297,7 +3551,7 @@ fn entity_key(e: &EntityRef) -> String {
 
 impl FactView for SnapshotFacts {
     fn is_focus_file(&self, file: &codescope_core::FileId) -> bool {
-        file.as_path().as_str() == self.focus_file
+        self.focus.contains_file(file.as_path().as_str())
     }
 
     fn file(&self, file: &codescope_core::FileId) -> Lookup<()> {
@@ -3420,19 +3674,28 @@ pub async fn run(
             },
             a = actions.recv() => match a {
                 Some(a) => {
-                    // SelectionChanged is latest-wins state (where the files-pane selection
-                    // sits): keep only the newest in a burst. Every other action is a one-shot
-                    // command (scope change, refresh, picker choice) and must never be dropped
-                    // behind a selection update.
+                    // Directory/file/symbol selection is latest-wins state (where the
+                    // changed-tree cursor sits): keep only the newest in a burst. Every other
+                    // action is a one-shot command and must never be dropped behind it.
                     let mut batch = vec![a];
                     while let Ok(next) = actions.try_recv() {
                         batch.push(next);
                     }
                     let last_selection = batch
                         .iter()
-                        .rposition(|act| matches!(act, Action::SelectionChanged { .. }));
+                        .rposition(|act| {
+                            matches!(
+                                act,
+                                Action::SelectionChanged { .. }
+                                    | Action::DirectorySelectionChanged { .. }
+                            )
+                        });
                     for (i, act) in batch.into_iter().enumerate() {
-                        if matches!(act, Action::SelectionChanged { .. })
+                        if matches!(
+                            act,
+                            Action::SelectionChanged { .. }
+                                | Action::DirectorySelectionChanged { .. }
+                        )
                             && Some(i) != last_selection
                         {
                             continue;
@@ -3466,6 +3729,21 @@ pub async fn run(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn agent_guidance_is_bounded_and_explicitly_not_evidence() {
+        let guidance = AgentGuidance {
+            question: Some("Where does this request fail?".to_string()),
+            feedback: Some("Emphasize the queue boundary.".to_string()),
+        };
+        let prompt = guidance.prompt_section();
+        assert!(prompt.contains("Where does this request fail?"));
+        assert!(prompt.contains("Emphasize the queue boundary."));
+        assert!(prompt.matches("not evidence").count() >= 1);
+
+        let normalized = normalize_agent_text(&"x".repeat(MAX_AGENT_GUIDANCE_CHARS + 50));
+        assert_eq!(normalized.chars().count(), MAX_AGENT_GUIDANCE_CHARS);
+    }
 
     /// Build a throwaway repo: one commit on `main`, one more on `feature` (checked out).
     /// Plain git CLI so the test needs no extra dev-dependencies.
@@ -3968,6 +4246,33 @@ mod tests {
         )
     }
 
+    /// Two files in one module plus a changed sibling outside it.
+    fn directory_changeset() -> codescope_core::ChangeSet {
+        use codescope_core::{ChangeSet, DiffLine, FileChange, FileStatus, Hunk};
+        let file = |path: &str, added: &str| FileChange {
+            path: path.into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_len: 1,
+                new_start: 1,
+                new_len: 1,
+                section: None,
+                lines: vec![DiffLine::del(1, "old"), DiffLine::add(1, added)],
+            }],
+            binary: false,
+        };
+        ChangeSet::new(
+            ChangeScope::Branch,
+            vec![
+                file("src/api/handler.rs", "handler-new"),
+                file("src/api/model.rs", "model-new"),
+                file("src/cli.rs", "cli-new"),
+            ],
+        )
+    }
+
     fn impact_row(label: &str) -> ImpactRow {
         ImpactRow {
             label: label.to_string(),
@@ -4011,14 +4316,106 @@ mod tests {
     }
 
     #[test]
+    fn directory_prompt_scope_includes_only_its_changed_files() {
+        let selection = AiSelectionKey::Directory("src/api".to_string());
+        let scoped = changeset_for_selection(&directory_changeset(), &selection);
+        let paths: Vec<&str> = scoped.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["src/api/handler.rs", "src/api/model.rs"]);
+
+        let semantics = std::collections::HashMap::new();
+        let mut prompt = String::new();
+        append_impact_focus(
+            &mut prompt,
+            &ImpactPane {
+                selected_change: Some(SelectedChange {
+                    file: "src/api".to_string(),
+                    label: "src/api/".to_string(),
+                    change: "modified",
+                    interpretation: "Two changed files form one API module update.".to_string(),
+                    interpretation_source: InterpretationSource::Deterministic,
+                }),
+                ..ImpactPane::default()
+            },
+            &selection,
+        );
+        append_selected_evidence_contract(&mut prompt, &selection, &scoped, &semantics);
+        append_focused_source_packet(&mut prompt, &selection, &scoped, &semantics);
+        assert!(prompt.contains("directory: src/api/"));
+        assert!(prompt.contains("Summarize this changed directory as a module"));
+        assert!(prompt.contains("Show the common purpose of the changes"));
+        assert!(prompt.contains("selected directory evidence contract"));
+        assert!(prompt.contains("directory scope: src/api/ (2 changed files"));
+        assert!(prompt.contains("file: src/api/handler.rs"));
+        assert!(prompt.contains("file: src/api/model.rs"));
+        assert!(!prompt.contains("src/cli.rs"));
+
+        let facts = SnapshotFacts::from_lazy(&scoped, &semantics, &selection);
+        let handler = codescope_core::FileId::new("src/api/handler.rs").unwrap();
+        let cli = codescope_core::FileId::new("src/cli.rs").unwrap();
+        assert!(facts.is_focus_file(&handler));
+        assert!(!facts.is_focus_file(&cli));
+        assert!(matches!(facts.file(&handler), Lookup::Present(())));
+        assert!(matches!(facts.file(&cli), Lookup::Unknown));
+    }
+
+    #[tokio::test]
+    async fn directory_selection_publishes_module_scope_and_summary_states() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(directory_changeset());
+        disp.data_epoch = disp.epoch;
+        let directory = AiSelectionKey::Directory("src/api".to_string());
+        disp.ai_cache
+            .insert(directory.clone(), cached_ai_plan("src/api"));
+        disp.ai_failures.insert(
+            AiSelectionKey::File("src/api/model.rs".to_string()),
+            "provider failed".to_string(),
+        );
+
+        disp.handle(DispatchEvent::Work(Action::DirectorySelectionChanged {
+            directory: "src/api".to_string(),
+        }))
+        .await;
+
+        assert_eq!(disp.current_ai_selection(), Some(directory));
+        let snap = snapshot_rx.borrow().clone();
+        assert_eq!(snap.diff.title, "src/api/");
+        let selected = snap
+            .impact
+            .selected_change
+            .as_ref()
+            .expect("directory impact");
+        assert_eq!(selected.label, "src/api/");
+        assert!(selected.interpretation.contains("2 changed files"));
+        assert_eq!(
+            snap.ai_summary_state(&AiSummaryKey::Directory("src/api".to_string())),
+            AiSummaryState::Ready
+        );
+        assert_eq!(
+            snap.ai_summary_state(&AiSummaryKey::File("src/api/model.rs".to_string())),
+            AiSummaryState::Failed
+        );
+        assert_eq!(
+            snap.ai_summary_state(&AiSummaryKey::File("src/api/handler.rs".to_string())),
+            AiSummaryState::NotGenerated
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn revision_cache_identity_survives_symbol_line_movement() {
-        let before = AiSelectionKey {
+        let before = AiSelectionKey::Symbol {
             file: "src/service.rs".to_string(),
-            symbol: Some(("request_plan".to_string(), 120, 4)),
+            name: "request_plan".to_string(),
+            line: 120,
+            col: 4,
         };
-        let after = AiSelectionKey {
+        let after = AiSelectionKey::Symbol {
             file: "src/service.rs".to_string(),
-            symbol: Some(("request_plan".to_string(), 164, 4)),
+            name: "request_plan".to_string(),
+            line: 164,
+            col: 4,
         };
         assert_ne!(
             before, after,
@@ -4390,8 +4787,6 @@ mod tests {
                 selection: selection.clone(),
                 epoch: disp.epoch,
                 generation,
-                priority: AiJobPriority::Focused,
-                accept_result: true,
             },
         );
         disp.handle(DispatchEvent::AiDone {
@@ -4634,14 +5029,8 @@ mod tests {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
         disp.changeset = Some(two_file_changeset());
-        let a = AiSelectionKey {
-            file: "a.txt".to_string(),
-            symbol: None,
-        };
-        let b = AiSelectionKey {
-            file: "b.txt".to_string(),
-            symbol: None,
-        };
+        let a = AiSelectionKey::File("a.txt".to_string());
+        let b = AiSelectionKey::File("b.txt".to_string());
         disp.ai_cache.insert(a.clone(), cached_ai_plan("plan-a"));
         disp.ai_cache.insert(b.clone(), cached_ai_plan("plan-b"));
 
@@ -4742,10 +5131,7 @@ mod tests {
             )
             .unwrap(),
         ));
-        let a = AiSelectionKey {
-            file: "a.txt".to_string(),
-            symbol: None,
-        };
+        let a = AiSelectionKey::File("a.txt".to_string());
         disp.ai_cache.insert(a, cached_ai_plan("plan-a"));
         disp.handle(DispatchEvent::Work(Action::SelectionChanged {
             file: Some("a.txt".to_string()),
@@ -4774,123 +5160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adaptive_ai_queue_orders_focus_then_visible_symbols_then_file_summaries() {
-        let root = scratch_repo();
-        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
-        let focused = AiSelectionKey {
-            file: "a.txt".to_string(),
-            symbol: Some(("focused".to_string(), 10, 2)),
-        };
-        let sibling = AiSelectionKey {
-            file: "a.txt".to_string(),
-            symbol: Some(("sibling".to_string(), 20, 2)),
-        };
-        let file_summary = AiSelectionKey {
-            file: "b.txt".to_string(),
-            symbol: None,
-        };
-        disp.selected_file = Some("a.txt".to_string());
-        disp.selected_symbol = Some(("a.txt".to_string(), "focused".to_string(), 10, 2));
-        // Insert in the opposite order to prove priority, not FIFO, owns the hierarchy.
-        disp.ai_queue = vec![
-            AiQueuedJob {
-                selection: file_summary.clone(),
-                epoch: disp.epoch,
-                priority: AiJobPriority::FileSummary,
-                order: 1,
-            },
-            AiQueuedJob {
-                selection: sibling.clone(),
-                epoch: disp.epoch,
-                priority: AiJobPriority::ExpandedSymbol,
-                order: 2,
-            },
-            AiQueuedJob {
-                selection: focused.clone(),
-                epoch: disp.epoch,
-                priority: AiJobPriority::FileSummary,
-                order: 3,
-            },
-        ];
-
-        disp.reprioritize_ai_queue();
-
-        assert_eq!(disp.ai_queue_position(&focused), Some(1));
-        assert_eq!(disp.ai_queue_position(&sibling), Some(2));
-        assert_eq!(disp.ai_queue_position(&file_summary), Some(3));
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[tokio::test]
-    async fn focused_only_policy_discards_every_unrelated_prefetch_job() {
-        let root = scratch_repo();
-        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
-        disp.ai_prefetch = AiPrefetchPolicy::FocusedOnly;
-        disp.selected_file = Some("a.txt".to_string());
-        let focused = AiSelectionKey {
-            file: "a.txt".to_string(),
-            symbol: None,
-        };
-        disp.ai_queue = vec![
-            AiQueuedJob {
-                selection: AiSelectionKey {
-                    file: "b.txt".to_string(),
-                    symbol: None,
-                },
-                epoch: disp.epoch,
-                priority: AiJobPriority::FileSummary,
-                order: 1,
-            },
-            AiQueuedJob {
-                selection: focused.clone(),
-                epoch: disp.epoch,
-                priority: AiJobPriority::FileSummary,
-                order: 2,
-            },
-        ];
-
-        disp.reprioritize_ai_queue();
-
-        assert_eq!(disp.ai_queue.len(), 1);
-        assert_eq!(disp.ai_queue[0].selection, focused);
-        assert_eq!(disp.ai_queue[0].priority, AiJobPriority::Focused);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[tokio::test]
-    async fn disabled_ai_leaves_pending_jobs_untouched() {
-        let root = scratch_repo();
-        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
-        let running = AiRunningJob {
-            selection: AiSelectionKey {
-                file: "a.txt".to_string(),
-                symbol: None,
-            },
-            epoch: disp.epoch,
-            generation: 7,
-            priority: AiJobPriority::FileSummary,
-            accept_result: true,
-        };
-        disp.ai_running.insert(7, running.clone());
-        disp.ai_queue.push(AiQueuedJob {
-            selection: AiSelectionKey {
-                file: "b.txt".to_string(),
-                symbol: None,
-            },
-            epoch: disp.epoch,
-            priority: AiJobPriority::FileSummary,
-            order: 1,
-        });
-
-        disp.pump_ai_queue();
-
-        assert_eq!(disp.ai_running.get(&7).unwrap().generation, 7);
-        assert_eq!(disp.ai_queue.len(), 1);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[tokio::test]
-    async fn late_focused_relations_replace_an_incomplete_running_plan() {
+    async fn late_focused_relations_do_not_cancel_a_running_plan() {
         let root = scratch_repo();
         let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
         let config = codescope_ai::AiConfig {
@@ -4920,8 +5190,6 @@ mod tests {
                 selection: selection.clone(),
                 epoch: disp.epoch,
                 generation: 9,
-                priority: AiJobPriority::Focused,
-                accept_result: true,
             },
         );
 
@@ -4937,57 +5205,15 @@ mod tests {
         .await;
 
         assert!(
-            !disp.ai_running.contains_key(&9),
-            "the incomplete request is cancelled instead of occupying capacity"
+            disp.ai_running.contains_key(&9),
+            "late relation data must not cancel or restart an active request"
         );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[tokio::test]
-    async fn repeated_provider_failures_pause_only_background_prefetch() {
-        let root = scratch_repo();
-        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
-        for generation in 1..=3 {
-            let selection = AiSelectionKey {
-                file: format!("background-{generation}.txt"),
-                symbol: None,
-            };
-            disp.ai_running.insert(
-                generation,
-                AiRunningJob {
-                    selection: selection.clone(),
-                    epoch: disp.epoch,
-                    generation,
-                    priority: AiJobPriority::FileSummary,
-                    accept_result: true,
-                },
-            );
-            disp.on_ai_done(
-                disp.epoch,
-                selection,
-                generation,
-                AiOutcome::Failed("provider unavailable".to_string()),
-            );
-        }
-
-        assert_eq!(disp.ai_consecutive_failures, 3);
-        assert!(disp.ai_background_paused);
-        // The queue itself remains intact: moving focus to one of these rows reclassifies
-        // it as Focused, which is still eligible while background warming is paused.
-        let focused = AiSelectionKey {
-            file: "still-useful.txt".to_string(),
-            symbol: None,
-        };
-        disp.ai_queue.push(AiQueuedJob {
-            selection: focused.clone(),
-            epoch: disp.epoch,
-            priority: AiJobPriority::FileSummary,
-            order: 1,
-        });
-        disp.selected_file = Some(focused.file);
-        disp.reprioritize_ai_queue();
-        assert_eq!(disp.ai_queue.len(), 1);
-        assert_eq!(disp.ai_queue[0].priority, AiJobPriority::Focused);
+        let relations = disp
+            .selected_relations
+            .as_ref()
+            .expect("current selection receives late relations");
+        assert_eq!(relations.callers.rows.len(), 1);
+        assert_eq!(relations.callees.rows.len(), 1);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -5057,10 +5283,7 @@ mod tests {
         .await;
         assert_eq!(
             disp.ai_running.values().map(|job| &job.selection).next(),
-            Some(&AiSelectionKey {
-                file: "b.txt".to_string(),
-                symbol: None,
-            }),
+            Some(&AiSelectionKey::File("b.txt".to_string())),
             "the provider request starts only after semantic readiness"
         );
 
@@ -5162,10 +5385,7 @@ mod tests {
         let stale_epoch = disp.epoch.next();
         disp.ai_rows = Some((
             stale_epoch,
-            AiSelectionKey {
-                file: "a.txt".to_string(),
-                symbol: None,
-            },
+            AiSelectionKey::File("a.txt".to_string()),
             cached_ai_plan("plan-a"),
         ));
         disp.publish();
@@ -5201,17 +5421,19 @@ mod tests {
                 selection: old_selection.clone(),
                 epoch: disp.epoch,
                 generation: 10,
-                priority: AiJobPriority::Focused,
-                accept_result: true,
             },
         );
 
-        // Arrow to b.txt invalidates a.txt's in-flight generation before its answer lands.
+        // Arrowing to b.txt does not cancel a.txt's in-flight generation.
         disp.handle(DispatchEvent::Work(Action::SelectionChanged {
             file: Some("b.txt".to_string()),
             symbol: None,
         }))
         .await;
+        assert!(
+            disp.ai_running.contains_key(&10),
+            "navigation leaves started requests active"
+        );
         let mut old_plan = codescope_core::VisualizationPlan::new(disp.epoch);
         old_plan.intent = "stale a.txt plan".to_string();
         old_plan.forms.push(codescope_core::VizForm {
@@ -5265,7 +5487,13 @@ mod tests {
             note: "partial: some relationships unavailable".to_string(),
         };
         let mut digest = "# change digest\n".to_string();
-        append_impact_focus(&mut digest, &impact);
+        let selection = AiSelectionKey::Symbol {
+            file: "pkg/api.go".to_string(),
+            name: "readinessHandler".to_string(),
+            line: 0,
+            col: 0,
+        };
+        append_impact_focus(&mut digest, &impact, &selection);
         assert!(digest.contains("current impact selection"));
         assert!(!digest.contains("required plan focus"));
         assert!(digest.contains("label: readinessHandler"));
@@ -5287,7 +5515,8 @@ mod tests {
         semantics.insert(path.to_string(), FileSemanticState::Unsupported);
         let mut digest = String::new();
 
-        append_selected_evidence_contract(&mut digest, &selection, &semantics);
+        let changeset = many_hunk_changeset(path, 1);
+        append_selected_evidence_contract(&mut digest, &selection, &changeset, &semantics);
 
         assert!(digest.contains("this file type has no semantic analyzer"));
         assert!(digest.contains("MUST use the exact selected file"));
@@ -5351,10 +5580,7 @@ mod tests {
     }
 
     fn file_selection(path: &str) -> AiSelectionKey {
-        AiSelectionKey {
-            file: path.to_string(),
-            symbol: None,
-        }
+        AiSelectionKey::File(path.to_string())
     }
 
     fn focused_packet(
@@ -5402,7 +5628,9 @@ mod tests {
         assert!(packet.contains("[old:- new:7] +new();"), "{packet}");
         assert!(packet.contains("[old:8 new:8]  finish();"), "{packet}");
 
-        let facts = SnapshotFacts::from_lazy(&changeset, &std::collections::HashMap::new(), path);
+        let selection = file_selection(path);
+        let facts =
+            SnapshotFacts::from_lazy(&changeset, &std::collections::HashMap::new(), &selection);
         let file = codescope_core::FileId::new_unchecked(path);
         assert!(facts.is_focus_file(&file));
         assert!(!facts.is_focus_file(&codescope_core::FileId::new_unchecked("src/other.rs")));
@@ -5670,9 +5898,11 @@ mod tests {
             .collect();
         let mut semantics = std::collections::HashMap::new();
         semantics.insert(path.to_string(), ready_semantics(path, vec![symbol]));
-        let selection = AiSelectionKey {
+        let selection = AiSelectionKey::Symbol {
             file: path.to_string(),
-            symbol: Some(("Shutdown".to_string(), 2, 4)),
+            name: "Shutdown".to_string(),
+            line: 2,
+            col: 4,
         };
         let packet = focused_packet(&selection, &many_hunk_changeset(path, 9), &semantics);
         assert!(packet.contains("hunk_id: 1"));
@@ -5705,9 +5935,11 @@ mod tests {
             .collect();
         let mut semantics = std::collections::HashMap::new();
         semantics.insert(path.to_string(), ready_semantics(path, vec![symbol]));
-        let selection = AiSelectionKey {
+        let selection = AiSelectionKey::Symbol {
             file: path.to_string(),
-            symbol: Some(("Run".to_string(), 2, 4)),
+            name: "Run".to_string(),
+            line: 2,
+            col: 4,
         };
         let packet = focused_packet(&selection, &many_hunk_changeset(path, total), &semantics);
         let tail = FOCUSED_MAX_HUNKS / 2;
@@ -6139,8 +6371,6 @@ mod tests {
                 selection: selection.clone(),
                 epoch: disp.epoch,
                 generation,
-                priority: AiJobPriority::Focused,
-                accept_result: true,
             },
         );
         disp.handle(DispatchEvent::AiDone {
@@ -6150,9 +6380,9 @@ mod tests {
             outcome: AiOutcome::Plan(plan, codescope_core::ValidationReport::valid()),
         })
         .await;
-        let revision_key = AiRevisionKey {
+        let revision_key = AiRevisionKey::Symbol {
             file: "a.txt".to_string(),
-            symbol: Some("sym0".to_string()),
+            name: "sym0".to_string(),
         };
         assert!(
             disp.ai_revision_cache.contains_key(&revision_key),

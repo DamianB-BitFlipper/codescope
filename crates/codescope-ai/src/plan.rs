@@ -66,7 +66,7 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
     });
     json_schema!({
         "type": "object",
-        "description": "A reviewer-first explanation: one description, the single smallest useful structural visual, and typed source evidence. Every fact MUST be echoed verbatim from the digest or a tool result.",
+        "description": "A reviewer-first explanation: one description, the single smallest useful structural visual, and typed source evidence. Every source fact MUST come from the current research brief or a tool result.",
         "properties": {
             "plan_version": {"type": "integer", "const": PLAN_VERSION},
             "epoch": {
@@ -132,12 +132,12 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
                                         "type": "array",
                                         "minItems": 1,
                                         "maxItems": MAX_NODE_CODE_REFS,
-                                        "description": "Exact relevant diff lines highlighted when this box is hovered. Every node needs one or two complete range objects copied from the annotated focused source packet, never a bare string or line number.",
+                                        "description": "Exact relevant diff lines highlighted when this box is hovered. Every node needs one or two complete range objects copied from an annotated git_diff_file result, never a bare string or line number.",
                                         "items": {
                                             "type": "object",
                                             "properties": {
-                                                "file": {"type": "string", "description": "MUST equal the required current impact selection file. Other files belong only in plan-level evidence."},
-                                                "hunk": {"type": "integer", "minimum": 0, "description": "Zero-based hunk_id copied from the focused source packet."},
+                                                "file": {"type": "string", "description": "Exact repo_path copied from git_diff_file; it must remain inside the current file/function or directory selection."},
+                                                "hunk": {"type": "integer", "minimum": 0, "description": "Zero-based hunk_id copied from git_diff_file."},
                                                 "side": {"type": "string", "enum": ["old", "new"], "description": "old for removed lines; new for added or post-change context lines."},
                                                 "start_line": {"type": "integer", "minimum": 1, "description": "First one-based line copied from an old/new annotation, inclusive."},
                                                 "end_line": {"type": "integer", "minimum": 1, "description": "Last one-based line on the same side and hunk, inclusive; at most 12 lines."}
@@ -192,9 +192,9 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "file": {"type": "string", "description": "Repo-relative path copied verbatim from the digest."},
-                        "hunk": {"type": "integer", "minimum": 0, "description": "Zero-based hunk index copied from the focused context packet."},
-                        "symbol": {"type": "string", "description": "Fully-qualified symbol copied verbatim from the digest."},
+                        "file": {"type": "string", "description": "Exact repo-relative path copied from the current brief or a tool result."},
+                        "hunk": {"type": "integer", "minimum": 0, "description": "Zero-based hunk index copied from git_status_file or git_diff_file."},
+                        "symbol": {"type": "string", "description": "Fully-qualified symbol copied from an exact current fact or tool result; omit when unavailable."},
                         "range": range_schema,
                         "reason": {
                             "type": "string",
@@ -225,7 +225,7 @@ pub fn plan_tool() -> ToolDef {
     let schema = schemars::schema_for!(PlanParams);
     ToolDef {
         name: PLAN_TOOL_NAME,
-        description: "Required final response. Always call this function instead of answering with text. Submit one complete visualization plan; all entities must be echoed from the digest or tool results.".into(),
+        description: "Required final response. Always call this function instead of answering with text. Submit one complete visualization plan grounded in the current research brief and tool results.".into(),
         parameters: schema.to_value(),
     }
 }
@@ -307,7 +307,7 @@ fn enforce_ai_input_contract(plan: &VisualizationPlan) -> Result<(), AiError> {
             let count = node.code_refs.len();
             if count == 0 || count > MAX_NODE_CODE_REFS {
                 return Err(AiError::MalformedPlan(format!(
-                    "node {} in form {index} has {count} code_refs; every node requires 1-{MAX_NODE_CODE_REFS} exact ranges copied from the annotated focused diff",
+                    "node {} in form {index} has {count} code_refs; every node requires 1-{MAX_NODE_CODE_REFS} exact ranges copied from an annotated git_diff_file result",
                     node.id
                 )));
             }

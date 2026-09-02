@@ -3,10 +3,12 @@
 //! Read-only: never edits files, stages, commits, or changes branches. AI is opt-in
 //! (`CODESCOPE_AI_*` / an API key); the app is fully functional without it.
 
+mod agent_protocol;
 mod backend;
 mod config;
 mod dispatcher;
 mod request_coordinator;
+mod research_tools;
 mod terminal;
 mod watcher;
 
@@ -27,8 +29,8 @@ use watcher::RepoWatchers;
 /// Understand what your current code changes do to the system.
 ///
 /// With no subcommand, the interactive TUI starts. The subcommands are the
-/// non-interactive JSON backend (for scripts and LLM/tool consumers); they never
-/// start the TUI.
+/// non-interactive JSON backend or a client for an already-running TUI; they never start a
+/// second TUI.
 #[derive(Parser, Debug)]
 #[command(name = "codescope", version, about)]
 struct Cli {
@@ -134,6 +136,7 @@ async fn main() -> Result<()> {
     // work actions; optional watchers send change events; spawned jobs report back on the same queue.
     let (snapshot_tx, snapshot_rx) = watch::channel(UiSnapshot::placeholder());
     let (action_tx, action_rx) = mpsc::channel::<Action>(64);
+    let (control_tx, control_rx) = mpsc::channel::<Action>(32);
     let (event_tx, event_rx) = mpsc::channel::<DispatchEvent>(64);
     let job_tx = event_tx.clone();
 
@@ -177,10 +180,17 @@ async fn main() -> Result<()> {
     }
     let disp_handle = tokio::spawn(dispatcher::run(disp, event_rx, action_rx));
 
+    // A repo-specific, owner-only Unix socket lets local CLI/agent clients inspect the
+    // exact published snapshot and feed typed controls through the visible TUI cursor.
+    let _agent_server =
+        agent_protocol::AgentServer::start(root.clone(), snapshot_rx.clone(), control_tx)
+            .await
+            .context("cannot start the local agent control protocol")?;
+
     // TUI owns the terminal; restore it no matter how we exit.
     let tui_result = terminal::run_with_terminal(|mut term| async move {
         let app = App::with_preferences(config_store.ui_preferences());
-        codescope_tui::run::run(&mut term, app, snapshot_rx, action_tx).await
+        codescope_tui::run::run(&mut term, app, snapshot_rx, action_tx, control_rx).await
     })
     .await;
 
@@ -275,6 +285,11 @@ mod tests {
             let cli = Cli::try_parse_from(["codescope", name]).unwrap();
             assert!(cli.command.is_some(), "{name} must be a subcommand");
         }
+        let cli = Cli::try_parse_from(["codescope", "agent", ".", "context"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(backend::BackendCommand::Agent(_))),
+            "agent must route to the live protocol client"
+        );
         let cli =
             Cli::try_parse_from(["codescope", "analyze", "/repo", "--scope", "staged"]).unwrap();
         match cli.command {

@@ -1,5 +1,5 @@
-//! The non-interactive JSON backend:
-//! `codescope <scan|changeset|analyze|digest|bases|debug-ai>`.
+//! The non-interactive JSON backend and live-agent client:
+//! `codescope <scan|changeset|analyze|digest|bases|debug-ai|agent>`.
 //!
 //! This module is wiring, not new analysis: every subcommand reuses the existing
 //! [`GitRepo`] / [`AnalysisEngine`] / [`codescope_analysis::ChangeDigest`] APIs and
@@ -10,8 +10,9 @@
 //! - JSON on **stdout**, pretty-printed by default, single-line with `--compact`.
 //! - `{"error": ...}` on **stderr** and exit code 1 on failure (e.g. a non-git path).
 //! - Exit code 0 on success — including git-only `analyze`/`digest` runs.
-//! - Deterministic output: repo-relative paths only (the absolute repo toplevel is
-//!   stripped from [`RepoContext`]), no timestamps.
+//! - One-shot backend output is deterministic: repo-relative paths only (the absolute repo
+//!   toplevel is stripped from [`RepoContext`]), no timestamps. The `agent` client is a live
+//!   session protocol and intentionally reports its running repository root and mutable epoch.
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -36,7 +37,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::config::ConfigStore;
-use crate::dispatcher::{self, AiPrefetchPolicy, DispatchEvent, Dispatcher};
+use crate::dispatcher::{self, DispatchEvent, Dispatcher};
 
 /// Non-interactive backend subcommands. With none given, the TUI starts instead.
 #[derive(Subcommand, Debug)]
@@ -54,6 +55,8 @@ pub enum BackendCommand {
     Bases(BackendArgs),
     /// Run the interactive backend headlessly and print its validated AI plan as JSON.
     DebugAi(DebugAiArgs),
+    /// Inspect and control a codescope TUI already running in this repository.
+    Agent(crate::agent_protocol::AgentArgs),
 }
 
 /// Shared arguments for subcommands that only read git state.
@@ -189,6 +192,7 @@ async fn run_inner(cmd: &BackendCommand) -> Result<()> {
         BackendCommand::Digest(args) => digest(args).await,
         BackendCommand::Bases(args) => bases(args).await,
         BackendCommand::DebugAi(args) => debug_ai(args).await,
+        BackendCommand::Agent(args) => crate::agent_protocol::run_client(args).await,
     }
 }
 
@@ -359,8 +363,7 @@ async fn debug_ai_session(args: &DebugAiArgs) -> Result<DebugAiOut> {
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<UiSnapshot>();
     let (action_tx, action_rx) = mpsc::channel::<Action>(32);
     let (event_tx, event_rx) = mpsc::channel::<DispatchEvent>(64);
-    let mut dispatcher = Dispatcher::new(repo, engine, Some(ai), output_tx, event_tx.clone())
-        .with_ai_prefetch_policy(AiPrefetchPolicy::FocusedOnly);
+    let mut dispatcher = Dispatcher::new(repo, engine, Some(ai), output_tx, event_tx.clone());
     if let Some(reason) = engine_unavailable {
         dispatcher = dispatcher.with_engine_unavailable(reason);
     }

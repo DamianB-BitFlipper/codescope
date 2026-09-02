@@ -4,7 +4,9 @@
 //! git/analysis/AI state into display rows so the renderer never reaches into `git`, `lsp`,
 //! or `ai` crates. The binary assembles it; `codescope-tui` only consumes it.
 
-use codescope_core::{AiStatus, ChangeScope, Epoch, LsStatus};
+use std::collections::HashMap;
+
+use codescope_core::{AiStatus, ChangeScope, DiagramDraft, Epoch, LsStatus};
 
 /// Everything the interface needs to draw one frame.
 #[derive(Debug, Clone)]
@@ -17,6 +19,8 @@ pub struct UiSnapshot {
     pub scope_counts: ScopeCounts,
     /// Left pane: changed files and the symbols inside them.
     pub files: Vec<FileRow>,
+    /// Generation state for every selectable directory, file, and symbol summary.
+    pub ai_summaries: HashMap<AiSummaryKey, AiSummaryState>,
     /// Center pane: the focused diff for the current selection.
     pub diff: DiffPane,
     /// Right pane: the semantic view for the current selection.
@@ -24,6 +28,9 @@ pub struct UiSnapshot {
     /// Legacy flattened view — superseded by [`UiSnapshot::impact`] (spec §4); both are
     /// published while the renderer migrates.
     pub semantic: SemanticPane,
+    /// Editable renderer-native diagram for the current selection, when an internal or
+    /// external agent is still constructing/revising it.
+    pub diagram_draft: Option<DiagramDraft>,
     /// Right pane: the impact view (selected change, callers, downstream).
     pub impact: ImpactPane,
     /// Language-server status for the top bar.
@@ -75,8 +82,10 @@ impl Default for UiSnapshot {
             scope: ChangeScope::Branch,
             scope_counts: ScopeCounts::default(),
             files: Vec::new(),
+            ai_summaries: HashMap::new(),
             diff: DiffPane::default(),
             semantic: SemanticPane::default(),
+            diagram_draft: None,
             impact: ImpactPane::default(),
             ls: LsStatus::Starting,
             ai: AiStatus::Disabled,
@@ -96,6 +105,47 @@ impl Default for UiSnapshot {
             epoch: Epoch::ZERO,
             refreshing: false,
         }
+    }
+}
+
+/// Stable identity of a selectable row in the changed-files tree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AiSummaryKey {
+    /// Every changed file below this repo-relative directory.
+    Directory(String),
+    /// One changed file.
+    File(String),
+    /// One changed symbol. Unmapped symbols retain `None` for selection stability but
+    /// fall back to their file when requesting AI.
+    Symbol {
+        /// Owning repo-relative file.
+        file: String,
+        /// Display/semantic symbol name.
+        name: String,
+        /// Identifier position when the language server resolved it.
+        position: Option<(u32, u32)>,
+    },
+}
+
+/// Whether a summary exists for one changed-tree row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AiSummaryState {
+    /// No request has completed for this row.
+    #[default]
+    NotGenerated,
+    /// A debounce or provider request is active.
+    Generating,
+    /// A validated summary is cached and ready to display.
+    Ready,
+    /// The last request for this row failed.
+    Failed,
+}
+
+impl UiSnapshot {
+    /// Generation state of `key`; rows absent from the map have not been generated.
+    #[must_use]
+    pub fn ai_summary_state(&self, key: &AiSummaryKey) -> AiSummaryState {
+        self.ai_summaries.get(key).copied().unwrap_or_default()
     }
 }
 
@@ -128,6 +178,22 @@ impl UiSnapshot {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
+    }
+
+    /// Full click-open diagnostic for the deterministic fallback banner shown after an
+    /// AI request fails. The failure reason lives in `AiStatus`, independently of the
+    /// transient footer, so later progress messages cannot erase the diagnostic before
+    /// the user opens it.
+    #[must_use]
+    pub fn ai_failure_status(&self) -> Option<StatusMessage> {
+        let codescope_core::AiStatus::Failed { reason } = &self.ai else {
+            return None;
+        };
+        Some(StatusMessage {
+            text: "AI failed; showing known relationships".to_string(),
+            detail: Some(reason.clone()),
+            level: StatusLevel::Warning,
+        })
     }
 }
 
@@ -416,6 +482,27 @@ mod tests {
         assert_eq!(snap.status.level, StatusLevel::Info);
         assert_eq!(snap.message, snap.status.text);
         assert!(snap.refreshing);
+    }
+
+    #[test]
+    fn ai_failure_status_retains_the_complete_reason_independently_of_the_footer() {
+        let reason = "provider HTTP 422\nsecond line that the footer cannot show";
+        let snap = UiSnapshot {
+            ai: codescope_core::AiStatus::Failed {
+                reason: reason.to_string(),
+            },
+            status: StatusMessage {
+                text: "automatic retry queued".to_string(),
+                detail: None,
+                level: StatusLevel::Info,
+            },
+            ..UiSnapshot::default()
+        };
+
+        let failure = snap.ai_failure_status().expect("retained AI failure");
+        assert_eq!(failure.text, "AI failed; showing known relationships");
+        assert_eq!(failure.detail.as_deref(), Some(reason));
+        assert_eq!(failure.level, StatusLevel::Warning);
     }
 
     /// Defaults must draw: an empty frame is what a user sees before the first analysis

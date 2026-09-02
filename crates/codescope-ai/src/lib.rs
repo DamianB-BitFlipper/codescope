@@ -6,15 +6,15 @@
 //! - [`AiConfig`]: env-first opt-in configuration; disabled by default without a key;
 //!   literal keys in config files are rejected ([`AiError::LiteralApiKeyInConfig`]).
 //! - [`AiClient`]: OpenAI-compatible `POST {base}/chat/completions` with a configurable
-//!   (required by default) `submit_visualization_plan` tool call, local rate limiting and a
-//!   3-strikes/60 s circuit breaker.
+//!   required-by-default tool calls, an in-flight concurrency guard, a high rate ceiling, and
+//!   a 3-strikes/60 s circuit breaker.
 //! - [`parse_plan`]: tool-call arguments → [`codescope_core::VisualizationPlan`].
 //! - [`validate`]: the deterministic fact-validation boundary (epoch gate, entity
 //!   resolution, edge existence, hunks by reference, caps) over a [`FactView`].
-//! - [`AiService`]: the request→tools→plan→validation loop returning an [`AiOutcome`];
+//! - [`AiService`]: the request→research/edit tools→draft→validation loop returning an [`AiOutcome`];
 //!   never blocks the UI (callers spawn it).
-//! - [`tools`]: the read-only tool definitions and the [`ToolExecutor`] boundary the
-//!   binary implements against the fact store.
+//! - [`tools`]: read-only research and shared incremental diagram tool definitions plus the
+//!   [`ToolExecutor`] boundary the binary implements against the fact store.
 //!
 //! Everything degrades deterministically: any failure maps to an [`AiOutcome`] the TUI
 //! can render as a status-line reason, never a blocking error.
@@ -44,9 +44,10 @@ pub use config::{
 pub use error::AiError;
 pub use plan::{parse_plan, plan_tool, PlanParams};
 pub use scrub::{scrub_secrets, REDACTED};
-pub use service::{redact_repo_root, AiOutcome, AiService, RetryPolicy};
+pub use service::{redact_repo_root, AiOutcome, AiService, DiagramObserver, RetryPolicy};
 pub use tools::{
-    is_read_only_tool, read_only_tools, NoToolExecutor, ToolDef, ToolExecError, ToolExecutor,
-    MAX_TOOL_CALLS, PLAN_TOOL_NAME,
+    diagram_tools, is_diagram_tool, is_read_only_tool, read_only_tools, research_tools,
+    NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
+    DIAGRAM_FINISH_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, MAX_TOOL_CALLS, PLAN_TOOL_NAME,
 };
 pub use validator::{validate, FactView, Lookup, IMPACT_SUMMARY_MAX_BULLETS};

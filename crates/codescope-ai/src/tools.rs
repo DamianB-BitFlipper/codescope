@@ -1,21 +1,30 @@
-//! Read-only tool surface the AI may call while composing a plan (research 05 §4).
+//! Research and incremental diagram tools the AI may call while composing a plan.
 //!
-//! Nine tool **definitions** (name / description / JSON-Schema parameters) plus the
-//! [`ToolExecutor`] boundary the binary implements against the fact store. Every tool is
-//! read-only, repo-root-sandboxed, and result-capped by its implementation; tool results
-//! embed the exact `entity` JSON the model must echo back into plan nodes so everything it
-//! cites is resolvable by the validator.
+//! Tool **definitions** (name / description / JSON-Schema parameters) plus the
+//! [`ToolExecutor`] boundary the binary implements against the fact store. The semantic
+//! Fact tools expose language-server facts; research tools provide a deliberately small,
+//! bash-like view of the selected diff. Those tools are read-only, repo-root-sandboxed, and
+//! result-capped. Diagram tools mutate only a bounded in-memory [`codescope_core::DiagramDraft`].
 //!
 //! The per-plan budget is [`MAX_TOOL_CALLS`]; [`AiService`](crate::AiService) enforces it.
 
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
 
-/// Hard budget of read-only tool calls per plan (research 05 §4: total ≤ 8 calls).
-pub const MAX_TOOL_CALLS: u32 = 8;
+/// Hard budget of research and diagram-edit tool calls per plan. Incremental construction
+/// needs room to inspect, create, revise, and validate without turning one missed detail
+/// into a terminal failure.
+pub const MAX_TOOL_CALLS: u32 = 48;
 
 /// Name of the required plan-submission tool (research 05 §5).
 pub const PLAN_TOOL_NAME: &str = "submit_visualization_plan";
+
+/// Mutate the in-progress renderer-native diagram with one [`codescope_core::DiagramCommand`].
+pub const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
+/// Read the complete in-progress diagram draft.
+pub const DIAGRAM_INSPECT_TOOL_NAME: &str = "inspect_visualization";
+/// Validate and publish the in-progress diagram draft.
+pub const DIAGRAM_FINISH_TOOL_NAME: &str = "finish_visualization";
 
 /// One tool definition in OpenAI tool-calling format.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -164,10 +173,187 @@ pub fn read_only_tools() -> Vec<ToolDef> {
     ]
 }
 
+/// Bash-like research tools used by the interactive diff summarizer.
+///
+/// Paths are relative to the executor's virtual working directory. Implementations decide
+/// the exact selection boundary and return canonical repo-relative paths in their results.
+#[must_use]
+pub fn research_tools() -> Vec<ToolDef> {
+    let path_prop = json!({
+        "type": "string",
+        "description": "Path relative to the virtual current working directory. Absolute paths and parent traversal are forbidden."
+    });
+    vec![
+        ToolDef {
+            name: "list_directory",
+            description: "List changed files and child directories at a path inside the current selection (like a bounded `ls`). Use `.` for the virtual cwd.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": path_prop},
+                "required": [],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "read_file",
+            description: "Read a numbered section of a changed file from the current worktree (like `sed -n`). Returns at most 200 lines and may be unavailable for deleted files.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": path_prop,
+                    "start_line": {"type": "integer", "minimum": 1, "default": 1,
+                                   "description": "One-based first line."},
+                    "end_line": {"type": "integer", "minimum": 1,
+                                 "description": "One-based inclusive final line; capped to 200 returned lines."}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "search_changed_files",
+            description: "Literal text search across readable changed files under a path (like a bounded `rg`). Returns at most 50 numbered matches.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1,
+                              "description": "Literal, case-sensitive search text."},
+                    "path": path_prop,
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "git_status_file",
+            description: "Show the captured Git status for one changed file: comparison scope, status, rename source, binary flag, line counts, and every hunk header.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": path_prop},
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "git_diff_file",
+            description: "Read the captured unified diff for one changed file. Omit hunk_index for a bounded overview or supply a zero-based hunk index for exact annotated lines used by plan code_refs.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": path_prop,
+                    "hunk_index": {"type": "integer", "minimum": 0,
+                                   "description": "Optional zero-based hunk index from git_status_file."}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+/// Incremental diagram tools. `edit_visualization` accepts the same tagged command JSON as
+/// the live `codescope agent diagram apply` controller endpoint.
+#[must_use]
+pub fn diagram_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: DIAGRAM_EDIT_TOOL_NAME,
+            description: "Apply one atomic renderer-native diagram command. Build the answer incrementally: set intent, create a form, create/update/delete boxes and edges, then add exact evidence. The `op` and remaining arguments are exactly the same JSON accepted by `codescope agent diagram apply`. Use inspect_visualization whenever you need the current ids/state.".into(),
+            parameters: json!({
+                "type": "object",
+                "description": "One DiagramCommand. Required fields depend on op. Nodes are complete PlanNode objects; edges are complete PlanEdge objects. Update patches contain only replacement fields plus clear_* booleans.",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": ["reset", "set_intent", "create_form", "delete_form",
+                                 "create_node", "update_node", "delete_node", "create_edge",
+                                 "update_edge", "delete_edge", "add_evidence", "delete_evidence"],
+                        "description": "Atomic edit operation. finish is a separate tool."
+                    },
+                    "intent": {"type": "string", "description": "set_intent: the one concrete sentence displayed above the diagram."},
+                    "form_id": {"type": "string", "description": "Stable editor id such as main; not displayed."},
+                    "kind": {"type": "string", "enum": ["changed_symbol_tree", "call_tree", "type_impl_tree", "relationship_flow", "before_after", "sequence"]},
+                    "node_id": {"type": "string", "description": "Existing plan-local node id for update/delete."},
+                    "node": {
+                        "type": "object",
+                        "description": "create_node: complete box. Required: id, label, detail, code_refs. Optional: entity, expanded_detail, change, severity, children, hint. code_refs contain file, zero-based hunk, old|new side, and one-based start_line/end_line.",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "entity": {"type": "object"},
+                            "label": {"type": "string"},
+                            "detail": {"type": "string"},
+                            "expanded_detail": {"type": "string"},
+                            "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": {"type": "object"}},
+                            "change": {"type": "string", "enum": ["added", "modified", "removed", "unchanged", "diagnostic"]},
+                            "severity": {"type": "string"},
+                            "children": {"type": "array", "items": {"type": "string"}},
+                            "hint": {"type": "object"}
+                        },
+                        "required": ["id", "label", "detail", "code_refs"],
+                        "additionalProperties": false
+                    },
+                    "patch": {"type": "object", "description": "update_node or update_edge replacement fields. Node patches support label, detail, expanded_detail, entity, code_refs, change, severity, children, hint and clear_detail/clear_expanded_detail/clear_entity/clear_severity. Edge patches support from, to, kind, label, clear_label."},
+                    "edge": {
+                        "type": "object",
+                        "description": "create_edge: directed relationship with from, to, kind, and a specific label.",
+                        "properties": {
+                            "from": {"type": "string"},
+                            "to": {"type": "string"},
+                            "kind": {"type": "string", "enum": ["calls", "imports", "implements", "contains", "reads", "writes"]},
+                            "label": {"type": "string"}
+                        },
+                        "required": ["from", "to", "kind", "label"],
+                        "additionalProperties": false
+                    },
+                    "from": {"type": "string", "description": "Existing edge source for update/delete."},
+                    "to": {"type": "string", "description": "Existing edge target for update/delete."},
+                    "evidence": {"type": "object", "description": "add_evidence: exact citation with file, optional zero-based hunk/symbol/range, and reason."},
+                    "index": {"type": "integer", "minimum": 0, "description": "delete_evidence: current zero-based index."}
+                },
+                "required": ["op"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: DIAGRAM_INSPECT_TOOL_NAME,
+            description: "Return the entire current diagram draft, including stable form ids, boxes, relationships, intent, and evidence. Use before targeted edits when ids or current text are uncertain.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: DIAGRAM_FINISH_TOOL_NAME,
+            description: "Validate and publish the current draft. Call only after research, intent, at least one connected renderer-native form, exact code_refs on every box, and exact evidence are complete. A rejected finish returns validator feedback so the same draft can be edited and retried.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
 /// `true` when `name` is one of the read-only tools (not the plan-submission tool).
 #[must_use]
 pub fn is_read_only_tool(name: &str) -> bool {
-    read_only_tools().iter().any(|t| t.name == name)
+    read_only_tools()
+        .into_iter()
+        .chain(research_tools())
+        .any(|tool| tool.name == name)
+}
+
+/// `true` when `name` is part of the shared incremental diagram API.
+#[must_use]
+pub fn is_diagram_tool(name: &str) -> bool {
+    matches!(
+        name,
+        DIAGRAM_EDIT_TOOL_NAME | DIAGRAM_INSPECT_TOOL_NAME | DIAGRAM_FINISH_TOOL_NAME
+    )
 }
 
 /// A tool execution failure, reported back to the model as an error tool result (it never
@@ -208,6 +394,13 @@ pub trait ToolExecutor: Send + Sync {
     /// request/failed-tool/request loop.
     fn available_tools(&self) -> Vec<ToolDef> {
         read_only_tools()
+    }
+
+    /// Whether this executor represents a research workflow that must inspect at least one
+    /// fact before a plan can be submitted. This is `false` for legacy fact stores and tests;
+    /// the scoped diff executor enables it so the small initial brief cannot be guessed from.
+    fn requires_research(&self) -> bool {
+        false
     }
 
     /// Execute one read-only tool call. `arguments` is the parsed JSON arguments object.
@@ -266,8 +459,27 @@ mod tests {
     }
 
     #[test]
+    fn five_scoped_research_tools_with_expected_names() {
+        let names: Vec<&str> = research_tools().iter().map(|tool| tool.name).collect();
+        assert_eq!(
+            names,
+            [
+                "list_directory",
+                "read_file",
+                "search_changed_files",
+                "git_status_file",
+                "git_diff_file",
+            ]
+        );
+    }
+
+    #[test]
     fn every_definition_is_an_object_schema() {
-        for tool in read_only_tools() {
+        for tool in read_only_tools()
+            .into_iter()
+            .chain(research_tools())
+            .chain(diagram_tools())
+        {
             assert_eq!(
                 tool.parameters["type"], "object",
                 "{} parameters must be an object schema",
@@ -299,8 +511,13 @@ mod tests {
     #[test]
     fn read_only_membership() {
         assert!(is_read_only_tool("get_hunk"));
+        assert!(is_read_only_tool("read_file"));
+        assert!(is_read_only_tool("git_status_file"));
         assert!(!is_read_only_tool(PLAN_TOOL_NAME));
         assert!(!is_read_only_tool("rm_rf"));
+        assert!(is_diagram_tool(DIAGRAM_EDIT_TOOL_NAME));
+        assert!(is_diagram_tool(DIAGRAM_INSPECT_TOOL_NAME));
+        assert!(is_diagram_tool(DIAGRAM_FINISH_TOOL_NAME));
     }
 
     #[test]
@@ -323,7 +540,7 @@ mod tests {
             by_name("get_callees").parameters["properties"]["depth"]["maximum"],
             2
         );
-        assert_eq!(MAX_TOOL_CALLS, 8);
+        assert_eq!(MAX_TOOL_CALLS, 48);
     }
 
     #[tokio::test]

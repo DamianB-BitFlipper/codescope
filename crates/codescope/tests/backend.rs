@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use codescope_core::{
-    Epoch, FormKind, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode, PlanNodeChange,
-    VisualizationPlan, VizForm,
+    DiagramCommand, Epoch, FormKind, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode,
+    PlanNodeChange, VisualizationPlan, VizForm,
 };
 use codescope_testutil::fake_ai::{AiScriptStep, ScriptedProvider};
 use codescope_testutil::scenarios;
@@ -85,6 +85,53 @@ fn assert_repo_relative(stdout: &str, root: &Path) {
         "canonical repo root {} leaked into output:\n{stdout}",
         canonical.display()
     );
+}
+
+/// Script the production incremental protocol: research once, build the renderer-native
+/// draft through the shared command API, then ask the validator to publish it.
+fn incremental_plan_script(plan: &VisualizationPlan) -> Vec<AiScriptStep> {
+    let mut script = vec![AiScriptStep::tool_call(
+        "git_diff_file",
+        serde_json::json!({"path": "middleware.go", "hunk_index": 0}),
+    )];
+    let mut edit = |command: DiagramCommand| {
+        script.push(AiScriptStep::tool_call(
+            "edit_visualization",
+            serde_json::to_value(command).unwrap(),
+        ));
+    };
+    edit(DiagramCommand::SetIntent {
+        intent: plan.intent.clone(),
+    });
+    for (index, form) in plan.forms.iter().enumerate() {
+        let form_id = format!("form-{}", index + 1);
+        edit(DiagramCommand::CreateForm {
+            form_id: form_id.clone(),
+            kind: form.kind,
+        });
+        for node in &form.nodes {
+            edit(DiagramCommand::CreateNode {
+                form_id: form_id.clone(),
+                node: node.clone(),
+            });
+        }
+        for edge in &form.edges {
+            edit(DiagramCommand::CreateEdge {
+                form_id: form_id.clone(),
+                edge: edge.clone(),
+            });
+        }
+    }
+    for evidence in &plan.evidence {
+        edit(DiagramCommand::AddEvidence {
+            evidence: evidence.clone(),
+        });
+    }
+    script.push(AiScriptStep::tool_call(
+        "finish_visualization",
+        serde_json::json!({}),
+    ));
+    script
 }
 
 // ---------------------------------------------------------------------------
@@ -527,9 +574,9 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         range: None,
         reason: "the middleware hunk that records request metadata".to_string(),
     });
-    let provider = ScriptedProvider::start([AiScriptStep::from_plan(&plan).unwrap()])
-        .await
-        .unwrap();
+    let expected_requests = incremental_plan_script(&plan);
+    let request_count = expected_requests.len();
+    let provider = ScriptedProvider::start(expected_requests).await.unwrap();
     let (_fixture, root) = go_fixture();
     let config_dir = TempDir::new().unwrap();
     let config_path = config_dir.path().join("missing-config.toml");
@@ -594,7 +641,11 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         "a clean plan serializes no dropped items: {json}"
     );
     let requests = provider.requests();
-    assert_eq!(requests.len(), 1, "one backend AI request");
+    assert_eq!(
+        requests.len(),
+        request_count,
+        "one research turn, incremental draft edits, and one finish turn"
+    );
     let body = requests[0].body_json().expect("debug-ai request JSON");
     assert_eq!(body["reasoning_effort"], "high");
     assert!(body.get("reasoning").is_none());
@@ -606,12 +657,34 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         .collect();
     assert_eq!(
         tool_names,
-        ["submit_visualization_plan"],
-        "the production NoToolExecutor must not advertise unusable read tools"
+        [
+            "list_directory",
+            "read_file",
+            "search_changed_files",
+            "git_status_file",
+            "git_diff_file",
+            "edit_visualization",
+            "inspect_visualization",
+            "finish_visualization",
+        ],
+        "the production executor advertises its scoped mini-shell and shared diagram tools"
     );
     assert!(
-        requests[0].body.contains("current impact selection"),
-        "headless path uses the dispatcher's focused prompt"
+        requests[0].body.contains("current research brief"),
+        "headless path starts with the compact research assignment"
+    );
+    assert!(!requests[0].body.contains("focused source evidence"));
+    let second_body = requests[1].body_json().expect("plan-turn request JSON");
+    assert!(
+        second_body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("[old:"))),
+        "the plan turn receives exact annotated diff evidence"
     );
 }
 
@@ -685,9 +758,9 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
         range: None,
         reason: "the middleware hunk that wraps the handler".to_string(),
     });
-    let provider = ScriptedProvider::start([AiScriptStep::from_plan(&plan).unwrap()])
-        .await
-        .unwrap();
+    let expected_requests = incremental_plan_script(&plan);
+    let request_count = expected_requests.len();
+    let provider = ScriptedProvider::start(expected_requests).await.unwrap();
     let (_fixture, root) = go_fixture();
     let config_dir = TempDir::new().unwrap();
     let config_path = config_dir.path().join("missing-config.toml");
@@ -751,8 +824,8 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
         .as_array()
         .expect("form edges");
     assert_eq!(edges.len(), 2, "the back-edge no longer renders: {json}");
-    // One backend request: the sanitized plan needed no repair turn.
-    assert_eq!(provider.requests().len(), 1);
+    // One research request, bounded draft edits, then finish; sanitization needs no repair.
+    assert_eq!(provider.requests().len(), request_count);
 }
 
 // ---------------------------------------------------------------------------

@@ -216,7 +216,7 @@ pub struct AiConfig {
     pub timeout: Duration,
     /// Provider tool-selection policy. Defaults to [`ToolChoice::Required`].
     pub tool_choice: ToolChoice,
-    /// Read-only tool-call budget per plan (≤ [`MAX_TOOL_CALLS`]).
+    /// Research plus incremental diagram-operation budget per plan (≤ [`MAX_TOOL_CALLS`]).
     pub max_tool_calls: u32,
     /// Prime Inference team id, sent as `X-Prime-Team-ID` so requests bill the team balance
     /// instead of the key's personal balance (read from `PRIME_TEAM_ID`; only sent on the

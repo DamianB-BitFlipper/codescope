@@ -53,8 +53,9 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    then every changed file enters a priority queue independent of expansion. One focused
    analysis may run beside one background warm-up; selection changes reprioritize queued
    work immediately. Each row carries a `FileSemanticLoad` state (Unloaded/Loading/Ready/
-   Unsupported/Failed), and `Tab` controls visibility only. Symbol relation queries and
-   automatic AI generation are gated on the selected file's Ready state. The
+   Unsupported/Failed), and `Tab` controls directory/file visibility only. Symbol relation
+   queries and file/symbol AI generation are gated on the selected file's Ready state;
+   directory AI generation uses the already-available changed-file/hunk facts. The
    language-server child is limited to two workers, and content-addressed symbol trees are
    reused across epochs. The non-interactive backend (`analyze`/`digest`) stays eager via
    `refresh_with_ctx`.
@@ -70,23 +71,42 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    identities and bounds. Wheel events update the hovered region without changing focus or
    selection. Any-motion events update only when the semantic node target changes; hover is local
    UI state and never starts backend work.
-6. **AI**: OpenAI-compatible chat completions via reqwest 0.13; plan returned through a single
-   required `submit_visualization_plan` tool call; six structural forms (legacy
+
+   **Live control protocol**: on Unix, the interactive binary also owns one repository-specific,
+   owner-only Unix socket. `codescope agent` projects the latest `UiSnapshot` into a bounded JSON
+   context and translates `focus`/`ask`/`feedback`/`diagram`/`refresh` requests into typed TUI
+   `Action`s.
+   Focus first updates the visible tree cursor and then passes through the normal selection
+   tracker, preventing the retained cursor from undoing remote control. The protocol exposes no
+   shell or raw plan injection. Questions and feedback are selection-scoped, untrusted prompt
+   guidance. Diagram edits are typed `DiagramCommand`s shared with the internal model tools;
+   both writers mutate the same draft and cross the existing evidence validator before final
+   publication.
+6. **AI**: OpenAI-compatible chat completions via reqwest 0.13. A bounded loop researches and
+   incrementally builds the renderer-native `DiagramDraft` through create/update/delete tools;
+   `finish_visualization` validates and publishes it. Six structural forms (legacy
    `impact_summary`/`focused_diff` are rejected at the AI plan boundary); reviewer-first
-   contract (required title/intent/review_focus, 1–4 evidence, default 4 / hard max 5 nodes
-   and ≤8 edges per form, nonempty 1–2 forms — core keeps larger node backstops). Plan schema v4
+   contract (required intent/forms/evidence, 1–4 evidence, default 4 / hard max 5 nodes
+   and ≤8 edges per form, nonempty 1–2 forms — core keeps larger node backstops). Plan schema v5
    requires every AI node to carry 1–2 exact old/new diff ranges and permits one optional expanded
-   explanation. External-review plans must fence their title and intent with explicit implemented-only
-   prefixes. The fact-validation boundary checks epoch, entity resolution, typed-edge existence,
+   explanation. The fact-validation boundary checks epoch, entity resolution, typed-edge existence,
    hunks, and every referenced source line, with up to 3 bounded repair turns; accepted validation reports travel with
    plans (debug-ai prints the full report; the TUI shows one sanitized-plan warning);
-   deterministic fallback always. One request coordinator continuously reprioritizes focused
-   selection, visible sibling symbols, then other file summaries. It admits 4 normal requests,
-   permits interactive bursts to 12, and enforces an absolute ceiling of 64. At the burst
-   boundary, focused work aborts the oldest lower-priority overflow request and returns that
-   still-valid work to the queue tail. Completed plans cache by selection; provider admission
-   also waits on a local token bucket, and repeated failures pause background prefetch while
-   focused work remains eligible. The headless policy is focused-only.
+   deterministic fallback always. The files pane projects changed paths as a directory → file →
+   symbol tree and publishes per-row AI readiness. Only the debounced current directory, file,
+   or symbol starts inference; directory facts are filtered to their subtree, and there
+   is no AI prefetch or background prompt queue. Navigation cancels an unsent debounce but leaves
+   started requests running so their results can cache under the original selection. One FIFO
+   coordinator bounds the active window to 16 requests: request 17 aborts the oldest active
+   generation, with no requeue. Completed plans cache by selection. Provider admission primarily
+   limits actual HTTP execution to 8 concurrent requests; a 600 rpm/burst-100 token bucket is a
+   high secondary ceiling. Initial context is a compact research brief; a 48-operation loop
+   exposes selection-scoped list/read/search and captured per-file Git status/diff tools alongside
+   the shared diagram editor. The headless backend uses the same policy.
+   A live-agent question replaces the current selection's presentation guidance; feedback also
+   supplies that selection's previous validated plan as the revision seed. Replacing guidance
+   may cancel only an older request for that same target. Navigation itself retains the 16-entry
+   active-request behavior above.
    AI off unless configured. (research 05)
 7. **Privacy**: 4-layer exclusion (git ignore rules < .codescopeignore < compiled denylist <
    content sniffing), applied to diff paths too; keys via env name only into secrecy::SecretString.

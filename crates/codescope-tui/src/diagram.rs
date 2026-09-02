@@ -89,7 +89,7 @@ struct DiagramContext<'a> {
     form: usize,
     selected_label: &'a str,
     hovered: Option<&'a PlanNodeTarget>,
-    expanded: Option<&'a PlanNodeTarget>,
+    expanded: &'a [PlanNodeTarget],
 }
 
 impl DiagramContext<'_> {
@@ -112,7 +112,7 @@ impl DiagramContext<'_> {
     }
 
     fn expanded(&self, node: &PlanNode) -> bool {
-        self.expanded == Some(&self.target(node))
+        self.expanded.contains(&self.target(node))
     }
 }
 
@@ -126,7 +126,7 @@ const EVIDENCE_REASON_MIN_WIDTH: usize = 60;
 /// Lay out a validated plan for the current pane width without transient interaction.
 #[must_use]
 pub fn plan_lines(plan: &VisualizationPlan, width: u16, selected_label: &str) -> Vec<DiagramLine> {
-    interactive_plan_lines(plan, width, selected_label, None, None)
+    interactive_plan_lines(plan, width, selected_label, None, &[])
 }
 
 /// Lay out a validated plan plus transient hover/expansion state.
@@ -139,12 +139,11 @@ pub fn interactive_plan_lines(
     width: u16,
     selected_label: &str,
     hovered: Option<&PlanNodeTarget>,
-    expanded: Option<&PlanNodeTarget>,
+    expanded: &[PlanNodeTarget],
 ) -> Vec<DiagramLine> {
     let width = usize::from(width).max(1);
     let mut lines = Vec::new();
-    // The intent is the sole prose description above the visual. The model title is
-    // retained in the plan/debug output, but rendering both repeats the same change.
+    // The intent is the sole prose description above the visual.
     lines.extend(wrap_role(&plan.intent, width, DiagramRole::Text, 2));
     for (index, form) in plan.forms.iter().enumerate() {
         if index > 0 {
@@ -166,7 +165,7 @@ pub fn interactive_plan_lines(
             FormKind::ChangedSymbolTree | FormKind::CallTree | FormKind::TypeImplTree => {
                 render_tree(form, width, context, &mut lines);
             }
-            // These legacy variants cannot pass v4 validation. Keeping a safe rendering
+            // These legacy variants cannot pass v5 validation. Keeping a safe rendering
             // path makes stale fixtures and hand-built snapshots non-panicking.
             FormKind::ImpactSummary | FormKind::FocusedDiff => {
                 render_vertical_nodes(form, width, context, &mut lines);
@@ -933,7 +932,7 @@ fn node_selected(node: &PlanNode, selected_label: &str) -> bool {
                     == Some(selected_label)))
 }
 
-fn edge_label(edge: &PlanEdge) -> &str {
+pub(crate) fn edge_label(edge: &PlanEdge) -> &str {
     edge.label.as_deref().unwrap_or("affects")
 }
 
@@ -949,7 +948,7 @@ fn horizontal_gap(edges: &[&PlanEdge]) -> usize {
 /// The compact preview is always `detail`; expansion swaps in the complete explanation
 /// when the model supplied one. Keeping this choice in one helper gives boxes, ladders,
 /// adjacency flows, and trees the same interaction semantics.
-fn displayed_node_detail(node: &PlanNode, expanded: bool) -> &str {
+pub(crate) fn displayed_node_detail(node: &PlanNode, expanded: bool) -> &str {
     if expanded {
         node.expanded_detail
             .as_deref()
@@ -1085,7 +1084,12 @@ fn plan_node_box(node: &PlanNode, width: usize, context: DiagramContext<'_>) -> 
 /// Collapsed nodes reserve two rows for the model's short `detail` preview. Expanded
 /// nodes replace that preview with the complete `expanded_detail` and grow vertically;
 /// nothing is ellipsized in that state, including identifiers longer than one row.
-fn node_box_text(label: &str, detail: &str, width: usize, expanded: bool) -> Vec<String> {
+pub(crate) fn node_box_text(
+    label: &str,
+    detail: &str,
+    width: usize,
+    expanded: bool,
+) -> Vec<String> {
     let width = width.max(4);
     let inner = width.saturating_sub(2);
     let label_lines = if expanded {
@@ -2437,8 +2441,9 @@ mod tests {
             form: 0,
             id: "before".to_string(),
         };
-        let collapsed = interactive_plan_lines(&plan, 100, "", None, None);
-        let lines = interactive_plan_lines(&plan, 100, "", Some(&target), Some(&target));
+        let collapsed = interactive_plan_lines(&plan, 100, "", None, &[]);
+        let expanded = [target.clone()];
+        let lines = interactive_plan_lines(&plan, 100, "", Some(&target), &expanded);
         assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
             span.target.as_ref() == Some(&target) && span.role == DiagramRole::Hovered
         }));

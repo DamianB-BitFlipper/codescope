@@ -1,14 +1,15 @@
 //! Provider-neutral OpenAI-compatible chat-completions client (research 05 §5, 07 §4).
 //!
 //! One endpoint: `POST {base_url}/chat/completions` with the configured tool choice
-//! (`required` by default) and the `submit_visualization_plan` tool always attached.
-//! Streaming is off (`"stream": false`): a plan is atomic — it must be complete
-//! and validated before render.
+//! (`required` by default). Legacy callers receive `submit_visualization_plan`; incremental
+//! callers provide `finish_visualization` and draft-editor tools instead. Streaming is off
+//! (`"stream": false`); draft mutations are ordinary tool turns and final publication is atomic.
 //!
 //! Local protections (all before/around the network call):
 //!
-//! - **token bucket** (`governor`, default 10 requests/minute) → [`AiError::Throttled`]
-//!   without any I/O;
+//! - **in-flight semaphore** (default 8 concurrent requests) bounds actual provider work;
+//! - **token bucket** (`governor`, default 600 requests/minute) remains a high safety
+//!   ceiling rather than the primary scheduler;
 //! - **circuit breaker**: 3 transport failures (connect/timeout/5xx) within 60 s opens the
 //!   circuit for 60 s → [`AiError::CircuitOpen`] without any I/O; one probe is allowed
 //!   after cooldown;
@@ -24,7 +25,7 @@
 use crate::config::{AiConfig, ProviderKind, ReasoningEffort, ToolChoice};
 use crate::error::AiError;
 use crate::plan::plan_tool;
-use crate::tools::{ToolDef, PLAN_TOOL_NAME};
+use crate::tools::{ToolDef, DIAGRAM_FINISH_TOOL_NAME, PLAN_TOOL_NAME};
 use governor::clock::{Clock, QuantaClock};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -166,11 +167,14 @@ impl RawPlanResponse {
 /// Client knobs beyond [`AiConfig`], with production defaults; tests tighten/loosen them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiClientOptions {
-    /// Token-bucket rate: requests per minute (research 07 §4: 10 rpm).
+    /// High token-bucket safety ceiling. Normal pacing is controlled by
+    /// [`Self::max_in_flight_requests`].
     pub requests_per_minute: u32,
-    /// Token-bucket burst. Defaults to `requests_per_minute` so one full tool loop
-    /// (≤ 8 tool turns + submission) fits a single burst.
+    /// Token-bucket burst. Large enough for several complete agentic tool loops.
     pub burst: u32,
+    /// Maximum provider HTTP requests executing concurrently. Requests beyond this limit
+    /// wait asynchronously instead of failing or consuming a rate-limit token.
+    pub max_in_flight_requests: usize,
     /// Circuit breaker: this many transport failures within [`Self::failure_window`] open
     /// the circuit.
     pub failure_threshold: u32,
@@ -185,8 +189,9 @@ pub struct AiClientOptions {
 impl Default for AiClientOptions {
     fn default() -> Self {
         AiClientOptions {
-            requests_per_minute: 10,
-            burst: 10,
+            requests_per_minute: 600,
+            burst: 100,
+            max_in_flight_requests: 8,
             failure_threshold: 3,
             failure_window: Duration::from_secs(60),
             cooldown: Duration::from_secs(60),
@@ -216,6 +221,7 @@ pub struct AiClient {
     provider: ProviderKind,
     tool_choice: ToolChoice,
     limiter: DirectLimiter,
+    in_flight: tokio::sync::Semaphore,
     clock: QuantaClock,
     breaker: Mutex<BreakerState>,
     input_tokens: AtomicU64,
@@ -255,6 +261,9 @@ impl AiClient {
             .ok_or_else(|| AiError::Config("requests_per_minute must be > 0".into()))?;
         let burst = NonZeroU32::new(options.burst)
             .ok_or_else(|| AiError::Config("burst must be > 0".into()))?;
+        if options.max_in_flight_requests == 0 {
+            return Err(AiError::Config("max_in_flight_requests must be > 0".into()));
+        }
         let http = reqwest::Client::builder()
             .connect_timeout(options.connect_timeout)
             .build()
@@ -289,6 +298,7 @@ impl AiClient {
             provider,
             tool_choice: config.tool_choice,
             limiter,
+            in_flight: tokio::sync::Semaphore::new(options.max_in_flight_requests),
             clock,
             breaker: Mutex::new(BreakerState::default()),
             input_tokens: AtomicU64::new(0),
@@ -488,8 +498,9 @@ impl AiClient {
             .is_some_and(|until| Instant::now() < until)
     }
 
-    /// One chat turn: send `messages` with `tools` + the always-attached
-    /// `submit_visualization_plan` tool, configured tool choice, streaming off.
+    /// One chat turn with configured tool choice and streaming off. Legacy callers get an
+    /// automatically attached `submit_visualization_plan`; incremental callers advertise
+    /// `finish_visualization`, which suppresses that legacy tool.
     ///
     /// Returns the parsed completion; the caller decides whether it is a plan submission
     /// or a batch of read-only tool calls. Fails with [`AiError::NoToolCall`] when the
@@ -501,7 +512,13 @@ impl AiClient {
         tools: &[ToolDef],
     ) -> Result<RawPlanResponse, AiError> {
         self.check_breaker()?;
+        let _in_flight = self
+            .in_flight
+            .acquire()
+            .await
+            .expect("the private AI request semaphore is never closed");
         self.check_limiter()?;
+        self.check_breaker()?;
         let response = self.chat_with_plan_admitted(messages, tools).await?;
         if response.tool_calls.is_empty() {
             Err(AiError::NoToolCall)
@@ -520,6 +537,11 @@ impl AiClient {
         tools: &[ToolDef],
     ) -> Result<RawPlanResponse, AiError> {
         self.check_breaker()?;
+        let _in_flight = self
+            .in_flight
+            .acquire()
+            .await
+            .expect("the private AI request semaphore is never closed");
         self.limiter.until_ready().await;
         // The circuit may have opened while this turn waited behind another request.
         self.check_breaker()?;
@@ -532,7 +554,10 @@ impl AiClient {
         tools: &[ToolDef],
     ) -> Result<RawPlanResponse, AiError> {
         let mut tool_values: Vec<Value> = tools.iter().map(ToolDef::to_openai).collect();
-        if !tools.iter().any(|t| t.name == PLAN_TOOL_NAME) {
+        if !tools
+            .iter()
+            .any(|t| matches!(t.name, PLAN_TOOL_NAME | DIAGRAM_FINISH_TOOL_NAME))
+        {
             tool_values.push(plan_tool().to_openai());
         }
         let body = self.build_body(messages, &tool_values);
@@ -1184,6 +1209,32 @@ mod tests {
         assert!(client.check_limiter().is_ok());
         let err = client.check_limiter().unwrap_err();
         assert!(matches!(err, AiError::Throttled { .. }));
+    }
+
+    #[test]
+    fn defaults_use_concurrency_as_the_primary_guard_and_a_high_rate_ceiling() {
+        let options = AiClientOptions::default();
+        assert_eq!(options.max_in_flight_requests, 8);
+        assert_eq!(options.requests_per_minute, 600);
+        assert!(options.requests_per_minute > 48);
+
+        let client = AiClient::with_options(&enabled_config(), options.clone()).unwrap();
+        let permits = (0..options.max_in_flight_requests)
+            .map(|_| client.in_flight.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        assert!(client.in_flight.try_acquire().is_err());
+        drop(permits);
+        assert!(client.in_flight.try_acquire().is_ok());
+    }
+
+    #[test]
+    fn zero_in_flight_limit_is_rejected() {
+        let options = AiClientOptions {
+            max_in_flight_requests: 0,
+            ..AiClientOptions::default()
+        };
+        let error = AiClient::with_options(&enabled_config(), options).unwrap_err();
+        assert!(error.to_string().contains("max_in_flight_requests"));
     }
 
     #[test]

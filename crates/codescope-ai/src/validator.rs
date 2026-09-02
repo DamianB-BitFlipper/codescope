@@ -78,9 +78,8 @@ pub trait FactView: Sync {
     /// Whether hunk `index` (zero-based, diff order) exists for `file`.
     fn hunk(&self, file: &FileId, index: u32) -> Lookup<()>;
 
-    /// Whether `file` is the diff currently being explained. Production plans keep every
-    /// node link in this file so hover never points at a hidden, different diff. Generic
-    /// validators without a selection context may accept all files.
+    /// Whether `file` belongs to the file/function or directory scope currently explained.
+    /// Generic validators without a selection context may accept all files.
     fn is_focus_file(&self, _file: &FileId) -> bool {
         true
     }
@@ -325,7 +324,7 @@ fn sanitize_evidence(
 fn code_ref_invalid_reason(code_ref: &PlanCodeRef, facts: &dyn FactView) -> Option<String> {
     if !facts.is_focus_file(&code_ref.file) {
         return Some(format!(
-            "code_ref {}#h{} is outside the focused diff",
+            "code_ref {}#h{} is outside the focused selection scope",
             code_ref.file, code_ref.hunk
         ));
     }
@@ -1760,7 +1759,7 @@ mod tests {
         assert!(report
             .dropped
             .iter()
-            .any(|item| item.reason.contains("outside the focused diff")));
+            .any(|item| item.reason.contains("outside the focused selection scope")));
 
         let mut wrong_side = make_plan(DiffSide::Old, 42, 42);
         let report = validate(&mut wrong_side, &facts, Epoch(1));
