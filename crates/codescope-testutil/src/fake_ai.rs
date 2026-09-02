@@ -129,15 +129,10 @@ impl AiScriptStep {
 /// (`@@ -15,6 +15,9 @@`: old side 15-20, new side 15-23).
 #[must_use]
 pub fn sample_plan(epoch: Epoch) -> VisualizationPlan {
-    let mut plan = VisualizationPlan::new(epoch, "What changed on feature/api-changes?");
-    plan.title = "Request handling gains logging and safer database errors".to_string();
+    let mut plan = VisualizationPlan::new(epoch);
     plan.intent =
         "LoggingMiddleware records request metadata before PostgresRepo.Get returns failures."
             .to_string();
-    plan.review_focus = Some(
-        "Confirm PostgresRepo.Get still returns typed errors after the middleware wraps it."
-            .to_string(),
-    );
     let mut middleware = PlanNode::new("n1", "LoggingMiddleware", PlanNodeChange::Added)
         .with_detail("records request metadata before calling the next handler")
         .with_expanded_detail(
@@ -179,8 +174,6 @@ pub fn sample_plan(epoch: Epoch) -> VisualizationPlan {
         ));
     plan.forms.push(VizForm {
         kind: FormKind::ChangedSymbolTree,
-        title: "Request path ownership".to_string(),
-        summary: String::new(),
         nodes: vec![middleware, postgres_get],
         edges: Vec::new(),
     });
@@ -200,10 +193,8 @@ pub fn sample_plan(epoch: Epoch) -> VisualizationPlan {
 /// boundary — not the parser — rejects it.
 #[must_use]
 pub fn hallucinated_sample_plan(epoch: Epoch) -> VisualizationPlan {
-    let mut plan = VisualizationPlan::new(epoch, "What changed on feature/api-changes?");
-    plan.title = "Imaginary impact".to_string();
+    let mut plan = VisualizationPlan::new(epoch);
     plan.intent = "An invented handler appears to own an imaginary request path.".to_string();
-    plan.review_focus = Some("Nothing to verify: the entities are invented.".to_string());
     let ghost = PlanNode::new("n1", "QuantumFluxHandler", PlanNodeChange::Modified)
         .with_detail("handles an imaginary quantum flux request")
         .with_entity(EntityRef::for_symbol(
@@ -220,8 +211,6 @@ pub fn hallucinated_sample_plan(epoch: Epoch) -> VisualizationPlan {
         ));
     plan.forms.push(VizForm {
         kind: FormKind::ChangedSymbolTree,
-        title: "Imaginary impact".to_string(),
-        summary: String::new(),
         nodes: vec![ghost],
         edges: Vec::new(),
     });

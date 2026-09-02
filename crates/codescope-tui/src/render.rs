@@ -1461,31 +1461,31 @@ pub(crate) fn generated_impact_content(
         let status: Option<(String, DiagramRole)> = match snap.ai {
             AiStatus::WaitingForSymbols { .. } => Some((
                 "Waiting for symbol analysis…".to_string(),
-                DiagramRole::Review,
+                DiagramRole::Warning,
             )),
             AiStatus::WaitingForRelations { .. } => Some((
                 "Waiting for symbol relationships…".to_string(),
-                DiagramRole::Review,
+                DiagramRole::Warning,
             )),
             AiStatus::Queued { position: 1, .. } => Some((
                 "Waiting for AI capacity · priority #1".to_string(),
-                DiagramRole::Review,
+                DiagramRole::Warning,
             )),
             AiStatus::Queued { position, .. } => Some((
                 format!("Waiting for AI capacity · priority #{position}"),
-                DiagramRole::Review,
+                DiagramRole::Warning,
             )),
             AiStatus::Loading { .. } => Some((
                 "Generating a deeper explanation…".to_string(),
-                DiagramRole::Review,
+                DiagramRole::Warning,
             )),
             AiStatus::Failed { .. } => Some((
                 "AI failed; showing known relationships".to_string(),
-                DiagramRole::Review,
+                DiagramRole::Warning,
             )),
             AiStatus::Stale { .. } => Some((
                 "Repository changed; showing known relationships".to_string(),
-                DiagramRole::Review,
+                DiagramRole::Warning,
             )),
             AiStatus::Disabled => Some((
                 "Known relationships · AI not configured".to_string(),
@@ -1511,7 +1511,7 @@ pub(crate) fn generated_impact_content(
                     &format!("⚠ sanitized AI plan · {removed} {items} removed"),
                     width.into(),
                 ),
-                DiagramRole::Review,
+                DiagramRole::Warning,
             ));
         }
     }
@@ -1534,7 +1534,7 @@ fn render_diagram_line(line: crate::diagram::DiagramLine) -> Line<'static> {
                         .bg(SELECTED_BG)
                         .add_modifier(Modifier::BOLD),
                     DiagramRole::Arrow | DiagramRole::Evidence => Style::new().fg(HUNK_FG),
-                    DiagramRole::Review => Style::new().fg(WARN),
+                    DiagramRole::Warning => Style::new().fg(WARN),
                 };
                 Span::styled(span.text, style)
             })
@@ -1830,12 +1830,13 @@ fn render_status_detail(frame: &mut Frame, area: Rect, status: &crate::snapshot:
         StatusLevel::Warning => WARN,
         StatusLevel::Info => ACCENT,
     };
-    let popup = status_detail_rect(area, &status.text);
+    let detail = status.detail.as_deref().unwrap_or(&status.text);
+    let popup = status_detail_rect(area, detail);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(border))
         .title(" status details · click or Esc to close ");
-    let paragraph = Paragraph::new(status.text.clone())
+    let paragraph = Paragraph::new(detail.to_string())
         .style(Style::new().fg(TEXT))
         .wrap(Wrap { trim: false })
         .block(block);
@@ -3028,16 +3029,10 @@ mod tests {
         snap.semantic = crate::snapshot::SemanticPane {
             report: Some(report),
             plan: (rows > 0).then(|| {
-                let mut plan = codescope_core::VisualizationPlan::new(
-                    codescope_core::Epoch(3),
-                    "How does authentication flow?",
-                );
-                plan.title = "Authentication request flow".into();
+                let mut plan = codescope_core::VisualizationPlan::new(codescope_core::Epoch(3));
                 plan.intent = "Each request moves through the changed authentication path.".into();
                 plan.forms.push(VizForm {
                     kind: FormKind::RelationshipFlow,
-                    title: "runtime".into(),
-                    summary: String::new(),
                     nodes: (0..rows)
                         .map(|i| {
                             PlanNode::new(
@@ -3079,7 +3074,7 @@ mod tests {
     }
 
     #[test]
-    fn ai_plan_renders_explained_annotations_and_title_after_loading_to_ready() {
+    fn ai_plan_renders_one_description_after_loading_to_ready() {
         let plan = ai_plan_snap(3);
         let app = app_after_ai_landed(&plan);
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
@@ -3090,20 +3085,15 @@ mod tests {
             "title-free border: {}",
             row_text(&t, 23)
         );
-        // The claim and the diagram grammar/context occupy separate readable lines.
+        // The fuller intent is the sole prose description; the redundant title is hidden.
         let header = row_text(&t, 24);
         assert!(
-            header.contains("Authentication request flow"),
-            "plan title: {header}"
+            header.contains("Each request moves through"),
+            "description: {header}"
         );
         assert!(
-            !header.contains("call tree"),
-            "title stays concise: {header}"
-        );
-        let context = row_text(&t, 25);
-        assert!(
-            context.contains("Each request moves through"),
-            "intent is explicit: {context}"
+            !buffer_text(&t).contains("Authentication request flow"),
+            "redundant title is hidden"
         );
         assert!(
             !header.contains("AI-selected"),
@@ -3113,10 +3103,10 @@ mod tests {
             (24..38)
                 .map(|y| row_text(&t, y))
                 .collect::<String>()
-                .matches("Authentication request flow")
+                .matches("Each request moves through")
                 .count(),
             1,
-            "the first form title renders once"
+            "the description renders once"
         );
         // Rows carry explanation and visual grammar, never a metadata badge inventory.
         let generated: String = (24..38).map(|y| row_text(&t, y)).collect();
@@ -3279,14 +3269,17 @@ mod tests {
                 && !text.contains("nonconsecutive or duplicate sequence edge"),
             "drop reasons stay out of the small pane: {text}"
         );
-        // The warning precedes the plan's own title, and uses WARN styling.
+        // The warning precedes the plan's sole description, and uses WARN styling.
         let warn_row = (24..38u16)
             .find(|y| row_text(&t, *y).contains("sanitized AI plan"))
             .expect("warning visible in the default viewport");
-        let title_row = (24..38u16)
-            .find(|y| row_text(&t, *y).contains("Authentication request flow"))
-            .expect("plan title visible");
-        assert!(warn_row < title_row, "warning precedes the plan: {text}");
+        let description_row = (24..38u16)
+            .find(|y| row_text(&t, *y).contains("Each request moves through"))
+            .expect("plan description visible");
+        assert!(
+            warn_row < description_row,
+            "warning precedes the plan: {text}"
+        );
         let mut styled = false;
         for x in 0..140u16 {
             let (symbol, fg, _, _) = cell(&t, x, warn_row);
@@ -3337,7 +3330,6 @@ mod tests {
         let mut plan = ai_plan_snap(7);
         {
             let viz = plan.semantic.plan.as_mut().unwrap();
-            viz.title = "API graceful drain".into();
             viz.intent = "Stop new traffic before waiting for in-flight requests.".into();
             let form = &mut viz.forms[0];
             form.kind = codescope_core::FormKind::Sequence;
@@ -3355,17 +3347,14 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
         let pane: String = (24..38).map(|y| format!("{}\n", row_text(&t, y))).collect();
-        assert!(pane.contains("API graceful drain"), "title: {pane}");
-        // The trust note precedes the ladder, so the default viewport shows it.
         assert!(
-            pane.contains("≈ ┊ = inferred from cited diff"),
-            "basis note above the ladder: {pane}"
+            pane.contains("Stop new traffic before waiting for in-flight requests."),
+            "description: {pane}"
         );
-        let note = pane.find("inferred from cited diff").expect("note");
-        let first_step = pane.find(" 1  Step0").expect("first step");
+        assert!(!pane.contains("API graceful drain"), "title hidden: {pane}");
         assert!(
-            note < first_step,
-            "the note precedes the first step: {pane}"
+            !pane.contains("inferred from cited diff"),
+            "no legend: {pane}"
         );
         assert!(
             pane.contains(" 1  Step0"),
@@ -3397,65 +3386,6 @@ mod tests {
                 20
             ) == 11,
             "80x20 gives Impact the reclaimed chrome rows"
-        );
-    }
-
-    /// The precise external-assumption warning renders inside the default Impact pane,
-    /// above the inference basis and the first visual, with Review (WARN) styling.
-    /// The full Review block stays below the diagram.
-    #[test]
-    fn external_assumption_warning_visible_in_default_pane() {
-        let mut plan = ai_plan_snap(7);
-        {
-            let viz = plan.semantic.plan.as_mut().unwrap();
-            viz.title = "API graceful drain".into();
-            viz.intent = "Stop new traffic before waiting for in-flight requests.".into();
-            viz.review_focus = Some(
-                "External assumption: the 10s drain delay matches the load balancer probe interval."
-                    .into(),
-            );
-            let form = &mut viz.forms[0];
-            form.kind = codescope_core::FormKind::Sequence;
-            for (index, node) in form.nodes.iter_mut().enumerate() {
-                node.label = format!("Step{index}");
-                node.detail = Some(format!("explains effect {index}"));
-            }
-            form.edges[0].label = Some("SIGTERM/SIGINT triggers shutdown, unblocks waiters".into());
-            for (index, edge) in form.edges.iter_mut().enumerate().skip(1) {
-                edge.label = Some(format!("passes step {index}"));
-            }
-        }
-        let mut app = App::new();
-        app.update(plan.clone());
-        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        t.draw(|f| render(f, &app, &plan)).unwrap();
-        let pane: String = (24..38).map(|y| format!("{}\n", row_text(&t, y))).collect();
-        // The warning sits above the basis note and the first step in the viewport.
-        let warning = pane.find("External assumption").expect("warning visible");
-        let basis = pane
-            .find("inferred from cited diff")
-            .expect("basis note visible");
-        let first_step = pane.find(" 1  Step0").expect("first step visible");
-        assert!(
-            warning < basis && basis < first_step,
-            "warning < basis < step: {pane}"
-        );
-        // Review styling (WARN) on the warning glyphs.
-        let warning_row = (24..38u16)
-            .find(|y| row_text(&t, *y).contains("External assumption"))
-            .expect("warning row");
-        let mut styled = false;
-        for x in 0..140u16 {
-            let (symbol, fg, _, _) = cell(&t, x, warning_row);
-            if (symbol == "⚠" || symbol == "e") && fg == WARN {
-                styled = true;
-            }
-        }
-        assert!(styled, "warning uses WARN styling: {pane}");
-        // The actual caveat, not a generic "see below" marker, is readable up front.
-        assert!(
-            pane.contains("load balancer probe interval"),
-            "precise caveat visible in the viewport: {pane}"
         );
     }
 
@@ -3550,15 +3480,13 @@ mod tests {
         t.draw(|f| render(f, &app, &plan)).unwrap();
         let initial: String = (24..38).map(|y| row_text(&t, y)).collect();
         assert!(
-            initial.contains("Authentication request flow"),
-            "title: {initial}"
+            initial.contains("Each request moves through the changed authentication path."),
+            "description: {initial}"
         );
         assert!(initial.contains("PlanStep0"), "first step: {initial}");
-        // The trust note precedes the ladder, so the default viewport shows it above
-        // the first step.
         assert!(
-            initial.contains("≈ ┊ = inferred from cited diff"),
-            "basis note above the ladder: {initial}"
+            !initial.contains("inferred from cited diff"),
+            "no legend: {initial}"
         );
         // Scrolling moves over physical ladder lines computed for this width: one line
         // per step, one per edge rail.
@@ -3570,8 +3498,8 @@ mod tests {
         t.draw(|f| render(f, &app, &plan)).unwrap();
         let moved: String = (24..38).map(|y| row_text(&t, y)).collect();
         assert!(
-            !moved.contains("Authentication request flow"),
-            "title scrolled: {moved}"
+            !moved.contains("Each request moves through the changed authentication path."),
+            "description scrolled: {moved}"
         );
         assert!(
             !moved.contains("PlanStep0"),
@@ -3706,6 +3634,7 @@ mod tests {
         let mut snap = sample();
         snap.status = crate::snapshot::StatusMessage {
             text: "AI timed out after 20s · m change model · retries automatically".to_string(),
+            detail: None,
             level: crate::snapshot::StatusLevel::Error,
         };
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
@@ -3717,6 +3646,7 @@ mod tests {
         );
         snap.status = crate::snapshot::StatusMessage {
             text: "base: main".to_string(),
+            detail: None,
             level: crate::snapshot::StatusLevel::Info,
         };
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
@@ -3728,6 +3658,7 @@ mod tests {
         let mut snap = sample();
         snap.status = crate::snapshot::StatusMessage {
             text: "git-only (no supported language detected)".to_string(),
+            detail: None,
             level: crate::snapshot::StatusLevel::Warning,
         };
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
@@ -3740,10 +3671,11 @@ mod tests {
         let mut snap = sample();
         let tail = "TAIL_OF_PROVIDER_RESPONSE";
         snap.status = crate::snapshot::StatusMessage {
-            text: format!(
+            text: "AI provider returned HTTP 400…".to_string(),
+            detail: Some(format!(
                 "AI provider returned HTTP 400: {{\"error\":{{\"message\":\"{} {tail}\"}}}}",
                 "unsupported provider parameter ".repeat(8)
-            ),
+            )),
             level: crate::snapshot::StatusLevel::Warning,
         };
         let mut app = App::new();

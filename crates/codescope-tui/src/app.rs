@@ -963,6 +963,7 @@ mod tests {
         let mut app = App::new();
         app.snapshot.status = StatusMessage {
             text: "original provider error".to_string(),
+            detail: Some("original complete provider diagnostic".to_string()),
             level: crate::snapshot::StatusLevel::Warning,
         };
         app.apply(Action::ToggleStatusDetail);
@@ -972,9 +973,16 @@ mod tests {
                 .map(|status| status.text.as_str()),
             Some("original provider error")
         );
+        assert_eq!(
+            app.status_detail
+                .as_ref()
+                .and_then(|status| status.detail.as_deref()),
+            Some("original complete provider diagnostic")
+        );
 
         let mut updated = app.snapshot.clone();
         updated.status.text = "automatic retry started".to_string();
+        updated.status.detail = Some("replacement detail".to_string());
         app.update(updated);
         assert_eq!(
             app.status_detail
@@ -982,6 +990,13 @@ mod tests {
                 .map(|status| status.text.as_str()),
             Some("original provider error"),
             "background statuses cannot replace the message being inspected"
+        );
+        assert_eq!(
+            app.status_detail
+                .as_ref()
+                .and_then(|status| status.detail.as_deref()),
+            Some("original complete provider diagnostic"),
+            "background statuses cannot replace the diagnostic being inspected"
         );
 
         app.apply(Action::ToggleStatusDetail);
@@ -1359,16 +1374,10 @@ mod tests {
             semantic: crate::snapshot::SemanticPane {
                 report: None,
                 plan: (rows > 0).then(|| {
-                    let mut plan = codescope_core::VisualizationPlan::new(
-                        snap_epoch,
-                        "How does authentication flow?",
-                    );
-                    plan.title = "Authentication flow".into();
+                    let mut plan = codescope_core::VisualizationPlan::new(snap_epoch);
                     plan.intent = "Requests pass through each authentication step.".into();
                     plan.forms.push(VizForm {
                         kind: FormKind::CallTree,
-                        title: "runtime".into(),
-                        summary: String::new(),
                         nodes: (0..rows)
                             .map(|i| {
                                 PlanNode::new(

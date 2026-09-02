@@ -201,13 +201,10 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
     ready.ai = AiStatus::Ready {
         epoch: codescope_core::Epoch(3),
     };
-    let mut plan = VisualizationPlan::new(codescope_core::Epoch(3), "How are retries bounded?");
-    plan.title = "Bounded request retries".to_string();
+    let mut plan = VisualizationPlan::new(codescope_core::Epoch(3));
     plan.intent = "RetryPolicy limits the attempts consumed by handleRequest.".to_string();
     plan.forms.push(VizForm {
         kind: FormKind::RelationshipFlow,
-        title: "runtime".into(),
-        summary: String::new(),
         nodes: vec![
             PlanNode::new("policy", "RetryPolicy", PlanNodeChange::Modified)
                 .with_detail("introduces a bounded retry budget"),
@@ -241,13 +238,14 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
     assert!(!text.contains("Impact"), "combined title removed: {text}");
     assert!(!text.contains("AI Plan"), "retired tab name: {text}");
     assert!(
-        text.contains("Bounded request retries"),
-        "plan title: {text}"
+        text.contains("RetryPolicy limits the attempts consumed by handleRequest."),
+        "plan description: {text}"
     );
     assert_eq!(
-        text.matches("Bounded request retries").count(),
+        text.matches("RetryPolicy limits the attempts consumed by handleRequest.")
+            .count(),
         1,
-        "behavioral title must not be repeated"
+        "description must not be repeated"
     );
     assert!(text.contains("RetryPolicy"), "plan root row: {text}");
     assert!(text.contains("handleRequest"), "plan child row: {text}");
@@ -264,8 +262,8 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
         "solid arrows stay reserved for verified relationships: {text}"
     );
     assert!(
-        text.contains("≈ ┊ = inferred from cited diff"),
-        "one provenance note for the inferred form: {text}"
+        !text.contains("inferred from cited diff"),
+        "retired provenance legend: {text}"
     );
     assert!(text.contains("hunk 1"), "one-based evidence hunk: {text}");
     assert!(!text.contains("diff modified"), "old change badge: {text}");
@@ -292,13 +290,10 @@ fn sanitized_sequence_plan_warns_in_the_generated_pane() {
     let mut t = Terminal::new(backend).unwrap();
     let mut app = App::new();
     let mut ready = sample();
-    let mut plan = VisualizationPlan::new(codescope_core::Epoch(3), "How does shutdown drain?");
-    plan.title = "Graceful drain of the API server".to_string();
+    let mut plan = VisualizationPlan::new(codescope_core::Epoch(3));
     plan.intent = "The server stops accepting work before closing listeners.".to_string();
     plan.forms.push(VizForm {
         kind: FormKind::Sequence,
-        title: "drain".into(),
-        summary: String::new(),
         nodes: vec![
             PlanNode::new("n1", "markUnready", PlanNodeChange::Modified)
                 .with_detail("flips readiness to false first"),
@@ -359,8 +354,13 @@ fn sanitized_sequence_plan_warns_in_the_generated_pane() {
         "drop reasons stay out of the pane: {text}"
     );
     let warning = text.find("sanitized AI plan").expect("warning rendered");
-    let title = text.find("Graceful drain").expect("plan title rendered");
-    assert!(warning < title, "the warning precedes the plan: {text}");
+    let description = text
+        .find("The server stops accepting work before closing listeners.")
+        .expect("plan description rendered");
+    assert!(
+        warning < description,
+        "the warning precedes the plan: {text}"
+    );
 }
 
 use codescope_tui::action::{map_key, Action};

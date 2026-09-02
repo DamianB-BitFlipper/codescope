@@ -486,13 +486,8 @@ fn digest_scratch_repo_git_only_notes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
     // One initial repository refresh owns one epoch increment.
-    let mut plan = VisualizationPlan::new(Epoch(1), "What does the selected change do?");
-    plan.title = "Request handling becomes observable".to_string();
+    let mut plan = VisualizationPlan::new(Epoch(1));
     plan.intent = "Record request metadata before continuing the request path.".to_string();
-    plan.review_focus = Some(
-        "Confirm the recorded metadata reaches the log sink before errors are returned."
-            .to_string(),
-    );
     plan.evidence.push(codescope_core::PlanEvidence {
         file: codescope_core::FileId::new_unchecked("internal/api/middleware.go"),
         hunk: Some(0),
@@ -521,8 +516,6 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         ));
     plan.forms.push(VizForm {
         kind: FormKind::ChangedSymbolTree,
-        title: "Request path".to_string(),
-        summary: String::new(),
         nodes: vec![entry, logging],
         edges: Vec::new(),
     });
@@ -631,16 +624,10 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
     // back-edge (n3 -> n1): the validator keeps the chain, drops the back-edge, and
     // records it — the plan is sanitized, not trusted.
     // One initial repository refresh owns one epoch increment.
-    let mut plan = VisualizationPlan::new(Epoch(1), "How does the request flow change?");
-    plan.title = "Request logging wraps the handler".to_string();
+    let mut plan = VisualizationPlan::new(Epoch(1));
     plan.intent = "The middleware logs each request around the handled call.".to_string();
-    plan.review_focus = Some(
-        "Confirm the log line is written before the handler consumes the request.".to_string(),
-    );
     plan.forms.push(VizForm {
         kind: FormKind::Sequence,
-        title: "request path".to_string(),
-        summary: String::new(),
         nodes: vec![
             PlanNode::new("n1", "request", PlanNodeChange::Modified)
                 .with_detail("enters the changed request path")

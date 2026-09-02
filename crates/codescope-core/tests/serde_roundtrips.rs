@@ -272,11 +272,10 @@ fn impact_graph_roundtrip() {
 }
 
 fn sample_plan() -> VisualizationPlan {
-    let mut plan = VisualizationPlan::new(Epoch(7), "What breaks if I rename SessionStore.load?");
+    let mut plan = VisualizationPlan::new(Epoch(7));
+    plan.intent = "SessionStore.load gains a guarded cache-miss path.".to_string();
     plan.forms.push(VizForm {
         kind: FormKind::CallTree,
-        title: "Callers of load".to_string(),
-        summary: "load has 3 callers; 2 are in changed files.".to_string(),
         nodes: vec![
             PlanNode {
                 id: "n1".to_string(),
@@ -388,17 +387,15 @@ fn viz_domain_roundtrips() {
     }
 }
 
-/// The exact JSON example from research 05 §2 must deserialize into our plan types.
+/// The current JSON schema deserializes into the shared plan types.
 #[test]
-fn research_05_schema_example_deserializes() {
+fn current_plan_schema_deserializes() {
     let json = serde_json::json!({
         "plan_version": PLAN_VERSION,
         "epoch": 42,
-        "focus": "What breaks if I rename SessionStore.load?",
+        "intent": "SessionStore.load gains a guarded cache-miss path.",
         "forms": [{
             "kind": "call_tree",
-            "title": "Callers of load",
-            "summary": "load has 3 callers; 2 are in changed files.",
             "nodes": [{
                 "id": "n1",
                 "entity": {
@@ -416,9 +413,10 @@ fn research_05_schema_example_deserializes() {
             "edges": [{
                 "from": "n1", "to": "n2", "kind": "calls", "label": "on cache miss"
             }]
-        }]
+        }],
+        "evidence": []
     });
-    let plan: VisualizationPlan = serde_json::from_value(json).expect("research-05 example parses");
+    let plan: VisualizationPlan = serde_json::from_value(json).expect("current example parses");
     assert_eq!(plan.plan_version, PLAN_VERSION);
     assert_eq!(plan.epoch, Epoch(42));
     assert_eq!(plan.forms.len(), 1);
@@ -436,29 +434,24 @@ fn research_05_schema_example_deserializes() {
     assert_eq!(plan.forms[0].edges[0].kind, PlanEdgeKind::Calls);
 }
 
-/// Serialized plans omit exactly the default fields (`summary: ""`,
-/// `change: "unchanged"`, default `hint`) while keeping nondefault values; deserialization
-/// restores the omitted defaults, so the shape stays backward compatible.
+/// Serialized plans omit default node fields while keeping nondefault values.
 #[test]
-fn plan_serialization_omits_only_default_fields() {
-    let mut plan = VisualizationPlan::new(Epoch(5), "shape of the change");
+fn plan_serialization_omits_default_node_fields() {
+    let mut plan = VisualizationPlan::new(Epoch(5));
+    plan.intent = "The change reshapes session storage.".to_string();
     plan.forms.push(VizForm {
         kind: FormKind::ChangedSymbolTree,
-        title: "Changed files".to_string(),
-        summary: String::new(),
         nodes: vec![PlanNode::new("n1", "store", PlanNodeChange::Unchanged)],
         edges: Vec::new(),
     });
 
     let json = serde_json::to_value(&plan).expect("serialize");
     let form = &json["forms"][0];
-    assert!(form.get("summary").is_none(), "empty summary omitted");
     let node = &form["nodes"][0];
     assert!(node.get("change").is_none(), "unchanged badge omitted");
     assert!(node.get("hint").is_none(), "default hint omitted");
 
-    // A form carrying nondefault values keeps every one of them.
-    plan.forms[0].summary = "2 symbols changed".to_string();
+    // A node carrying nondefault values keeps every one of them.
     plan.forms[0].nodes[0].change = PlanNodeChange::Added;
     plan.forms[0].nodes[0].hint = NodeHint {
         highlight: true,
@@ -466,7 +459,6 @@ fn plan_serialization_omits_only_default_fields() {
     };
     let json = serde_json::to_value(&plan).expect("serialize");
     let form = &json["forms"][0];
-    assert_eq!(form["summary"], "2 symbols changed");
     let node = &form["nodes"][0];
     assert_eq!(node["change"], "added");
     assert_eq!(
@@ -483,12 +475,12 @@ fn minimal_plan_json_uses_defaults() {
     let json = serde_json::json!({
         "plan_version": PLAN_VERSION,
         "epoch": 0,
-        "focus": "shape of the change",
+        "intent": "The change reshapes session storage.",
         "forms": [{
             "kind": "impact_summary",
-            "title": "Impact",
             "nodes": [{"id": "n1", "label": "3 symbols changed", "change": "unchanged"}]
-        }]
+        }],
+        "evidence": []
     });
     let plan: VisualizationPlan = serde_json::from_value(json).expect("minimal plan parses");
     let node = &plan.forms[0].nodes[0];
@@ -504,5 +496,17 @@ fn minimal_plan_json_uses_defaults() {
         }
     );
     assert!(plan.forms[0].edges.is_empty());
-    assert_eq!(plan.forms[0].summary, "");
+}
+
+#[test]
+fn removed_plan_fields_are_rejected() {
+    let json = serde_json::json!({
+        "plan_version": PLAN_VERSION,
+        "epoch": 0,
+        "focus": "obsolete",
+        "intent": "The change reshapes session storage.",
+        "forms": [],
+        "evidence": []
+    });
+    assert!(serde_json::from_value::<VisualizationPlan>(json).is_err());
 }

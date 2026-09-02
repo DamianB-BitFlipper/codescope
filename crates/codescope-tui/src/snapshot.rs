@@ -116,6 +116,7 @@ impl UiSnapshot {
             message: "scanning repository…".to_string(),
             status: StatusMessage {
                 text: "scanning repository…".to_string(),
+                detail: None,
                 level: StatusLevel::Info,
             },
             refreshing: true,
@@ -360,11 +361,14 @@ pub struct ImpactRow {
     pub has_diagnostic: bool,
 }
 
-/// A typed status-bar message: text plus severity.
+/// A typed status-bar message: concise text, optional full detail, and severity.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatusMessage {
-    /// The message (empty: the bar falls back to the selected file's path).
+    /// Concise message for the one-line footer (empty: fall back to the selected path).
     pub text: String,
+    /// Full diagnostic shown by the click-open details dialog. When absent, the dialog
+    /// uses [`Self::text`]. This must retain information omitted from the footer summary.
+    pub detail: Option<String>,
     /// Severity driving the bar's styling.
     pub level: StatusLevel,
 }
@@ -398,6 +402,7 @@ mod tests {
         assert!(snap.impact.note.is_empty());
         assert_eq!(snap.status, StatusMessage::default());
         assert_eq!(snap.status.level, StatusLevel::Info);
+        assert!(snap.status.detail.is_none());
         assert!(snap.diff.focused_symbol.is_none());
         assert!(snap.files.is_empty());
     }

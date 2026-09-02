@@ -433,6 +433,7 @@ mod tests {
         let mut a = app();
         a.snapshot.status = crate::snapshot::StatusMessage {
             text: "provider returned HTTP 400".to_string(),
+            detail: None,
             level: crate::snapshot::StatusLevel::Warning,
         };
         a.apply(Action::ToggleStatusDetail);

@@ -5,7 +5,7 @@
 //! field carries the plan document; its JSON Schema is hand-maintained in
 //! [`plan_value_schema`] as the **AI input dialect** of the research 05 §2 schema: it
 //! intentionally narrows what core serde accepts (legacy list forms excluded, tighter
-//! caps, required reviewer-first fields) while parsing into the same core types, and the
+//! caps, required renderer-consumed fields) while parsing into the same core types, and the
 //! dialect's compatibility with core serde output is tested rather than assumed. Semantic
 //! checking is **not** serde's job — [`crate::validate`] is the boundary that decides what
 //! renders.
@@ -39,19 +39,11 @@ pub const MAX_AI_FORM_EDGES: usize = 8;
 /// items. MAX_PLAN_EVIDENCE (6) remains the validator's deterministic backstop.
 pub const MAX_AI_EVIDENCE: usize = 4;
 
-/// Required intent prefix when review_focus fences an external or out-of-diff outcome.
-/// The structural prefix makes epistemic separation enforceable without trying to infer
-/// semantics from arbitrary model prose.
-pub const IMPLEMENTED_INTENT_PREFIX: &str = "Implemented behavior:";
-
-/// Required title prefix when review_focus fences an external or out-of-diff outcome.
-pub const IMPLEMENTED_TITLE_PREFIX: &str = "Implemented change:";
-
 /// Arguments of the `submit_visualization_plan` tool: a single `plan` document.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub struct PlanParams {
-    /// The visualization plan document (research 05 §2 schema): one behavioral title and
-    /// intent, the single smallest useful structural visual, and typed source evidence.
+    /// The visualization plan document: one description, the smallest useful structural
+    /// visual, and typed source evidence.
     #[schemars(schema_with = "plan_value_schema")]
     pub plan: Value,
 }
@@ -74,34 +66,18 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
     });
     json_schema!({
         "type": "object",
-        "description": "A reviewer-first explanation: one behavioral title and intent, the single smallest useful structural visual, and typed source evidence. Every fact MUST be echoed verbatim from the digest or a tool result.",
+        "description": "A reviewer-first explanation: one description, the single smallest useful structural visual, and typed source evidence. Every fact MUST be echoed verbatim from the digest or a tool result.",
         "properties": {
             "plan_version": {"type": "integer", "const": PLAN_VERSION},
             "epoch": {
                 "type": "integer",
                 "description": "Repo-state epoch counter echoed verbatim from the prompt. Plans carrying a different epoch are discarded as stale."
             },
-            "focus": {
-                "type": "string",
-                "description": "The single question this plan answers (one sentence)."
-            },
-            "title": {
-                "type": "string",
-                "minLength": 3,
-                "maxLength": 100,
-                "description": "A concrete title naming the last behavior this diff implements. When review_focus fences an external outcome, title MUST start exactly Implemented change: and stop before that outcome."
-            },
             "intent": {
                 "type": "string",
                 "minLength": 8,
                 "maxLength": 240,
-                "description": "One concise sentence explaining implemented behavior and purpose. When review_focus starts External assumption: or Not shown by this diff:, intent MUST start exactly Implemented behavior: and stop before the unshown handoff."
-            },
-            "review_focus": {
-                "type": "string",
-                "minLength": 8,
-                "maxLength": 240,
-                "description": "Required. The one invariant, risk, external assumption, or question the reviewer should check; word unverified external outcomes 'External assumption:' or 'Not shown by this diff:'."
+                "description": "The single displayed description: one concise sentence explaining implemented behavior and purpose. Stop at the last behavior the supplied repository facts establish."
             },
             "forms": {
                 "type": "array",
@@ -114,9 +90,8 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
                             "type": "string",
                             "enum": ["changed_symbol_tree", "call_tree", "type_impl_tree",
                                       "relationship_flow", "before_after", "sequence"],
-                            "description": "before_after is exactly two flat states (nodes[0] = before, nodes[1] = after) with no children and at most one transition edge directed before -> after; use a tree or flow form for any nested structure."
+                            "description": "before_after is exactly two flat states (nodes[0] = before, nodes[1] = after) with no children and at most one transition edge directed before -> after. Use it for localized literal, format-string, default-value, condition, or configuration changes that do not alter control flow or topology; use a tree or flow form for nested structure."
                         },
-                        "title": {"type": "string"},
                         "nodes": {
                             "type": "array",
                             "maxItems": MAX_AI_FORM_NODES,
@@ -145,13 +120,13 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
                                         "type": "string",
                                         "minLength": 3,
                                         "maxLength": 160,
-                                        "description": "One concise, always-visible reviewer fact explaining this node's implemented role or state. Never repeat an external actor or outcome fenced by review_focus here, even as purpose."
+                                        "description": "Collapsed box preview: one concrete reviewer fact, normally at most 8 words and 56 characters. Do not assert an external actor or outcome absent from supplied repository facts."
                                     },
                                     "expanded_detail": {
                                         "type": "string",
                                         "minLength": 8,
                                         "maxLength": 320,
-                                        "description": "Optional deeper context shown only when the user expands this box. Do not repeat detail."
+                                        "description": "Optional complete, self-contained explanation shown inside this box when clicked. It may include the preview fact but must add useful context."
                                     },
                                     "code_refs": {
                                         "type": "array",
@@ -196,7 +171,7 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
                                         "type": "string",
                                         "minLength": 2,
                                         "maxLength": 100,
-                                        "description": "Required implemented trigger, condition, data movement, or effect shown on the arrow; do not repeat the edge kind or any external actor/outcome fenced by review_focus."
+                                        "description": "Required implemented trigger, condition, data movement, or effect shown on the arrow; do not repeat the edge kind or assert an external actor/outcome absent from supplied repository facts."
                                     }
                                 },
                                 "required": ["from", "to", "kind", "label"],
@@ -205,7 +180,7 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
                             "description": "Edges select existing relationships; the validator rejects edges absent from the impact graph."
                         }
                     },
-                    "required": ["kind", "title", "nodes", "edges"],
+                    "required": ["kind", "nodes", "edges"],
                     "additionalProperties": false
                 }
             },
@@ -213,7 +188,7 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": MAX_AI_EVIDENCE,
-                "description": "One to four typed source references supporting the visual; every distinct claim in title/intent/nodes/details/edges must be covered by at least one item. Hunks are zero-based here and displayed one-based by the UI.",
+                "description": "One to four typed source references supporting the visual; every distinct claim in intent/nodes/details/edges must be covered by at least one item. Hunks are zero-based here and displayed one-based by the UI.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -225,7 +200,7 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
                             "type": "string",
                             "minLength": 3,
                             "maxLength": 160,
-                            "description": "What these cited lines directly implement. Never repeat an external actor/outcome fenced by review_focus; a similarly named config field does not prove cross-system injection."
+                            "description": "What these cited lines directly implement. Do not assert an external actor/outcome absent from supplied repository facts; a similarly named config field does not prove cross-system injection."
                         }
                     },
                     "required": ["file", "reason"],
@@ -236,10 +211,7 @@ fn plan_value_schema(_gen: &mut SchemaGenerator) -> Schema {
         "required": [
             "plan_version",
             "epoch",
-            "focus",
-            "title",
             "intent",
-            "review_focus",
             "forms",
             "evidence"
         ],
@@ -296,49 +268,14 @@ pub fn parse_plan(arguments: &str) -> Result<VisualizationPlan, AiError> {
     Ok(plan)
 }
 
-/// Enforce the AI-facing input contract the tool schema advertises: nonempty
-/// `review_focus`, and the model-facing caps (forms, nodes per form, evidence) that are
-/// tighter than the validator's deterministic backstops. Unlike validation (which
+/// Enforce the AI-facing input contract the tool schema advertises: model-facing caps
+/// (forms, nodes per form, evidence) that are tighter than the validator's deterministic
+/// backstops. Unlike validation (which
 /// truncates), this is a parse-time rejection: the last lifecycle node may be the point
 /// of the diagram, so an oversized plan must be **rewritten**, not silently truncated.
 /// Errors are [`AiError::MalformedPlan`] so the service's bounded repair loop can ask for
 /// a corrected submission with the observed/allowed counts.
 fn enforce_ai_input_contract(plan: &VisualizationPlan) -> Result<(), AiError> {
-    if plan
-        .review_focus
-        .as_deref()
-        .is_none_or(|review| review.trim().is_empty())
-    {
-        return Err(AiError::MalformedPlan(
-            "plan is missing the required review_focus field: state the one invariant, risk, \
-             external assumption (worded 'External assumption:' or 'Not shown by this diff:'), \
-             or question the reviewer should check; do not place caveats only in focus"
-                .into(),
-        ));
-    }
-    let review = plan.review_focus.as_deref().unwrap_or_default().trim();
-    let fences_external =
-        review.starts_with("External assumption:") || review.starts_with("Not shown by this diff:");
-    if fences_external
-        && !plan
-            .title
-            .trim_start()
-            .starts_with(IMPLEMENTED_TITLE_PREFIX)
-    {
-        return Err(AiError::MalformedPlan(format!(
-            "review_focus fences an unverified external outcome, so title must start exactly {IMPLEMENTED_TITLE_PREFIX:?} and name only the last change implemented by this diff; move the external mapping or result only into review_focus"
-        )));
-    }
-    if fences_external
-        && !plan
-            .intent
-            .trim_start()
-            .starts_with(IMPLEMENTED_INTENT_PREFIX)
-    {
-        return Err(AiError::MalformedPlan(format!(
-            "review_focus fences an unverified external outcome, so intent must start exactly {IMPLEMENTED_INTENT_PREFIX:?} and stop at the last behavior implemented by this diff; move the external mapping or result only into review_focus"
-        )));
-    }
     if plan.forms.is_empty() {
         return Err(AiError::MalformedPlan(
             "plan has no forms; submit exactly one structural form (two only for a distinct relationship)"
@@ -414,7 +351,7 @@ fn enforce_ai_input_contract(plan: &VisualizationPlan) -> Result<(), AiError> {
     if plan.evidence.len() > MAX_AI_EVIDENCE {
         let observed = plan.evidence.len();
         return Err(AiError::MalformedPlan(format!(
-            "plan has {observed} evidence entries; the schema allows at most {MAX_AI_EVIDENCE} - keep the strongest items supporting the visual and review_focus"
+            "plan has {observed} evidence entries; the schema allows at most {MAX_AI_EVIDENCE} - keep the strongest items supporting the displayed description and visual"
         )));
     }
     Ok(())
@@ -429,13 +366,9 @@ mod tests {
         serde_json::json!({
             "plan_version": PLAN_VERSION,
             "epoch": epoch,
-            "focus": "What breaks if I rename SessionStore.load?",
-            "title": "Session loading call path",
             "intent": "Show which entry point reaches SessionStore.load before a rename.",
-            "review_focus": "Confirm every caller is updated with the renamed symbol.",
             "forms": [{
                 "kind": "call_tree",
-                "title": "Callers of load",
                 "nodes": [{
                     "id": "n1",
                     "entity": {
@@ -514,7 +447,7 @@ mod tests {
 
     #[test]
     fn rejects_shape_mismatch() {
-        // focus missing entirely.
+        // intent missing entirely.
         let err = parse_plan(r#"{"plan_version":1,"epoch":1,"forms":[]}"#).unwrap_err();
         assert!(matches!(err, AiError::MalformedPlan(_)));
         // unknown form kind.
@@ -535,63 +468,21 @@ mod tests {
         ));
     }
 
-    /// The AI-facing input contract: a missing review_focus is a repairable parse error
-    /// that names the field (round-3 live failure — the model put the external assumption
-    /// only in `focus`, which is not rendered).
     #[test]
-    fn rejects_missing_review_focus_with_named_field() {
-        let mut bad = sample_json(1);
-        bad.as_object_mut().unwrap().remove("review_focus");
-        let err = parse_plan(&bad.to_string()).unwrap_err();
-        assert!(matches!(err, AiError::MalformedPlan(_)), "{err}");
-        let msg = err.to_string();
-        assert!(msg.contains("review_focus"), "names the field: {msg}");
-        assert!(
-            msg.contains("External assumption:"),
-            "prefix rule taught: {msg}"
-        );
-        assert!(
-            msg.contains("do not place caveats only in focus"),
-            "focus trap named: {msg}"
-        );
-        // An empty string is equally missing.
-        let mut empty = sample_json(1);
-        empty["review_focus"] = Value::String(String::new());
-        assert!(matches!(
-            parse_plan(&empty.to_string()).unwrap_err(),
-            AiError::MalformedPlan(_)
-        ));
-        // Whitespace-only is not user-visible content either.
-        let mut blank = sample_json(1);
-        blank["review_focus"] = Value::String("   \t  ".into());
-        assert!(matches!(
-            parse_plan(&blank.to_string()).unwrap_err(),
-            AiError::MalformedPlan(_)
-        ));
-    }
+    fn rejects_removed_fields() {
+        for field in ["focus", "title", "review_focus"] {
+            let mut bad = sample_json(1);
+            bad[field] = Value::String("obsolete".into());
+            let error = parse_plan(&bad.to_string()).unwrap_err().to_string();
+            assert!(error.contains("unknown field"), "{field}: {error}");
+        }
 
-    #[test]
-    fn external_review_focus_requires_implemented_title_and_intent_fences() {
-        let mut unfenced = sample_json(1);
-        unfenced["review_focus"] =
-            Value::String("Not shown by this diff: whether the deployment rotates the job.".into());
-        let error = parse_plan(&unfenced.to_string()).unwrap_err().to_string();
-        assert!(error.contains("title must start exactly"), "{error}");
-        assert!(error.contains(IMPLEMENTED_TITLE_PREFIX), "{error}");
-
-        unfenced["title"] = Value::String(format!(
-            "{IMPLEMENTED_TITLE_PREFIX} manifest gains rollout identity"
-        ));
-        let error = parse_plan(&unfenced.to_string()).unwrap_err().to_string();
-        assert!(error.contains("intent must start exactly"), "{error}");
-        assert!(error.contains(IMPLEMENTED_INTENT_PREFIX), "{error}");
-
-        unfenced["intent"] = Value::String(format!(
-            "{IMPLEMENTED_INTENT_PREFIX} the manifest gains a per-run rollout id."
-        ));
-        let parsed = parse_plan(&unfenced.to_string()).unwrap();
-        assert!(parsed.title.starts_with(IMPLEMENTED_TITLE_PREFIX));
-        assert!(parsed.intent.starts_with(IMPLEMENTED_INTENT_PREFIX));
+        for field in ["title", "summary"] {
+            let mut bad = sample_json(1);
+            bad["forms"][0][field] = Value::String("obsolete".into());
+            let error = parse_plan(&bad.to_string()).unwrap_err().to_string();
+            assert!(error.contains("unknown field"), "form {field}: {error}");
+        }
     }
 
     #[test]
@@ -827,38 +718,42 @@ mod tests {
         assert_eq!(MAX_AI_FORM_NODES, 5);
         assert_eq!(MAX_AI_EVIDENCE, 4);
         let plan_schema = &params["properties"]["plan"];
-        assert!(plan_schema["description"]
-            .as_str()
-            .unwrap()
-            .contains("single smallest useful structural visual"));
-        for required in ["title", "intent", "review_focus", "forms", "evidence"] {
+        let plan_description = plan_schema["description"].as_str().unwrap();
+        let plan_description = plan_description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            plan_description.contains("one description")
+                && plan_description.contains("smallest useful structural visual"),
+            "{plan_description}"
+        );
+        for required in ["intent", "forms", "evidence"] {
             assert!(plan_schema["required"]
                 .as_array()
                 .unwrap()
                 .contains(&Value::String(required.into())));
         }
-        // review_focus is a required AI-input field (core keeps its Option).
-        let review = plan_schema["properties"]["review_focus"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(review.starts_with("Required."), "{review}");
-        assert!(review.contains("External assumption:"), "{review}");
-        assert!(review.contains("Not shown by this diff:"), "{review}");
+        for removed in ["focus", "title", "review_focus"] {
+            assert!(plan_schema["properties"].get(removed).is_none());
+        }
+        let form_schema = &plan_schema["properties"]["forms"]["items"];
+        for removed in ["title", "summary"] {
+            assert!(form_schema["properties"].get(removed).is_none());
+        }
     }
 
     #[test]
     fn core_serde_output_parses_through_the_ai_input_contract() {
         // A core-typed plan within the AI input contract round-trips through parse_plan,
         // proving the dialect the schema documents is the one core actually emits. The
-        // schema is an AI input dialect that intentionally narrows core (no legacy forms,
-        // tighter caps, required review_focus/evidence) — compatibility-tested here, not
-        // an exact schema identity.
-        let mut plan = VisualizationPlan::new(Epoch(9), "focus?");
-        plan.review_focus = Some("confirm the entry point stays reachable".into());
+        // schema is an AI input dialect that intentionally narrows core (no list forms,
+        // tighter caps, required evidence) — compatibility-tested here, not an exact
+        // schema identity.
+        let mut plan = VisualizationPlan::new(Epoch(9));
+        plan.intent = "The changed entry point stays reachable.".into();
         plan.forms.push(codescope_core::VizForm {
             kind: FormKind::CallTree,
-            title: "t".into(),
-            summary: "s".into(),
             nodes: vec![
                 codescope_core::PlanNode::new("n1", "l", PlanNodeChange::Added)
                     .with_detail("explains the changed entry point")

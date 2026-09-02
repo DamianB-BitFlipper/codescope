@@ -13,7 +13,7 @@ use crate::relation::DiagnosticSeverity;
 use crate::semantic::EntityRef;
 
 /// Current [`VisualizationPlan::plan_version`]. Bump on any schema change.
-pub const PLAN_VERSION: u32 = 4;
+pub const PLAN_VERSION: u32 = 5;
 
 /// Hard cap on nodes per form (Show Me rule S4; enforced at validation).
 pub const MAX_FORM_NODES: usize = 12;
@@ -23,9 +23,6 @@ pub const MAX_FORM_DEPTH: usize = 3;
 
 /// Maximum forms per plan ("one form per plan, two max").
 pub const MAX_FORMS_PER_PLAN: usize = 2;
-
-/// Maximum summary length in rendered lines (Show Me rule S5).
-pub const MAX_SUMMARY_LINES: usize = 3;
 
 /// Maximum source references attached to a plan.
 pub const MAX_PLAN_EVIDENCE: usize = 6;
@@ -38,22 +35,14 @@ pub const MAX_CODE_REF_LINES: u32 = 12;
 
 /// A visualization plan: the AI's answer to one focus question, as renderable forms.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VisualizationPlan {
     /// Schema version; must equal [`PLAN_VERSION`].
     pub plan_version: u32,
     /// Repo-state epoch echoed from the prompt; the validator gates on it.
     pub epoch: Epoch,
-    /// The single question this plan answers (one sentence, required).
-    pub focus: String,
-    /// Reviewer-facing name for the behavioral change.
-    #[serde(default)]
-    pub title: String,
     /// One concise sentence explaining the change's intent or resulting behavior.
-    #[serde(default)]
     pub intent: String,
-    /// The highest-value invariant, risk, or question for the reviewer to check.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_focus: Option<String>,
     /// One or two forms ([`MAX_FORMS_PER_PLAN`]).
     #[serde(default)]
     pub forms: Vec<VizForm>,
@@ -65,15 +54,11 @@ pub struct VisualizationPlan {
 impl VisualizationPlan {
     /// A new empty plan at the current schema version.
     #[must_use]
-    pub fn new(epoch: Epoch, focus: impl Into<String>) -> Self {
-        let focus = focus.into();
+    pub fn new(epoch: Epoch) -> Self {
         VisualizationPlan {
             plan_version: PLAN_VERSION,
             epoch,
-            title: focus.clone(),
-            intent: focus.clone(),
-            focus,
-            review_focus: None,
+            intent: String::new(),
             forms: Vec::new(),
             evidence: Vec::new(),
         }
@@ -106,7 +91,7 @@ pub struct PlanEvidence {
     /// Exact source range, when supplied by the fact digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<crate::LineRange>,
-    /// Why this source supports the visual or review focus.
+    /// Why this source supports the description or visual.
     pub reason: String,
 }
 
@@ -161,15 +146,10 @@ impl FormKind {
 
 /// One renderable form inside a [`VisualizationPlan`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VizForm {
     /// Which form to render.
     pub kind: FormKind,
-    /// Short title.
-    pub title: String,
-    /// Prose summary, ≤ [`MAX_SUMMARY_LINES`] lines, rendered next to the visual.
-    /// Empty summaries are omitted from serialized output (defaults restore them).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub summary: String,
     /// Plan nodes, keyed by [`PlanNode::id`] (≤ [`MAX_FORM_NODES`]).
     #[serde(default)]
     pub nodes: Vec<PlanNode>,
@@ -650,8 +630,6 @@ mod tests {
     fn viz_form_helpers() {
         let form = VizForm {
             kind: FormKind::CallTree,
-            title: "Callers of load".into(),
-            summary: "load has 3 callers".into(),
             nodes: vec![PlanNode::new("n1", "load", PlanNodeChange::Modified)],
             edges: vec![],
         };
@@ -660,20 +638,17 @@ mod tests {
         assert!(form.node("n9").is_none());
     }
 
-    /// Default fields (`summary: ""`, `change: "unchanged"`, default `hint`) are omitted
-    /// from serialized plans; deserialization restores them, so the round-trip is exact.
+    /// Default node fields (`change: "unchanged"`, default `hint`) are omitted from
+    /// serialized plans; deserialization restores them, so the round-trip is exact.
     #[test]
     fn default_fields_are_omitted_from_serialized_forms() {
         let form = VizForm {
             kind: FormKind::ChangedSymbolTree,
-            title: "Request path".into(),
-            summary: String::new(),
             nodes: vec![PlanNode::new("n1", "load", PlanNodeChange::Unchanged)],
             edges: Vec::new(),
         };
 
         let json = serde_json::to_value(&form).expect("serialize");
-        assert!(json.get("summary").is_none(), "empty summary omitted");
         let node = &json["nodes"][0];
         assert!(node.get("change").is_none(), "unchanged badge omitted");
         assert!(node.get("hint").is_none(), "default hint omitted");
@@ -681,18 +656,15 @@ mod tests {
 
         let back: VizForm = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back, form, "defaults restore exactly");
-        assert_eq!(back.summary, "");
         assert_eq!(back.nodes[0].change, PlanNodeChange::Unchanged);
         assert_eq!(back.nodes[0].hint, NodeHint::default());
     }
 
-    /// Nonempty summary, non-`unchanged` badge, and nondefault hints keep serializing.
+    /// Non-`unchanged` badges and nondefault hints keep serializing.
     #[test]
     fn nondefault_fields_are_preserved_in_serialized_forms() {
         let form = VizForm {
             kind: FormKind::ChangedSymbolTree,
-            title: "Request path".into(),
-            summary: "load has 3 callers".into(),
             nodes: vec![PlanNode {
                 hint: NodeHint {
                     highlight: true,
@@ -704,7 +676,6 @@ mod tests {
         };
 
         let json = serde_json::to_value(&form).expect("serialize");
-        assert_eq!(json["summary"], "load has 3 callers");
         let node = &json["nodes"][0];
         assert_eq!(node["change"], "modified");
         assert_eq!(

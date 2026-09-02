@@ -587,6 +587,7 @@ mod tests {
         let mut s = snap();
         s.status = crate::snapshot::StatusMessage {
             text: "AI provider returned HTTP 400 with a long response".to_string(),
+            detail: None,
             level: crate::snapshot::StatusLevel::Warning,
         };
         let mut app = app_with(&s);
@@ -755,13 +756,10 @@ mod tests {
     #[test]
     fn plan_node_motion_redraws_only_on_target_change_and_click_expands() {
         let mut s = snap();
-        let mut plan = codescope_core::VisualizationPlan::new(codescope_core::Epoch(1), "focus?");
-        plan.title = "Request path".to_string();
+        let mut plan = codescope_core::VisualizationPlan::new(codescope_core::Epoch(1));
         plan.intent = "A changed entry point forwards work to storage.".to_string();
         plan.forms.push(codescope_core::VizForm {
             kind: codescope_core::FormKind::Sequence,
-            title: "flow".to_string(),
-            summary: String::new(),
             nodes: vec![
                 codescope_core::PlanNode::new(
                     "n1",

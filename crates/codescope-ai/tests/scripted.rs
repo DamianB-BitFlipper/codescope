@@ -343,8 +343,7 @@ async fn previous_validated_design_is_sent_as_a_non_evidentiary_revision_seed() 
         .unwrap();
     let service = service_for(&provider);
     let mut previous = sample_plan(Epoch(6));
-    previous.title = "Earlier cached design".to_string();
-    previous.intent = format!("Prior explanation for {REPO_ROOT}/{MIDDLEWARE_FILE}.");
+    previous.intent = format!("Earlier cached design for {REPO_ROOT}/{MIDDLEWARE_FILE}.");
 
     let outcome = service
         .request_plan_with_previous(
@@ -901,13 +900,8 @@ async fn two_validation_repair_turns_can_cross_schema_and_fact_boundaries() {
 /// `readinessHandler` symbol entity whose file was never analyzed, so the lazy fact store
 /// reported it unqueried and validation rejected the whole sequence form.
 fn drain_plan(epoch: Epoch, attach_entity: bool) -> VisualizationPlan {
-    let mut plan = VisualizationPlan::new(epoch, "How does shutdown drain traffic?");
-    plan.title = "Readiness flips to 503 before the drain wait".into();
+    let mut plan = VisualizationPlan::new(epoch);
     plan.intent = "Shutdown marks readiness unhealthy and waits before draining requests.".into();
-    plan.review_focus = Some(
-        "The 10s drain delay must exceed the load balancer probe interval times its unhealthy          threshold; the probe config lives outside this diff."
-            .into(),
-    );
     let mut n1 = PlanNode::new("n1", "readinessHandler → 503", PlanNodeChange::Unchanged)
         .with_detail("readiness endpoint answers 503 draining once shutdown begins")
         .with_code_ref(PlanCodeRef::new(
@@ -926,8 +920,6 @@ fn drain_plan(epoch: Epoch, attach_entity: bool) -> VisualizationPlan {
     }
     plan.forms.push(VizForm {
         kind: FormKind::Sequence,
-        title: "shutdown drain order".into(),
-        summary: String::new(),
         nodes: vec![
             n1,
             PlanNode::new("n2", "wait shutdownDrainDelay", PlanNodeChange::Unchanged)
@@ -1610,53 +1602,7 @@ async fn repeated_invalid_evidence_stays_bounded() {
     );
 }
 
-/// Round-3 live failure 2: review_focus omitted while the external assumption sits only
-/// in `focus` (which is not rendered). The parse boundary rejects with a named-field
-/// error, and the corrected plan carrying review_focus validates.
-#[tokio::test]
-async fn missing_review_focus_gets_named_field_repair() {
-    let mut no_review = drain_plan(Epoch(10), false);
-    no_review.review_focus = None;
-    let provider = ScriptedProvider::start([
-        AiScriptStep::from_plan(&no_review).unwrap(),
-        AiScriptStep::from_plan(&drain_plan(Epoch(10), false)).unwrap(),
-    ])
-    .await
-    .unwrap();
-    let service = service_for(&provider);
-    let digest = format!("changed file {MIDDLEWARE_FILE}: hunk 0 adds the readiness handler");
-
-    let outcome = service
-        .request_plan(&digest, &NoToolExecutor, &LazyFacts, Epoch(10))
-        .await;
-    let AiOutcome::Plan(plan, report) = outcome else {
-        panic!("expected corrected plan, got {outcome:?}");
-    };
-    assert_eq!(report.verdict, ValidationVerdict::Valid);
-    assert!(plan.review_focus.is_some());
-
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2, "one schema repair");
-    let messages = requests[1].body_json().unwrap()["messages"]
-        .as_array()
-        .unwrap()
-        .clone();
-    let feedback = messages.last().unwrap()["content"].as_str().unwrap();
-    assert!(
-        feedback.contains("review_focus"),
-        "names the missing field: {feedback}"
-    );
-    assert!(
-        feedback.contains("External assumption:"),
-        "prefix rule in feedback: {feedback}"
-    );
-    assert!(
-        feedback.contains("do not place caveats only in focus"),
-        "focus trap in feedback: {feedback}"
-    );
-}
-
-/// Repeated cap/review_focus violations terminate within the existing repair bound:
+/// Repeated cap violations terminate within the existing repair bound:
 /// every submission is oversized, so all three repairs are consumed and the request
 /// fails with the parse error instead of looping.
 #[tokio::test]

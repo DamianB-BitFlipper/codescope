@@ -8,8 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use codescope_core::{
-    DiffSide, FormKind, PlanCodeRef, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode,
-    VisualizationPlan, VizForm,
+    FormKind, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode, VisualizationPlan, VizForm,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -31,8 +30,8 @@ pub enum DiagramRole {
     Hovered,
     /// Labeled connector or arrow.
     Arrow,
-    /// Review question or invariant.
-    Review,
+    /// Warning or generation-status message.
+    Warning,
     /// Source evidence.
     Evidence,
     /// Low-emphasis separators and status.
@@ -90,6 +89,7 @@ struct DiagramContext<'a> {
     form: usize,
     selected_label: &'a str,
     hovered: Option<&'a PlanNodeTarget>,
+    expanded: Option<&'a PlanNodeTarget>,
 }
 
 impl DiagramContext<'_> {
@@ -110,6 +110,10 @@ impl DiagramContext<'_> {
             normal
         }
     }
+
+    fn expanded(&self, node: &PlanNode) -> bool {
+        self.expanded == Some(&self.target(node))
+    }
 }
 
 const MIN_BOX_WIDTH: usize = 18;
@@ -119,21 +123,6 @@ const MAX_HORIZONTAL_GAP: usize = 24;
 /// Pane width at which evidence keeps a one-line reason per entry; below it the block
 /// collapses to bare `basename:line` references.
 const EVIDENCE_REASON_MIN_WIDTH: usize = 60;
-/// Provenance note drawn before any form containing inferred connectors. It must fit a
-/// 36-cell pane so the default narrow viewport still shows it above the visual.
-const BASIS_NOTE: &str = "≈ ┊ = inferred from cited diff";
-
-/// Review-focus prefixes marking a claim this diff cannot verify. The full Review block
-/// renders below the visuals; this one-liner surfaces the risk in the default viewport.
-const EXTERNAL_PREFIX: &str = "External assumption:";
-/// Same treatment for facts deliberately outside this diff's scope.
-const NOT_SHOWN_PREFIX: &str = "Not shown by this diff:";
-/// `true` when the trimmed review focus carries an unverifiable-claim prefix.
-fn needs_external_warning(review: &str) -> bool {
-    let review = review.trim();
-    review.starts_with(EXTERNAL_PREFIX) || review.starts_with(NOT_SHOWN_PREFIX)
-}
-
 /// Lay out a validated plan for the current pane width without transient interaction.
 #[must_use]
 pub fn plan_lines(plan: &VisualizationPlan, width: u16, selected_label: &str) -> Vec<DiagramLine> {
@@ -154,29 +143,9 @@ pub fn interactive_plan_lines(
 ) -> Vec<DiagramLine> {
     let width = usize::from(width).max(1);
     let mut lines = Vec::new();
-    lines.extend(wrap_role(&plan.title, width, DiagramRole::Title, 2));
+    // The intent is the sole prose description above the visual. The model title is
+    // retained in the plan/debug output, but rendering both repeats the same change.
     lines.extend(wrap_role(&plan.intent, width, DiagramRole::Text, 2));
-    // An unverifiable review claim gets its precise caveat above every visual; the full
-    // Review block below repeats it. The upfront caveat precedes the inference
-    // basis note so the strongest caveat is always the first thing after the intent.
-    if let Some(review) = plan
-        .review_focus
-        .as_deref()
-        .filter(|review| needs_external_warning(review))
-    {
-        lines.extend(wrap_prefixed("⚠ ", review, width, DiagramRole::Review, 2));
-    }
-
-    if let Some(target) = expanded {
-        if let Some(node) = plan
-            .forms
-            .get(target.form)
-            .and_then(|form| form.nodes.iter().find(|node| node.id == target.id))
-        {
-            render_expanded_node(node, target, width, &mut lines);
-        }
-    }
-
     for (index, form) in plan.forms.iter().enumerate() {
         if index > 0 {
             lines.push(DiagramLine::plain("", DiagramRole::Muted));
@@ -185,6 +154,7 @@ pub fn interactive_plan_lines(
             form: index,
             selected_label,
             hovered,
+            expanded,
         };
         match form.kind {
             FormKind::RelationshipFlow | FormKind::Sequence => {
@@ -204,20 +174,6 @@ pub fn interactive_plan_lines(
         }
     }
 
-    if let Some(review) = plan
-        .review_focus
-        .as_deref()
-        .filter(|review| !review.trim().is_empty())
-    {
-        lines.push(DiagramLine::plain("", DiagramRole::Muted));
-        lines.extend(wrap_prefixed(
-            "Review: ",
-            review,
-            width,
-            DiagramRole::Review,
-            3,
-        ));
-    }
     if !plan.evidence.is_empty() {
         lines.push(DiagramLine::plain("", DiagramRole::Muted));
         if width >= EVIDENCE_REASON_MIN_WIDTH {
@@ -259,64 +215,6 @@ pub fn interactive_plan_lines(
         }
     }
     lines
-}
-
-fn render_expanded_node(
-    node: &PlanNode,
-    target: &PlanNodeTarget,
-    width: usize,
-    lines: &mut Vec<DiagramLine>,
-) {
-    let heading = format!("Details · {}", node.label.trim());
-    for text in wrap_text(&heading, width, 2) {
-        lines.push(DiagramLine::for_node(
-            text,
-            DiagramRole::Selected,
-            target.clone(),
-        ));
-    }
-    let detail = node
-        .expanded_detail
-        .as_deref()
-        .or(node.detail.as_deref())
-        .unwrap_or_default()
-        .trim();
-    for text in wrap_text(detail, width, 5) {
-        lines.push(DiagramLine::for_node(
-            text,
-            DiagramRole::Text,
-            target.clone(),
-        ));
-    }
-    for code_ref in &node.code_refs {
-        let locator = code_ref_source(code_ref, width >= EVIDENCE_REASON_MIN_WIDTH);
-        for text in wrap_text(&format!("Code · {locator}"), width, 2) {
-            lines.push(DiagramLine::for_node(
-                text,
-                DiagramRole::Evidence,
-                target.clone(),
-            ));
-        }
-    }
-}
-
-fn code_ref_source(code_ref: &PlanCodeRef, full_path: bool) -> String {
-    let file = code_ref.file.to_string();
-    let file = if full_path {
-        file.as_str()
-    } else {
-        basename(&file)
-    };
-    let side = match code_ref.side {
-        DiffSide::Old => "old:",
-        DiffSide::New => "new:",
-    };
-    let range = if code_ref.start_line == code_ref.end_line {
-        code_ref.start_line.to_string()
-    } else {
-        format!("{}-{}", code_ref.start_line, code_ref.end_line)
-    };
-    format!("{file}[h{}] {side}{range}", code_ref.hunk.saturating_add(1))
 }
 
 /// Compact evidence locator: `basename:line (hunk n)`, both one-based for display. The
@@ -439,13 +337,6 @@ fn render_sequence_ladder(
     context: DiagramContext<'_>,
     lines: &mut Vec<DiagramLine>,
 ) {
-    if edges
-        .iter()
-        .enumerate()
-        .any(|(index, edge)| !edge_verified(nodes[index], nodes[index + 1], edge))
-    {
-        push_basis_line(width, lines);
-    }
     if width < 6 {
         // The ladder grammar needs five cells for a step prefix and six for a rail;
         // below that, one truncated plain line per step and edge.
@@ -456,6 +347,7 @@ fn render_sequence_ladder(
                 role,
                 context.target(node),
             ));
+            push_expanded_detail(node, "", width, context, lines);
             if let Some(edge) = edges.get(index) {
                 lines.push(DiagramLine::plain(
                     truncate(edge_label(edge), width),
@@ -500,6 +392,7 @@ fn render_sequence_ladder(
             }
         }
         lines.push(DiagramLine { spans });
+        push_expanded_detail(node, "     ", width, context, lines);
         if let Some(edge) = edges.get(index) {
             let verified = edge_verified(nodes[index], nodes[index + 1], edge);
             let rail = if verified { "│" } else { "┊" };
@@ -537,14 +430,6 @@ fn edge_verified(from: &PlanNode, to: &PlanNode, edge: &PlanEdge) -> bool {
         )
 }
 
-/// One concise muted provenance note under a form that contains inferred connectors.
-fn push_basis_line(width: usize, lines: &mut Vec<DiagramLine>) {
-    lines.push(DiagramLine::plain(
-        truncate(BASIS_NOTE, width),
-        DiagramRole::Muted,
-    ));
-}
-
 fn render_horizontal_chain(
     nodes: &[&PlanNode],
     edges: &[&PlanEdge],
@@ -560,24 +445,22 @@ fn render_horizontal_chain(
     let left_pad = " ".repeat((width.saturating_sub(used)) / 2);
     // A renderer-synthesized edge (e.g. BeforeAfter's "becomes") is presentational even
     // when both endpoints carry entities: it never borrows their verification.
-    let any_inferred = synthetic
-        || edges
-            .iter()
-            .enumerate()
-            .any(|(index, edge)| !edge_verified(nodes[index], nodes[index + 1], edge));
-    if any_inferred {
-        push_basis_line(width, lines);
-    }
-    let boxes: Vec<Vec<String>> = nodes
+    let mut boxes: Vec<Vec<String>> = nodes
         .iter()
         .map(|node| {
             node_box_text(
                 &node.label,
-                node.detail.as_deref().unwrap_or_default(),
+                displayed_node_detail(node, context.expanded(node)),
                 box_width,
+                context.expanded(node),
             )
         })
         .collect();
+    let box_heights: Vec<usize> = boxes.iter().map(Vec::len).collect();
+    let row_count = box_heights.iter().copied().max().unwrap_or_default();
+    for node_box in &mut boxes {
+        node_box.resize(row_count, " ".repeat(box_width));
+    }
     for (row, _) in boxes[0].iter().enumerate() {
         let mut spans = vec![DiagramSpan {
             text: left_pad.clone(),
@@ -585,15 +468,22 @@ fn render_horizontal_chain(
             target: None,
         }];
         for (index, node) in nodes.iter().enumerate() {
-            let normal = if row == 1 || row == 2 || row == 3 {
-                DiagramRole::Text
-            } else {
+            let inside_box = row < box_heights[index];
+            let normal = if !inside_box {
+                DiagramRole::Muted
+            } else if boxes[index][row].starts_with('┌') || boxes[index][row].starts_with('└') {
                 DiagramRole::Border
+            } else {
+                DiagramRole::Text
             };
             spans.push(DiagramSpan {
                 text: boxes[index][row].clone(),
-                role: context.role(node, normal),
-                target: Some(context.target(node)),
+                role: if inside_box {
+                    context.role(node, normal)
+                } else {
+                    normal
+                },
+                target: inside_box.then(|| context.target(node)),
             });
             if index + 1 < count {
                 let verified =
@@ -632,14 +522,6 @@ fn render_branching_flow(
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    // The provenance note precedes the visual, so it must be decided up front.
-    let any_inferred = form.edges.iter().any(|edge| {
-        !matches!((by_id.get(edge.from.as_str()), by_id.get(edge.to.as_str())), (Some(from), Some(to))
-            if edge_verified(from, to, edge))
-    });
-    if any_inferred {
-        push_basis_line(width, lines);
-    }
     // Compact adjacency grammar: each node renders once in stable document order on a
     // full-width line, followed by one child line per outgoing edge naming BOTH the
     // edge effect and its target. Cycles and shared targets stay clear because every
@@ -669,6 +551,7 @@ fn render_branching_flow(
             }
         }
         lines.push(DiagramLine { spans });
+        push_expanded_detail(node, "  ", width, context, lines);
         let outgoing: Vec<&PlanEdge> = form
             .edges
             .iter()
@@ -827,9 +710,6 @@ fn render_before_after(
                     .edges
                     .first()
                     .is_some_and(|real| edge_verified(nodes[0], nodes[1], real));
-            if !verified {
-                push_basis_line(width, lines);
-            }
             lines.extend(plan_node_box(nodes[0], box_width, context));
             lines.push(centered_arrow(edge_label(edge), width, verified));
             lines.extend(plan_node_box(nodes[1], box_width, context));
@@ -855,15 +735,6 @@ fn render_tree(
         .iter()
         .flat_map(|node| node.children.iter().map(String::as_str))
         .collect();
-    // Trust: tree parent/child links are interpretive unless an explicit edge that
-    // passes `edge_verified` backs them. One basis note covers the whole form.
-    if form.nodes.iter().any(|node| {
-        node.children
-            .iter()
-            .any(|child| !link_verified(form, &by_id, node, child))
-    }) {
-        push_basis_line(width, lines);
-    }
     // Cycle safety: validation guarantees proper trees, but stale fixtures and
     // hand-built snapshots must never loop; every node renders at most once.
     let mut shown: HashSet<&str> = HashSet::new();
@@ -969,6 +840,8 @@ fn render_tree_node<'a>(
         }
         lines.push(DiagramLine { spans });
     }
+    let detail_prefix = format!("{indent}   ");
+    push_expanded_detail(node, &detail_prefix, width, context, lines);
     let descendants: Vec<&PlanNode> = node
         .children
         .iter()
@@ -1073,6 +946,68 @@ fn horizontal_gap(edges: &[&PlanEdge]) -> usize {
         .clamp(MIN_HORIZONTAL_GAP, MAX_HORIZONTAL_GAP)
 }
 
+/// The compact preview is always `detail`; expansion swaps in the complete explanation
+/// when the model supplied one. Keeping this choice in one helper gives boxes, ladders,
+/// adjacency flows, and trees the same interaction semantics.
+fn displayed_node_detail(node: &PlanNode, expanded: bool) -> &str {
+    if expanded {
+        node.expanded_detail
+            .as_deref()
+            .filter(|detail| !detail.trim().is_empty())
+            .or(node.detail.as_deref())
+            .unwrap_or_default()
+    } else {
+        node.detail.as_deref().unwrap_or_default()
+    }
+}
+
+/// Expand a node in place for compact layouts that do not draw boxes. The continuation
+/// is part of the same hit target and uses lossless wrapping, so clicking a ladder/tree
+/// row behaves the same way as clicking a box.
+fn push_expanded_detail(
+    node: &PlanNode,
+    indent: &str,
+    width: usize,
+    context: DiagramContext<'_>,
+    lines: &mut Vec<DiagramLine>,
+) {
+    if !context.expanded(node) {
+        return;
+    }
+    let detail = displayed_node_detail(node, true).trim();
+    if detail.is_empty() {
+        return;
+    }
+    let prefix = format!("{indent}↳ ");
+    let prefix_width = prefix.width();
+    let (prefix, available) = if prefix_width < width {
+        (prefix, width - prefix_width)
+    } else {
+        (String::new(), width.max(1))
+    };
+    let target = context.target(node);
+    for (index, detail) in wrap_text_full(detail, available).into_iter().enumerate() {
+        let mut spans = Vec::with_capacity(2);
+        if !prefix.is_empty() {
+            spans.push(DiagramSpan {
+                text: if index == 0 {
+                    prefix.clone()
+                } else {
+                    " ".repeat(prefix_width)
+                },
+                role: DiagramRole::Muted,
+                target: Some(target.clone()),
+            });
+        }
+        spans.push(DiagramSpan {
+            text: detail,
+            role: context.role(node, DiagramRole::Text),
+            target: Some(target.clone()),
+        });
+        lines.push(DiagramLine { spans });
+    }
+}
+
 fn node_box(label: &str, detail: &str, width: usize, selected: bool) -> Vec<DiagramLine> {
     if width < 4 {
         let role = if selected {
@@ -1088,7 +1023,7 @@ fn node_box(label: &str, detail: &str, width: usize, selected: bool) -> Vec<Diag
         );
         return out;
     }
-    node_box_text(label, detail, width)
+    node_box_text(label, detail, width, false)
         .into_iter()
         .enumerate()
         .map(|(index, text)| {
@@ -1106,7 +1041,8 @@ fn node_box(label: &str, detail: &str, width: usize, selected: bool) -> Vec<Diag
 
 fn plan_node_box(node: &PlanNode, width: usize, context: DiagramContext<'_>) -> Vec<DiagramLine> {
     let target = context.target(node);
-    let detail = node.detail.as_deref().unwrap_or_default();
+    let expanded = context.expanded(node);
+    let detail = displayed_node_detail(node, expanded);
     // A box needs at least four cells to draw its own borders; below that degrade to
     // truncated plain lines so no line exceeds the requested width.
     if width < 4 {
@@ -1116,18 +1052,25 @@ fn plan_node_box(node: &PlanNode, width: usize, context: DiagramContext<'_>) -> 
             role,
             target.clone(),
         )];
-        out.extend(
+        let detail_lines = if expanded {
+            wrap_text_full(detail.trim(), width)
+        } else {
             wrap_text(detail.trim(), width, 2)
+        };
+        out.extend(
+            detail_lines
                 .into_iter()
                 .map(|line| DiagramLine::for_node(line, role, target.clone())),
         );
         return out;
     }
-    node_box_text(&node.label, detail, width)
+    let box_lines = node_box_text(&node.label, detail, width, expanded);
+    let last = box_lines.len().saturating_sub(1);
+    box_lines
         .into_iter()
         .enumerate()
         .map(|(index, text)| {
-            let normal = if index == 0 || index == 4 {
+            let normal = if index == 0 || index == last {
                 DiagramRole::Border
             } else {
                 DiagramRole::Text
@@ -1137,19 +1080,45 @@ fn plan_node_box(node: &PlanNode, width: usize, context: DiagramContext<'_>) -> 
         .collect()
 }
 
-fn node_box_text(label: &str, detail: &str, width: usize) -> Vec<String> {
+/// Draw a node in its collapsed or expanded state.
+///
+/// Collapsed nodes reserve two rows for the model's short `detail` preview. Expanded
+/// nodes replace that preview with the complete `expanded_detail` and grow vertically;
+/// nothing is ellipsized in that state, including identifiers longer than one row.
+fn node_box_text(label: &str, detail: &str, width: usize, expanded: bool) -> Vec<String> {
     let width = width.max(4);
     let inner = width.saturating_sub(2);
-    let label = truncate(label.trim(), inner);
-    let mut detail_lines = wrap_text(detail.trim(), inner, 2);
-    detail_lines.resize(2, String::new());
-    vec![
-        format!("┌{}┐", "─".repeat(inner)),
-        format!("│{}│", pad(&label, inner)),
-        format!("│{}│", pad(&detail_lines[0], inner)),
-        format!("│{}│", pad(&detail_lines[1], inner)),
-        format!("└{}┘", "─".repeat(inner)),
-    ]
+    let label_lines = if expanded {
+        wrap_text_full(label.trim(), inner)
+    } else {
+        vec![truncate(label.trim(), inner)]
+    };
+    let mut detail_lines = if expanded {
+        wrap_text_full(detail.trim(), inner)
+    } else {
+        wrap_text(detail.trim(), inner, 2)
+    };
+    if expanded {
+        if detail_lines.is_empty() {
+            detail_lines.push(String::new());
+        }
+    } else {
+        detail_lines.resize(2, String::new());
+    }
+    let mut lines = Vec::with_capacity(label_lines.len() + detail_lines.len() + 2);
+    lines.push(format!("┌{}┐", "─".repeat(inner)));
+    lines.extend(
+        label_lines
+            .into_iter()
+            .map(|label| format!("│{}│", pad(&label, inner))),
+    );
+    lines.extend(
+        detail_lines
+            .into_iter()
+            .map(|detail| format!("│{}│", pad(&detail, inner))),
+    );
+    lines.push(format!("└{}┘", "─".repeat(inner)));
+    lines
 }
 
 fn centered_arrow(label: &str, width: usize, verified: bool) -> DiagramLine {
@@ -1245,6 +1214,69 @@ fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     lines
 }
 
+/// Lossless word wrapping for expanded content. Unlike [`wrap_text`], this has no line
+/// cap and splits long identifiers across rows instead of replacing their tail with an
+/// ellipsis. A double-width glyph in a one-cell viewport is the sole impossible case;
+/// it degrades to a one-cell ellipsis to preserve the renderer's width contract.
+fn wrap_text_full(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        if word.width() <= width {
+            let candidate_width = current.width() + usize::from(!current.is_empty()) + word.width();
+            if candidate_width <= width {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(word);
+            } else {
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                }
+                current.push_str(word);
+            }
+            continue;
+        }
+
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        let mut chunk = String::new();
+        let mut chunk_width = 0usize;
+        for ch in word.chars() {
+            let char_width = ch.width().unwrap_or(0);
+            if char_width > width {
+                if !chunk.is_empty() {
+                    lines.push(std::mem::take(&mut chunk));
+                    chunk_width = 0;
+                }
+                lines.push("…".to_string());
+                continue;
+            }
+            if chunk_width + char_width > width && !chunk.is_empty() {
+                lines.push(std::mem::take(&mut chunk));
+                chunk_width = 0;
+            }
+            chunk.push(ch);
+            chunk_width += char_width;
+            if chunk_width == width {
+                lines.push(std::mem::take(&mut chunk));
+                chunk_width = 0;
+            }
+        }
+        current = chunk;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 fn truncate(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
@@ -1286,14 +1318,10 @@ mod tests {
     };
 
     fn flow_plan() -> VisualizationPlan {
-        let mut plan = VisualizationPlan::new(Epoch(1), "How does shutdown drain traffic?");
-        plan.title = "Readiness-gated graceful drain".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "Stop new traffic before waiting for in-flight requests.".into();
-        plan.review_focus = Some("Confirm the drain budget exceeds probe propagation time.".into());
         plan.forms.push(VizForm {
             kind: FormKind::RelationshipFlow,
-            title: "runtime".into(),
-            summary: String::new(),
             nodes: vec![
                 PlanNode::new("a", "shutdown", PlanNodeChange::Modified)
                     .with_detail("marks the service unready"),
@@ -1337,8 +1365,8 @@ mod tests {
 
     #[test]
     fn wide_flow_uses_horizontal_boxes_and_arrows() {
-        // flow_plan's nodes carry no entities, so its arrows are inferred: dashed, with
-        // one provenance note. Solid arrows stay reserved for verified relationships.
+        // flow_plan's nodes carry no entities, so its arrows are inferred and dashed.
+        // Solid arrows stay reserved for verified relationships.
         let text = plan_text(&flow_plan(), 100, "shutdown");
         assert!(text.contains("┌"));
         assert!(text.contains("▷"));
@@ -1348,12 +1376,9 @@ mod tests {
         );
         assert!(text.contains("readiness becomes"));
         assert!(
-            text.contains("≈ ┊ = inferred from cited diff"),
-            "basis note: {text}"
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
-        let note = text.find("inferred from cited diff").expect("note");
-        let first_box = text.find('┌').expect("boxes");
-        assert!(note < first_box, "the note precedes the visual: {text}");
     }
 
     #[test]
@@ -1369,12 +1394,9 @@ mod tests {
         );
         assert!(text.contains('┊'), "inferred rail: {text}");
         assert!(
-            text.contains("≈ ┊ = inferred from cited diff"),
-            "basis note: {text}"
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
-        let note = text.find("inferred from cited diff").expect("note");
-        let first_step = text.find(" 1  shutdown").expect("first step");
-        assert!(note < first_step, "the note precedes the ladder: {text}");
         assert!(!text.contains('┌'), "no boxes in the ladder: {text}");
     }
 
@@ -1383,8 +1405,7 @@ mod tests {
     /// truncated against the box width at every terminal size).
     /// The validated 7-step sequence shape from the real AI baseline plan.
     fn seven_step_sequence_plan() -> VisualizationPlan {
-        let mut plan = VisualizationPlan::new(Epoch(1), "How does the API drain traffic?");
-        plan.title = "API graceful drain".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "Stop new traffic before waiting for in-flight requests to finish.".into();
         let steps = [
             ("SIGTERM received", "run() begins teardown"),
@@ -1397,8 +1418,6 @@ mod tests {
         ];
         plan.forms.push(VizForm {
             kind: FormKind::Sequence,
-            title: "runtime".into(),
-            summary: String::new(),
             nodes: steps
                 .iter()
                 .enumerate()
@@ -1446,12 +1465,9 @@ mod tests {
         );
         assert!(text.contains('┊'), "entityless chain is inferred: {text}");
         assert!(
-            text.contains("≈ ┊ = inferred from cited diff"),
-            "basis note: {text}"
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
-        let note = text.find("inferred from cited diff").expect("note");
-        let first_step = text.find(" 1  SIGTERM received").expect("first step");
-        assert!(note < first_step, "the note precedes the ladder: {text}");
         // One line per step and one per edge: the whole chain fits a short pane.
         assert!(
             lines.len() <= 20,
@@ -1471,8 +1487,6 @@ mod tests {
         };
         let mut form = VizForm {
             kind: FormKind::RelationshipFlow,
-            title: "runtime".into(),
-            summary: String::new(),
             nodes: vec![
                 PlanNode::new("a", "shutdown", PlanNodeChange::Modified)
                     .with_entity(entity("shutdown"))
@@ -1488,7 +1502,7 @@ mod tests {
                 label: Some("readiness becomes 503".into()),
             }],
         };
-        let mut plan = VisualizationPlan::new(Epoch(1), "focus");
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.forms.push(form.clone());
         // 40 cells cannot fit two boxes side by side, so the ladder path renders.
         let text = plan_text(&plan, 40, "shutdown");
@@ -1501,13 +1515,12 @@ mod tests {
         let text = plan_text(&plan, 40, "");
         assert!(text.contains('┊'), "writes edge is inferred: {text}");
         assert!(
-            text.contains("≈ ┊ = inferred from cited diff"),
-            "basis note: {text}"
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
     }
 
-    /// A chain mixing verified and inferred edges marks only the inferred rails and
-    /// emits exactly one basis note.
+    /// A chain mixing verified and inferred edges marks only the inferred rails.
     #[test]
     fn mixed_edges_mark_only_inferred_rails() {
         let entity = |symbol: &str| EntityRef {
@@ -1515,11 +1528,9 @@ mod tests {
             symbol: Some(symbol.to_string()),
             range: None,
         };
-        let mut plan = VisualizationPlan::new(Epoch(1), "focus");
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.forms.push(VizForm {
             kind: FormKind::RelationshipFlow,
-            title: "runtime".into(),
-            summary: String::new(),
             nodes: vec![
                 PlanNode::new("n1", "signal", PlanNodeChange::Unchanged)
                     .with_entity(entity("signal")),
@@ -1551,23 +1562,19 @@ mod tests {
             text.contains("┊ waits the drain delay"),
             "entityless endpoint makes the rail inferred: {text}"
         );
-        assert_eq!(
-            text.matches("≈ ┊ = inferred from cited diff").count(),
-            1,
-            "exactly one basis note: {text}"
+        assert!(
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
     }
 
     /// Intent is capped at two lines: the ladder and title carry the story.
     #[test]
     fn long_intent_caps_at_two_lines() {
-        let mut plan = VisualizationPlan::new(Epoch(1), "focus");
-        plan.title = "Title".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "word ".repeat(60);
         plan.forms.push(VizForm {
             kind: FormKind::ChangedSymbolTree,
-            title: "tree".into(),
-            summary: String::new(),
             nodes: vec![PlanNode::new("n1", "root", PlanNodeChange::Modified)],
             edges: Vec::new(),
         });
@@ -1592,12 +1599,9 @@ mod tests {
     /// bare basename:line references when the pane is too narrow for prose.
     #[test]
     fn evidence_compacts_to_basename_refs() {
-        let mut plan = VisualizationPlan::new(Epoch(1), "focus");
-        plan.title = "Title".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.forms.push(VizForm {
             kind: FormKind::ChangedSymbolTree,
-            title: "tree".into(),
-            summary: String::new(),
             nodes: vec![PlanNode::new("n1", "root", PlanNodeChange::Modified)],
             edges: Vec::new(),
         });
@@ -1656,13 +1660,10 @@ mod tests {
     /// Narrow BeforeAfter boxes never exceed the pane: every top border closes.
     #[test]
     fn before_after_narrow_keeps_box_borders_intact() {
-        let mut plan = VisualizationPlan::new(Epoch(1), "How does shutdown change?");
-        plan.title = "Shutdown ownership moves".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "Only signal handling is cancelled.".into();
         plan.forms.push(VizForm {
             kind: FormKind::BeforeAfter,
-            title: "transition".into(),
-            summary: String::new(),
             nodes: vec![
                 PlanNode::new("before", "cancel root", PlanNodeChange::Removed),
                 PlanNode::new("after", "cancel signal", PlanNodeChange::Added),
@@ -1710,16 +1711,13 @@ mod tests {
     }
 
     fn tree_plan() -> VisualizationPlan {
-        let mut plan = VisualizationPlan::new(Epoch(1), "Where is readiness owned?");
-        plan.title = "Readiness ownership".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "The API owns a listener and its readiness handler.".into();
         let mut root = PlanNode::new("root", "API", PlanNodeChange::Modified)
             .with_detail("owns readiness behavior");
         root.children = vec!["listener".into(), "handler".into()];
         plan.forms.push(VizForm {
             kind: FormKind::ChangedSymbolTree,
-            title: "ownership".into(),
-            summary: String::new(),
             nodes: vec![
                 root,
                 PlanNode::new("listener", "readiness listener", PlanNodeChange::Added)
@@ -1734,7 +1732,7 @@ mod tests {
 
     #[test]
     fn tree_visual_keeps_parent_child_shape() {
-        // No explicit edges: the compact tree uses dashed branches plus one basis note.
+        // No explicit edges: the compact tree uses dashed branches without a legend.
         let plan = tree_plan();
         let lines = plan_lines(&plan, 60, "API");
         let text = lines
@@ -1749,18 +1747,9 @@ mod tests {
         assert!(text.contains("readiness listener"));
         assert!(text.contains("readinessHandler"));
         assert!(
-            text.contains("≈ ┊ = inferred from cited diff"),
-            "basis note: {text}"
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
-        let note = lines
-            .iter()
-            .position(|line| line.text().contains("inferred from cited diff"))
-            .expect("note");
-        let root = lines
-            .iter()
-            .position(|line| line.text().starts_with("API"))
-            .expect("root line");
-        assert!(note < root, "the note precedes the root: {text}");
         assert!(!text.contains('┌'), "no box glyphs: {text}");
         // One physical line per node: each label lands on exactly one line.
         for label in ["API", "readiness listener", "readinessHandler"] {
@@ -1790,13 +1779,10 @@ mod tests {
     }
 
     fn before_after_plan() -> VisualizationPlan {
-        let mut plan = VisualizationPlan::new(Epoch(1), "How does shutdown change?");
-        plan.title = "Shutdown ownership moves".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "The root context survives while only signal handling is cancelled.".into();
         plan.forms.push(VizForm {
             kind: FormKind::BeforeAfter,
-            title: "transition".into(),
-            summary: String::new(),
             nodes: vec![
                 PlanNode::new("before", "cancel root", PlanNodeChange::Removed)
                     .with_detail("aborts every in-flight request"),
@@ -1823,11 +1809,7 @@ mod tests {
     /// The exact six-node file-root tree from the live run-2 fallback plan: one root
     /// with five children, no explicit edges.
     fn six_node_tree_plan() -> VisualizationPlan {
-        let mut plan = VisualizationPlan::new(
-            Epoch(1),
-            "How does the new readiness port and reordered shutdown sequence drain the API?",
-        );
-        plan.title = "Sandbox API drains gracefully via readiness port".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "A new readiness port flips to 503 on shutdown so the load balancer stops routing before the server drains.".into();
         let mut root = PlanNode::new("n1", "main.go run()", PlanNodeChange::Unchanged).with_detail(
             "run() gains plaintext readiness listener and reordered graceful shutdown path.",
@@ -1868,8 +1850,6 @@ mod tests {
         ];
         plan.forms.push(VizForm {
             kind: FormKind::ChangedSymbolTree,
-            title: "Sandbox API graceful drain sequence".into(),
-            summary: String::new(),
             nodes: std::iter::once(root)
                 .chain(details.iter().enumerate().map(|(index, (label, detail))| {
                     PlanNode::new(format!("n{}", index + 2), *label, PlanNodeChange::Unchanged)
@@ -1908,8 +1888,7 @@ mod tests {
     }
 
     /// The live six-node tree renders one line per node at both 36 and 96 cells —
-    /// no five-row boxes — with the basis note before the root and every line inside
-    /// the requested width.
+    /// no five-row boxes — and every line stays inside the requested width.
     #[test]
     fn six_node_tree_renders_compactly_at_36_and_96() {
         let plan = six_node_tree_plan();
@@ -1929,9 +1908,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(!text.contains('┌'), "no box glyphs at {width}: {text}");
-            let note = text.find("inferred from cited diff").expect("note");
-            let root = text.find("main.go run()").expect("root");
-            assert!(note < root, "basis before the root at {width}: {text}");
+            assert!(
+                !text.contains("inferred from cited diff"),
+                "no legend: {text}"
+            );
             for label in labels {
                 // At 36 cells the longest label truncates with an ellipsis; its
                 // recognizable head must still be visible. At 96 the full label fits.
@@ -1984,105 +1964,8 @@ mod tests {
         }
     }
 
-    /// The live plan's review focus (`External assumption: ...`) yields a precise
-    /// warning above every visual — before the basis note and the first form — while
-    /// the full Review block stays at the bottom. Ordinary review questions get no
-    /// upfront warning.
-    #[test]
-    fn external_assumption_warning_precedes_everything() {
-        let mut plan = seven_step_sequence_plan();
-        plan.review_focus = Some(
-            "External assumption: the 10s drain delay matches the load balancer's probe interval."
-                .into(),
-        );
-        let lines = plan_lines(&plan, 96, "");
-        let text = lines
-            .iter()
-            .map(DiagramLine::text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let warning = lines
-            .iter()
-            .position(|line| line.text().contains("External assumption"))
-            .expect("warning line");
-        let basis = lines
-            .iter()
-            .position(|line| line.text().contains("inferred from cited diff"))
-            .expect("basis note");
-        let first_step = lines
-            .iter()
-            .position(|line| line.text().contains(" 1  SIGTERM received"))
-            .expect("first step");
-        assert!(
-            warning < basis && basis < first_step,
-            "warning < basis < visual: {text}"
-        );
-        // The warning line carries the Review role (WARN styling in the renderer).
-        assert!(
-            lines[warning]
-                .spans
-                .iter()
-                .any(|span| span.role == DiagramRole::Review),
-            "warning uses the Review role: {text}"
-        );
-        // The precise caveat is repeated intentionally: once before the visual and once
-        // in the full Review block below it, so the first viewport cannot hide the risk.
-        assert!(
-            text.matches("External assumption").count() >= 2,
-            "precise caveat stays visible above and below: {text}"
-        );
-        let full_review = lines
-            .iter()
-            .position(|line| line.text().contains("Review:"))
-            .expect("full review block");
-        assert!(first_step < full_review, "full block stays at the bottom");
-
-        // The alternative prefix warns too.
-        plan.review_focus =
-            Some("Not shown by this diff: the load balancer's actual probe interval.".into());
-        let text = plan_text(&plan, 96, "");
-        assert!(
-            text.lines()
-                .take(5)
-                .any(|line| line.contains("Not shown by this diff")),
-            "not-shown caveat is explicit above the visual: {text}"
-        );
-
-        // An ordinary review question gets no upfront warning.
-        plan.review_focus = Some("Confirm the drain budget exceeds propagation time.".into());
-        let text = plan_text(&plan, 96, "");
-        assert_eq!(
-            text.matches("Confirm the drain budget").count(),
-            1,
-            "ordinary question stays in the Review block only: {text}"
-        );
-        assert!(text.contains("Review: Confirm"), "block retained: {text}");
-    }
-
-    /// The upfront warning degrades by truncation at tiny widths instead of overflowing.
-    #[test]
-    fn external_assumption_warning_fits_tiny_widths() {
-        let mut plan = seven_step_sequence_plan();
-        plan.review_focus = Some("External assumption: probes stop before drain.".into());
-        for width in 1..=17u16 {
-            for line in plan_lines(&plan, width, "") {
-                assert!(
-                    line.text().width() <= usize::from(width),
-                    "width {width} leaked: {:?}",
-                    line.text()
-                );
-            }
-            let text = plan_text(&plan, width, "");
-            // Even at one cell the truncated warning still renders (⚠ …).
-            assert!(
-                text.contains('⚠') || width < 3,
-                "warning glyph survives at {width}: {text}"
-            );
-        }
-    }
-
-    /// A tree whose parent/child links are all backed by explicit verified edges is a
-    /// fully verified tree: solid branches and NO basis note.
+    /// A tree whose parent/child links are all backed by explicit verified edges uses
+    /// solid branches; inferred links remain dashed without adding a legend.
     #[test]
     fn verified_tree_links_render_solid_without_basis_note() {
         let entity = |symbol: &str| EntityRef {
@@ -2090,8 +1973,7 @@ mod tests {
             symbol: Some(symbol.to_string()),
             range: None,
         };
-        let mut plan = VisualizationPlan::new(Epoch(1), "Where is readiness owned?");
-        plan.title = "Readiness ownership".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "The API owns a listener and its readiness handler.".into();
         let mut root = PlanNode::new("root", "API", PlanNodeChange::Modified)
             .with_entity(entity("API"))
@@ -2102,8 +1984,6 @@ mod tests {
             .with_detail("accepts plaintext probes");
         plan.forms.push(VizForm {
             kind: FormKind::ChangedSymbolTree,
-            title: "ownership".into(),
-            summary: String::new(),
             nodes: vec![root, listener],
             edges: vec![PlanEdge {
                 from: "root".into(),
@@ -2121,17 +2001,16 @@ mod tests {
         let text = plan_text(&plan, 60, "");
         assert!(text.contains("└┄"), "reads link is inferred: {text}");
         assert!(
-            text.contains("≈ ┊ = inferred from cited diff"),
-            "note: {text}"
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
     }
 
     /// Multiple roots each render without a branch prefix, and depth-two subtrees keep
-    /// nested guide rails. With no edges the form carries exactly one basis note.
+    /// nested guide rails.
     #[test]
     fn tree_supports_multiple_roots_and_nested_guides() {
-        let mut plan = VisualizationPlan::new(Epoch(1), "Who owns what?");
-        plan.title = "Ownership".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "Two owners each own a subtree.".into();
         let mut first = PlanNode::new("a", "API", PlanNodeChange::Modified);
         first.children = vec!["a1".into(), "a2".into()];
@@ -2142,8 +2021,6 @@ mod tests {
         let second = PlanNode::new("b", "CLI", PlanNodeChange::Modified);
         plan.forms.push(VizForm {
             kind: FormKind::ChangedSymbolTree,
-            title: "owners".into(),
-            summary: String::new(),
             nodes: vec![first, a1, a1x, a2, second],
             edges: Vec::new(),
         });
@@ -2176,10 +2053,9 @@ mod tests {
             text.contains("  └┄ second"),
             "last child closes the level: {text}"
         );
-        assert_eq!(
-            text.matches("≈ ┊ = inferred from cited diff").count(),
-            1,
-            "exactly one basis note: {text}"
+        assert!(
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
         // Exactly one line per node across both roots.
         assert_eq!(
@@ -2202,11 +2078,7 @@ mod tests {
     /// build artifact: document-order nodes, target-bearing adjacency edges, a visible
     /// cycle, and a compact body.
     fn cyclic_flow_plan() -> VisualizationPlan {
-        let mut plan = VisualizationPlan::new(
-            Epoch(1),
-            "How does the new plaintext readiness port interact with the mTLS shutdown sequence?",
-        );
-        plan.title = "Plaintext readiness port gates graceful API drain".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         plan.intent = "Adds an unauthenticated /health listener, flips it to 503 on shutdown, waits 10s, then drains.".into();
         let details = [
             (
@@ -2270,8 +2142,6 @@ mod tests {
         ];
         plan.forms.push(VizForm {
             kind: FormKind::RelationshipFlow,
-            title: "API adds plaintext readiness port driving graceful drain".into(),
-            summary: String::new(),
             nodes: details
                 .iter()
                 .enumerate()
@@ -2294,7 +2164,7 @@ mod tests {
     }
 
     /// The final cyclic artifact renders compactly: no boxes, each node exactly once,
-    /// all six edges carrying their target, the cycle visible, one basis note first.
+    /// all six edges carrying their target, and the cycle visible.
 
     #[test]
     fn cyclic_flow_renders_compact_adjacency() {
@@ -2306,16 +2176,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!text.contains('┌'), "no box glyphs: {text}");
-        // One basis note before any node line.
-        let basis = lines
-            .iter()
-            .position(|line| line.text().contains("inferred from cited diff"))
-            .expect("basis note");
         let first_node = lines
             .iter()
             .position(|line| line.text().starts_with("readinessHandler"))
             .expect("first node");
-        assert!(basis < first_node, "basis before the visual: {text}");
+        assert!(
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
+        );
         // Every node renders exactly once on its own document-order line.
         for label in [
             "readinessHandler",
@@ -2349,7 +2217,7 @@ mod tests {
             "the closing cycle edge is explicit: {text}"
         );
         // Compact body: roughly nodes + edges (5 + 6 = 11 lines), not five-row boxes.
-        let body = lines.len() - basis;
+        let body = lines.len() - first_node;
         assert!(body <= 12, "compact body, got {body} lines: {text}");
         // Every line respects the requested width.
         for line in &lines {
@@ -2405,8 +2273,8 @@ mod tests {
         }
     }
 
-    /// Verified adjacency edges get solid branches and no basis note; a single inferred
-    /// edge in the same form dashes its own branch and adds exactly one note.
+    /// Verified adjacency edges get solid branches; an inferred edge in the same form
+    /// dashes only its own branch.
     #[test]
     fn branching_flow_marks_verified_and_inferred_edges() {
         let entity = |symbol: &str| EntityRef {
@@ -2414,8 +2282,7 @@ mod tests {
             symbol: Some(symbol.to_string()),
             range: None,
         };
-        let mut plan = VisualizationPlan::new(Epoch(1), "focus");
-        plan.title = "Flow".into();
+        let mut plan = VisualizationPlan::new(Epoch(1));
         let nodes = vec![
             PlanNode::new("a", "signal", PlanNodeChange::Modified).with_entity(entity("signal")),
             PlanNode::new("b", "readiness", PlanNodeChange::Modified)
@@ -2425,8 +2292,6 @@ mod tests {
         // Branching: two outgoing edges from `a` keep this off the ladder path.
         plan.forms.push(VizForm {
             kind: FormKind::RelationshipFlow,
-            title: "flow".into(),
-            summary: String::new(),
             nodes,
             edges: vec![
                 PlanEdge {
@@ -2461,7 +2326,7 @@ mod tests {
         assert!(!text.contains('┄'), "no dashed branch: {text}");
         assert!(!text.contains("cited diff"), "no basis note: {text}");
 
-        // One Reads edge makes its own branch dashed and adds exactly one note.
+        // One Reads edge makes only its own branch dashed.
         plan.forms[0].edges[1].kind = PlanEdgeKind::Reads;
         let text = plan_text(&plan, 96, "");
         assert!(
@@ -2472,10 +2337,9 @@ mod tests {
             text.contains("  ├─ flips readiness"),
             "the verified sibling stays solid: {text}"
         );
-        assert_eq!(
-            text.matches("≈ ┊ = inferred from cited diff").count(),
-            1,
-            "exactly one basis note: {text}"
+        assert!(
+            !text.contains("inferred from cited diff"),
+            "no legend: {text}"
         );
     }
 
@@ -2510,7 +2374,7 @@ mod tests {
         form.nodes[1].entity = Some(entity("cancelSignal"));
 
         // Wide: the horizontal path (2 boxes + arrow). The synthetic Contains edge must
-        // render dashed with the basis note before the boxes.
+        // render dashed without adding a textual legend.
         let wide = plan_text(&plan, 100, "");
         assert!(
             wide.contains("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄▷") || wide.contains('▷'),
@@ -2521,20 +2385,17 @@ mod tests {
             "no solid arrow for the synthetic edge: {wide}"
         );
         assert!(
-            wide.contains("≈ ┊ = inferred from cited diff"),
-            "basis note: {wide}"
+            !wide.contains("inferred from cited diff"),
+            "no legend: {wide}"
         );
-        let note = wide.find("inferred from cited diff").expect("note");
-        let first_box = wide.find('┌').expect("boxes");
-        assert!(note < first_box, "the note precedes the visual: {wide}");
 
         // Narrow: the stacked path keeps the same verdict.
         let narrow = plan_text(&plan, 40, "");
         assert!(narrow.contains("┊ becomes"), "inferred glyph: {narrow}");
         assert!(!narrow.contains("▼ becomes"), "no verified glyph: {narrow}");
         assert!(
-            narrow.contains("≈ ┊ = inferred from cited diff"),
-            "basis note: {narrow}"
+            !narrow.contains("inferred from cited diff"),
+            "no legend: {narrow}"
         );
     }
 
@@ -2564,23 +2425,20 @@ mod tests {
     }
 
     #[test]
-    fn interactive_layout_tags_hover_nodes_and_expands_exact_code_refs() {
-        let mut plan = flow_plan();
+    fn interactive_layout_expands_the_clicked_box_in_place_without_truncation() {
+        let mut plan = before_after_plan();
         let node = &mut plan.forms[0].nodes[0];
-        node.expanded_detail =
-            Some("Marks readiness false before the server begins its bounded drain.".to_string());
-        node.code_refs.push(PlanCodeRef::new(
-            FileId::new("cmd/server/main.go").unwrap(),
-            0,
-            DiffSide::New,
-            42,
-            44,
-        ));
+        node.detail = Some("Prints the unversioned parse error and exits".to_string());
+        node.expanded_detail = Some(
+            "When parsing fails, the existing fatal branch prints the original error without a diagnostic-version marker, then preserves status one."
+                .to_string(),
+        );
         let target = PlanNodeTarget {
             form: 0,
-            id: "a".to_string(),
+            id: "before".to_string(),
         };
-        let lines = interactive_plan_lines(&plan, 80, "shutdown", Some(&target), Some(&target));
+        let collapsed = interactive_plan_lines(&plan, 100, "", None, None);
+        let lines = interactive_plan_lines(&plan, 100, "", Some(&target), Some(&target));
         assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
             span.target.as_ref() == Some(&target) && span.role == DiagramRole::Hovered
         }));
@@ -2592,12 +2450,24 @@ mod tests {
                 "
 ",
             );
-        assert!(text.contains("Details · shutdown"), "{text}");
         assert!(
-            text.find("Details · shutdown") < text.find(" 1  shutdown"),
-            "pinned details stay visible above the form: {text}"
+            !text.contains("Details ·"),
+            "expansion belongs to the clicked box: {text}"
         );
-        assert!(text.contains("Marks readiness false"), "{text}");
-        assert!(text.contains("cmd/server/main.go[h1] new:42-44"), "{text}");
+        assert!(text.contains("When parsing fails"), "{text}");
+        assert!(text.contains("diagnostic-version"), "{text}");
+        assert!(text.contains("preserves status one"), "{text}");
+        assert!(
+            lines.len() > collapsed.len(),
+            "the selected box grows vertically"
+        );
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.target.as_ref() == Some(&target))
+                .all(|span| !span.text.contains('…')),
+            "expanded target has no ellipsis: {text}"
+        );
     }
 }

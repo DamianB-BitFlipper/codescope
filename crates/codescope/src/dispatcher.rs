@@ -215,6 +215,27 @@ const AUTO_BASE: &str = "(auto / inferred)";
 const AI_FAILURE_SUFFIX: &str =
     "m change model · retries automatically when the selection or file changes · deterministic impact remains available";
 
+/// Keep backend-owned status summaries stable and small; the TUI separately receives the
+/// complete failure in [`StatusMessage::detail`]. Newlines are detail structure, never footer
+/// content.
+fn ai_failure_footer_reason(reason: &str) -> String {
+    const MAX_CHARS: usize = 180;
+    let first_line = reason
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("AI generation failed")
+        .trim();
+    if first_line.chars().count() <= MAX_CHARS {
+        return first_line.to_string();
+    }
+    let mut concise = first_line
+        .chars()
+        .take(MAX_CHARS.saturating_sub(1))
+        .collect::<String>();
+    concise.push('…');
+    concise
+}
+
 /// Lazy per-file semantic state (the interactive counterpart of the eager
 /// `AnalysisSnapshot.files`). The files pane renders this directly.
 #[derive(Debug, Clone)]
@@ -583,6 +604,22 @@ impl Dispatcher {
     fn set_status(&mut self, text: impl Into<String>, level: StatusLevel) {
         self.status = StatusMessage {
             text: text.into(),
+            detail: None,
+            level,
+        };
+    }
+
+    /// Set a concise footer message with a separate full diagnostic for the click-open
+    /// status dialog. The detail is frozen by the TUI when opened, just like the summary.
+    fn set_status_with_detail(
+        &mut self,
+        text: impl Into<String>,
+        detail: impl Into<String>,
+        level: StatusLevel,
+    ) {
+        self.status = StatusMessage {
+            text: text.into(),
+            detail: Some(detail.into()),
             level,
         };
     }
@@ -2298,8 +2335,12 @@ impl Dispatcher {
                 // Every AI failure carries the recovery suffix (spec §3.6); the
                 // deterministic impact pane is unaffected by the failure.
                 if is_focused {
-                    self.set_status(
-                        format!("AI: {reason} · {AI_FAILURE_SUFFIX}"),
+                    let footer_reason = ai_failure_footer_reason(&reason);
+                    self.set_status_with_detail(
+                        format!("AI: {footer_reason} · {AI_FAILURE_SUFFIX}"),
+                        format!(
+                            "AI generation failed\n\n{reason}\n\nRecovery: {AI_FAILURE_SUFFIX}"
+                        ),
                         StatusLevel::Warning,
                     );
                 }
@@ -2597,7 +2638,7 @@ fn append_impact_focus(digest: &mut String, impact: &ImpactPane) {
     let Some(selected) = &impact.selected_change else {
         return;
     };
-    digest.push_str("\n## current impact selection (required plan focus)\n");
+    digest.push_str("\n## current impact selection\n");
     digest.push_str(&format!("file: {}\n", one_line(&selected.file)));
     digest.push_str(&format!("label: {}\n", one_line(&selected.label)));
     digest.push_str(&format!("change: {}\n", selected.change));
@@ -2613,7 +2654,7 @@ fn append_impact_focus(digest: &mut String, impact: &ImpactPane) {
         digest.push_str(&format!("impact caveat: {}\n", one_line(&impact.note)));
     }
     digest.push_str(
-        "focus question: Visually explain this selected change to a reviewer seeing it for the first time. Show its intent, the most important runtime/data/control relationship, and the direct implication or review risk. The main pane already shows the raw diff, so do not restate a list of modified symbols. The plan MUST be about this file/function only; every node code_ref MUST use this selected file, and other digest files are plan-level evidence only. If this diff publishes input to an external system, end the visual at that publication; put the unshown external actor name, mapping, and outcome only in review_focus, and do not repeat them in a node detail or evidence reason.\n",
+        "request: Visually explain this selected change to a reviewer seeing it for the first time. Show its intent, the most important runtime/data/control relationship, and the direct code-owned implication. The main pane already shows the raw diff, so do not restate a list of modified symbols. The plan MUST be about this file/function only; every node code_ref MUST use this selected file, and other digest files are plan-level evidence only. If this diff publishes input to an external system, end the visual at that publication and omit any unshown actor, mapping, or outcome.\n",
     );
 }
 
@@ -3946,13 +3987,10 @@ mod tests {
     /// A cached plan whose report records one dropped item tagged with `label`, so
     /// report-preservation assertions can tell selections apart.
     fn cached_ai_plan(label: &str) -> CachedAiPlan {
-        let mut plan = codescope_core::VisualizationPlan::new(Epoch(1), "selection impact");
-        plan.title = format!("plan for {label}");
-        plan.intent = "Explains the selected change.".to_string();
+        let mut plan = codescope_core::VisualizationPlan::new(Epoch(1));
+        plan.intent = format!("plan for {label}");
         plan.forms.push(codescope_core::VizForm {
             kind: codescope_core::FormKind::CallTree,
-            title: "runtime".to_string(),
-            summary: String::new(),
             nodes: vec![codescope_core::PlanNode::new(
                 "n1",
                 label,
@@ -4336,8 +4374,8 @@ mod tests {
         );
     }
 
-    /// Every AI failure maps to a Warning status describing automatic regeneration,
-    /// model recovery, and deterministic fallback; the legacy `message` mirrors it.
+    /// Every AI failure maps to a concise Warning footer plus a complete click-open
+    /// diagnostic describing automatic regeneration, model recovery, and fallback.
     #[tokio::test]
     async fn ai_failure_status_carries_retry_suffix() {
         let root = scratch_repo();
@@ -4373,8 +4411,30 @@ mod tests {
             snap.message, snap.status.text,
             "the legacy message field mirrors the status text"
         );
+        assert_eq!(
+            snap.status.detail.as_deref(),
+            Some(
+                "AI generation failed\n\nai request timed out after 20s\n\nRecovery: m change model · retries automatically when the selection or file changes · deterministic impact remains available"
+            )
+        );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ai_failure_footer_uses_only_a_bounded_first_line() {
+        let reason = format!(
+            "plan rejected: concise explanation\n\nValidation details:\n- {}",
+            "full validation reason ".repeat(40)
+        );
+        assert_eq!(
+            ai_failure_footer_reason(&reason),
+            "plan rejected: concise explanation"
+        );
+        let long = "x".repeat(300);
+        let compact = ai_failure_footer_reason(&long);
+        assert_eq!(compact.chars().count(), 180);
+        assert!(compact.ends_with('…'));
     }
 
     /// Analysis and engine failures map to typed status levels (spec §5.9): the LSP
@@ -5152,11 +5212,10 @@ mod tests {
             symbol: None,
         }))
         .await;
-        let mut old_plan = codescope_core::VisualizationPlan::new(disp.epoch, "old selection");
+        let mut old_plan = codescope_core::VisualizationPlan::new(disp.epoch);
+        old_plan.intent = "stale a.txt plan".to_string();
         old_plan.forms.push(codescope_core::VizForm {
             kind: codescope_core::FormKind::ImpactSummary,
-            title: "stale a.txt plan".to_string(),
-            summary: "must never render".to_string(),
             nodes: vec![codescope_core::PlanNode::new(
                 "n1",
                 "a.txt",
@@ -5207,7 +5266,8 @@ mod tests {
         };
         let mut digest = "# change digest\n".to_string();
         append_impact_focus(&mut digest, &impact);
-        assert!(digest.contains("current impact selection (required plan focus)"));
+        assert!(digest.contains("current impact selection"));
+        assert!(!digest.contains("required plan focus"));
         assert!(digest.contains("label: readinessHandler"));
         assert!(digest.contains("- run (calls)"));
         assert!(digest.contains("- http.HandlerFunc (calls)"));
@@ -5215,7 +5275,8 @@ mod tests {
         assert!(digest.contains("MUST be about this file/function only"));
         assert!(digest.contains("every node code_ref MUST use this selected file"));
         assert!(digest.contains("end the visual at that publication"));
-        assert!(digest.contains("do not repeat them in a node detail or evidence reason"));
+        assert!(digest.contains("omit any unshown actor, mapping, or outcome"));
+        assert!(!digest.contains("review_focus"));
     }
 
     #[test]
@@ -5720,7 +5781,7 @@ mod tests {
             "the ready plan survives loaded relations"
         );
         assert_eq!(
-            snap.semantic.plan.as_ref().map(|plan| plan.title.as_str()),
+            snap.semantic.plan.as_ref().map(|plan| plan.intent.as_str()),
             Some("plan for RetryPolicy")
         );
         assert_eq!(semantic_node_label(&snap), Some("RetryPolicy"));
@@ -6059,11 +6120,10 @@ mod tests {
         .await;
 
         // A real validated plan lands via AiDone (as spawn_ai's job would report).
-        let mut plan = codescope_core::VisualizationPlan::new(disp.epoch, "What does sym0 affect?");
+        let mut plan = codescope_core::VisualizationPlan::new(disp.epoch);
+        plan.intent = "sym0 affects its callers.".to_string();
         plan.forms.push(codescope_core::VizForm {
             kind: codescope_core::FormKind::CallTree,
-            title: "call tree".to_string(),
-            summary: String::new(),
             nodes: vec![codescope_core::PlanNode::new(
                 "n1",
                 "sym0",

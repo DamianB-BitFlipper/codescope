@@ -9,15 +9,18 @@
 //! - **Tree forms** (`changed_symbol_tree`, `call_tree`, `type_impl_tree`,
 //!   `before_after`): invalid nodes are dropped and their children re-parented; an invalid
 //!   root or >20% invalid nodes rejects the form.
+//!   A `before_after` node with exact diff-line references may shed an unqueried symbol
+//!   decoration and remain as an explicitly presentational state; proven-absent symbols
+//!   are never rescued.
 //! - **Flow/sequence forms**: any invalid endpoint (node or edge) rejects the form, because
 //!   it breaks ordering semantics.
 //! - **Reviewer-first contract**: the primary form must be structural. Legacy
 //!   `impact_summary` / `focused_diff` forms cannot cross this boundary; typed plan
 //!   evidence references hunks directly and is re-checked via [`FactView::hunk`].
-//! - **Caps** (Show Me rule S4/S5) are enforced with truncation recorded in the report:
+//! - **Caps** (Show Me rule S4) are enforced with truncation recorded in the report:
 //!   ≤ [`MAX_FORMS_PER_PLAN`] forms, ≤ [`MAX_FORM_NODES`] nodes, depth ≤
-//!   [`MAX_FORM_DEPTH`], summary ≤ [`MAX_SUMMARY_LINES`] lines (and ≤
-//!   [`IMPACT_SUMMARY_MAX_BULLETS`] bullets for `impact_summary`, research 05 §2).
+//!   [`MAX_FORM_DEPTH`] (and ≤ [`IMPACT_SUMMARY_MAX_BULLETS`] bullets for
+//!   `impact_summary`, research 05 §2).
 //!
 //! Edges may only *select* relationships that exist ([`FactView::edge`]); `reads`/
 //! `writes` edges have no impact-graph counterpart in v0 and are kept with an
@@ -27,7 +30,7 @@ use codescope_core::{
     DiffSide, DroppedItem, EntityRef, Epoch, FileId, FormKind, LineRange, PlanCodeRef, PlanEdge,
     PlanEdgeKind, PlanEvidence, PlanNode, ValidationReport, ValidationVerdict, VisualizationPlan,
     VizForm, MAX_CODE_REF_LINES, MAX_FORMS_PER_PLAN, MAX_FORM_DEPTH, MAX_FORM_NODES,
-    MAX_NODE_CODE_REFS, MAX_PLAN_EVIDENCE, MAX_SUMMARY_LINES, PLAN_VERSION,
+    MAX_NODE_CODE_REFS, MAX_PLAN_EVIDENCE, PLAN_VERSION,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -122,12 +125,6 @@ pub fn validate(
     let mut dropped: Vec<DroppedItem> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
-    if plan.focus.trim().is_empty() {
-        return ValidationReport::rejected("plan focus is empty");
-    }
-    if plan.title.trim().is_empty() {
-        return ValidationReport::rejected("plan title is empty");
-    }
     if plan.intent.trim().is_empty() {
         return ValidationReport::rejected("plan intent is empty");
     }
@@ -549,25 +546,13 @@ fn sanitize_form(
         return Err("form has no nodes".to_string());
     }
 
-    let summary_lines = form.summary.lines().count();
-    if summary_lines > MAX_SUMMARY_LINES {
-        form.summary = form
-            .summary
-            .lines()
-            .take(MAX_SUMMARY_LINES)
-            .collect::<Vec<_>>()
-            .join("\n");
-        notes.push(format!(
-            "form {form_idx}: summary truncated from {summary_lines} to {MAX_SUMMARY_LINES} lines"
-        ));
-    }
-
     // BeforeAfter renders exactly nodes[0] (before) and nodes[1] (after) with at most one
     // transition edge (render_before_after). The renderer silently ignores anything past
     // two nodes, children, and extra edges, so validation must reject the shape instead
     // of losing content.
     if form.kind == FormKind::BeforeAfter {
         check_before_after_shape(form)?;
+        downgrade_unqueried_before_after_entities(form, form_idx, facts, dropped);
     }
 
     // Per-node validity; duplicate ids are invalid (first occurrence wins).
@@ -593,6 +578,49 @@ fn sanitize_form(
         FormClass::ImpactSummary | FormClass::FocusedDiff => {
             sanitize_list(form, form_idx, class, &validity, facts, dropped, notes)
         }
+    }
+}
+
+/// Preserve a diff-grounded before/after visual when semantic coverage is unavailable.
+///
+/// Before/after nodes describe states, not graph relationships, and the renderer already
+/// treats entityless nodes as inferred from their exact code references. A model-provided
+/// symbol is therefore optional metadata here: if the symbol universe was never queried,
+/// strip it only when at least one exact diff line fully validates. This mirrors the
+/// evidence downgrade and avoids rejecting an otherwise honest atomic-change visual.
+/// Authoritative [`Lookup::Absent`] results still flow into normal validation unchanged.
+fn downgrade_unqueried_before_after_entities(
+    form: &mut VizForm,
+    form_idx: usize,
+    facts: &dyn FactView,
+    dropped: &mut Vec<DroppedItem>,
+) {
+    for node in &mut form.nodes {
+        let Some(entity) = node.entity.as_ref() else {
+            continue;
+        };
+        let Some(symbol) = entity.symbol.as_deref() else {
+            continue;
+        };
+        if !matches!(facts.file(&entity.file), Lookup::Present(()))
+            || !matches!(facts.symbol(&entity.file, symbol), Lookup::Unknown)
+            || node.code_refs.is_empty()
+            || node
+                .code_refs
+                .iter()
+                .any(|code_ref| code_ref_invalid_reason(code_ref, facts).is_some())
+        {
+            continue;
+        }
+        let file = entity.file.clone();
+        let symbol = symbol.to_string();
+        node.entity = None;
+        dropped.push(DroppedItem {
+            subject: format!("node {} in form {form_idx}", node.id),
+            reason: format!(
+                "symbol-level identity {symbol} was unavailable in {file}; retained presentational before/after state from exact code_refs"
+            ),
+        });
     }
 }
 
@@ -1302,17 +1330,12 @@ mod tests {
     }
 
     fn form(kind: FormKind, nodes: Vec<PlanNode>, edges: Vec<PlanEdge>) -> VizForm {
-        VizForm {
-            kind,
-            title: "t".into(),
-            summary: "s".into(),
-            nodes,
-            edges,
-        }
+        VizForm { kind, nodes, edges }
     }
 
     fn plan_with(forms: Vec<VizForm>) -> VisualizationPlan {
-        let mut p = VisualizationPlan::new(Epoch(1), "focus?");
+        let mut p = VisualizationPlan::new(Epoch(1));
+        p.intent = "The selected code changes its runtime relationship.".into();
         p.forms = forms;
         p
     }
@@ -1749,15 +1772,14 @@ mod tests {
     }
 
     #[test]
-    fn caps_forms_nodes_depth_summary_with_notes() {
+    fn caps_forms_and_nodes_with_notes() {
         let item = |i: usize| node(&format!("n{i}"), Some(sym_entity("main.go", "A")), &[]);
         // Form 0: 14 nodes → capped at 12. Form 2 is dropped (max 2 forms).
         let mut many_nodes: Vec<PlanNode> = (0..14).map(item).collect();
         for (i, n) in many_nodes.iter_mut().enumerate() {
             n.id = format!("n{i}");
         }
-        let mut f0 = form(FormKind::ChangedSymbolTree, many_nodes, vec![]);
-        f0.summary = "l1\nl2\nl3\nl4\nl5".into();
+        let f0 = form(FormKind::ChangedSymbolTree, many_nodes, vec![]);
         let f1 = form(
             FormKind::ChangedSymbolTree,
             vec![node("m1", Some(sym_entity("main.go", "B")), &[])],
@@ -1773,8 +1795,6 @@ mod tests {
         assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
         assert_eq!(plan.forms.len(), MAX_FORMS_PER_PLAN);
         assert_eq!(plan.forms[0].nodes.len(), MAX_FORM_NODES);
-        assert_eq!(plan.forms[0].summary.lines().count(), MAX_SUMMARY_LINES);
-        assert!(report.notes.iter().any(|n| n.contains("summary truncated")));
         assert!(report
             .dropped
             .iter()
@@ -2488,6 +2508,67 @@ mod tests {
             .dropped
             .iter()
             .any(|d| d.reason.contains("before_after nodes must be flat")));
+    }
+
+    #[test]
+    fn before_after_downgrades_unqueried_symbols_when_exact_diff_refs_exist() {
+        let facts = StubFacts::default()
+            .incomplete()
+            .with_file("main.go")
+            .with_diff_line("main.go", 0, DiffSide::New, 19);
+        let state = |id: &str, symbol: &str| {
+            node(id, Some(sym_entity("main.go", symbol)), &[]).with_code_ref(PlanCodeRef::new(
+                FileId::new_unchecked("main.go"),
+                0,
+                DiffSide::New,
+                19,
+                19,
+            ))
+        };
+        let mut plan = plan_with(vec![form(
+            FormKind::BeforeAfter,
+            vec![state("n1", "old diagnostic"), state("n2", "new diagnostic")],
+            vec![],
+        )]);
+
+        let report = validate(&mut plan, &facts, Epoch(1));
+
+        assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
+        assert_eq!(plan.forms.len(), 1, "the before/after visual survives");
+        assert!(plan.forms[0]
+            .nodes
+            .iter()
+            .all(|node| node.entity.is_none() && !node.code_refs.is_empty()));
+        assert_eq!(
+            report
+                .dropped
+                .iter()
+                .filter(|item| item
+                    .reason
+                    .contains("retained presentational before/after state"))
+                .count(),
+            2
+        );
+
+        // A complete symbol query proving the same identities absent remains a hard
+        // validation failure; only missing semantic coverage is recoverable.
+        let complete_facts = StubFacts::default().with_file("main.go").with_diff_line(
+            "main.go",
+            0,
+            DiffSide::New,
+            19,
+        );
+        let mut disproven = plan_with(vec![form(
+            FormKind::BeforeAfter,
+            vec![state("n1", "old diagnostic"), state("n2", "new diagnostic")],
+            vec![],
+        )]);
+        let report = validate(&mut disproven, &complete_facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report
+            .dropped
+            .iter()
+            .any(|item| item.reason.contains("not found in main.go (analyzed)")));
     }
 
     /// BeforeAfter contract: two edges reject; a single reversed edge rejects; the valid
