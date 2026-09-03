@@ -1,5 +1,10 @@
 # 07 — Privacy & Safety (codescope)
 
+> **Historical design research (2026-08), not the current runtime contract.** The proposals and
+> example names/counts below record the original design exploration and may be obsolete. Current
+> behavior is defined by `docs/architecture.md`, `docs/ai-dataflow.md`, and the source/config
+> rustdocs.
+
 Scope: secret exclusion, AI opt-in + key handling, read-only guarantees, temp files,
 AI failure modes, recommended Rust types/defaults. Verified locally 2026-08 (macOS,
 git 2.50.1, gopls 0.21.0); crate versions checked against crates.io / docs.rs.

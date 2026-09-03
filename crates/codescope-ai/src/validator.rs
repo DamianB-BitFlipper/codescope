@@ -88,6 +88,15 @@ pub trait FactView: Sync {
     /// This exact lookup grounds hover highlights in diff rows rather than arbitrary source
     /// ranges that happen to fall inside a file.
     fn diff_line(&self, file: &FileId, index: u32, side: DiffSide, line: u32) -> Lookup<()>;
+
+    /// Whether `line` is an actual changed diff row: an addition on [`DiffSide::New`] or
+    /// deletion on [`DiffSide::Old`]. Context rows and non-hunk lines are [`Lookup::Absent`]
+    /// when the hunk is known; unavailable diff facts are [`Lookup::Unknown`].
+    ///
+    /// Validators use this in addition to [`FactView::diff_line`]: a code reference range
+    /// may include context, but each node with references must cite at least one changed row.
+    fn changed_diff_line(&self, file: &FileId, index: u32, side: DiffSide, line: u32)
+        -> Lookup<()>;
 }
 
 /// Validate and sanitize `plan` in place against `facts`, gated on `current_epoch`.
@@ -97,8 +106,8 @@ pub trait FactView: Sync {
 /// references are cleaned up, and all caps are enforced. Every removal is recorded in the
 /// report ([`ValidationReport::dropped`] / [`ValidationReport::notes`]).
 ///
-/// The plan is **not** mutated when the verdict is [`ValidationVerdict::Stale`] (the TUI
-/// keeps showing the last valid render with a badge) or when the whole plan is rejected.
+/// The plan is **not** mutated when the verdict is [`ValidationVerdict::Stale`] or when the
+/// whole plan is rejected. Neither result is published as current generated output.
 #[tracing::instrument(level = "debug", skip_all, fields(epoch = %plan.epoch, forms = plan.forms.len()))]
 pub fn validate(
     plan: &mut VisualizationPlan,
@@ -398,6 +407,32 @@ fn node_invalid_reason(
     {
         return Some(reason);
     }
+    if !node.code_refs.is_empty() {
+        let mut has_changed_line = false;
+        let mut unknown_changed_line = None;
+        for code_ref in &node.code_refs {
+            for line in code_ref.start_line..=code_ref.end_line {
+                match facts.changed_diff_line(&code_ref.file, code_ref.hunk, code_ref.side, line) {
+                    Lookup::Present(()) => has_changed_line = true,
+                    Lookup::Absent => {}
+                    Lookup::Unknown => {
+                        unknown_changed_line.get_or_insert_with(|| {
+                            format!(
+                                "code_ref {}#h{} {:?} line {line} changed status not queried (cannot validate)",
+                                code_ref.file, code_ref.hunk, code_ref.side
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        if !has_changed_line {
+            return Some(unknown_changed_line.unwrap_or_else(|| {
+                "node code_refs cite only unchanged context; cite at least one added/removed line"
+                    .to_string()
+            }));
+        }
+    }
     if node
         .detail
         .as_deref()
@@ -510,6 +545,19 @@ fn edge_kind_verifiable(kind: PlanEdgeKind) -> bool {
     )
 }
 
+/// Stable wire name for focused repair feedback.
+fn edge_kind_name(kind: PlanEdgeKind) -> &'static str {
+    match kind {
+        PlanEdgeKind::Calls => "calls",
+        PlanEdgeKind::Imports => "imports",
+        PlanEdgeKind::Implements => "implements",
+        PlanEdgeKind::Contains => "contains",
+        PlanEdgeKind::Reads => "reads",
+        PlanEdgeKind::Writes => "writes",
+        PlanEdgeKind::FlowsTo => "flows_to",
+    }
+}
+
 /// Defensive bound on raw node count per form before structural analysis (the real cap is
 /// [`MAX_FORM_NODES`]; anything far beyond it is rejected outright to keep validation
 /// bounded on adversarial input).
@@ -552,6 +600,19 @@ fn sanitize_form(
     if form.kind == FormKind::BeforeAfter {
         check_before_after_shape(form)?;
         downgrade_unqueried_before_after_entities(form, form_idx, facts, dropped);
+    }
+
+    if form.kind != FormKind::Sequence {
+        if let Some(edge) = form
+            .edges
+            .iter()
+            .find(|edge| edge.kind == PlanEdgeKind::FlowsTo)
+        {
+            return Err(format!(
+                "flows_to edge {} -> {} is only valid in a sequence form",
+                edge.from, edge.to
+            ));
+        }
     }
 
     // Per-node validity; duplicate ids are invalid (first occurrence wins).
@@ -870,10 +931,36 @@ fn sanitize_flow(
     if connected.len() != form.nodes.len() {
         return Err("relationship visual is disconnected".to_string());
     }
-    // Asserted relationships must exist (the AI selects edges, never asserts new ones).
+    // `flows_to` is a presentational chronological transition, never a graph claim.
+    // A Sequence may alternatively show a real, proven semantic relation; all other
+    // Sequence semantic edges get repair guidance rather than an unverifiable-edge note.
+    // RelationshipFlow retains its existing graph-validation behavior.
     for edge in &form.edges {
+        if edge.kind == PlanEdgeKind::FlowsTo {
+            if form.kind == FormKind::Sequence {
+                continue;
+            }
+            return Err(format!(
+                "flows_to edge {} -> {} is only valid in a sequence form",
+                edge.from, edge.to
+            ));
+        }
         let from = &form.nodes[id_to_idx[&edge.from]];
         let to = &form.nodes[id_to_idx[&edge.to]];
+        if form.kind == FormKind::Sequence {
+            if matches!(
+                (&from.entity, &to.entity),
+                (Some(fe), Some(te)) if matches!(facts.edge(fe, te, edge.kind), Lookup::Present(()))
+            ) {
+                continue;
+            }
+            return Err(format!(
+                "sequence edge {} -> {} uses {}; use flows_to for lifecycle order (actual call topology belongs call_tree/relationship_flow)",
+                edge.from,
+                edge.to,
+                edge_kind_name(edge.kind)
+            ));
+        }
         if edge_kind_verifiable(edge.kind) {
             match (&from.entity, &to.entity) {
                 (Some(fe), Some(te)) => match facts.edge(fe, te, edge.kind) {
@@ -1133,6 +1220,12 @@ fn retain_clean_edges(
     let ids: HashSet<String> = form.nodes.iter().map(|node| node.id.clone()).collect();
     let edges = std::mem::take(&mut form.edges);
     for edge in edges {
+        // `flows_to` is handled as a presentational transition, not a fact-store edge.
+        // Non-Sequence uses have already rejected in `sanitize_form`.
+        if edge.kind == PlanEdgeKind::FlowsTo {
+            form.edges.push(edge);
+            continue;
+        }
         if !ids.contains(&edge.from) || !ids.contains(&edge.to) {
             dropped.push(DroppedItem {
                 subject: format!("edge {} -> {} in form {form_idx}", edge.from, edge.to),
@@ -1191,6 +1284,8 @@ mod tests {
         edges: HashSet<(String, String, PlanEdgeKind)>,
         hunks: HashSet<(String, u32)>,
         diff_lines: HashSet<(String, u32, DiffSide, u32)>,
+        changed_diff_lines: HashSet<(String, u32, DiffSide, u32)>,
+        changed_diff_lines_available: bool,
         focus_file: Option<String>,
         /// When true, symbol/edge misses are authoritative `Absent` (a complete query ran);
         /// when false they are `Unknown` (never queried). Default true to preserve the
@@ -1206,6 +1301,8 @@ mod tests {
                 edges: HashSet::new(),
                 hunks: HashSet::new(),
                 diff_lines: HashSet::new(),
+                changed_diff_lines: HashSet::new(),
+                changed_diff_lines_available: true,
                 focus_file: None,
                 complete: true,
             }
@@ -1221,6 +1318,10 @@ mod tests {
 
         fn focused_on(mut self, file: &str) -> Self {
             self.focus_file = Some(file.to_string());
+            self
+        }
+        fn changed_diff_lines_unavailable(mut self) -> Self {
+            self.changed_diff_lines_available = false;
             self
         }
 
@@ -1244,6 +1345,21 @@ mod tests {
         }
 
         fn with_diff_line(mut self, file: &str, index: u32, side: DiffSide, line: u32) -> Self {
+            self.hunks.insert((file.to_string(), index));
+            self.diff_lines
+                .insert((file.to_string(), index, side, line));
+            self.changed_diff_lines
+                .insert((file.to_string(), index, side, line));
+            self
+        }
+
+        fn with_context_diff_line(
+            mut self,
+            file: &str,
+            index: u32,
+            side: DiffSide,
+            line: u32,
+        ) -> Self {
             self.hunks.insert((file.to_string(), index));
             self.diff_lines
                 .insert((file.to_string(), index, side, line));
@@ -1314,6 +1430,31 @@ mod tests {
                 Lookup::Unknown
             }
         }
+        fn changed_diff_line(
+            &self,
+            file: &FileId,
+            index: u32,
+            side: DiffSide,
+            line: u32,
+        ) -> Lookup<()> {
+            if self.changed_diff_lines.contains(&(
+                file.as_path().as_str().to_string(),
+                index,
+                side,
+                line,
+            )) {
+                Lookup::Present(())
+            } else if !self.changed_diff_lines_available {
+                Lookup::Unknown
+            } else if self
+                .hunks
+                .contains(&(file.as_path().as_str().to_string(), index))
+            {
+                Lookup::Absent
+            } else {
+                Lookup::Unknown
+            }
+        }
     }
 
     fn sym_entity(file: &str, name: &str) -> EntityRef {
@@ -1369,7 +1510,7 @@ mod tests {
         let report = validate(&mut plan, &abc_facts(), Epoch(2));
         assert_eq!(report.verdict, ValidationVerdict::Stale);
         assert!(!report.is_renderable());
-        // Plan untouched: TUI keeps the last valid render.
+        // Plan stays untouched for caller diagnostics/seed handling, but is not renderable.
         assert_eq!(plan.forms.len(), 1);
     }
 
@@ -1494,54 +1635,93 @@ mod tests {
             .any(|d| d.reason.contains("endpoint n2 invalid")));
     }
 
-    /// Review 19: an unqueried edge is `Unknown` and rejected as "not queried", NOT as
-    /// "does not exist" — absence of evidence is not evidence of absence.
     #[test]
-    fn unqueried_edge_is_unknown_not_absent() {
-        let a = sym_entity("main.go", "A");
-        let b = sym_entity("main.go", "B");
-        let facts = abc_facts().incomplete(); // never queried the graph
+    fn nonsequence_flows_to_is_rejected_with_targeted_reason() {
+        for kind in [
+            FormKind::ChangedSymbolTree,
+            FormKind::CallTree,
+            FormKind::TypeImplTree,
+            FormKind::RelationshipFlow,
+            FormKind::BeforeAfter,
+        ] {
+            let mut plan = plan_with(vec![form(
+                kind,
+                vec![node("n1", None, &[]), node("n2", None, &[])],
+                vec![edge("n1", "n2", PlanEdgeKind::FlowsTo)],
+            )]);
+            let report = validate(&mut plan, &StubFacts::default(), Epoch(1));
+            assert_eq!(report.verdict, ValidationVerdict::Rejected, "{kind:?}");
+            assert!(report.dropped.iter().any(|item| item
+                .reason
+                .contains("flows_to edge n1 -> n2 is only valid in a sequence form")));
+        }
+    }
+
+    /// A presentational Sequence can describe lifecycle phases even when no node maps to
+    /// a fact-store entity. `flows_to` must not query `FactView::edge` or add an
+    /// unverifiable/not-verifiable edge note.
+    #[test]
+    fn sequence_conceptual_flows_to_chain_is_valid_without_edge_note() {
         let mut plan = plan_with(vec![form(
             FormKind::Sequence,
-            vec![node("n1", Some(a), &[]), node("n2", Some(b), &[])],
-            vec![edge("n1", "n2", PlanEdgeKind::Calls)],
+            vec![
+                node("n1", None, &[]),
+                node("n2", None, &[]),
+                node("n3", None, &[]),
+            ],
+            vec![
+                edge("n1", "n2", PlanEdgeKind::FlowsTo),
+                edge("n2", "n3", PlanEdgeKind::FlowsTo),
+            ],
         )]);
-        let report = validate(&mut plan, &facts, Epoch(1));
-        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        let report = validate(&mut plan, &StubFacts::default(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Valid);
         assert!(
-            report
-                .dropped
-                .iter()
-                .any(|d| d.reason.contains("not queried (cannot validate)")),
-            "unqueried edge is honest about coverage: {:?}",
-            report.dropped
-        );
-        assert!(
-            !report
-                .dropped
-                .iter()
-                .any(|d| d.reason.contains("not in the impact graph")),
-            "unqueried must not be misreported as proven-absent"
+            !report.notes.iter().any(|note| note.contains("edge")),
+            "flows_to has no graph-verification note: {:?}",
+            report.notes
         );
     }
 
-    /// Review 19: a complete edge query that found nothing is authoritatively Absent and
-    /// keeps the original "not in the impact graph" wording (proven, not unqueried).
+    /// Unproven semantic Sequence edges need actionable repair guidance. A semantic edge
+    /// belongs only when FactView proves it; otherwise it should be a presentational
+    /// `flows_to` lifecycle transition.
     #[test]
-    fn queried_absent_edge_says_not_in_graph() {
+    fn sequence_unproven_semantic_edge_gets_flows_to_repair() {
         let a = sym_entity("main.go", "A");
         let b = sym_entity("main.go", "B");
-        let facts = abc_facts(); // complete universe
+        for facts in [abc_facts(), abc_facts().incomplete()] {
+            let mut plan = plan_with(vec![form(
+                FormKind::Sequence,
+                vec![
+                    node("n1", Some(a.clone()), &[]),
+                    node("n2", Some(b.clone()), &[]),
+                ],
+                vec![edge("n1", "n2", PlanEdgeKind::Calls)],
+            )]);
+            let report = validate(&mut plan, &facts, Epoch(1));
+            assert_eq!(report.verdict, ValidationVerdict::Rejected);
+            assert!(report.dropped.iter().any(|item| item
+                .reason
+                .contains("sequence edge n1 -> n2 uses calls; use flows_to for lifecycle order")));
+            assert!(report.dropped.iter().any(|item| item
+                .reason
+                .contains("actual call topology belongs call_tree/relationship_flow")));
+        }
+    }
+
+    #[test]
+    fn sequence_entityless_semantic_edge_gets_flows_to_repair() {
         let mut plan = plan_with(vec![form(
             FormKind::Sequence,
-            vec![node("n1", Some(a), &[]), node("n2", Some(b), &[])],
+            vec![node("n1", None, &[]), node("n2", None, &[])],
             vec![edge("n1", "n2", PlanEdgeKind::Calls)],
         )]);
-        let report = validate(&mut plan, &facts, Epoch(1));
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("not in the impact graph")));
+        let report = validate(&mut plan, &StubFacts::default(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report.dropped.iter().any(|item| item
+            .reason
+            .contains("sequence edge n1 -> n2 uses calls; use flows_to for lifecycle order")));
     }
 
     /// Review 19: an unqueried symbol is "not queried", distinct from a proven-absent one.
@@ -1620,21 +1800,18 @@ mod tests {
     }
 
     #[test]
-    fn flow_rejects_edge_missing_from_impact_graph() {
+    fn sequence_accepts_proven_semantic_edge() {
         let a = sym_entity("main.go", "A");
         let b = sym_entity("main.go", "B");
-        let facts = abc_facts(); // no edges at all
+        let facts = abc_facts().with_edge(&a, &b, PlanEdgeKind::Calls);
         let mut plan = plan_with(vec![form(
             FormKind::Sequence,
             vec![node("n1", Some(a), &[]), node("n2", Some(b), &[])],
             vec![edge("n1", "n2", PlanEdgeKind::Calls)],
         )]);
         let report = validate(&mut plan, &facts, Epoch(1));
-        assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("not in the impact graph")));
+        assert_eq!(report.verdict, ValidationVerdict::Valid);
+        assert!(report.notes.is_empty());
     }
 
     #[test]
@@ -1768,6 +1945,87 @@ mod tests {
             .dropped
             .iter()
             .any(|item| item.reason.contains("Old line 42 is not in that hunk")));
+    }
+
+    #[test]
+    fn code_refs_need_one_changed_line_but_may_include_context() {
+        let facts = abc_facts()
+            .focused_on("main.go")
+            .with_context_diff_line("main.go", 0, DiffSide::New, 42)
+            .with_context_diff_line("main.go", 0, DiffSide::New, 43)
+            .with_diff_line("main.go", 0, DiffSide::New, 44)
+            .with_diff_line("main.go", 0, DiffSide::Old, 41);
+        let make_plan = |refs: Vec<PlanCodeRef>| {
+            let mut focus = node("n1", Some(sym_entity("main.go", "A")), &[]);
+            focus.code_refs = refs;
+            plan_with(vec![form(FormKind::ChangedSymbolTree, vec![focus], vec![])])
+        };
+
+        let mut context_only = make_plan(vec![PlanCodeRef::new(
+            FileId::new_unchecked("main.go"),
+            0,
+            DiffSide::New,
+            42,
+            42,
+        )]);
+        let report = validate(&mut context_only, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report.dropped.iter().any(|item| item.reason.contains(
+            "node code_refs cite only unchanged context; cite at least one added/removed line"
+        )));
+
+        let mut two_context_refs = make_plan(vec![
+            PlanCodeRef::new(FileId::new_unchecked("main.go"), 0, DiffSide::New, 42, 42),
+            PlanCodeRef::new(FileId::new_unchecked("main.go"), 0, DiffSide::New, 43, 43),
+        ]);
+        let report = validate(&mut two_context_refs, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report.dropped.iter().any(|item| item.reason.contains(
+            "node code_refs cite only unchanged context; cite at least one added/removed line"
+        )));
+
+        let mut context_and_change = make_plan(vec![
+            PlanCodeRef::new(FileId::new_unchecked("main.go"), 0, DiffSide::New, 42, 42),
+            PlanCodeRef::new(FileId::new_unchecked("main.go"), 0, DiffSide::New, 44, 44),
+        ]);
+        assert_eq!(
+            validate(&mut context_and_change, &facts, Epoch(1)).verdict,
+            ValidationVerdict::Valid
+        );
+
+        let mut removed_line = make_plan(vec![PlanCodeRef::new(
+            FileId::new_unchecked("main.go"),
+            0,
+            DiffSide::Old,
+            41,
+            41,
+        )]);
+        assert_eq!(
+            validate(&mut removed_line, &facts, Epoch(1)).verdict,
+            ValidationVerdict::Valid
+        );
+    }
+
+    #[test]
+    fn unavailable_changed_line_fact_rejects_deterministically() {
+        let facts = abc_facts()
+            .focused_on("main.go")
+            .with_context_diff_line("main.go", 0, DiffSide::New, 42)
+            .changed_diff_lines_unavailable();
+        let mut focus = node("n1", Some(sym_entity("main.go", "A")), &[]);
+        focus.code_refs.push(PlanCodeRef::new(
+            FileId::new_unchecked("main.go"),
+            0,
+            DiffSide::New,
+            42,
+            42,
+        ));
+        let mut plan = plan_with(vec![form(FormKind::ChangedSymbolTree, vec![focus], vec![])]);
+        let report = validate(&mut plan, &facts, Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Rejected);
+        assert!(report.dropped.iter().any(|item| item
+            .reason
+            .contains("changed status not queried (cannot validate)")));
     }
 
     #[test]
@@ -2032,13 +2290,13 @@ mod tests {
                 let mut e = edge(
                     &format!("n{i}"),
                     &format!("n{}", i + 1),
-                    PlanEdgeKind::Writes,
+                    PlanEdgeKind::FlowsTo,
                 );
                 e.label = Some(format!("step {i} behavior"));
                 e
             })
             .collect();
-        let mut back = edge("n5", "n2", PlanEdgeKind::Writes);
+        let mut back = edge("n5", "n2", PlanEdgeKind::FlowsTo);
         back.label = Some("readiness listener closes last".into());
         edges.push(back);
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
@@ -2083,11 +2341,11 @@ mod tests {
                 )
             })
             .collect();
-        let mut first = edge("n1", "n2", PlanEdgeKind::Writes);
+        let mut first = edge("n1", "n2", PlanEdgeKind::FlowsTo);
         first.label = Some("flips the health flag".into());
-        let mut dup = edge("n1", "n2", PlanEdgeKind::Writes);
+        let mut dup = edge("n1", "n2", PlanEdgeKind::FlowsTo);
         dup.label = Some("redundant second label".into());
-        let mut third = edge("n2", "n3", PlanEdgeKind::Writes);
+        let mut third = edge("n2", "n3", PlanEdgeKind::FlowsTo);
         third.label = Some("probes return 503".into());
         let mut plan = plan_with(vec![form(
             FormKind::Sequence,
@@ -2121,7 +2379,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut only = edge("n1", "n2", PlanEdgeKind::Writes);
+        let mut only = edge("n1", "n2", PlanEdgeKind::FlowsTo);
         only.label = Some("one edge is not enough for three nodes".into());
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, vec![only])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
@@ -2151,13 +2409,13 @@ mod tests {
                 let mut e = edge(
                     &format!("n{i}"),
                     &format!("n{}", i + 1),
-                    PlanEdgeKind::Writes,
+                    PlanEdgeKind::FlowsTo,
                 );
                 e.label = Some("step behavior".into());
                 e
             })
             .collect();
-        let mut cross = edge("n1", "n4", PlanEdgeKind::Writes);
+        let mut cross = edge("n1", "n4", PlanEdgeKind::FlowsTo);
         cross.label = Some("keeps the form connected".into());
         edges.push(cross);
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
@@ -2186,7 +2444,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut required = edge("n1", "n2", PlanEdgeKind::Writes);
+        let mut required = edge("n1", "n2", PlanEdgeKind::FlowsTo);
         required.label = Some("state write drives handler response".into());
         // A Calls back-edge the complete universe proves absent: would reject if validated.
         let mut back = edge("n2", "n1", PlanEdgeKind::Calls);
@@ -2232,13 +2490,13 @@ mod tests {
                 let mut e = edge(
                     &format!("n{i}"),
                     &format!("n{}", i + 1),
-                    PlanEdgeKind::Writes,
+                    PlanEdgeKind::FlowsTo,
                 );
                 e.label = Some(format!("step {i} behavior"));
                 e
             })
             .collect();
-        let mut blank_back = edge("n3", "n1", PlanEdgeKind::Writes);
+        let mut blank_back = edge("n3", "n1", PlanEdgeKind::FlowsTo);
         blank_back.label = Some("   ".into()); // blank label on an irrelevant extra
         edges.push(blank_back);
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
@@ -2272,13 +2530,13 @@ mod tests {
                 let mut e = edge(
                     &format!("n{i}"),
                     &format!("n{}", i + 1),
-                    PlanEdgeKind::Writes,
+                    PlanEdgeKind::FlowsTo,
                 );
                 e.label = Some(format!("step {i} behavior"));
                 e
             })
             .collect();
-        let mut cross = edge("n1", "ghost", PlanEdgeKind::Writes);
+        let mut cross = edge("n1", "ghost", PlanEdgeKind::FlowsTo);
         cross.label = Some("points nowhere".into());
         edges.push(cross);
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
@@ -2307,9 +2565,9 @@ mod tests {
                 )
             })
             .collect();
-        let mut blank = edge("n1", "n2", PlanEdgeKind::Writes);
+        let mut blank = edge("n1", "n2", PlanEdgeKind::FlowsTo);
         blank.label = Some("   ".into());
-        let mut labeled = edge("n1", "n2", PlanEdgeKind::Writes);
+        let mut labeled = edge("n1", "n2", PlanEdgeKind::FlowsTo);
         labeled.label = Some("flips the health flag".into());
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, vec![blank, labeled])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
@@ -2336,7 +2594,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut blank = edge("n1", "n2", PlanEdgeKind::Writes);
+        let mut blank = edge("n1", "n2", PlanEdgeKind::FlowsTo);
         blank.label = Some("   ".into());
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, vec![blank])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
@@ -2358,7 +2616,7 @@ mod tests {
                 node("n1", Some(sym_entity("main.go", "A")), &[]),
                 node("n2", Some(sym_entity("main.go", "B")), &[]),
             ],
-            vec![edge("n1", "n2", PlanEdgeKind::Writes)],
+            vec![edge("n1", "n2", PlanEdgeKind::FlowsTo)],
         )]);
         plan.evidence.push(PlanEvidence {
             file: FileId::new_unchecked("main.go"),
@@ -2392,7 +2650,7 @@ mod tests {
                 node("n1", Some(sym_entity("main.go", "A")), &[]),
                 node("n2", Some(sym_entity("main.go", "B")), &[]),
             ],
-            vec![edge("n1", "n2", PlanEdgeKind::Writes)],
+            vec![edge("n1", "n2", PlanEdgeKind::FlowsTo)],
         )]);
         plan.evidence.push(PlanEvidence {
             file: FileId::new_unchecked("main.go"),
@@ -2428,7 +2686,7 @@ mod tests {
         let mut plan = plan_with(vec![form(
             FormKind::Sequence,
             vec![node("n1", None, &[]), node("n2", None, &[])],
-            vec![edge("n1", "n2", PlanEdgeKind::Writes)],
+            vec![edge("n1", "n2", PlanEdgeKind::FlowsTo)],
         )]);
         plan.evidence.push(PlanEvidence {
             file: FileId::new_unchecked(path),

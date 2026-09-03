@@ -417,8 +417,8 @@ impl DiffLine {
 
 /// Stable reference to one hunk: `(file, hunk_index)` in the file's diff order.
 ///
-/// AI `focused_diff` forms reference hunks by this id and re-read them from git — the model
-/// orders/subsets/annotates, it never writes diff text (research 05 §3).
+/// AI evidence and node code references use this identity to re-check cited changed rows against
+/// repository-owned diff facts; the model never supplies authoritative diff text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct HunkId {
     /// Repo-relative file path (the change's current path).

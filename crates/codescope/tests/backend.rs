@@ -87,49 +87,185 @@ fn assert_repo_relative(stdout: &str, root: &Path) {
     );
 }
 
-/// Script the production incremental protocol: research once, build the renderer-native
-/// draft through the shared command API, then ask the validator to publish it.
+/// Script an operation while the hybrid controller requires one focused singleton edit.
+/// Only the initial intent and form creation use this mode. Their wire shape is still the
+/// shared command JSON, so the fixture stays compatible with the public editor API.
+fn focused_diagram_step(command: &DiagramCommand) -> AiScriptStep {
+    assert!(
+        matches!(
+            command,
+            DiagramCommand::SetIntent { .. } | DiagramCommand::CreateForm { .. }
+        ),
+        "only intent and form setup are focused singleton operations"
+    );
+    AiScriptStep::tool_call(
+        "edit_visualization",
+        serde_json::to_value(command).expect("diagram command serializes"),
+    )
+}
+
+/// Script a normal full-editor operation using its canonical nested `DiagramCommand` JSON.
+fn diagram_step(command: &DiagramCommand) -> AiScriptStep {
+    AiScriptStep::tool_call(
+        "edit_visualization",
+        serde_json::to_value(command).expect("diagram command serializes"),
+    )
+}
+
+/// Number of provider requests in [`incremental_plan_script`]. This deliberately includes
+/// the research handoff and the final tool-less completion. Exact assertions make an unexpected
+/// controller repair loop visible instead of silently accepting extra provider work.
+fn incremental_plan_request_count(plan: &VisualizationPlan) -> usize {
+    1 // initial diff research
+        + 1 // focused set_intent
+        + plan.forms.len() // create_form (the first one is the focused scaffold step)
+        + plan.forms.iter().map(|form| form.nodes.len() + form.edges.len()).sum::<usize>()
+        + plan.evidence.len() // canonical full-editor edits after the form exists
+        + 1 // final assistant completion
+}
+
+/// Number of nodes the controller requires before it accepts evidence for a form.
+fn structural_minimum_nodes(kind: FormKind) -> usize {
+    match kind {
+        FormKind::ChangedSymbolTree
+        | FormKind::CallTree
+        | FormKind::TypeImplTree
+        | FormKind::ImpactSummary
+        | FormKind::FocusedDiff => 1,
+        FormKind::BeforeAfter | FormKind::RelationshipFlow | FormKind::Sequence => 2,
+    }
+}
+
+fn edge_joins_scaffold(form: &VizForm, edge: &PlanEdge, scaffold_nodes: usize) -> bool {
+    let scaffold = &form.nodes[..scaffold_nodes];
+    let has_from = scaffold.iter().any(|node| node.id == edge.from);
+    let has_to = scaffold.iter().any(|node| node.id == edge.to);
+    has_from && has_to && edge.from != edge.to
+}
+
+/// Script the hybrid incremental protocol in the controller's atomic normal-stage order.
+///
+/// These backend fixtures use one form. They first establish that form's minimum structural
+/// scaffold and required topology, then add evidence. Optional quality nodes, their required
+/// edges, and deliberately extra edges follow only after that scaffold is complete.
 fn incremental_plan_script(plan: &VisualizationPlan) -> Vec<AiScriptStep> {
+    assert_eq!(
+        plan.forms.len(),
+        1,
+        "the staged backend fixture helper supports one-form plans"
+    );
+    let form = &plan.forms[0];
+    let scaffold_nodes = structural_minimum_nodes(form.kind);
+    assert!(
+        form.nodes.len() >= scaffold_nodes,
+        "fixture plan must contain its controller-required structural scaffold"
+    );
+
     let mut script = vec![AiScriptStep::tool_call(
         "git_diff_file",
         serde_json::json!({"path": "middleware.go", "hunk_index": 0}),
     )];
-    let mut edit = |command: DiagramCommand| {
-        script.push(AiScriptStep::tool_call(
-            "edit_visualization",
-            serde_json::to_value(command).unwrap(),
-        ));
-    };
-    edit(DiagramCommand::SetIntent {
+    script.push(focused_diagram_step(&DiagramCommand::SetIntent {
         intent: plan.intent.clone(),
-    });
-    for (index, form) in plan.forms.iter().enumerate() {
-        let form_id = format!("form-{}", index + 1);
-        edit(DiagramCommand::CreateForm {
+    }));
+
+    let form_id = "form-1".to_string();
+    script.push(focused_diagram_step(&DiagramCommand::CreateForm {
+        form_id: form_id.clone(),
+        kind: form.kind,
+    }));
+    script.extend(form.nodes[..scaffold_nodes].iter().cloned().map(|node| {
+        diagram_step(&DiagramCommand::CreateNode {
             form_id: form_id.clone(),
-            kind: form.kind,
-        });
-        for node in &form.nodes {
-            edit(DiagramCommand::CreateNode {
-                form_id: form_id.clone(),
-                node: node.clone(),
-            });
-        }
-        for edge in &form.edges {
-            edit(DiagramCommand::CreateEdge {
-                form_id: form_id.clone(),
-                edge: edge.clone(),
-            });
+            node,
+        })
+    }));
+
+    let scaffold_edges: Vec<usize> = match form.kind {
+        FormKind::Sequence => form.nodes[..scaffold_nodes]
+            .windows(2)
+            .map(|pair| {
+                form.edges
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, edge)| {
+                        (edge.from == pair[0].id
+                            && edge.to == pair[1].id
+                            && edge.kind == PlanEdgeKind::FlowsTo)
+                            .then_some(index)
+                    })
+                    .expect("fixture sequence plan must connect each scaffold pair with flows_to")
+            })
+            .collect(),
+        FormKind::RelationshipFlow => vec![form
+            .edges
+            .iter()
+            .enumerate()
+            .find_map(|(index, edge)| {
+                edge_joins_scaffold(form, edge, scaffold_nodes).then_some(index)
+            })
+            .expect("fixture relationship flow must connect its scaffold")],
+        _ => Vec::new(),
+    };
+    script.extend(scaffold_edges.iter().map(|&index| {
+        diagram_step(&DiagramCommand::CreateEdge {
+            form_id: form_id.clone(),
+            edge: form.edges[index].clone(),
+        })
+    }));
+
+    script.extend(
+        plan.evidence
+            .iter()
+            .cloned()
+            .map(|evidence| diagram_step(&DiagramCommand::AddEvidence { evidence })),
+    );
+
+    // For a longer Sequence, complete each new ordinary lifecycle adjacency while adding its
+    // quality node. Deliberately nonconsecutive or duplicate relations remain for the end.
+    let mut quality_edges = Vec::new();
+    for node_index in scaffold_nodes..form.nodes.len() {
+        script.push(diagram_step(&DiagramCommand::CreateNode {
+            form_id: form_id.clone(),
+            node: form.nodes[node_index].clone(),
+        }));
+        if form.kind == FormKind::Sequence {
+            if let Some(edge_index) = form.edges.iter().enumerate().find_map(|(index, edge)| {
+                (!scaffold_edges.contains(&index)
+                    && edge.from == form.nodes[node_index - 1].id
+                    && edge.to == form.nodes[node_index].id
+                    && edge.kind == PlanEdgeKind::FlowsTo)
+                    .then_some(index)
+            }) {
+                script.push(diagram_step(&DiagramCommand::CreateEdge {
+                    form_id: form_id.clone(),
+                    edge: form.edges[edge_index].clone(),
+                }));
+                quality_edges.push(edge_index);
+            }
         }
     }
-    for evidence in &plan.evidence {
-        edit(DiagramCommand::AddEvidence {
-            evidence: evidence.clone(),
-        });
-    }
+    script.extend(
+        form.edges
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !scaffold_edges.contains(index) && !quality_edges.contains(index))
+            .map(|(_, edge)| {
+                diagram_step(&DiagramCommand::CreateEdge {
+                    form_id: form_id.clone(),
+                    edge: edge.clone(),
+                })
+            }),
+    );
+
     script.push(AiScriptStep::AssistantText {
         content: String::new(),
     });
+    assert_eq!(
+        script.len(),
+        incremental_plan_request_count(plan),
+        "script request accounting must stay exact"
+    );
     script
 }
 
@@ -573,9 +709,9 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         range: None,
         reason: "the middleware hunk that records request metadata".to_string(),
     });
-    let expected_requests = incremental_plan_script(&plan);
-    let request_count = expected_requests.len();
-    let provider = ScriptedProvider::start(expected_requests).await.unwrap();
+    let provider = ScriptedProvider::start(incremental_plan_script(&plan))
+        .await
+        .unwrap();
     let (_fixture, root) = go_fixture();
     let config_dir = TempDir::new().unwrap();
     let config_path = config_dir.path().join("missing-config.toml");
@@ -642,8 +778,8 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
     let requests = provider.requests();
     assert_eq!(
         requests.len(),
-        request_count,
-        "one research turn, incremental draft edits, and one completion turn"
+        incremental_plan_request_count(&plan),
+        "the scripted hybrid path has no hidden repair loop"
     );
     let body = requests[0].body_json().expect("debug-ai request JSON");
     assert_eq!(body["reasoning_effort"], "high");
@@ -678,11 +814,11 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|message| message["role"] == "tool"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("[old:"))),
-        "the plan turn receives exact annotated diff evidence"
+            .any(|message| message["role"] == "user"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("successful_diff_results") && content.contains("[old:")
+                })),
+        "the fresh plan turn receives exact annotated diff evidence in its controller handoff"
     );
 }
 
@@ -732,19 +868,19 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
             PlanEdge {
                 from: "n1".into(),
                 to: "n2".into(),
-                kind: PlanEdgeKind::Writes,
+                kind: PlanEdgeKind::FlowsTo,
                 label: Some("carries the request id".into()),
             },
             PlanEdge {
                 from: "n2".into(),
                 to: "n3".into(),
-                kind: PlanEdgeKind::Writes,
+                kind: PlanEdgeKind::FlowsTo,
                 label: Some("passes the logged request".into()),
             },
             PlanEdge {
                 from: "n3".into(),
                 to: "n1".into(),
-                kind: PlanEdgeKind::Writes,
+                kind: PlanEdgeKind::FlowsTo,
                 label: Some("returns the response".into()),
             },
         ],
@@ -756,9 +892,9 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
         range: None,
         reason: "the middleware hunk that wraps the handler".to_string(),
     });
-    let expected_requests = incremental_plan_script(&plan);
-    let request_count = expected_requests.len();
-    let provider = ScriptedProvider::start(expected_requests).await.unwrap();
+    let provider = ScriptedProvider::start(incremental_plan_script(&plan))
+        .await
+        .unwrap();
     let (_fixture, root) = go_fixture();
     let config_dir = TempDir::new().unwrap();
     let config_path = config_dir.path().join("missing-config.toml");
@@ -822,8 +958,11 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
         .as_array()
         .expect("form edges");
     assert_eq!(edges.len(), 2, "the back-edge no longer renders: {json}");
-    // One research request, bounded draft edits, then natural completion; sanitization needs no repair.
-    assert_eq!(provider.requests().len(), request_count);
+    assert_eq!(
+        provider.requests().len(),
+        incremental_plan_request_count(&plan),
+        "sanitization publishes without an extra repair loop"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@
 //!
 //! The per-plan budget is [`MAX_TOOL_CALLS`]; [`AiService`](crate::AiService) enforces it.
 
+use codescope_core::MAX_CODE_REF_LINES;
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
 
@@ -49,125 +50,17 @@ impl ToolDef {
     }
 }
 
-/// The nine read-only tool definitions (research 05 §4 table).
+/// Current read-only tool definitions.
+///
+/// This compatibility entry point combines the five scoped research tools with the one
+/// capability-discoverable semantic tool. New callers may use [`research_tools`] and
+/// [`semantic_tools`] when they need to distinguish the two groups.
 #[must_use]
 pub fn read_only_tools() -> Vec<ToolDef> {
-    let file_prop = json!({
-        "type": "string",
-        "description": "Repo-relative file path exactly as given in the digest or a previous tool result."
-    });
-    let symbol_prop = json!({
-        "type": "string",
-        "description": "Fully-qualified symbol name exactly as given in the digest or a previous tool result."
-    });
-    vec![
-        ToolDef {
-            name: "get_file_outline",
-            description: "List the symbols of one file: name, kind, range, container (capped at 200). Results include the exact `entity` JSON to echo back in plan nodes.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {"file": file_prop},
-                "required": ["file"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "get_symbol",
-            description: "Get one symbol's signature, doc comment (first 20 lines), range and kind.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {"file": file_prop, "symbol": symbol_prop},
-                "required": ["file", "symbol"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "get_hunk",
-            description: "Read one diff hunk verbatim (capped at 200 lines), addressed by file and zero-based hunk index from the digest. Cite the same file and hunk index in plan evidence.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "file": file_prop,
-                    "hunk_index": {"type": "integer", "minimum": 0,
-                                    "description": "Zero-based index into the file's hunks, diff order."}
-                },
-                "required": ["file", "hunk_index"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "get_references",
-            description: "Find reference sites of a symbol: file, range, one preview line each.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "symbol": symbol_prop,
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}
-                },
-                "required": ["symbol"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "get_callers",
-            description: "Call hierarchy upward: who calls this symbol (tree of fully-qualified names).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "symbol": symbol_prop,
-                    "depth": {"type": "integer", "minimum": 1, "maximum": 2, "default": 1}
-                },
-                "required": ["symbol"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "get_callees",
-            description: "Call hierarchy downward: what this symbol calls (tree of fully-qualified names).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "symbol": symbol_prop,
-                    "depth": {"type": "integer", "minimum": 1, "maximum": 2, "default": 1}
-                },
-                "required": ["symbol"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "get_implementations",
-            description: "Implementations of an interface (or the interfaces a type implements), with file and range.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {"symbol": symbol_prop},
-                "required": ["symbol"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "search_symbols",
-            description: "Fuzzy workspace symbol search (capped at 20 matches).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Fuzzy symbol name query."},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10}
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDef {
-            name: "get_diagnostics",
-            description: "Current compiler/linter diagnostics, optionally filtered to one file (capped at 50).".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {"file": file_prop},
-                "required": [],
-                "additionalProperties": false
-            }),
-        },
-    ]
+    research_tools()
+        .into_iter()
+        .chain(semantic_tools())
+        .collect()
 }
 
 /// Bash-like research tools used by the interactive diff summarizer.
@@ -440,7 +333,7 @@ pub fn diagram_tools() -> Vec<ToolDef> {
             json!({
                 "op": "create_edge",
                 "form_id": "main",
-                "edge": {"from": "n1", "to": "n2", "kind": "calls", "label": "starts listener"}
+                "edge": {"from": "n1", "to": "n2", "kind": "flows_to", "label": "starts listener"}
             }),
         ),
         diagram_command_variant(
@@ -606,7 +499,7 @@ fn diagram_entity_schema() -> Value {
 fn diagram_code_ref_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Exact changed-line citation copied from git_diff_file. Hunk is zero-based; source lines are one-based and inclusive.",
+        "description": format!("Exact changed-line citation copied from git_diff_file. Hunk is zero-based; source lines are one-based and inclusive; each span contains at most {MAX_CODE_REF_LINES} inclusive lines."),
         "properties": {
             "file": {"type": "string", "minLength": 1, "description": "Exact repo_path from git_diff_file."},
             "hunk": {"type": "integer", "minimum": 0, "description": "Zero-based hunk index."},
@@ -641,7 +534,7 @@ fn diagram_node_schema() -> Value {
             "label": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Short identifier or action displayed as the box title."},
             "detail": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "Required concrete reviewer-facing preview; keep it to at most 8 words and 56 characters."},
             "expanded_detail": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "Optional self-contained deeper explanation shown when the box expands in place."},
-            "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": diagram_code_ref_schema(), "description": "One or two exact changed-line references."},
+            "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": diagram_code_ref_schema(), "description": format!("One or two exact changed-line references, each at most {MAX_CODE_REF_LINES} inclusive lines.")},
             "change": {"type": "string", "enum": ["added", "modified", "removed", "unchanged", "diagnostic"], "description": "Optional change badge string."},
             "severity": {"type": "string", "enum": ["error", "warning", "information", "hint"], "description": "Optional diagnostic severity badge."},
             "children": {"type": "array", "maxItems": 12, "items": {"type": "string", "minLength": 1}, "description": "Child node ids for tree forms only."},
@@ -679,8 +572,8 @@ fn diagram_node_patch_schema() -> Value {
 fn diagram_edge_kind_schema() -> Value {
     json!({
         "type": "string",
-        "enum": ["calls", "imports", "implements", "contains", "reads", "writes"],
-        "description": "Typed directed relationship. Semantic kinds must be supported by research evidence."
+        "enum": ["calls", "imports", "implements", "contains", "reads", "writes", "flows_to"],
+        "description": "Typed directed relationship. Use flows_to only for conceptual chronological adjacency in a Sequence form. Use semantic kinds only when supplied relationship evidence proves them; calls means only a proven actual call, never a generic next step."
     })
 }
 
@@ -731,6 +624,28 @@ fn diagram_evidence_schema() -> Value {
     })
 }
 
+/// Return the canonical editor constrained to one atomic operation.
+///
+/// The branch is extracted from [`diagram_tools`] rather than maintained as a relaxed second
+/// schema. Bootstrap uses intent/form branches and focused recovery can safely use any current
+/// canonical operation branch.
+#[must_use]
+pub(crate) fn diagram_tool_for_op(op: &str) -> Option<ToolDef> {
+    let mut editor = diagram_tools()
+        .into_iter()
+        .find(|tool| tool.name == DIAGRAM_EDIT_TOOL_NAME)?;
+    let branch = editor.parameters["oneOf"]
+        .as_array()?
+        .iter()
+        .find(|branch| branch["properties"]["op"]["const"].as_str() == Some(op))?
+        .clone();
+    editor.parameters = branch;
+    editor.description = format!(
+        "Each invocation applies exactly one canonical `{op}` command; make exactly one invocation for the current controller-required step. Do not select another operation."
+    );
+    Some(editor)
+}
+
 /// Return the canonical example embedded in the strict schema branch for `op`.
 /// Parse failures use this to give the model a concrete recovery shape without maintaining
 /// a second, potentially divergent set of examples.
@@ -761,11 +676,7 @@ pub(crate) fn diagram_command_example(op: Option<&str>) -> Value {
 /// `true` when `name` is one of the read-only research tools.
 #[must_use]
 pub fn is_read_only_tool(name: &str) -> bool {
-    read_only_tools()
-        .into_iter()
-        .chain(research_tools())
-        .chain(semantic_tools())
-        .any(|tool| tool.name == name)
+    read_only_tools().into_iter().any(|tool| tool.name == name)
 }
 
 /// `true` when `name` is part of the shared incremental diagram API.
@@ -794,7 +705,7 @@ impl ToolExecError {
 /// - resolve paths repo-relative only; reject absolute paths and `..` escapes;
 /// - serve results exclusively from the fact store / read-only git plumbing — never
 ///   mutate the repository or execute anything;
-/// - cap result sizes per the research 05 §4 table;
+/// - cap result sizes according to the advertised tool schemas;
 /// - include the ready-to-echo `entity` JSON in results wherever entities appear.
 ///
 /// `Ok` carries the tool result as a string (JSON recommended) that is sent back to the
@@ -806,12 +717,10 @@ impl ToolExecError {
 pub trait ToolExecutor: Send + Sync {
     /// Read-only tools this executor can actually serve.
     ///
-    /// The service advertises only this set to the model. Implementations that use the
-    /// complete production surface may keep the default; executors without a fact-store
-    /// backend must return an empty list so automatic tool choice cannot create a futile
-    /// request/failed-tool/request loop.
+    /// The service advertises only this set to the model. The safe default is empty:
+    /// implementations must opt in only to tools they can actually serve.
     fn available_tools(&self) -> Vec<ToolDef> {
-        read_only_tools()
+        Vec::new()
     }
 
     /// Whether this executor represents a research workflow that must inspect at least one
@@ -835,10 +744,6 @@ pub trait ToolExecutor: Send + Sync {
 pub struct NoToolExecutor;
 
 impl ToolExecutor for NoToolExecutor {
-    fn available_tools(&self) -> Vec<ToolDef> {
-        Vec::new()
-    }
-
     fn execute<'a>(
         &'a self,
         name: &'a str,
@@ -857,21 +762,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nine_read_only_tools_with_expected_names() {
-        let tools = read_only_tools();
-        let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
+    fn singleton_editor_uses_the_canonical_branch_for_every_operation() {
+        for op in [
+            "reset",
+            "set_intent",
+            "create_form",
+            "delete_form",
+            "create_node",
+            "update_node",
+            "delete_node",
+            "create_edge",
+            "update_edge",
+            "delete_edge",
+            "add_evidence",
+            "delete_evidence",
+        ] {
+            let tool = diagram_tool_for_op(op).expect("canonical operation");
+            assert_eq!(tool.name, DIAGRAM_EDIT_TOOL_NAME);
+            assert!(tool.parameters.get("oneOf").is_none());
+            assert_eq!(tool.parameters["properties"]["op"]["const"], op);
+            assert_eq!(tool.parameters["additionalProperties"], false);
+            assert!(tool.parameters["required"].as_array().is_some());
+            assert_eq!(tool.parameters["examples"].as_array().unwrap().len(), 1);
+            let canonical = diagram_tools().remove(0).parameters["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|branch| branch["properties"]["op"]["const"] == op)
+                .unwrap()
+                .clone();
+            assert_eq!(
+                tool.parameters, canonical,
+                "{op} must be exact canonical branch"
+            );
+        }
+        assert!(diagram_tool_for_op("unknown").is_none());
+    }
+
+    #[test]
+    fn full_editor_keeps_canonical_nested_node_schema() {
+        let full = diagram_tools().remove(0);
+        let branch = full.parameters["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["properties"]["op"]["const"] == "create_node")
+            .unwrap();
+        for present in ["entity", "severity", "hint", "node", "code_refs"] {
+            assert!(serde_json::to_string(branch).unwrap().contains(present));
+        }
+        assert_eq!(branch["required"], json!(["op", "form_id", "node"]));
+    }
+
+    #[test]
+    fn read_only_tools_combine_current_research_and_semantic_surfaces() {
+        let names: Vec<&str> = read_only_tools().iter().map(|tool| tool.name).collect();
         assert_eq!(
             names,
             [
-                "get_file_outline",
-                "get_symbol",
-                "get_hunk",
-                "get_references",
-                "get_callers",
-                "get_callees",
-                "get_implementations",
-                "search_symbols",
-                "get_diagnostics",
+                "list_directory",
+                "read_file",
+                "search_changed_files",
+                "git_status_file",
+                "git_diff_file",
+                LSP_INSPECT_TOOL_NAME,
             ]
         );
     }
@@ -907,12 +861,7 @@ mod tests {
 
     #[test]
     fn every_definition_is_an_object_schema() {
-        for tool in read_only_tools()
-            .into_iter()
-            .chain(research_tools())
-            .chain(semantic_tools())
-            .chain(diagram_tools())
-        {
+        for tool in read_only_tools().into_iter().chain(diagram_tools()) {
             assert_eq!(
                 tool.parameters["type"], "object",
                 "{} parameters must be an object schema",
@@ -990,7 +939,31 @@ mod tests {
         let patch = &update_node["properties"]["patch"];
         assert_eq!(patch["properties"]["clear_entity"]["type"], "boolean");
         assert!(patch["properties"].get("clear_label").is_none());
+        let create_edge = by_op("create_edge");
+        let edge_kind = &create_edge["properties"]["edge"]["properties"]["kind"];
+        assert!(edge_kind["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("flows_to")));
+        assert!(edge_kind["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("conceptual chronological adjacency in a Sequence form")
+                    && description.contains("supplied relationship evidence proves")
+                    && !description.contains("required normal")
+            }));
+        assert_eq!(
+            create_edge["examples"][0]["edge"]["kind"], "flows_to",
+            "the canonical edge example must teach the Sequence transition kind"
+        );
+
         let update_edge = by_op("update_edge");
+        assert!(
+            update_edge["properties"]["patch"]["properties"]["kind"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("flows_to"))
+        );
         assert_eq!(
             update_edge["properties"]["patch"]["properties"]["clear_label"]["type"],
             "boolean"
@@ -1005,41 +978,19 @@ mod tests {
         let t = &read_only_tools()[0];
         let v = t.to_openai();
         assert_eq!(v["type"], "function");
-        assert_eq!(v["function"]["name"], "get_file_outline");
+        assert_eq!(v["function"]["name"], "list_directory");
         assert!(v["function"]["parameters"].is_object());
     }
 
     #[test]
-    fn read_only_membership() {
-        assert!(is_read_only_tool("get_hunk"));
+    fn read_only_membership_uses_current_surface() {
         assert!(is_read_only_tool("read_file"));
         assert!(is_read_only_tool("git_status_file"));
         assert!(is_read_only_tool(LSP_INSPECT_TOOL_NAME));
+        assert!(!is_read_only_tool("removed_read_only_tool"));
         assert!(!is_read_only_tool("rm_rf"));
         assert!(is_diagram_tool(DIAGRAM_EDIT_TOOL_NAME));
         assert!(is_diagram_tool(DIAGRAM_INSPECT_TOOL_NAME));
-    }
-
-    #[test]
-    fn limits_match_research_table() {
-        let tools = read_only_tools();
-        let by_name = |n: &str| tools.iter().find(|t| t.name == n).unwrap();
-        assert_eq!(
-            by_name("get_references").parameters["properties"]["limit"]["maximum"],
-            50
-        );
-        assert_eq!(
-            by_name("search_symbols").parameters["properties"]["limit"]["maximum"],
-            20
-        );
-        assert_eq!(
-            by_name("get_callers").parameters["properties"]["depth"]["maximum"],
-            2
-        );
-        assert_eq!(
-            by_name("get_callees").parameters["properties"]["depth"]["maximum"],
-            2
-        );
         assert_eq!(MAX_TOOL_CALLS, 48);
     }
 
@@ -1048,7 +999,7 @@ mod tests {
         let exec = NoToolExecutor;
         assert!(exec.available_tools().is_empty());
         let err = exec
-            .execute("get_symbol", &serde_json::json!({}))
+            .execute("read_file", &serde_json::json!({}))
             .await
             .unwrap_err();
         assert!(err.0.contains("unavailable"));

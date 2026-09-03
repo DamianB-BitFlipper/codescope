@@ -11,19 +11,21 @@ codescope opens a repository and answers, at a glance:
 - **How the AI thinks the change is best explained** — clearly marked as interpretation
 - **What's verified and what's approximate**
 
-Go is the first supported language (via `gopls`). The design is language-neutral; see
+Go (`gopls`) and Rust (`rust-analyzer`) have production language-server adapters. The design is
+language-neutral; Go wins detection ties in mixed repositories. See
 [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
-Prototype. The core loop works end-to-end against a real `gopls`: git change detection →
-change→symbol mapping → callers/callees/impact → AI-generated visualization → TUI.
+Prototype. The core loop works end-to-end against real `gopls` and `rust-analyzer` adapters:
+git change detection → change→symbol mapping → callers/callees/impact → AI visualization → TUI.
 The full workspace test suite passes; `clippy -D warnings` is clean.
 
 ## Build & run
 
-Requires: Rust 1.85+, `gopls` on PATH (for semantic features), a git repository, and an AI
-provider configured through `PRIME_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`.
+Requires: Rust 1.85+, a git repository, the relevant `gopls` or `rust-analyzer` executable for
+semantic features, and an AI provider configured through `PRIME_API_KEY`, `OPENAI_API_KEY`, or
+`ANTHROPIC_API_KEY`.
 
 ```sh
 cargo build --release
@@ -169,9 +171,11 @@ off by default.
 
 ## AI
 
-AI is required by the interactive application. Set one of `PRIME_API_KEY`, `OPENAI_API_KEY`, or
-`ANTHROPIC_API_KEY` (the first one found wins; the provider is inferred from the key), and
-optionally use the global `[ai]` table, `CODESCOPE_AI_BASE_URL`, `--model <model_name>`, or
+AI is required by the interactive application. A global `[ai].api_key_env` may name the key
+variable to resolve first; otherwise set `PRIME_API_KEY`, `OPENAI_API_KEY`, or
+`ANTHROPIC_API_KEY` (first built-in found wins and identifies the provider). An arbitrary named
+key requires an explicit base URL. You may also use the global `[ai]` table,
+`CODESCOPE_AI_BASE_URL`, `--model <model_name>`, or
 `--reasoning-effort <default|none|minimal|low|medium|high|xhigh|max>`. Environment variables
 override the global file. Interactive startup exits with a configuration error when AI is absent
 or explicitly disabled; there is no no-AI mode.

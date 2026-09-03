@@ -40,7 +40,7 @@ some years-old ref) — a huge, wrong changeset with a plausible-looking base la
 the default path (`infer_base` repo.rs:217 prefers nearest_ancestor over origin/HEAD and
 guesses).
 
-Why 405 tests pass: `git_repo.rs:397-429` and `:431-465` only ever construct a single
+Why the 405 tests present at review time passed: `git_repo.rs:397-429` and `:431-465` only ever construct a single
 ancestor candidate or two refs pointing at the same commit, so pop-vs-first is invisible.
 
 The stale doc block was left in place and now contradicts itself: repo.rs:328-329 (old:

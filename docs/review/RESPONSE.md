@@ -1,8 +1,10 @@
 # Review response — what was fixed
 
 8 fresh sub-agent reviews produced docs/review/01..08. This file records the disposition.
-Gate after fixes: 371 tests, 0 failures, `cargo clippy --workspace --all-targets -- -D warnings`
-clean. End-to-end: fixture renders, analysis runs, gopls exits 0 on quit.
+Historical gate when this review response was written: 371 tests, 0 failures, and
+`cargo clippy --workspace --all-targets -- -D warnings` clean. These are archival counts, not the
+current repository gate. End-to-end at that time: fixture rendered, analysis ran, and gopls exited
+0 on quit.
 
 ## Fixed (by review finding id)
 
@@ -56,7 +58,7 @@ engine skips non-owned files instead of mislabeling them as Go.
 - rv-ui mediums/lows not listed above (spinner timing, LsStatus transitions, legend, hunk
   scroll-to, narrow-tier polish) — tracked in FIX-PLAN.
 - rv-tests T3/T4 (kill-escalation + fake-lsp wired to the real client) and the AI-review
-  (rv-ai never returned; the AI crate is covered by its own 81-test suite incl. hallucination,
+  (rv-ai never returned; at review time the AI crate had an 81-test suite incl. hallucination,
   stale-epoch, circuit-breaker, redaction cases).
 
 The architecture doc's decision 4 now matches the implemented spawn + epoch-gate model.

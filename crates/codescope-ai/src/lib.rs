@@ -1,16 +1,16 @@
-//! `codescope-ai` — the AI visualization engine (research 05, 07).
+//! `codescope-ai` — the AI visualization engine.
 //!
 //! The AI only *chooses and parameterizes* visualizations; codescope owns facts,
 //! validation, and rendering. This crate provides:
 //!
 //! - [`AiConfig`]: env-first opt-in configuration; disabled by default without a key;
 //!   literal keys in config files are rejected ([`AiError::LiteralApiKeyInConfig`]).
-//! - [`AiClient`]: OpenAI-compatible `POST {base}/chat/completions` with a configurable
-//!   required-by-default tool calls, an in-flight concurrency guard, a high rate ceiling, and
-//!   a 3-strikes/60 s circuit breaker.
+//! - [`AiClient`]: OpenAI-compatible `POST {base}/chat/completions` with controller-selected
+//!   Auto or Required tool choice, an in-flight concurrency guard, a high rate ceiling, and a
+//!   3-strikes/60 s circuit breaker.
 //! - [`parse_plan`]: tool-call arguments → [`codescope_core::VisualizationPlan`].
-//! - [`validate`]: the deterministic fact-validation boundary (epoch gate, entity
-//!   resolution, edge existence, hunks by reference, caps) over a [`FactView`].
+//! - [`validate`]: the deterministic fact-validation boundary (epoch, entities, semantic-edge
+//!   evidence or Sequence transition adjacency, exact changed diff lines, and caps) over a [`FactView`].
 //! - [`AiService`]: the request→research/edit tools→draft→validation loop returning an [`AiOutcome`];
 //!   never blocks the UI (callers spawn it).
 //! - [`tools`]: read-only research and shared incremental diagram tool definitions plus the

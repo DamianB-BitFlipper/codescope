@@ -1,7 +1,8 @@
 # 08 — Testing strategy & Go fixture design
 
-Scope: codescope (Rust/Ratatui/crossterm/tokio; gopls first; AI optional). All tool
-claims below were verified locally: gopls v0.21.0, git 2.50.1, go 1.26.7, macOS arm64.
+Scope: codescope (Rust/Ratatui/crossterm/tokio; gopls first). Interactive startup now requires
+an enabled AI provider; the live-provider smoke remains opt-in. Historical tool-version claims
+below were verified locally with gopls v0.21.0, git 2.50.1, go 1.26.7, and macOS arm64.
 
 ## 1. Go fixture repo
 

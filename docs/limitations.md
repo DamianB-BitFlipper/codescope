@@ -13,26 +13,28 @@ relationships because of:
 - **generated code** (stringer, mockgen, protobuf) not present or not indexed
 - **build tags / conditional compilation** — gopls indexes the default build configuration
 - **dependency injection and runtime registration** — wiring that only exists at runtime
-- **language-server limits** — gopls returns partial or no results while indexing, under heavy
-  build-tag matrices, or for some cross-module references
+- **language-server limits** — gopls or rust-analyzer can return partial/no results while
+  indexing, under complex build/configuration matrices, or for some cross-module references
 
 codescope surfaces this as `Evidence` completeness and `~`/`?` confidence markers rather than
 claiming a complete project graph. There is no runtime data-flow analysis in v0.
 
 ## Prototype-scope limitations
 
-- **Go only.** rust-analyzer/clangd/pyright/tsls are designed for but not implemented.
-- **gopls document sync** uses close+reopen with full text (correct, simple; not incremental).
+- **Go and Rust language-server adapters.** clangd, pyright, and tsls are designed for but not
+  implemented.
+- **Language-server document sync** uses close+reopen with full text (correct, simple; not
+  incremental).
 - **AI plan entities** for implementation/reference results carry range-derived placeholder
   names (e.g. `42:8`) until hover-based name enrichment lands; the *positions* are exact.
-- **Hunk citations are index-based** — plan evidence references hunks by zero-based diff
-  index (rendered one-based) rather than a stable `HunkId`; the legacy `focused_diff` form
-  that used index addressing is no longer accepted at the AI plan boundary.
+- **Hunk identity is positional within a captured change set** — `HunkId` is the stable
+  `(file, zero-based diff index)` identity for that epoch. Evidence and node refs are rechecked
+  against it; a repository refresh changes the epoch and requires fresh validation.
 - **Submodules, symlinked roots, and `.gitignore`-driven AI exclusions** are handled
   conservatively; edge cases (linked worktrees with unusual layouts) are untested.
 - **The TUI renders the first changed file's diff and the full impact graph**; per-selection
   diff/call-tree re-centering is wired but shallow.
-- **No `$/cancelRequest`** to gopls — superseded in-flight requests finish and their results
+- **No `$/cancelRequest`** to the active language server — superseded requests finish and their results
   are dropped by epoch check (sufficient, slightly wasteful).
 
 ## Highest-value next improvements
@@ -40,6 +42,6 @@ claiming a complete project graph. There is no runtime data-flow analysis in v0.
 1. **Hover/signature enrichment** for graph node labels (real names for implementation refs).
 2. **Incremental LSP sync** (gopls supports it) to cut churn on rapid edits.
 3. **Per-selection semantic views** — re-center the impact/call tree on the focused symbol.
-4. **rust-analyzer adapter** to prove the multi-language boundary.
+4. **Additional language adapters** (for example pyright or tsls) to extend the proven boundary.
 5. **A plan-validation debug pane** to tune prompts against the drop/reject report.
-6. **Deeper privacy filters** — content sniffing for secrets in outgoing digests.
+6. **Broader path-level privacy exclusions** in addition to current outbound content scrubbing.

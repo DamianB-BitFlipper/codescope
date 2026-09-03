@@ -1,9 +1,8 @@
-//! Provider-neutral OpenAI-compatible chat-completions client (research 05 §5, 07 §4).
+//! Provider-neutral Chat Completions / Anthropic Messages client.
 //!
-//! One endpoint: `POST {base_url}/chat/completions` with the configured tool choice
-//! (`auto`, so ending a tool sequence is the completion signal). Callers provide incremental
-//! draft-editor tools. Streaming is off (`"stream": false`); draft mutations are ordinary
-//! tool turns and final publication is atomic.
+//! OpenAI-compatible providers use `POST {base_url}/chat/completions`; Anthropic uses its native
+//! Messages shape. Callers select Auto or Required tool choice and provide incremental draft-editor
+//! tools. Streaming is off; draft mutations are ordinary tool turns and final publication is atomic.
 //!
 //! Local protections (all before/around the network call):
 //!
@@ -48,9 +47,9 @@ pub struct TokenUsage {
     pub output: u64,
 }
 
-/// GLM enables long-form reasoning by default. Codescope needs one bounded structured plan,
-/// not an open-ended agent trajectory, so keep enough output room for the complete schema.
-const GLM_PLAN_MAX_TOKENS: u64 = 4096;
+/// GLM enables long-form reasoning by default. Keep enough bounded output room for the model to
+/// finish reasoning and emit the structured tool call instead of stopping at the old 4k ceiling.
+const GLM_PLAN_MAX_TOKENS: u64 = 8_192;
 
 /// One chat message, stored as its OpenAI wire object.
 ///
@@ -139,6 +138,8 @@ pub struct RawPlanResponse {
     pub tool_calls: Vec<RawToolCall>,
     /// Model the provider reports having used.
     pub model: Option<String>,
+    /// Provider stop reason (`tool_calls`, `stop`, `length`, …), when reported.
+    pub finish_reason: Option<String>,
 }
 
 /// Client knobs beyond [`AiConfig`], with production defaults; tests tighten/loosen them.
@@ -186,7 +187,8 @@ struct BreakerState {
 
 type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, QuantaClock>;
 
-/// The chat-completions client. Constructed only when AI is enabled.
+/// Provider request client for Chat Completions or native Anthropic Messages.
+/// Constructed only when AI is enabled.
 pub struct AiClient {
     http: reqwest::Client,
     endpoint: String,
@@ -281,7 +283,7 @@ impl AiClient {
         })
     }
 
-    /// The resolved chat-completions endpoint URL.
+    /// The resolved provider inference endpoint URL.
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -385,8 +387,34 @@ impl AiClient {
         Ok(parse_model_list(&body))
     }
 
+    /// The output-limit field accepted by this Chat Completions endpoint.
+    ///
+    /// `api.openai.com` uses `max_completion_tokens`; OpenAI-compatible providers retain
+    /// `max_tokens`. Native Anthropic bodies are built separately.
+    fn output_token_field(&self) -> &'static str {
+        if self.provider == ProviderKind::OpenAiCompatible
+            && reqwest::Url::parse(&self.endpoint)
+                .ok()
+                .and_then(|url| {
+                    url.host_str()
+                        .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+                })
+                .unwrap_or(false)
+        {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        }
+    }
+
     /// Build the provider-shaped request body.
-    fn build_body(&self, messages: &[ChatMessage], tool_values: &[Value]) -> Value {
+    fn build_body(
+        &self,
+        messages: &[ChatMessage],
+        tool_values: &[Value],
+        require_tool: bool,
+        max_tokens_override: Option<u64>,
+    ) -> Value {
         match self.provider {
             ProviderKind::OpenAiCompatible => {
                 let model = self.model();
@@ -394,7 +422,7 @@ impl AiClient {
                     "model": model,
                     "messages": messages,
                     "tools": tool_values,
-                    "tool_choice": "auto",
+                    "tool_choice": if require_tool { "required" } else { "auto" },
                     "stream": false,
                 });
                 let reasoning_effort = self.reasoning_effort();
@@ -404,7 +432,7 @@ impl AiClient {
                     body["reasoning_effort"] = json!(effort);
                 }
                 if is_glm_model(&model) {
-                    body["max_tokens"] = json!(GLM_PLAN_MAX_TOKENS);
+                    body["max_tokens"] = json!(max_tokens_override.unwrap_or(GLM_PLAN_MAX_TOKENS));
                     if reasoning_effort == ReasoningEffort::Default
                         && self.endpoint.contains("pinference.ai")
                     {
@@ -415,10 +443,21 @@ impl AiClient {
                         // Native Z.AI-compatible GLM endpoints use the family-specific knob.
                         body["thinking"] = json!({"type": "disabled"});
                     }
+                } else if let Some(max_tokens) = max_tokens_override {
+                    // Official Chat Completions rejects the legacy `max_tokens` field.
+                    // Compatible endpoints keep that field, so select by endpoint capability,
+                    // never by a model-name heuristic.
+                    body[self.output_token_field()] = json!(max_tokens);
                 }
                 body
             }
-            ProviderKind::Anthropic => build_anthropic_body(&self.model(), messages, tool_values),
+            ProviderKind::Anthropic => build_anthropic_body_with_tool_choice(
+                &self.model(),
+                messages,
+                tool_values,
+                require_tool,
+                max_tokens_override,
+            ),
         }
     }
 
@@ -489,7 +528,9 @@ impl AiClient {
             .expect("the private AI request semaphore is never closed");
         self.check_limiter()?;
         self.check_breaker()?;
-        let response = self.chat_with_plan_admitted(messages, tools).await?;
+        let response = self
+            .chat_with_plan_admitted(messages, tools, false, None)
+            .await?;
         if response.tool_calls.is_empty() {
             Err(AiError::NoToolCall)
         } else {
@@ -499,12 +540,14 @@ impl AiClient {
 
     /// Scheduler path: wait asynchronously for token-bucket capacity instead of turning
     /// normal background pacing into a user-visible throttle failure. Unlike the public
-    /// public method, this keeps a tool-less assistant message so the service can spend one
+    /// method, this keeps a tool-less assistant message so the service can spend one
     /// bounded repair turn asking an auto-choice model for the required structured call.
     pub(crate) async fn chat_with_plan_waiting(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDef],
+        require_tool: bool,
+        max_tokens_override: Option<u64>,
     ) -> Result<RawPlanResponse, AiError> {
         self.check_breaker()?;
         let _in_flight = self
@@ -515,16 +558,19 @@ impl AiClient {
         self.limiter.until_ready().await;
         // The circuit may have opened while this turn waited behind another request.
         self.check_breaker()?;
-        self.chat_with_plan_admitted(messages, tools).await
+        self.chat_with_plan_admitted(messages, tools, require_tool, max_tokens_override)
+            .await
     }
 
     async fn chat_with_plan_admitted(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDef],
+        require_tool: bool,
+        max_tokens_override: Option<u64>,
     ) -> Result<RawPlanResponse, AiError> {
         let tool_values: Vec<Value> = tools.iter().map(ToolDef::to_openai).collect();
-        let body = self.build_body(messages, &tool_values);
+        let body = self.build_body(messages, &tool_values, require_tool, max_tokens_override);
 
         let mut request = self
             .http
@@ -582,6 +628,11 @@ impl AiClient {
         self.input_tokens.fetch_add(usage.input, Ordering::Relaxed);
         self.output_tokens
             .fetch_add(usage.output, Ordering::Relaxed);
+        tracing::debug!(
+            input_tokens = usage.input,
+            output_tokens = usage.output,
+            "provider completion token usage"
+        );
         match self.provider {
             ProviderKind::OpenAiCompatible => parse_completion(completion),
             ProviderKind::Anthropic => parse_anthropic_response(completion),
@@ -709,7 +760,16 @@ fn body_snippet(text: String) -> String {
 /// with `tool_calls` / `tool` results). Anthropic expects: `system` hoisted to a top-level
 /// field, `messages` alternating user/assistant, tool calls as assistant `tool_use` content
 /// blocks, and tool results as user `tool_result` blocks.
-fn build_anthropic_body(model: &str, messages: &[ChatMessage], tool_values: &[Value]) -> Value {
+///
+/// Requiring a tool is used only for focused singleton controller turns. Other turns retain
+/// normal automatic tool selection.
+fn build_anthropic_body_with_tool_choice(
+    model: &str,
+    messages: &[ChatMessage],
+    tool_values: &[Value],
+    require_tool: bool,
+    max_tokens_override: Option<u64>,
+) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
     let mut out_messages: Vec<Value> = Vec::new();
     for msg in messages {
@@ -747,10 +807,10 @@ fn build_anthropic_body(model: &str, messages: &[ChatMessage], tool_values: &[Va
     let merged = merge_same_role(out_messages);
     let mut body = json!({
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": max_tokens_override.unwrap_or(4096),
         "messages": merged,
         "tools": anthropic_tools(tool_values),
-        "tool_choice": { "type": "auto" },
+        "tool_choice": { "type": if require_tool { "any" } else { "auto" } },
     });
     if !system_parts.is_empty() {
         body["system"] = Value::String(system_parts.join("\n\n"));
@@ -833,6 +893,7 @@ fn merge_same_role(messages: Vec<Value>) -> Vec<Value> {
 /// Parse an Anthropic Messages response into the shared [`RawPlanResponse`] shape.
 fn parse_anthropic_response(body: Value) -> Result<RawPlanResponse, AiError> {
     let model = body["model"].as_str().map(str::to_string);
+    let finish_reason = body["stop_reason"].as_str().map(str::to_string);
     let mut tool_calls = Vec::new();
     let mut text_parts = Vec::new();
     if let Some(blocks) = body.get("content").and_then(Value::as_array) {
@@ -875,6 +936,7 @@ fn parse_anthropic_response(body: Value) -> Result<RawPlanResponse, AiError> {
         message,
         tool_calls,
         model,
+        finish_reason,
     })
 }
 
@@ -896,12 +958,18 @@ fn parse_model_list(body: &Value) -> Vec<String> {
 
 fn parse_completion(completion: Value) -> Result<RawPlanResponse, AiError> {
     let model = completion["model"].as_str().map(str::to_string);
-    let message = completion
+    let choice = completion
         .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
+        .and_then(|choices| choices.get(0))
+        .ok_or_else(|| AiError::MalformedResponse("completion has no choices[0]".into()))?;
+    let message = choice
+        .get("message")
         .cloned()
         .ok_or_else(|| AiError::MalformedResponse("completion has no choices[0].message".into()))?;
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let mut tool_calls = Vec::new();
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -926,11 +994,16 @@ fn parse_completion(completion: Value) -> Result<RawPlanResponse, AiError> {
             });
         }
     }
-    tracing::debug!(calls = tool_calls.len(), "completion parsed");
+    tracing::debug!(
+        calls = tool_calls.len(),
+        finish_reason = finish_reason.as_deref().unwrap_or(""),
+        "completion parsed"
+    );
     Ok(RawPlanResponse {
         message,
         tool_calls,
         model,
+        finish_reason,
     })
 }
 
@@ -1013,7 +1086,7 @@ mod tests {
         cfg.model = "z-ai/glm-5.3".into();
         cfg.base_url = "https://api.pinference.ai/api/v1".into();
         let client = AiClient::new(&cfg).unwrap();
-        let body = client.build_body(&[ChatMessage::user("digest")], &[]);
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
         assert_eq!(body["reasoning_effort"], "minimal");
         assert!(body.get("reasoning").is_none());
         assert!(body.get("thinking").is_none());
@@ -1021,22 +1094,69 @@ mod tests {
 
         cfg.base_url = "https://api.z.ai/api/paas/v4".into();
         let client = AiClient::new(&cfg).unwrap();
-        let body = client.build_body(&[ChatMessage::user("digest")], &[]);
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
         assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning").is_none());
         assert!(body.get("reasoning_effort").is_none());
 
         cfg.reasoning_effort = ReasoningEffort::High;
         let client = AiClient::new(&cfg).unwrap();
-        let body = client.build_body(&[ChatMessage::user("digest")], &[]);
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("thinking").is_none());
 
         cfg.model = "openai/gpt-5-mini".into();
         let client = AiClient::new(&cfg).unwrap();
-        let body = client.build_body(&[ChatMessage::user("digest")], &[]);
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
         assert!(body.get("thinking").is_none());
         assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn official_openai_output_override_uses_max_completion_tokens() {
+        let mut cfg = enabled_config();
+        cfg.base_url = crate::OPENAI_BASE_URL.into();
+        cfg.model = crate::DEFAULT_OPENAI_MODEL.into();
+        let client = AiClient::new(&cfg).unwrap();
+
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], true, Some(4_096));
+        assert_eq!(body["max_completion_tokens"], 4_096);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn custom_openai_compatible_output_override_uses_max_tokens() {
+        let client = AiClient::new(&enabled_config()).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], true, Some(4_096));
+
+        assert_eq!(body["max_tokens"], 4_096);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn glm_output_override_uses_max_tokens() {
+        let mut cfg = enabled_config();
+        cfg.base_url = crate::PRIME_BASE_URL.into();
+        cfg.model = "z-ai/glm-5.3".into();
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, Some(4_096));
+
+        assert_eq!(body["max_tokens"], 4_096);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn native_anthropic_output_override_uses_max_tokens() {
+        let mut cfg = enabled_config();
+        cfg.base_url = crate::ANTHROPIC_BASE_URL.into();
+        cfg.model = crate::DEFAULT_ANTHROPIC_MODEL.into();
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], true, Some(4_096));
+
+        assert_eq!(body["max_tokens"], 4_096);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert_eq!(body["tool_choice"]["type"], "any");
     }
 
     #[test]
@@ -1062,12 +1182,12 @@ mod tests {
     fn parse_completion_extracts_calls() {
         let completion = serde_json::json!({
             "model": "m",
-            "choices": [{"message": {
+            "choices": [{"finish_reason": "tool_calls", "message": {
                 "role": "assistant",
                 "content": null,
                 "tool_calls": [
                     {"id": "c1", "type": "function",
-                     "function": {"name": "get_hunk", "arguments": "{\"file\":\"a.go\",\"hunk_index\":0}"}},
+                     "function": {"name": "git_diff_file", "arguments": "{\"file\":\"a.go\",\"hunk_index\":0}"}},
                     {"id": "c2", "type": "function",
                      "function": {"name": "inspect_visualization", "arguments": "{}"}}
                 ]
@@ -1078,6 +1198,7 @@ mod tests {
         assert_eq!(parsed.tool_calls[1].name, "inspect_visualization");
         assert_eq!(parsed.tool_calls[1].arguments, "{}");
         assert_eq!(parsed.model.as_deref(), Some("m"));
+        assert_eq!(parsed.finish_reason.as_deref(), Some("tool_calls"));
     }
 
     #[test]
@@ -1219,16 +1340,17 @@ mod tests {
                 "tool_calls": [{
                     "id": "c1",
                     "type": "function",
-                    "function": {"name": "get_hunk", "arguments": "{\"file\":\"a.go\"}"},
+                    "function": {"name": "git_diff_file", "arguments": "{\"file\":\"a.go\"}"},
                 }],
             })),
             ChatMessage::tool("c1", "result text"),
         ];
         let tools = vec![json!({
             "type": "function",
-            "function": {"name": "get_hunk", "description": "d", "parameters": {"type":"object"}},
+            "function": {"name": "git_diff_file", "description": "d", "parameters": {"type":"object"}},
         })];
-        let body = build_anthropic_body("claude-x", &messages, &tools);
+        let body =
+            build_anthropic_body_with_tool_choice("claude-x", &messages, &tools, false, None);
         assert_eq!(body["model"], "claude-x");
         assert_eq!(body["system"], "sys");
         assert_eq!(body["tool_choice"]["type"], "auto");
@@ -1243,9 +1365,46 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_body_requires_the_focused_tool() {
+        let messages = vec![ChatMessage::user("focused handoff")];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "edit_diagram", "parameters": {"type": "object"}},
+        })];
+        let body = build_anthropic_body_with_tool_choice("claude-x", &messages, &tools, true, None);
+        assert_eq!(body["tool_choice"]["type"], "any");
+    }
+
+    #[test]
+    fn anthropic_hoists_combined_compact_protocol_context() {
+        let protocol = "CONSTRUCTION PROTOCOL (mandatory, current step). Apply only `set_intent`.";
+        let messages = vec![
+            ChatMessage::system(format!("compact base\n\n{protocol}")),
+            ChatMessage::user("compact handoff"),
+        ];
+        let body = build_anthropic_body_with_tool_choice("claude-x", &messages, &[], false, None);
+
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["system"], format!("compact base\n\n{protocol}"));
+        assert_eq!(
+            body["system"]
+                .as_str()
+                .unwrap()
+                .matches("CONSTRUCTION PROTOCOL")
+                .count(),
+            1
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "compact handoff");
+    }
+
+    #[test]
     fn anthropic_response_parses_tool_use_blocks() {
         let body = json!({
             "model": "claude-x",
+            "stop_reason": "tool_use",
             "content": [
                 {"type": "text", "text": "thinking"},
                 {"type": "tool_use", "id": "t1", "name": "inspect_visualization",
@@ -1256,6 +1415,7 @@ mod tests {
         assert_eq!(res.tool_calls.len(), 1);
         assert_eq!(res.tool_calls[0].name, "inspect_visualization");
         assert!(res.tool_calls[0].arguments.contains("plan_version"));
+        assert_eq!(res.finish_reason.as_deref(), Some("tool_use"));
     }
 
     #[test]

@@ -3,8 +3,9 @@
 Scope: `codescope-ai` config/key handling, redaction, exclusion layers (.gitignore /
 .codescopeignore / secret denylist / content sniffing), exactly what leaves the machine,
 and the end-to-end read-only guarantee. Reviewed against `docs/architecture.md` (decision 7)
-and `docs/research/07-privacy-safety.md`. Verified by reading source and running
-`cargo test -p codescope-ai` (81 tests pass, live smoke ignored).
+and `docs/research/07-privacy-safety.md`. At review time this was verified by reading source and
+running `cargo test -p codescope-ai` (81 then-current tests passed; live smoke ignored). This is an
+archival count, not the current repository gate.
 
 ## Summary
 

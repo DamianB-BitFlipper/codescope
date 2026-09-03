@@ -30,8 +30,8 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 
 1. **Git via CLI subprocess**, `--porcelain=v2 -z`, `--no-optional-locks` everywhere.
    Why: exact user-git semantics, no C build. (research 02)
-2. **Enum-dispatch LanguageService** over one generic `LspClient`; gopls adapter only.
-   Capabilities resolved at initialize into a `FeatureSet`; utf-16 default position encoding,
+2. **Enum-dispatch LanguageService** over one generic `LspClient`; gopls and rust-analyzer
+   adapters. Capabilities resolve at initialize into a `FeatureSet`; utf-16 default position encoding,
    converted at wire boundary only. Why: verified cross-server quirks (research 01).
 3. **Hunks → symbols via hierarchical DocumentSymbols**; worktree tree for new-side hunks,
    base-revision overlay for pure deletions; confidence Exact/Approximate/Unmapped end-to-end.
@@ -82,35 +82,47 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    guidance. Diagram edits are typed `DiagramCommand`s shared with the internal model tools;
    both writers mutate the same draft and cross the existing evidence validator before final
    publication.
-6. **AI**: OpenAI-compatible chat completions via reqwest 0.13. A bounded loop researches and
-   incrementally builds the renderer-native `DiagramDraft` through create/update/delete tools;
-   a natural end to the tool sequence validates and publishes it. Six structural forms (legacy
-   `impact_summary`/`focused_diff` are rejected at the AI plan boundary); reviewer-first
-   contract (required intent/forms/evidence, 1–4 evidence, default 4 / hard max 5 nodes
-   and ≤8 edges per form, nonempty 1–2 forms — core keeps larger node backstops). Plan schema v5
-   requires every AI node to carry 1–2 exact old/new diff ranges and permits one optional expanded
-   explanation. The fact-validation boundary checks epoch, entity resolution, typed-edge existence,
-   hunks, and every referenced source line, with up to 3 bounded repair turns; accepted validation reports travel with
-   plans (debug-ai prints the full report; the TUI shows one sanitized-plan warning). During
-   generation the TUI shows ordered tool-call progress, and a terminal generation failure shows
-   only `AI failed` in the generated half rather than a deterministic substitute. The files pane
-   projects changed paths as a directory → file →
-   symbol tree and publishes per-row AI readiness. Only the debounced current directory, file,
-   or symbol starts inference; directory facts are filtered to their subtree, and there
-   is no AI prefetch or background prompt queue. Navigation cancels an unsent debounce but leaves
-   started requests running so their results can cache under the original selection. One FIFO
-   coordinator bounds the active window to 16 requests: request 17 aborts the oldest active
-   generation, with no requeue. Completed plans cache by selection. Provider admission primarily
-   limits actual HTTP execution to 8 concurrent requests; a 600 rpm/burst-100 token bucket is a
-   high secondary ceiling. Initial context is a compact research brief; a 48-operation loop
-   exposes selection-scoped list/read/search and captured per-file Git status/diff tools alongside
-   the shared diagram editor. The headless backend uses the same policy.
+6. **AI**: OpenAI-compatible Chat Completions and native Anthropic Messages via reqwest 0.13. A
+   bounded loop researches and
+   incrementally builds the renderer-native `DiagramDraft` through create/update/delete tools.
+   Initial research and normal full-schema construction turns use `Auto` tool choice. Once an
+   exact diff is retained, the intent/form bootstrap and a focused recovery from a
+   provider-truncated response use `Required` with one controller-selected canonical editor
+   branch; the next normal turn returns to full-schema `Auto`. A tool-less full `Auto` turn
+   validates and publishes the draft. Six structural forms (legacy `impact_summary`/
+   `focused_diff` are rejected at the AI plan boundary); reviewer-first contract (required
+   intent/forms/evidence, 1–4 evidence, default 4 / hard max 5 nodes and ≤8 edges per form,
+   nonempty 1–2 forms — core keeps larger node backstops). Plan schema v6 requires every AI node
+   to carry 1–2 exact old/new diff ranges and permits one optional expanded explanation. The
+   fact-validation boundary checks epoch, entity resolution, hunks, every referenced source
+   line, and at least one actual added/removed row per node (context-only refs reject). In
+   `relationship_flow`, `calls`, `imports`, `implements`, and `contains` are
+   graph-validated; `reads` and `writes` may remain presentational/unverified. Schema v6
+   `flows_to` is a Sequence-only inferred/dashed chronological transition that bypasses graph
+   lookup; a semantic Sequence edge still requires graph proof. Validation has up to 3 bounded
+   repair turns; accepted reports travel with plans (`debug-ai` prints the full report; the TUI
+   shows one sanitized-plan warning). During generation the TUI shows ordered tool-call progress,
+   and a terminal generation failure shows only `AI failed` in the generated half rather than a
+   deterministic substitute. The files pane projects changed paths as a directory → file → symbol
+   tree and publishes per-row AI readiness. Only the debounced current directory, file, or symbol
+   starts inference; directory facts are filtered to their subtree, and there is no AI prefetch or
+   background prompt queue. Navigation cancels an unsent debounce but leaves started requests
+   running so their results can cache under the original selection. One FIFO coordinator bounds
+   the active window to 16 requests: request 17 aborts the oldest active generation, with no
+   requeue. Completed plans cache by selection. Provider admission primarily limits actual HTTP
+   execution to 8 concurrent requests; a 600 rpm/burst-100 token bucket is a high secondary
+   ceiling. The initial context is an assignment-only research brief. After a retained exact diff,
+   every later compact handoff is rebuilt from that assignment, retained exact diffs first,
+   bounded tool-tagged supplementary reads, the current draft, and controller feedback—never an
+   old tool transcript. Up to eight current research/editor tools share the 48-operation loop.
+   The headless backend uses the same policy.
    A live-agent question replaces the current selection's presentation guidance; feedback also
    supplies that selection's previous validated plan as the revision seed. Replacing guidance
    may cancel only an older request for that same target. Navigation itself retains the 16-entry
    active-request behavior above.
    Interactive startup requires a resolved AI provider; missing or disabled configuration is a
    startup error rather than a reduced-function mode. (research 05)
+
 7. **Privacy**: 4-layer exclusion (git ignore rules < .codescopeignore < compiled denylist <
    content sniffing), applied to diff paths too; keys via env name only into secrecy::SecretString.
    (research 07)
@@ -154,7 +166,8 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 ## Vertical slice order (each independently testable)
 
 1. core types + git → ChangeSets (fixture-backed tests)
-2. lsp client + gopls → symbols/references/call hierarchy (fixture-backed, skip w/o gopls)
+2. lsp client + gopls/rust-analyzer → symbols/references/call hierarchy (fixture-backed,
+   skip when the relevant server is unavailable)
 3. analysis → ChangedSymbols + ImpactGraph (pure tests + fixture)
 4. tui → renders UiSnapshot headless (TestBackend), keymap actions
 5. ai → fake provider plan validation; optional live smoke
@@ -162,8 +175,8 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 
 ## Explicit non-goals for v0
 
-- tree-sitter fallback, runtime data flow, multi-language beyond Go,
-  `$/cancelRequest` to gopls, writing anything to the repo.
+- tree-sitter fallback, runtime data flow, language adapters beyond Go and Rust,
+  `$/cancelRequest` to language servers, and writing anything to the repo.
 
 ## Lead decisions recorded during implementation
 

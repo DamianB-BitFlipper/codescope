@@ -45,21 +45,26 @@ remain explicit rather than being replaced by deterministic summary content.
    a reviewer-first `DiagramDraft` through a bounded agentic loop (at most 48 total research and
    diagram operations). `edit_visualization` applies atomic intent/form/node/edge/evidence
    create-update-delete commands, and `inspect_visualization` returns the current draft. The model
-   never needs to resend the complete plan after each correction. Tool selection is always
-   automatic; ending a turn without another tool call implicitly validates and publishes the
-   accumulated draft.
+   never needs to resend the complete plan after each correction. Initial research and normal
+   full-schema turns use `Auto` tool choice. After an exact diff is retained, the initial
+   intent/form bootstrap, and a focused recovery after a provider-truncated response, use
+   `Required` tool choice with one controller-selected canonical editor branch; the next normal
+   turn returns to full-schema `Auto`. Ending a full `Auto` turn without another tool call
+   implicitly requests validation and publication of the accumulated draft.
    `intent`, `forms`, and `evidence` are required, and the primary form
    must be structural — one of changed-symbol tree, call tree, type/impl tree, relationship
    flow, before/after, or sequence; the legacy `impact_summary` and `focused_diff` forms
    are not accepted as AI plans. The dispatcher exposes a selection-scoped mini-shell:
-   `list_directory`, `read_file`, `search_changed_files`, `git_status_file`, and
-   `git_diff_file`. Directory paths are relative to a virtual cwd (the selected directory or
+   `list_directory`, `read_file`, `search_changed_files`, `git_status_file`, `git_diff_file`,
+   plus capability-discovered `inspect_language_server` when semantic support is available.
+   Directory paths are relative to a virtual cwd (the selected directory or
    selected file's parent); file tools additionally accept an exact repo-relative path or an unambiguous
    repo-path suffix. Absolute/parent-traversal paths are rejected, file reads cannot leave the
    selected changed files, and results are line/byte capped. Git status/diff results come from
    the immutable captured `ChangeSet`, so exact evidence cannot drift during the loop. Diff rows
-   carry copyable one-based `[old:… new:…]` coordinates. Completion before one successful research
-   call is rejected and the model is sent back to research. Each accepted draft edit is retained
+   carry copyable one-based `[old:… new:…]` coordinates. A research-required plan cannot complete
+   until a nonempty exact `git_diff_file` result is retained; status, source, or LSP reads alone are
+   insufficient. Each accepted draft edit is retained
    in the shared snapshot/controller state, while the in-flight TUI view shows the
    complete, vertically scrollable tool-call lifecycle (`running`, `succeeded`, or `failed`)
    rather than unfinished boxes. Failed rows include a bounded, scrubbed error reason.
@@ -75,15 +80,20 @@ remain explicit rather than being replaced by deterministic summary content.
    ceiling; active jobs wait asynchronously for both capacities instead of turning normal pacing
    into a false provider failure.
 6. **Validate** — every cited entity must resolve against the fact store (file exists,
-   symbol resolves, hunk index valid), and a typed edge between two fact-backed entities must
-   exist in the impact graph. Plan schema v5 also requires every AI node to carry one or two
-   exact `code_refs` (`file`, zero-based hunk, old/new side, inclusive one-based lines). Node refs
-   must stay in the selected research scope: one file for file/symbol selection, or any changed
-   file below a directory selection. Every
-   referenced line is checked against the actual parsed hunk before it can drive highlighting.
-   Entityless conceptual nodes and their hunk-derived links need no entity check but always
-   render inferred. Hallucinated entities are dropped (tree forms) or
-   the form is rejected (flow/sequence). The AI-facing caps are nonempty 1–2 forms, ≤5
+   symbol resolves, hunk index valid). In a `relationship_flow`, `calls`, `imports`,
+   `implements`, and `contains` between fact-backed entities must exist in the impact graph.
+   `reads` and `writes` have no v0 graph counterpart, so they may remain presentational and are
+   reported unverified rather than treated as proven relationships. Plan schema v6 also requires
+   every AI node to carry one or two exact `code_refs` (`file`, zero-based hunk, old/new side,
+   inclusive one-based lines). Node refs must stay in the selected research scope: one file for
+   file/symbol selection, or any changed file below a directory selection. Every referenced line
+   is checked against the actual parsed hunk, and every node must include at least one actual
+   added/new-side or removed/old-side row rather than only unchanged context. Entityless
+   conceptual nodes and their hunk-derived links need no entity check but always render inferred.
+   Schema v6 adds `flows_to`: a renderer-native chronological/control-flow transition, not a
+   graph fact. It is valid only in sequence forms and renders inferred/dashed, bypassing
+   impact-graph lookup; any semantic Sequence edge still requires graph proof. Hallucinated entities are dropped
+   (tree forms) or the form is rejected (flow/sequence). The AI-facing caps are nonempty 1–2 forms, ≤5
    nodes per form (4 is the default; core keeps larger internal backstops), ≤8 edges per
    form, and 1–4 evidence entries. A rejected plan gets up to 3 bounded repair turns —
    schema, entity/fact, and structural errors each receive targeted guidance — before the
@@ -148,22 +158,27 @@ the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` re
 
 ## Provider neutrality
 
-The client speaks OpenAI-compatible `chat/completions` with automatic tool selection. A tool-less
-assistant turn is the completion signal; if its accumulated draft is invalid, the service uses one
-of its bounded repair turns to return exact validation feedback. Verified against Prime
+The client speaks OpenAI-compatible Chat Completions for OpenAI, Prime, and custom endpoints,
+and native Anthropic Messages for Anthropic. Initial research and normal full-schema turns use
+`Auto` tool choice. Only the initial intent/form bootstrap after retained diff evidence,
+and a focused recovery from a provider-truncated response, use `Required` with one
+controller-selected canonical editor branch. A tool-less full `Auto` turn is the completion signal;
+if its accumulated draft is invalid, the service uses one of its bounded repair turns to return
+exact validation feedback. Verified against Prime
 Inference (`https://api.pinference.ai/api/v1`) and OpenAI; anything compatible (Ollama, vLLM, …)
 works by setting the base URL. The default model is a small, schema-constrained one — plans are
 structured, so they don't need a frontier model.
 
 ## Privacy
 
-- API keys come from **environment variables only** (`PRIME_API_KEY` > `OPENAI_API_KEY` >
-  `ANTHROPIC_API_KEY`; first found wins, provider inferred from the key); a literal key in a
-  config file is a hard error.
+- Key values come from **environment variables only**. A global `[ai].api_key_env` names the
+  variable resolved first; otherwise resolution tries `PRIME_API_KEY`, `OPENAI_API_KEY`, then
+  `ANTHROPIC_API_KEY` and infers the provider from the built-in name. An arbitrary named key
+  requires an explicit base URL; a literal key in a config file is a hard error.
 - Keys are wrapped in `secrecy::SecretString`; never logged, never shown.
-- What leaves initially is the compact research brief. On later turns, only the bounded tool
-  results the model requested leave the machine: selection-scoped changed-file sections, literal
-  search matches, or captured per-file status/diff facts. Results and any prior validated revision
-  seed use repo-relative paths, have absolute roots removed, and pass through secret scrubbing.
+- What leaves initially is the bounded research assignment. Later fresh handoffs can include
+  retained exact diffs and tagged tool results, the current diagram draft, bounded controller
+  feedback/state, and an explicitly untrusted prior validated revision seed. These values use
+  repo-relative paths, have absolute roots removed, and pass through secret scrubbing.
 - The status bar shows the active AI service state. The changed tree independently marks each
   directory/file/symbol summary as `◆` ready, `◇` not generated, `◌` generating, or `!` failed.

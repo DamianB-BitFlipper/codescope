@@ -687,6 +687,7 @@ struct CanvasEdge {
 
 fn relationship_kind_name(kind: PlanEdgeKind) -> &'static str {
     match kind {
+        PlanEdgeKind::FlowsTo => "flows to",
         PlanEdgeKind::Calls => "calls",
         PlanEdgeKind::Reads => "reads",
         PlanEdgeKind::Writes => "writes",
@@ -1137,7 +1138,9 @@ fn cell_chunks(text: &str, width: usize) -> Vec<String> {
 const MIN_BOX_WIDTH: usize = 18;
 
 fn edge_verified(from: &PlanNode, to: &PlanNode, edge: &PlanEdge) -> bool {
-    from.entity.is_some()
+    // `flows_to` is renderer-native sequence grammar, so it has no fact-store proof.
+    edge.kind != PlanEdgeKind::FlowsTo
+        && from.entity.is_some()
         && to.entity.is_some()
         && matches!(
             edge.kind,
@@ -1227,7 +1230,7 @@ fn pad(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod canvas_tests {
     use super::*;
-    use codescope_core::{DiffSide, Epoch, FileId, PlanCodeRef, PlanNodeChange};
+    use codescope_core::{DiffSide, EntityRef, Epoch, FileId, PlanCodeRef, PlanNodeChange};
 
     fn live_shape() -> VisualizationPlan {
         let mut plan = VisualizationPlan::new(Epoch(7));
@@ -1344,6 +1347,61 @@ mod canvas_tests {
             .relationship_overlay_in_viewport(&plan, &edge, 0, 0, 0)
             .is_none());
     }
+    #[test]
+    fn relationship_kind_names_are_truthful_and_exhaustive() {
+        for (kind, expected) in [
+            (PlanEdgeKind::FlowsTo, "flows to"),
+            (PlanEdgeKind::Calls, "calls"),
+            (PlanEdgeKind::Reads, "reads"),
+            (PlanEdgeKind::Writes, "writes"),
+            (PlanEdgeKind::Imports, "imports"),
+            (PlanEdgeKind::Implements, "implements"),
+            (PlanEdgeKind::Contains, "contains"),
+        ] {
+            assert_eq!(relationship_kind_name(kind), expected);
+        }
+    }
+
+    #[test]
+    fn flows_to_renders_as_an_unverified_transition_with_a_fallback_overlay() {
+        let mut plan = VisualizationPlan::new(Epoch(7));
+        plan.forms.push(VizForm {
+            kind: FormKind::Sequence,
+            nodes: vec![
+                PlanNode::new("request", "request", PlanNodeChange::Modified).with_entity(
+                    EntityRef::for_file(FileId::new("src/request.rs").expect("valid file id")),
+                ),
+                PlanNode::new("handler", "handler", PlanNodeChange::Modified).with_entity(
+                    EntityRef::for_file(FileId::new("src/handler.rs").expect("valid file id")),
+                ),
+            ],
+            edges: vec![PlanEdge {
+                from: "request".into(),
+                to: "handler".into(),
+                kind: PlanEdgeKind::FlowsTo,
+                label: None,
+            }],
+        });
+
+        let canvas = built(&plan, &DiagramState::default(), 40);
+        let relationship = canvas
+            .relationships
+            .first()
+            .expect("flow transition renders");
+        assert!(
+            relationship.label.is_empty(),
+            "no compact label was supplied"
+        );
+        assert!(
+            !relationship.verified,
+            "renderer-native transitions are inferred and therefore dashed"
+        );
+        let overlay = canvas
+            .relationship_overlay(&plan, &relationship.target)
+            .expect("transition has a fallback overlay");
+        assert!(overlay.lines.join("\n").contains("flows to"));
+    }
+
     #[test]
     fn move_parallel_optional_unicode_and_z_contracts() {
         let mut plan = live_shape();

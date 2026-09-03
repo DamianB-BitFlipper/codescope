@@ -3,7 +3,8 @@
 //! The AI only *chooses and parameterizes* views; codescope owns facts, validation, and
 //! rendering. Agents may build plans incrementally through [`DiagramDraft`](crate::DiagramDraft)
 //! commands, but every finished projection passes the deterministic validation boundary (epoch
-//! gate, entity resolution, edge existence, hunks by reference) before publication.
+//! gate, entity resolution, semantic-edge evidence or Sequence transition adjacency, and hunks by
+//! reference) before publication.
 //!
 //! Field names and enum values serialize exactly as in the research 05 §2 schema
 //! (`snake_case` kinds, flat [`LineRange`](crate::LineRange) entities).
@@ -13,7 +14,7 @@ use crate::relation::DiagnosticSeverity;
 use crate::semantic::EntityRef;
 
 /// Current [`VisualizationPlan::plan_version`]. Bump on any schema change.
-pub const PLAN_VERSION: u32 = 5;
+pub const PLAN_VERSION: u32 = 6;
 
 /// Hard cap on nodes per form (Show Me rule S4; enforced at validation).
 pub const MAX_FORM_NODES: usize = 12;
@@ -95,7 +96,7 @@ pub struct PlanEvidence {
     pub reason: String,
 }
 
-/// Visualization forms understood by core. Plan schema v3 accepts only the six structural
+/// Visualization forms understood by core. Plan schema v6 accepts only the six structural
 /// forms; `ImpactSummary` and `FocusedDiff` remain deserializable for stored/internal data
 /// but are rejected at the AI validation boundary.
 ///
@@ -357,10 +358,13 @@ impl NodeHint {
 /// Kind of edge the AI may draw between plan nodes (research 05 §2).
 ///
 /// Edges asserting `calls`/`implements`/`imports` must exist in the impact graph —
-/// the AI selects edges, it never asserts new ones.
+/// the AI selects edges, it never asserts new ones. [`PlanEdgeKind::FlowsTo`] is a
+/// renderer-native chronological/control-flow transition, not a graph fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanEdgeKind {
+    /// Renderer-native chronological/control-flow transition, not an impact-graph fact.
+    FlowsTo,
     /// Call relationship.
     Calls,
     /// Import dependency.
@@ -397,8 +401,8 @@ pub enum ValidationVerdict {
     Valid,
     /// Some nodes/edges/bullets were dropped; render the remainder.
     ValidWithDrops,
-    /// The plan's epoch no longer matches the repo state; show the last valid render with a
-    /// "regenerating" badge and re-request.
+    /// The plan's epoch no longer matches repository state; do not publish it as current and
+    /// request fresh generation. Prior validated structure may remain only as an untrusted seed.
     Stale,
     /// The plan (or every remaining form) is unusable; do not publish it.
     Rejected,
@@ -507,12 +511,13 @@ pub enum AiStatus {
         /// Epoch the rendered plan was validated against.
         epoch: Epoch,
     },
-    /// The displayed plan's epoch no longer matches the repo state; regenerating.
+    /// Repository state changed and generated output is being refreshed. Stale generated plans
+    /// are not rendered as current; prior validated structure may be retained only as an untrusted seed.
     Stale {
-        /// Epoch of the stale plan still being displayed.
+        /// Current repository epoch awaiting a newly validated plan.
         epoch: Epoch,
     },
-    /// The last request failed (validation/render falls back deterministically).
+    /// The last generated request failed; deterministic impact remains available separately.
     Failed {
         /// Human-readable failure reason (never contains secrets).
         reason: String,
@@ -520,11 +525,10 @@ pub enum AiStatus {
 }
 
 impl AiStatus {
-    /// `true` when a validated plan can be displayed (`Ready`; `Stale` still shows the last
-    /// valid render with a badge).
+    /// `true` only when a current-epoch validated generated plan can be displayed.
     #[must_use]
     pub fn has_plan(&self) -> bool {
-        matches!(self, AiStatus::Ready { .. } | AiStatus::Stale { .. })
+        matches!(self, AiStatus::Ready { .. })
     }
 }
 
@@ -612,7 +616,7 @@ mod tests {
         }
         .has_plan());
         assert!(AiStatus::Ready { epoch: Epoch(1) }.has_plan());
-        assert!(AiStatus::Stale { epoch: Epoch(1) }.has_plan());
+        assert!(!AiStatus::Stale { epoch: Epoch(1) }.has_plan());
         assert!(!AiStatus::Failed {
             reason: "boom".into()
         }

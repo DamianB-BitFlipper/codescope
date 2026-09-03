@@ -178,6 +178,7 @@ impl DiagramDraft {
                 ensure_id("edge.from", &edge.from)?;
                 ensure_id("edge.to", &edge.to)?;
                 let form = self.form_mut(form_id)?;
+                ensure_flows_to_form(form_id, form.kind, edge.kind)?;
                 if form.edges.len() >= MAX_DRAFT_EDGES {
                     return Err(DiagramEditError::Invalid(format!(
                         "form {form_id:?} supports at most {MAX_DRAFT_EDGES} edges"
@@ -202,8 +203,9 @@ impl DiagramDraft {
                 to,
                 patch,
             } => {
-                let edge = self
-                    .form_mut(form_id)?
+                let form = self.form_mut(form_id)?;
+                let form_kind = form.kind;
+                let edge = form
                     .edges
                     .iter_mut()
                     .find(|edge| edge.from == *from && edge.to == *to)
@@ -211,6 +213,7 @@ impl DiagramDraft {
                 patch.apply(edge)?;
                 ensure_id("edge.from", &edge.from)?;
                 ensure_id("edge.to", &edge.to)?;
+                ensure_flows_to_form(form_id, form_kind, edge.kind)?;
                 Ok(format!("updated edge {from} -> {to}"))
             }
             DiagramCommand::DeleteEdge { form_id, from, to } => {
@@ -482,6 +485,20 @@ fn ensure_form_kind(kind: FormKind) -> Result<(), DiagramEditError> {
     Ok(())
 }
 
+/// `flows_to` is renderer-native sequence grammar, never a relationship-flow graph fact.
+fn ensure_flows_to_form(
+    form_id: &str,
+    form_kind: FormKind,
+    edge_kind: PlanEdgeKind,
+) -> Result<(), DiagramEditError> {
+    if edge_kind == PlanEdgeKind::FlowsTo && form_kind != FormKind::Sequence {
+        return Err(DiagramEditError::Invalid(format!(
+            "edge kind flows_to is only valid in sequence form {form_id:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_node(node: &PlanNode) -> Result<(), DiagramEditError> {
     ensure_id("node.id", &node.id)?;
     ensure_text("node.label", &node.label, 512)?;
@@ -595,6 +612,85 @@ mod tests {
             })
             .unwrap();
         assert!(draft.plan().forms[0].edges.is_empty());
+    }
+
+    #[test]
+    fn flows_to_is_sequence_only_and_rejected_edits_are_atomic() {
+        let mut draft = DiagramDraft::new(Epoch(1));
+        for (form_id, kind) in [
+            ("flow", FormKind::RelationshipFlow),
+            ("sequence", FormKind::Sequence),
+        ] {
+            draft
+                .apply(&DiagramCommand::CreateForm {
+                    form_id: form_id.into(),
+                    kind,
+                })
+                .unwrap();
+        }
+
+        let transition = PlanEdge {
+            from: "first".into(),
+            to: "second".into(),
+            kind: PlanEdgeKind::FlowsTo,
+            label: None,
+        };
+        let before = draft.clone();
+        let error = draft
+            .apply(&DiagramCommand::CreateEdge {
+                form_id: "flow".into(),
+                edge: transition.clone(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("flows_to"));
+        assert!(error.to_string().contains("sequence"));
+        assert_eq!(draft, before, "failed create must not mutate the draft");
+
+        draft
+            .apply(&DiagramCommand::CreateEdge {
+                form_id: "sequence".into(),
+                edge: transition,
+            })
+            .unwrap();
+        // Fact-aware validation decides whether a semantic sequence edge is supported; the
+        // draft keeps the edit grammar renderer-neutral and accepts it provisionally.
+        draft
+            .apply(&DiagramCommand::CreateEdge {
+                form_id: "sequence".into(),
+                edge: PlanEdge {
+                    from: "second".into(),
+                    to: "third".into(),
+                    kind: PlanEdgeKind::Calls,
+                    label: None,
+                },
+            })
+            .unwrap();
+
+        draft
+            .apply(&DiagramCommand::CreateEdge {
+                form_id: "flow".into(),
+                edge: PlanEdge {
+                    from: "first".into(),
+                    to: "second".into(),
+                    kind: PlanEdgeKind::Calls,
+                    label: None,
+                },
+            })
+            .unwrap();
+        let before = draft.clone();
+        let error = draft
+            .apply(&DiagramCommand::UpdateEdge {
+                form_id: "flow".into(),
+                from: "first".into(),
+                to: "second".into(),
+                patch: DiagramEdgePatch {
+                    kind: Some(PlanEdgeKind::FlowsTo),
+                    ..DiagramEdgePatch::default()
+                },
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("flows_to"));
+        assert_eq!(draft, before, "failed update must not mutate the draft");
     }
 
     #[test]

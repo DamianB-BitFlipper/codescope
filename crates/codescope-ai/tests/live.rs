@@ -4,8 +4,8 @@
 //! CODESCOPE_LIVE=1 cargo test -p codescope-ai --test live -- --ignored
 //! ```
 //!
-//! Uses [`AiConfig::from_env`]: set `CODESCOPE_AI_API_KEY` / `PRIME_API_KEY` /
-//! `OPENAI_API_KEY` (and optionally `CODESCOPE_AI_BASE_URL`).
+//! Uses [`AiConfig::from_env`]: set `PRIME_API_KEY`, `OPENAI_API_KEY`, or
+//! `ANTHROPIC_API_KEY` (and optionally `CODESCOPE_AI_BASE_URL`).
 
 use codescope_ai::{AiConfig, AiOutcome, AiService, FactView, Lookup, NoToolExecutor};
 use codescope_core::{
@@ -30,6 +30,15 @@ impl FactView for AcceptAll {
         Lookup::Present(())
     }
     fn diff_line(&self, _file: &FileId, _index: u32, _side: DiffSide, _line: u32) -> Lookup<()> {
+        Lookup::Present(())
+    }
+    fn changed_diff_line(
+        &self,
+        _file: &FileId,
+        _index: u32,
+        _side: DiffSide,
+        _line: u32,
+    ) -> Lookup<()> {
         Lookup::Present(())
     }
 }

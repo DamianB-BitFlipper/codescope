@@ -1,4 +1,4 @@
-//! `codescope-lsp` — generic LSP client plus the gopls adapter.
+//! `codescope-lsp` — generic LSP client with gopls and rust-analyzer adapters.
 //!
 //! Layering (research 01):
 //!
@@ -15,8 +15,8 @@
 //!   all-null broken-session detection (research 01, quirk 5).
 //! - [`service`]: `LanguageService` — enum-dispatch semantic surface returning
 //!   `codescope-core` domain types wrapped in [`codescope_core::Evidence`].
-//! - [`gopls`]: `GoplsService` — the gopls 0.21 adapter (spawn, initialize, overlays,
-//!   feature gating).
+//! - [`gopls`]: `GoplsService` — Go adapter (spawn, initialize, overlays, feature gating).
+//! - [`rust_analyzer`]: `RustAnalyzerService` — Rust adapter over the same semantic boundary.
 //!
 //! Every relationship query is gated on the resolved [`codescope_core::FeatureSet`]
 //! *before* anything is sent on the wire; unsupported features fail fast with

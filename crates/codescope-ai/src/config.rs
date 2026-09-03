@@ -2,9 +2,10 @@
 //!
 //! Environment-over-file resolution: [`AiConfig::from_env`] reads environment only, while
 //! [`AiConfig::from_env_with_file`] accepts the binary's global `[ai]` configuration and then
-//! applies the same environment variables as higher-precedence overrides. The supported vars are
-//! `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_TIMEOUT_MS`, and the API key from the first of
-//! `PRIME_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` that is set. **AI is disabled by
+//! applies the same environment variables as higher-precedence overrides. Supported vars are
+//! `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_TIMEOUT_MS`, optional `PRIME_TEAM_ID`,
+//! and the API key from the first of `PRIME_API_KEY`, `OPENAI_API_KEY`, or
+//! `ANTHROPIC_API_KEY` that is set. **AI is disabled by
 //! default**: with no explicit `CODESCOPE_AI=on|off` the subsystem enables itself only when
 //! an API key is found (auto mode). The default `base_url` follows the key's provider
 //! (Prime Inference / OpenAI / Anthropic); `CODESCOPE_AI_BASE_URL` overrides it.
@@ -20,6 +21,7 @@
 
 use crate::error::AiError;
 use crate::tools::MAX_TOOL_CALLS;
+use reqwest::Url;
 use secrecy::SecretString;
 use std::fmt;
 use std::str::FromStr;
@@ -160,13 +162,15 @@ impl<'de> serde::Deserialize<'de> for ReasoningEffort {
 pub struct AiConfig {
     /// Whether the AI subsystem may run at all. `false` ⇒ no HTTP client is constructed.
     pub enabled: bool,
-    /// Chat-completions base URL (endpoint is `{base_url}/chat/completions`).
+    /// Provider base URL. The client derives an OpenAI-compatible Chat Completions endpoint or
+    /// uses the native Anthropic Messages endpoint according to the resolved provider.
     pub base_url: String,
     /// Model identifier sent in the request body.
     pub model: String,
-    /// Chat Completions reasoning budget, or [`ReasoningEffort::Default`] for automatic behavior.
+    /// Provider reasoning budget, or [`ReasoningEffort::Default`] for automatic behavior.
     pub reasoning_effort: ReasoningEffort,
-    /// Bearer token, if any (local providers like Ollama run keyless).
+    /// Provider credential, if any (local providers may run keyless). OpenAI-compatible requests
+    /// use Bearer auth; native Anthropic requests use `x-api-key`.
     pub api_key: Option<SecretString>,
     /// Per-request timeout.
     pub timeout: Duration,
@@ -285,22 +289,18 @@ impl AiConfig {
             _ => OPENAI_BASE_URL,
         };
         let base_url = configured_base.unwrap_or_else(|| default_base.to_string());
-        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-            return Err(AiError::Config(format!(
-                "base_url must start with http:// or https://, got {base_url:?}"
-            )));
-        }
+        let parsed_base_url = parse_base_url(&base_url)?;
 
         let default_model = match key_source {
             Some(KeySource::OpenaiApiKey) => DEFAULT_OPENAI_MODEL,
             Some(KeySource::AnthropicApiKey) => DEFAULT_ANTHROPIC_MODEL,
             Some(KeySource::FileNamedEnv)
-                if base_url.trim_end_matches('/') == OPENAI_BASE_URL.trim_end_matches('/') =>
+                if is_official_base_url(&parsed_base_url, OPENAI_BASE_URL) =>
             {
                 DEFAULT_OPENAI_MODEL
             }
             Some(KeySource::FileNamedEnv)
-                if base_url.trim_end_matches('/') == ANTHROPIC_BASE_URL.trim_end_matches('/') =>
+                if is_official_base_url(&parsed_base_url, ANTHROPIC_BASE_URL) =>
             {
                 DEFAULT_ANTHROPIC_MODEL
             }
@@ -363,13 +363,14 @@ impl AiConfig {
     /// The provider protocol the base URL speaks.
     ///
     /// Anthropic's native Messages API is **not** OpenAI-compatible (different envelope and
-    /// auth header), so the client must know which protocol to use. Inference: the default
-    /// Anthropic base URL, or any URL whose host contains `anthropic.com`, selects the
-    /// Anthropic protocol; everything else is OpenAI-compatible.
+    /// auth header), so the client must know which protocol to use. Only Anthropic's domain
+    /// itself or one of its DNS subdomains selects the native protocol; all other hosts are
+    /// OpenAI-compatible.
     #[must_use]
     pub fn provider(&self) -> ProviderKind {
-        if self.base_url.trim_end_matches('/') == ANTHROPIC_BASE_URL
-            || self.base_url.contains("anthropic.com")
+        if Url::parse(&self.base_url)
+            .ok()
+            .is_some_and(|url| is_anthropic_host(url.host_str()))
         {
             ProviderKind::Anthropic
         } else {
@@ -379,16 +380,18 @@ impl AiConfig {
 
     /// A short display label for which credential/provider is active (for the UI).
     ///
-    /// Derived from the base URL: the provider whose default base matches, or "custom" for an
-    /// overridden/unknown base. Only meaningful for an enabled config.
+    /// Derived from a normalized match with a provider's official default base URL, or
+    /// "custom" for an overridden/unknown base. Only meaningful for an enabled config.
     #[must_use]
     pub fn provider_label(&self) -> &'static str {
-        let base = self.base_url.trim_end_matches('/');
-        if base == PRIME_BASE_URL.trim_end_matches('/') {
+        let Ok(base_url) = Url::parse(&self.base_url) else {
+            return "custom";
+        };
+        if is_official_base_url(&base_url, PRIME_BASE_URL) {
             "prime"
-        } else if base == OPENAI_BASE_URL.trim_end_matches('/') {
+        } else if is_official_base_url(&base_url, OPENAI_BASE_URL) {
             "openai"
-        } else if base == ANTHROPIC_BASE_URL.trim_end_matches('/') {
+        } else if is_official_base_url(&base_url, ANTHROPIC_BASE_URL) {
             "anthropic"
         } else {
             "custom"
@@ -449,7 +452,7 @@ pub struct AiFileConfig {
     /// Per-request timeout override, in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// Read-only tool-call budget override (clamped to [`MAX_TOOL_CALLS`]).
+    /// Combined research and diagram-operation budget override (clamped to [`MAX_TOOL_CALLS`]).
     #[serde(default)]
     pub max_tool_calls: Option<u32>,
 }
@@ -516,6 +519,70 @@ fn resolve_key(
     Ok((None, None))
 }
 
+/// Parse and validate an HTTP(S) provider base URL.
+///
+/// Credentials and fragments have no useful meaning for a base endpoint. Rejecting them also
+/// prevents a configured credential from being silently embedded in a URL that gets logged.
+fn parse_base_url(value: &str) -> Result<Url, AiError> {
+    let url = Url::parse(value).map_err(|error| {
+        AiError::Config(format!(
+            "base_url must be a valid absolute http:// or https:// URL, got {value:?}: {error}"
+        ))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AiError::Config(format!(
+            "base_url must use http:// or https://, got scheme {:?}",
+            url.scheme()
+        )));
+    }
+    if url.host_str().is_none() {
+        return Err(AiError::Config(format!(
+            "base_url must include a host, got {value:?}"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AiError::Config(
+            "base_url must not include embedded credentials".into(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(AiError::Config(
+            "base_url must not include a URL fragment".into(),
+        ));
+    }
+    Ok(url)
+}
+
+/// Whether a parsed URL denotes a provider's official default base endpoint.
+///
+/// URL parsing makes scheme/host/default-port comparisons case-insensitive where the URL
+/// standard requires it. A trailing slash remains equivalent to preserve existing configuration
+/// behavior, while a query or a different path remains custom.
+fn is_official_base_url(base_url: &Url, default_base_url: &str) -> bool {
+    let Ok(default_url) = Url::parse(default_base_url) else {
+        return false;
+    };
+    base_url.scheme().eq_ignore_ascii_case(default_url.scheme())
+        && base_url
+            .host_str()
+            .zip(default_url.host_str())
+            .is_some_and(|(base_host, default_host)| base_host.eq_ignore_ascii_case(default_host))
+        && base_url.port_or_known_default() == default_url.port_or_known_default()
+        && base_url.path().trim_end_matches('/') == default_url.path().trim_end_matches('/')
+        && base_url.query().is_none()
+        && base_url.fragment().is_none()
+        && base_url.username().is_empty()
+        && base_url.password().is_none()
+}
+
+/// Whether a host belongs to Anthropic's DNS domain.
+fn is_anthropic_host(host: Option<&str>) -> bool {
+    host.is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "anthropic.com" || host.ends_with(".anthropic.com")
+    })
+}
+
 /// `std::env::var` as an `Option`-returning lookup.
 fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -559,6 +626,89 @@ mod tests {
         assert_eq!(c.provider_label(), "anthropic");
         c.base_url = "http://127.0.0.1:11434/v1".to_string();
         assert_eq!(c.provider_label(), "custom");
+    }
+
+    #[test]
+    fn normalized_official_base_urls_keep_labels_and_default_models() {
+        let file = AiFileConfig {
+            api_key_env: Some("CUSTOM_KEY".into()),
+            base_url: Some("HTTPS://API.ANTHROPIC.COM/v1/".into()),
+            ..AiFileConfig::default()
+        };
+        let cfg = AiConfig::resolve(Some(&file), env_of(&[("CUSTOM_KEY", "secret")])).unwrap();
+        assert_eq!(cfg.provider(), ProviderKind::Anthropic);
+        assert_eq!(cfg.provider_label(), "anthropic");
+        assert_eq!(cfg.model, DEFAULT_ANTHROPIC_MODEL);
+    }
+
+    #[test]
+    fn provider_uses_anthropic_dns_boundaries_not_url_substrings() {
+        let mut config = AiConfig::disabled();
+        for base_url in [
+            "https://anthropic.com/v1",
+            "https://api.anthropic.com/v1",
+            "https://gateway.api.anthropic.com/v1",
+        ] {
+            config.base_url = base_url.into();
+            assert_eq!(config.provider(), ProviderKind::Anthropic, "{base_url}");
+        }
+        for base_url in [
+            "https://notanthropic.com/v1",
+            "https://anthropic.com.example.test/v1",
+            "https://example.test/anthropic.com/v1",
+            "https://example.test/v1?provider=anthropic.com",
+        ] {
+            config.base_url = base_url.into();
+            assert_eq!(
+                config.provider(),
+                ProviderKind::OpenAiCompatible,
+                "{base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_paths_are_not_official_default_bases() {
+        let file = AiFileConfig {
+            api_key_env: Some("CUSTOM_KEY".into()),
+            base_url: Some("https://api.anthropic.com/v1/proxy".into()),
+            ..AiFileConfig::default()
+        };
+        let cfg = AiConfig::resolve(Some(&file), env_of(&[("CUSTOM_KEY", "secret")])).unwrap();
+        assert_eq!(cfg.provider(), ProviderKind::Anthropic);
+        assert_eq!(cfg.provider_label(), "custom");
+        assert_eq!(cfg.model, DEFAULT_MODEL);
+
+        let mut config = AiConfig::disabled();
+        config.base_url = "https://api.openai.com/v1/proxy".into();
+        assert_eq!(config.provider_label(), "custom");
+    }
+
+    #[test]
+    fn base_url_requires_an_http_or_https_url_with_a_host() {
+        for base_url in ["https://", "http://", "not a URL", "ftp://example.test/v1"] {
+            let err = AiConfig::resolve(
+                None,
+                env_of(&[("CODESCOPE_AI", "on"), ("CODESCOPE_AI_BASE_URL", base_url)]),
+            )
+            .unwrap_err();
+            assert!(matches!(err, AiError::Config(_)), "{base_url}");
+        }
+    }
+
+    #[test]
+    fn base_url_rejects_embedded_credentials_and_fragments() {
+        for base_url in [
+            "https://user:password@example.test/v1",
+            "https://example.test/v1#fragment",
+        ] {
+            let err = AiConfig::resolve(
+                None,
+                env_of(&[("CODESCOPE_AI", "on"), ("CODESCOPE_AI_BASE_URL", base_url)]),
+            )
+            .unwrap_err();
+            assert!(matches!(err, AiError::Config(_)), "{base_url}");
+        }
     }
 
     #[test]

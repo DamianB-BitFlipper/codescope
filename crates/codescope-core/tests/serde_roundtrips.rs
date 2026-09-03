@@ -342,6 +342,7 @@ fn viz_domain_roundtrips() {
         roundtrip(&change);
     }
     for kind in [
+        PlanEdgeKind::FlowsTo,
         PlanEdgeKind::Calls,
         PlanEdgeKind::Imports,
         PlanEdgeKind::Implements,
@@ -387,6 +388,26 @@ fn viz_domain_roundtrips() {
     ] {
         roundtrip(&status);
     }
+}
+
+/// Schema v6 serializes the renderer-native sequence transition exactly as `flows_to`.
+#[test]
+fn plan_schema_v6_and_flows_to_serde_contract() {
+    assert_eq!(PLAN_VERSION, 6);
+    assert_eq!(
+        serde_json::to_value(PlanEdgeKind::FlowsTo).expect("serialize flows_to"),
+        serde_json::json!("flows_to")
+    );
+    assert_eq!(
+        serde_json::from_value::<PlanEdgeKind>(serde_json::json!("flows_to"))
+            .expect("deserialize flows_to"),
+        PlanEdgeKind::FlowsTo
+    );
+    assert_eq!(
+        serde_json::to_value(VisualizationPlan::new(Epoch(0))).expect("serialize new plan")
+            ["plan_version"],
+        serde_json::json!(6)
+    );
 }
 
 /// The current JSON schema deserializes into the shared plan types.

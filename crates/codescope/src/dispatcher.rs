@@ -13,8 +13,8 @@ use codescope_ai::{
 };
 use codescope_analysis::{AnalysisEngine, AnalysisSnapshot};
 use codescope_core::{
-    AiStatus, ChangeScope, DiagramCommand, DiagramDraft, DiffSide, EntityRef, Epoch, LineRange,
-    LsStatus, PlanEdgeKind,
+    AiStatus, ChangeScope, DiagramCommand, DiagramDraft, DiffLineKind, DiffSide, EntityRef, Epoch,
+    LineRange, LsStatus, PlanEdgeKind,
 };
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
@@ -3704,6 +3704,7 @@ struct SnapshotFacts {
     edges: HashSet<(String, String, PlanEdgeKind)>,
     hunks: std::collections::HashMap<String, usize>,
     diff_lines: HashSet<(String, u32, DiffSide, u32)>,
+    changed_diff_lines: HashSet<(String, u32, DiffSide, u32)>,
     /// Semantic entities and relationships actually returned to the model during this
     /// generation. Interior mutability lets completion-time validation observe tool evidence.
     queried_lsp: QueriedLspFacts,
@@ -3737,6 +3738,7 @@ impl SnapshotFacts {
             edges: HashSet::new(),
             hunks: std::collections::HashMap::new(),
             diff_lines: HashSet::new(),
+            changed_diff_lines: HashSet::new(),
             queried_lsp,
         };
         for f in &changeset.files {
@@ -3757,6 +3759,29 @@ impl SnapshotFacts {
                         facts
                             .diff_lines
                             .insert((path.clone(), hunk_index, DiffSide::New, new_ln));
+                    }
+                    match line.kind {
+                        DiffLineKind::Add => {
+                            if let Some(new_ln) = line.new_ln {
+                                facts.changed_diff_lines.insert((
+                                    path.clone(),
+                                    hunk_index,
+                                    DiffSide::New,
+                                    new_ln,
+                                ));
+                            }
+                        }
+                        DiffLineKind::Del => {
+                            if let Some(old_ln) = line.old_ln {
+                                facts.changed_diff_lines.insert((
+                                    path.clone(),
+                                    hunk_index,
+                                    DiffSide::Old,
+                                    old_ln,
+                                ));
+                            }
+                        }
+                        DiffLineKind::Context => {}
                     }
                 }
             }
@@ -3841,6 +3866,25 @@ impl FactView for SnapshotFacts {
     ) -> Lookup<()> {
         let path = file.to_string();
         if self.diff_lines.contains(&(path.clone(), index, side, line)) {
+            Lookup::Present(())
+        } else if self.hunks.contains_key(&path) {
+            Lookup::Absent
+        } else {
+            Lookup::Unknown
+        }
+    }
+    fn changed_diff_line(
+        &self,
+        file: &codescope_core::FileId,
+        index: u32,
+        side: DiffSide,
+        line: u32,
+    ) -> Lookup<()> {
+        let path = file.to_string();
+        if self
+            .changed_diff_lines
+            .contains(&(path.clone(), index, side, line))
+        {
             Lookup::Present(())
         } else if self.hunks.contains_key(&path) {
             Lookup::Absent
@@ -6043,6 +6087,24 @@ mod tests {
         );
         assert_eq!(facts.diff_line(&file, 0, DiffSide::Old, 9), Lookup::Absent);
         assert_eq!(facts.diff_line(&file, 1, DiffSide::Old, 7), Lookup::Absent);
+        // Only `-old()` and `+new()` are changed. The shared `finish()` context row
+        // remains highlightable through diff_line but cannot ground a code reference.
+        assert_eq!(
+            facts.changed_diff_line(&file, 0, DiffSide::Old, 7),
+            Lookup::Present(())
+        );
+        assert_eq!(
+            facts.changed_diff_line(&file, 0, DiffSide::New, 7),
+            Lookup::Present(())
+        );
+        assert_eq!(
+            facts.changed_diff_line(&file, 0, DiffSide::New, 8),
+            Lookup::Absent
+        );
+        assert_eq!(
+            facts.changed_diff_line(&file, 1, DiffSide::Old, 7),
+            Lookup::Absent
+        );
     }
 
     /// File-level packets must carry the whole file while it fits the hunk cap: the

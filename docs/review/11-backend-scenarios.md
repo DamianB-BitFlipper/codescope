@@ -8,10 +8,11 @@ the scope-flicker fix (`crates/codescope-tui/src/run.rs` `PendingScope`, dispatc
 forwarding), (3) the scenario library (`crates/codescope-testutil/src/scenarios.rs`,
 `crates/codescope/tests/scenarios.rs`).
 
-Verification performed: `cargo test -p codescope --test scenarios` (17 pass),
-`--test backend` (14 pass), `cargo test -p codescope-git --lib` (36 pass, incl. the new
-fallback regression test), `cargo test -p codescope-tui --lib run::` (2 pass); plus live
-probes of the compiled binary against five scratch repos (scenario-shaped, truly
+Historical verification at review time: `cargo test -p codescope --test scenarios` (17),
+`--test backend` (14), `cargo test -p codescope-git --lib` (36, including the then-new fallback
+regression), and `cargo test -p codescope-tui --lib run::` (2). These are archival counts, not the
+current repository gate. The review also used live probes of the compiled binary against five
+scratch repos (scenario-shaped, truly
 fully-pushed dirty, net-empty-diff-ahead dirty, single-branch, clean fully-pushed).
 
 Direct answers to the review questions:

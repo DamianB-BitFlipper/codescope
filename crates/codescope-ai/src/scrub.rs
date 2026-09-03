@@ -29,8 +29,9 @@ fn rules() -> &'static [Rule] {
             (r#"(?i)bearer\s+[A-Za-z0-9/_+.-]{16,}"#, 7),
             // PEM blocks
             (r#"-----BEGIN [A-Z ]*PRIVATE KEY-----"#, 0),
-            // common provider key shapes (sk-…, ghp_…, xox…, AKIA…)
-            (r#"(sk|pk|ghp|gho|ghu|ghs|ghr|xox[baprs]|AKIA|ASIA)[A-Za-z0-9_-]{16,}"#, 0),
+            // Common standalone provider token shapes. Boundaries avoid matching
+            // ordinary words which merely contain a prefix such as `sk` or `pk`.
+            (r#"(?i)\b(?:sk-(?:ant-)?|pk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_-]{12,}\b"#, 0),
         ];
         specs
             .iter()
@@ -82,6 +83,50 @@ mod tests {
     #[test]
     fn scrubs_pem_header() {
         assert!(scrub_secrets("-----BEGIN PRIVATE KEY-----\nMIIB...").contains(REDACTED));
+    }
+
+    #[test]
+    fn scrubs_standalone_provider_tokens() {
+        let tokens = [
+            "sk-abcdef012345",
+            "sk-ant-abcdef012345",
+            "pk-abcdef012345",
+            "ghp_abcdef012345",
+            "gho_abcdef012345",
+            "ghu_abcdef012345",
+            "ghs_abcdef012345",
+            "ghr_abcdef012345",
+            "github_pat_abcdef012345",
+            "xoxb-abcdef012345",
+            "xoxa-abcdef012345",
+            "xoxp-abcdef012345",
+            "xoxr-abcdef012345",
+            "xoxs-abcdef012345",
+            "AKIAabcdef012345",
+            "ASIAabcdef012345",
+        ];
+
+        for token in tokens {
+            let out = scrub_secrets(token);
+            assert!(!out.contains(token), "token leaked: {token}");
+            assert!(out.contains(REDACTED), "token was not redacted: {token}");
+        }
+    }
+
+    #[test]
+    fn scrubs_provider_tokens_surrounded_by_punctuation_and_newlines() {
+        let token = "sk-abcdef012345";
+        let out = scrub_secrets(&format!("before (\n{token}\n), after"));
+        assert!(!out.contains(token));
+        assert!(out.contains(REDACTED));
+        assert!(out.contains("before (\n"));
+        assert!(out.contains("\n), after"));
+    }
+
+    #[test]
+    fn leaves_provider_prefixes_inside_words() {
+        let text = "whiskeysk-abcdef012345 desktoppk-abcdef012345 xghp_abcdef012345";
+        assert_eq!(scrub_secrets(text), text);
     }
 
     #[test]

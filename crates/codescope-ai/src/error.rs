@@ -87,7 +87,7 @@ pub enum AiError {
         expected: u32,
     },
 
-    /// The model asked for more read-only tool calls than the per-plan budget allows.
+    /// The model asked for more combined research/diagram operations than the plan budget allows.
     #[error("tool-call budget exceeded (max {max} per plan)")]
     ToolBudgetExceeded {
         /// The enforced budget.

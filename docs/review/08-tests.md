@@ -2,9 +2,9 @@
 
 Reviewer scope: test quality against the brief's validation list (terminal restore, LS shutdown,
 malformed responses, unsupported caps, rapid changes, fixture states), isolation (no network/key),
-flaky risks, and gaps. Verified by reading every test file in the workspace and running
-`cargo test --workspace` (365 passed + 1 ignored, ~10 s warm, gopls + go 1.26 present on this
-machine).
+flaky risks, and gaps. At review time this was verified by reading every test file and running
+`cargo test --workspace` (365 then-current tests passed + 1 ignored, ~10 s warm, gopls + go 1.26
+present). This is an archival count, not the current repository gate.
 
 ## Summary
 

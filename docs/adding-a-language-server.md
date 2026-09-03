@@ -10,7 +10,8 @@ Nothing in git analysis, change mapping, visualization, or the TUI changes.
 ```rust
 pub enum LanguageService {
     Gopls(GoplsService),
-    // RustAnalyzer(RustAnalyzerService),   // <- add here
+    RustAnalyzer(RustAnalyzerService),
+    // Add the next adapter variant here.
 }
 ```
 
@@ -40,27 +41,28 @@ returned at initialize. Do not convert anywhere else.
 1. Create `crates/codescope-lsp/src/<server>.rs` with a struct holding
    `{ client: LspClient, root, features: FeatureSet, encoding, versions }` — copy `gopls.rs`
    as the template.
-2. In `start()`: find the project root (e.g. `Cargo.toml` for rust-analyzer, walk up like
-   `find_module_root`), spawn the server, send `initialize` with
+2. In `start()`: find the server's project root (using its manifest/workspace markers), spawn
+   the server, send `initialize` with
    `hierarchicalDocumentSymbolSupport` + `positionEncodings: ["utf-8","utf-16"]`, resolve
    features (returns `SemanticError::BrokenSession` on all-null capabilities — e.g. tsls with
    TS 7), send `initialized`.
 3. Implement the query methods you can support; for the rest, return
    `SemanticError::Unsupported(feature)` (the `require()` helper gates before sending). The
    impact graph silently skips unsupported relations and notes it.
-4. Add the enum variant and extend `LanguageService::start` detection (e.g. pick rust-analyzer
-   when `Cargo.toml` is present). For a repo with several languages, run one session per
-   language and route by file path prefix.
+4. Add the enum variant and extend `LanguageService::start` detection for the new marker.
+   Current production adapters are gopls and rust-analyzer; one active service is selected, with
+   Go winning ties in mixed repositories. Supporting simultaneous services requires a separate
+   orchestration change rather than only a new enum variant.
 5. Add a live integration test in `tests/` that skips gracefully when the server is absent.
 
 ## Verified capability notes (docs/research/01)
 
-| server | implementation | typeHierarchy | positionEncoding | notes |
+| server | current adapter | probed typeHierarchy | positionEncoding | notes |
 |---|---|---|---|---|
 | gopls 0.21 | ✓ | ✓ (interfaces) | utf-16 (no negotiation) | push-only diagnostics; serverInfo.version is a build-info blob |
-| rust-analyzer | ✓ | ✗ | **utf-8** (negotiated) | |
-| clangd 17 | ✓ | ✓ | utf-16 | wants didSave |
-| pyright | ✗ (null) | ✗ | utf-16 | providers are objects, textDocumentSync is a bare int |
-| tsls + TS 5.9 | ✓ | ✗ | utf-16 | all-null capabilities with TS 7 = broken session |
+| rust-analyzer | ✓ | ✗ | **utf-8** (negotiated) | production Rust adapter |
+| clangd 17 | — | ✓ | utf-16 | probe wanted didSave; no adapter yet |
+| pyright | — | ✗ | utf-16 | providers are objects; no adapter yet |
+| tsls + TS 5.9 | — | ✗ | utf-16 | all-null capabilities with TS 7; no adapter yet |
 
 Treat every capability as `Option<Value>`; "supported" = present and not false/null.

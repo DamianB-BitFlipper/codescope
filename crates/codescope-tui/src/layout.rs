@@ -78,10 +78,6 @@ pub fn choose_tier(area: Rect, zoomed: bool) -> Tier {
     Tier::FocusOnly
 }
 
-/// The files-pane width for a work row of `work_width` cells, given the App-owned
-/// `request` (docs/review/15 §1.1): the request is clamped to
-/// [`MIN_FILES_WIDTH`..=`MAX_FILES_WIDTH`] and then yields to [`MIN_DIFF_WIDTH`] without
-/// changing the stored preference.
 /// The Impact-pane height for a frame of `frame_height` rows, given the App-owned
 /// `request`: clamped to `MIN_IMPACT_HEIGHT..=MAX_IMPACT_HEIGHT`, then yields to the
 /// `MIN_WORK_HEIGHT` work area after reserving the top bar and combined bottom bar.
