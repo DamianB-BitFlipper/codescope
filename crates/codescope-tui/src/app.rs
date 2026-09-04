@@ -437,13 +437,11 @@ impl App {
                 }
             }
             Action::ToggleReviewed => {
-                if self.focused == Pane::Files {
-                    if let Some(target) = self
-                        .selected_projected_row()
-                        .and_then(|row| row.review_target(&self.snapshot.files))
-                    {
-                        self.review.toggle(&target);
-                    }
+                if let Some(target) = self
+                    .selected_projected_row()
+                    .and_then(|row| row.review_target(&self.snapshot.files))
+                {
+                    self.review.toggle(&target);
                 }
             }
             Action::ToggleReviewedTarget(target) => self.review.toggle(&target),
@@ -1346,6 +1344,26 @@ mod tests {
             ReviewState::Unreviewed
         );
         assert_eq!(app.review_progress().reviewed, 1);
+    }
+
+    #[test]
+    fn review_action_uses_the_retained_tree_selection_from_every_pane() {
+        let mut app = app_with_reviewable_directory();
+        app.file_sel = 1;
+
+        for (pane, expected) in [
+            (Pane::Files, ReviewState::Explicit),
+            (Pane::Diff, ReviewState::Unreviewed),
+            (Pane::Impact, ReviewState::Explicit),
+        ] {
+            app.focused = pane;
+            app.apply(Action::ToggleReviewed);
+            assert_eq!(
+                app.review_state(&ReviewTarget::File("x/a.rs".into())),
+                expected,
+                "review toggle must use the retained files selection from {pane:?}"
+            );
+        }
     }
 
     #[test]

@@ -375,8 +375,7 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('n') => Action::NextHunk,
         KeyCode::Char('N') => Action::PrevHunk,
         KeyCode::Char('z') => Action::ToggleZoom,
-        KeyCode::Char('v') if app.focused == Pane::Files => Action::ToggleReviewed,
-        KeyCode::Char('v') => Action::None,
+        KeyCode::Char('v') => Action::ToggleReviewed,
         KeyCode::Char('W') => Action::ToggleWrap,
         KeyCode::Char('0') => Action::ResetHScroll,
         KeyCode::Home => Action::Top,
@@ -613,14 +612,15 @@ mod tests {
     }
 
     #[test]
-    fn v_toggles_review_only_in_the_files_pane() {
-        assert_eq!(
-            map_key(key(KeyCode::Char('v')), &app()),
-            Action::ToggleReviewed
-        );
-        let mut a = app();
-        a.focused = Pane::Diff;
-        assert_eq!(map_key(key(KeyCode::Char('v')), &a), Action::None);
+    fn v_toggles_review_from_every_pane() {
+        let mut app = app();
+        for pane in [Pane::Files, Pane::Diff, Pane::Impact] {
+            app.focused = pane;
+            assert_eq!(
+                map_key(key(KeyCode::Char('v')), &app),
+                Action::ToggleReviewed
+            );
+        }
     }
 
     #[test]

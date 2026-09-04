@@ -2612,9 +2612,22 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
 // -- help modal -------------------------------------------------------------------
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 70, 70);
+    let lines = help_lines();
+    let popup = content_dialog(area, &lines);
     frame.render_widget(ratatui::widgets::Clear, popup);
-    let lines = vec![
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(WARN))
+                .title(" help "),
+        ),
+        popup,
+    );
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    vec![
         Line::from(Span::styled(
             "codescope — controls",
             Style::new().add_modifier(Modifier::BOLD),
@@ -2648,16 +2661,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  z               zoom the focused pane (Tab still switches)"),
         Line::from("  W / 0           diff: toggle wrap / reset horizontal scroll"),
         Line::from("  Home / G        top / bottom"),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().fg(WARN))
-                .title(" help "),
-        ),
-        popup,
-    );
+    ]
 }
 
 // -- helpers ------------------------------------------------------------------
@@ -2696,6 +2700,19 @@ fn fixed_dialog(area: Rect, width: u16, height: u16) -> Rect {
         width.min(available_width),
         height.min(available_height),
     )
+}
+
+/// Size a bordered dialog to its rendered lines, keeping a two-cell viewport margin.
+fn content_dialog(area: Rect, lines: &[Line<'_>]) -> Rect {
+    let width = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(1)
+        .saturating_add(2)
+        .min(usize::from(u16::MAX)) as u16;
+    let height = lines.len().saturating_add(2).min(usize::from(u16::MAX)) as u16;
+    fixed_dialog(area, width, height)
 }
 
 // -- model picker modal -------------------------------------------------------
@@ -5048,12 +5065,21 @@ mod tests {
     }
 
     #[test]
-    fn help_modal_covers_screen() {
+    fn help_modal_is_content_sized() {
         let mut app = App::new();
         app.show_help = true;
         let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
         t.draw(|f| render(f, &app, &sample())).unwrap();
         assert!(buffer_text(&t).contains("codescope — controls"));
+
+        let lines = help_lines();
+        let popup = content_dialog(Rect::new(0, 0, 220, 100), &lines);
+        assert_eq!(popup.width, 71);
+        assert_eq!(popup.height, 32);
+        assert_eq!(popup, Rect::new(74, 34, 71, 32));
+
+        let constrained = content_dialog(Rect::new(0, 0, 60, 16), &lines);
+        assert_eq!(constrained, Rect::new(2, 2, 56, 12));
     }
 
     #[test]

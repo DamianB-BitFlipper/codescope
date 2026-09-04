@@ -161,7 +161,7 @@ fn width_sweep_never_panics() {
 }
 
 #[test]
-fn help_modal_covers_screen() {
+fn help_modal_renders_its_controls() {
     let backend = TestBackend::new(160, 40);
     let mut t = Terminal::new(backend).unwrap();
     let mut app = App::new();

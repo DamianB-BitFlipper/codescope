@@ -30,8 +30,8 @@ Codescope currently has production language-server adapters for Go (`gopls`) and
 Codescope is currently installed from source. It requires Rust 1.85 or newer:
 
 ```bash
-git clone https://github.com/DamianB-BitFlipper/lsp_intelligence.git
-cd lsp_intelligence
+git clone https://github.com/DamianB-BitFlipper/codescope.git
+cd codescope
 cargo install --path crates/codescope --locked
 ```
 
@@ -204,7 +204,7 @@ write to Git.
 | `Space`, `h` / `l` | expand / collapse the targeted item |
 | `a` / `A` | generate AI / toggle automatic generation |
 | `m` | choose model and reasoning effort |
-| `v` | toggle reviewed state in the files pane |
+| `v` | toggle the selected change's reviewed state from any pane |
 | `?` | show help |
 | `q`, `Ctrl-C` | quit |
 
