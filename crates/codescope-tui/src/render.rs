@@ -46,6 +46,8 @@ pub(crate) const MUTED: Color = Color::Rgb(122, 128, 139);
 pub(crate) const BORDER: Color = Color::Rgb(67, 73, 83);
 /// Focused border, product/repo, active symbol.
 pub(crate) const ACCENT: Color = Color::Rgb(91, 166, 255);
+/// Blue-tinted fill for active diagram elements and expanded relationship text.
+pub(crate) const DIAGRAM_ACTIVE_BG: Color = Color::Rgb(25, 55, 92);
 /// Active list row background.
 pub(crate) const SELECTED_BG: Color = Color::Rgb(46, 54, 66);
 /// Owning file's background while one of its child symbols is active.
@@ -1934,13 +1936,13 @@ fn render_diagram_canvas(
             });
         let style = if hovered == Some(&node.target) {
             Style::new()
-                .fg(ACCENT)
+                .fg(TEXT)
                 .bg(SELECTED_BG)
                 .add_modifier(Modifier::BOLD)
         } else if selected {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(TEXT)
+            Style::new().fg(ACCENT)
         };
         for (row, line) in node.lines.iter().enumerate() {
             draw_canvas_text(
@@ -1973,7 +1975,10 @@ fn render_diagram_canvas(
                 overlay.rect.height.min(area.height),
             );
             frame.render_widget(ratatui::widgets::Clear, rect);
-            frame.render_widget(Block::default().style(Style::new().bg(SURFACE_ALT)), rect);
+            frame.render_widget(
+                Block::default().style(Style::new().bg(DIAGRAM_ACTIVE_BG)),
+                rect,
+            );
             for (row, line) in overlay.lines.iter().enumerate() {
                 draw_canvas_text(
                     frame,
@@ -1982,7 +1987,10 @@ fn render_diagram_canvas(
                     overlay.rect.x,
                     overlay.rect.y.saturating_add(row as u16),
                     line,
-                    Style::new().fg(TEXT).bg(SURFACE_ALT),
+                    Style::new()
+                        .fg(ACCENT)
+                        .bg(DIAGRAM_ACTIVE_BG)
+                        .add_modifier(Modifier::BOLD),
                 );
             }
         }
@@ -4167,11 +4175,10 @@ mod tests {
             buffer_text(&terminal).contains("UNIQUE_RELATIONSHIP_TAIL"),
             "the top-layer overlay renders the complete relationship text"
         );
-        assert_eq!(
-            cell(&terminal, overlay.rect.x, overlay.rect.y).2,
-            SURFACE_ALT,
-            "the in-place overlay paints an opaque readable background"
-        );
+        let (_, foreground, background, modifier) = cell(&terminal, overlay.rect.x, overlay.rect.y);
+        assert_eq!(foreground, ACCENT);
+        assert_eq!(background, DIAGRAM_ACTIVE_BG);
+        assert!(modifier.contains(Modifier::BOLD));
 
         app.apply(crate::action::Action::TogglePlanRelationship(target));
         terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
@@ -4589,6 +4596,28 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_diagram_nodes_keep_the_blue_visual_language() {
+        let snap = ai_plan_snap(3);
+        let app = app_after_ai_landed(&snap);
+        let target = crate::action::PlanNodeTarget {
+            form: 0,
+            id: "n0".into(),
+        };
+        let geometry = crate::geometry::UiGeometry::build(Rect::new(0, 0, 140, 40), &app, &snap);
+        let node_rect = geometry
+            .plan_node_rects
+            .iter()
+            .find(|(_, item)| item == &target)
+            .map(|(rect, _)| *rect)
+            .expect("ordinary box is visible");
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let (_, foreground, _, _) = cell(&terminal, node_rect.x, node_rect.y);
+        assert_eq!(foreground, ACCENT);
+    }
+
+    #[test]
     fn hovered_node_has_a_distinct_lit_background() {
         let snap = ai_plan_snap(3);
         let mut app = app_after_ai_landed(&snap);
@@ -4608,7 +4637,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
         terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
         let (_, foreground, background, modifier) = cell(&terminal, node_rect.x, node_rect.y);
-        assert_eq!(foreground, ACCENT);
+        assert_eq!(foreground, TEXT);
         assert_eq!(background, SELECTED_BG);
         assert!(modifier.contains(Modifier::BOLD));
     }
