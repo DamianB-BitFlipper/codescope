@@ -2,3 +2,4 @@
 **/*.rs.bk
 *.pyc
 .DS_Store
+codescope-debug.log
