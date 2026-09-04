@@ -1017,12 +1017,9 @@ pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
             AgentOperation::Refresh => AgentRequest::Refresh,
             AgentOperation::Socket => unreachable!(),
         };
-        let mut stream = UnixStream::connect(&path).await.with_context(|| {
-            format!(
-                "cannot connect to {}; start codescope in this repository first",
-                path.display()
-            )
-        })?;
+        let mut stream = UnixStream::connect(&path)
+            .await
+            .map_err(|error| agent_connect_error(&path, error))?;
         let mut bytes = serde_json::to_vec(&request)?;
         bytes.push(b'\n');
         stream.write_all(&bytes).await?;
@@ -1041,6 +1038,24 @@ pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
         );
         emit(&response, args.compact)
     }
+}
+
+#[cfg(unix)]
+fn agent_connect_error(path: &Path, error: std::io::Error) -> anyhow::Error {
+    let guidance = match error.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            concat!(
+                "permission was denied; if this command is running in a sandboxed coding agent, ",
+                "retry the same `codescope agent` command with the agent's sandbox-escalation ",
+                "or approval mechanism"
+            )
+        }
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+            "no live session accepted the connection; start codescope in this repository first"
+        }
+        _ => "the live codescope session could not be reached",
+    };
+    anyhow::Error::new(error).context(format!("cannot connect to {}; {guidance}", path.display()))
 }
 
 fn emit(value: &Value, compact: bool) -> Result<()> {
@@ -1130,6 +1145,32 @@ mod tests {
         let second = socket_path(camino::Utf8Path::new("/tmp/example/repo"));
         assert_eq!(first, second);
         assert!(first.to_string_lossy().len() < 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_connection_recommends_sandbox_escalation() {
+        let error = agent_connect_error(
+            Path::new("/tmp/codescope-agent.sock"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("permission was denied"));
+        assert!(message.contains("sandbox-escalation"));
+        assert!(!message.contains("start codescope"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_connection_recommends_starting_codescope() {
+        let error = agent_connect_error(
+            Path::new("/tmp/codescope-agent.sock"),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("no live session accepted the connection"));
+        assert!(message.contains("start codescope"));
+        assert!(!message.contains("sandbox-escalation"));
     }
 
     #[test]

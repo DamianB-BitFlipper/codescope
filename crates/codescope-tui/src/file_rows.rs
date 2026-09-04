@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::review::ReviewTarget;
 use crate::snapshot::{AiSummaryKey, FileRow, FileSemanticLoad};
 
 /// One physical row in the changed-files tree.
@@ -83,6 +84,21 @@ impl ProjectedRow {
                     name: symbol.name.clone(),
                     position: symbol.position,
                 })
+            }
+            ProjectedRow::Note { .. } => None,
+        }
+    }
+
+    /// Review target represented by this row. Symbols intentionally map to their owning file so
+    /// the keyboard shortcut remains useful while inspecting a symbol; analysis notes are inert.
+    #[must_use]
+    pub fn review_target(&self, files: &[FileRow]) -> Option<ReviewTarget> {
+        match self {
+            ProjectedRow::Directory { path, .. } => Some(ReviewTarget::Directory(path.clone())),
+            ProjectedRow::File { file_index, .. } | ProjectedRow::Symbol { file_index, .. } => {
+                files
+                    .get(*file_index)
+                    .map(|file| ReviewTarget::File(file.path.clone()))
             }
             ProjectedRow::Note { .. } => None,
         }

@@ -170,6 +170,7 @@ total added/removed lines. Branch diffs always run from that resolved merge-base
 | `q` / `Ctrl-C` | quit |
 | `?` | help modal |
 | `Tab` (files pane) | expand / collapse the selected directory or file; symbols load automatically |
+| `v` (files pane) | toggle the selected directory or file's explicit reviewed mark |
 | `1` `2` `3` | focus files / diff / impact pane |
 | `j`/`k` · `↑`/`↓` | move selection / scroll |
 | `Ctrl-d`/`Ctrl-u`, `PgDn`/`PgUp` | half / full page in diff |
@@ -191,6 +192,7 @@ total added/removed lines. Branch diffs always run from that resolved merge-base
 | mouse drag | resize any pane divider |
 | drag diff code | select code without line-number gutters; release copies it |
 | click diff | clear the retained text selection |
+| click a changed-tree review marker | toggle that directory or file without changing selection |
 
 The changed-files pane is a directory → file → symbol tree. Selecting a directory produces a
 module-level summary over only the changed files below it; selecting a file or symbol narrows the
@@ -198,7 +200,13 @@ summary to that entry. Every selectable row carries an AI state marker: `◆` re
 generated, `◌` generating, or `!` failed. Directories are expanded by default and collapse
 locally without starting or cancelling inference. Directory-only chains are combined into one
 path row and split only at real branch points; directory totals show a bare file count followed
-by added/deleted lines.
+by added/deleted lines. Review markers are content-aware: `●` is an explicit mark, `↳` is inherited
+from a marked parent, `✓` means every child is independently reviewed, and `◐` means only part of a
+directory is reviewed. Marking a directory covers the current revisions below it; unmarking the
+directory removes only that coverage, preserving explicit child marks. New or edited file content
+therefore becomes unreviewed after refresh rather than inheriting a stale decision. Clicking a
+partially reviewed directory first includes every current descendant; clicking it again removes
+the directory override.
 
 ## Refresh mode
 

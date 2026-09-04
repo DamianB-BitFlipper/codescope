@@ -10,6 +10,7 @@ use crate::action::{
 };
 use crate::divider::DividerSizes;
 use crate::file_rows::ProjectedRow;
+use crate::review::{ReviewLedger, ReviewProgress, ReviewState, ReviewTarget};
 use crate::scroll::ScrollRegionId;
 use crate::snapshot::{AiSummaryKey, DiffRow, StatusMessage, UiSnapshot};
 
@@ -157,6 +158,8 @@ pub struct App {
     pub file_sel: usize,
     /// Directory rows are expanded by default; this set records only user-collapsed paths.
     pub collapsed_directories: HashSet<String>,
+    /// Content-aware explicit and inherited review marks for changed directories/files.
+    pub review: ReviewLedger,
     /// Independent physical-row viewport used after wheel-scrolling Files.
     pub files_scroll: usize,
     /// `false` keeps keyboard selection visible; `true` lets the wheel inspect rows without
@@ -351,6 +354,7 @@ impl App {
         // Selection identity survives the swap: directory insertion and asynchronously
         // arriving symbols both shift flat indices.
         let keep = self.selected_summary_key();
+        self.review.sync(&snapshot);
         self.snapshot = snapshot;
         self.collapsed_directories.retain(|directory| {
             self.snapshot
@@ -432,6 +436,17 @@ impl App {
                     }
                 }
             }
+            Action::ToggleReviewed => {
+                if self.focused == Pane::Files {
+                    if let Some(target) = self
+                        .selected_projected_row()
+                        .and_then(|row| row.review_target(&self.snapshot.files))
+                    {
+                        self.review.toggle(&target);
+                    }
+                }
+            }
+            Action::ToggleReviewedTarget(target) => self.review.toggle(&target),
             Action::Focus(p) => self.focused = p,
             Action::Down => self.move_sel(1),
             Action::Up => self.move_sel(-1),
@@ -525,7 +540,11 @@ impl App {
                     self.diff_selection = None;
                 }
                 Pane::Impact => {
-                    self.diagram.clear_expansion();
+                    if let Some(target) = self.hovered_plan_node.clone() {
+                        if self.plan_node(&target).is_some() {
+                            self.diagram.set_node_expanded(target, false);
+                        }
+                    }
                 }
                 // Files-pane expansion is dispatcher-owned: run.rs routes Space/h/l to
                 // the targeted SetFileExpanded command; App applies no local tree
@@ -541,7 +560,7 @@ impl App {
                 Pane::Impact => {
                     if let Some(target) = self.hovered_plan_node.clone() {
                         if self.plan_node(&target).is_some() {
-                            self.diagram.toggle_node(target);
+                            self.diagram.set_node_expanded(target, true);
                         }
                     }
                 }
@@ -1108,6 +1127,18 @@ impl App {
         crate::file_rows::project(&self.snapshot.files, &self.collapsed_directories)
     }
 
+    /// Effective review state of one changed-tree target.
+    #[must_use]
+    pub fn review_state(&self, target: &ReviewTarget) -> ReviewState {
+        self.review.state(target)
+    }
+
+    /// Aggregate review progress for the current changed-file comparison.
+    #[must_use]
+    pub fn review_progress(&self) -> ReviewProgress {
+        self.review.progress(self.snapshot.files.len())
+    }
+
     fn selected_projected_row(&self) -> Option<ProjectedRow> {
         crate::file_rows::resolve_logical(
             &self.snapshot.files,
@@ -1194,6 +1225,10 @@ fn step(cur: usize, delta: i32, len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use codescope_core::{ChangeSet, FileChange, FileStatus, UnifiedDiffSection};
+
     use super::*;
     use crate::divider::DividerId;
     use crate::snapshot::{FileRow, SymbolRow};
@@ -1232,6 +1267,39 @@ mod tests {
         app
     }
 
+    fn app_with_reviewable_directory() -> App {
+        let files = vec![row("x/a.rs", false, 0), row("x/b.rs", false, 0)];
+        let changes = files
+            .iter()
+            .map(|file| FileChange {
+                path: file.path.as_str().into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                hunks: Vec::new(),
+                binary: false,
+            })
+            .collect();
+        let sections = files
+            .iter()
+            .map(|file| UnifiedDiffSection {
+                path: file.path.as_str().into(),
+                text: format!("diff --git a/{0} b/{0}\n", file.path),
+            })
+            .collect();
+        let mut app = App::new();
+        app.update(UiSnapshot {
+            files,
+            agent_changeset: Some(Arc::new(
+                ChangeSet::new(ChangeScope::Branch, changes).with_diff_sections(sections),
+            )),
+            agent_changeset_epoch: Epoch(1),
+            epoch: Epoch(1),
+            base_ref: "main".into(),
+            ..UiSnapshot::default()
+        });
+        app
+    }
+
     #[test]
     fn move_selection_clamps() {
         let mut app = app_with_files();
@@ -1245,6 +1313,39 @@ mod tests {
             app.apply(Action::Up);
         }
         assert_eq!(app.file_sel, 0);
+    }
+
+    #[test]
+    fn review_action_uses_the_selected_hierarchy_without_destroying_child_state() {
+        let mut app = app_with_reviewable_directory();
+        assert_eq!(
+            app.selected_summary_key(),
+            Some(AiSummaryKey::Directory("x".into()))
+        );
+        app.apply(Action::ToggleReviewed);
+        assert_eq!(
+            app.review_state(&ReviewTarget::File("x/a.rs".into())),
+            ReviewState::Inherited
+        );
+
+        app.file_sel = 1;
+        app.apply(Action::ToggleReviewed);
+        assert_eq!(
+            app.review_state(&ReviewTarget::File("x/a.rs".into())),
+            ReviewState::Explicit
+        );
+
+        app.file_sel = 0;
+        app.apply(Action::ToggleReviewed);
+        assert_eq!(
+            app.review_state(&ReviewTarget::File("x/a.rs".into())),
+            ReviewState::Explicit
+        );
+        assert_eq!(
+            app.review_state(&ReviewTarget::File("x/b.rs".into())),
+            ReviewState::Unreviewed
+        );
+        assert_eq!(app.review_progress().reviewed, 1);
     }
 
     #[test]
@@ -1911,7 +2012,7 @@ mod tests {
 
         app.apply(Action::HoverPlanNode(Some(target.clone())));
         app.apply(Action::TogglePlanNode(target.clone()));
-        assert_eq!(app.diagram.expanded_node(), Some(&target));
+        assert!(app.diagram.is_node_expanded(&target));
         assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Center);
 
         // A live-draft publish may add or refine other boxes while this one remains valid.
@@ -1920,7 +2021,7 @@ mod tests {
             .push(PlanNode::new("n2", "later", PlanNodeChange::Added).with_detail("arrived later"));
         app.update(snap);
         assert_eq!(app.hovered_plan_node.as_ref(), Some(&target));
-        assert_eq!(app.diagram.expanded_node(), Some(&target));
+        assert!(app.diagram.is_node_expanded(&target));
 
         app.apply(Action::HoverPlanNode(None));
         assert_eq!(
@@ -1933,11 +2034,37 @@ mod tests {
             app.active_code_node().is_none(),
             "an open box is not highlighted"
         );
-        assert_eq!(
-            app.diagram.expanded_node(),
-            Some(&target),
+        assert!(
+            app.diagram.is_node_expanded(&target),
             "mouse-out does not collapse the clicked box"
         );
+    }
+
+    #[test]
+    fn directional_impact_controls_change_only_the_hovered_box() {
+        let mut app = app_with_ai_plan(2);
+        app.focused = Pane::Impact;
+        let first = PlanNodeTarget {
+            form: 0,
+            id: "n0".into(),
+        };
+        let second = PlanNodeTarget {
+            form: 0,
+            id: "n1".into(),
+        };
+        app.apply(Action::HoverPlanNode(Some(first.clone())));
+        app.apply(Action::Expand);
+        app.apply(Action::HoverPlanNode(Some(second.clone())));
+        app.apply(Action::Expand);
+        assert!(app.diagram.is_node_expanded(&first));
+        assert!(app.diagram.is_node_expanded(&second));
+
+        app.apply(Action::Collapse);
+        assert!(
+            app.diagram.is_node_expanded(&first),
+            "collapsing the hovered box retains every other box"
+        );
+        assert!(!app.diagram.is_node_expanded(&second));
     }
 
     #[test]
@@ -2075,12 +2202,19 @@ mod tests {
             form: 0,
             id: "n0".to_string(),
         };
+        let second_target = PlanNodeTarget {
+            form: 0,
+            id: "n1".to_string(),
+        };
         app.apply(Action::MovePlanNode {
             target: target.clone(),
             x: 37,
             y: 19,
         });
         app.apply(Action::TogglePlanNode(target.clone()));
+        app.apply(Action::TogglePlanNode(second_target.clone()));
+        assert!(app.diagram.is_node_expanded(&target));
+        assert!(app.diagram.is_node_expanded(&second_target));
         app.ai_plan_scroll = 11;
         app.diff_scroll = 3;
         app.diff_scroll_alignment = DiffScrollAlignment::Center;
@@ -2090,7 +2224,7 @@ mod tests {
 
         app.update(selected_plan("b.go"));
         assert!(app.diagram.positions().is_empty());
-        assert!(app.diagram.expanded_node().is_none());
+        assert!(app.diagram.expanded_nodes().is_empty());
         assert_eq!(app.ai_plan_scroll, 0);
         assert_eq!(app.diff_scroll, 0);
         assert_eq!(app.diff_hscroll, 0);
@@ -2104,7 +2238,11 @@ mod tests {
             app.diagram.positions().get(&target),
             Some(&crate::diagram::DiagramPosition { x: 37, y: 19 })
         );
-        assert_eq!(app.diagram.expanded_node(), Some(&target));
+        assert!(app.diagram.is_node_expanded(&target));
+        assert!(
+            app.diagram.is_node_expanded(&second_target),
+            "every open box is restored with the selection's session view"
+        );
         assert_eq!(app.ai_plan_scroll, 11);
         assert_eq!(app.diff_scroll, 3);
         assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Center);

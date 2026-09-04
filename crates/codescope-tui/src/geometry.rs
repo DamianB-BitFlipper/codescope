@@ -14,6 +14,7 @@ use crate::divider::{DividerAxis, DividerHandle, DividerId};
 use crate::layout::{
     choose_tier, files_width, impact_left_width, impact_section_heights, Tier, MIN_DIFF_WIDTH,
 };
+use crate::review::ReviewTarget;
 use crate::scroll::{ScrollRegion, ScrollRegionId};
 use crate::snapshot::UiSnapshot;
 
@@ -43,6 +44,9 @@ pub struct UiGeometry {
     /// The visible files rows: (screen rect, physical row index). Physical indices index
     /// into the shared projection.
     pub file_row_rects: Vec<(Rect, usize)>,
+    /// Dedicated right-edge review controls for visible directory/file rows. These sit above the
+    /// general row targets so clicking a marker never changes selection.
+    pub file_review_rects: Vec<(Rect, ReviewTarget)>,
     /// Physical index of the first visible file row (the scroll offset).
     pub files_first_visible: usize,
     /// Independently scrollable rectangles in the frame the user actually saw.
@@ -111,10 +115,25 @@ impl UiGeometry {
                     geo.files_first_visible = first;
                     let fi = inner(body);
                     let mut rects = Vec::new();
+                    let mut review_rects = Vec::new();
                     for (slot, phys) in (first..rows_proj.len()).take(cap).enumerate() {
-                        rects.push((Rect::new(fi.x, fi.y + slot as u16, fi.width, 1), phys));
+                        let y = fi.y + slot as u16;
+                        rects.push((Rect::new(fi.x, y, fi.width, 1), phys));
+                        if fi.width > 0
+                            && matches!(
+                                rows_proj[phys],
+                                crate::file_rows::ProjectedRow::Directory { .. }
+                                    | crate::file_rows::ProjectedRow::File { .. }
+                            )
+                        {
+                            let target = rows_proj[phys]
+                                .review_target(&snap.files)
+                                .expect("directory/file rows are reviewable");
+                            review_rects.push((Rect::new(fi.x + fi.width - 1, y, 1, 1), target));
+                        }
                     }
                     geo.file_row_rects = rects;
+                    geo.file_review_rects = review_rects;
                     geo.register_scroll_region(
                         ScrollRegionId::Files,
                         body,
@@ -202,10 +221,25 @@ impl UiGeometry {
             let first = app.files_first_visible(cap);
             geo.files_first_visible = first;
             let mut rects = Vec::new();
+            let mut review_rects = Vec::new();
             for (slot, phys) in (first..rows_proj.len()).take(cap).enumerate() {
-                rects.push((Rect::new(fi.x, fi.y + slot as u16, fi.width, 1), phys));
+                let y = fi.y + slot as u16;
+                rects.push((Rect::new(fi.x, y, fi.width, 1), phys));
+                if fi.width > 0
+                    && matches!(
+                        rows_proj[phys],
+                        crate::file_rows::ProjectedRow::Directory { .. }
+                            | crate::file_rows::ProjectedRow::File { .. }
+                    )
+                {
+                    let target = rows_proj[phys]
+                        .review_target(&snap.files)
+                        .expect("directory/file rows are reviewable");
+                    review_rects.push((Rect::new(fi.x + fi.width - 1, y, 1, 1), target));
+                }
             }
             geo.file_row_rects = rects;
+            geo.file_review_rects = review_rects;
             geo.register_scroll_region(
                 ScrollRegionId::Files,
                 work_split[0],
@@ -540,7 +574,7 @@ impl UiGeometry {
                         height: generated_inner.height,
                     },
                     app.diagram.positions(),
-                    app.diagram.expanded_node(),
+                    app.diagram.expanded_nodes(),
                     app.diagram.z_order(),
                     &annotations,
                 )

@@ -267,7 +267,18 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         };
     }
 
-    // 9. A selectable file/symbol row.
+    // 9. A dedicated review marker. It wins over the containing row so review can be toggled
+    // without disrupting the current selection or retargeting the diff.
+    for (rect, target) in &geo.file_review_rects {
+        if hit(*rect, x, y) {
+            return MouseOutcome::action(
+                Action::ToggleReviewedTarget(target.clone()),
+                DragState::Idle,
+            );
+        }
+    }
+
+    // 10. A selectable file/symbol row.
     for (rect, phys) in &geo.file_row_rects {
         if hit(*rect, x, y) {
             let rows = app.projected_file_rows();
@@ -286,7 +297,7 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
         }
     }
 
-    // 10. A pane rectangle: focus only. Clicking blank diff space also clears any
+    // 11. A pane rectangle: focus only. Clicking blank diff space also clears any
     // retained text selection, matching a plain click on a rendered code row.
     if let Some(pane) = geo.pane_at(x, y) {
         if pane == Pane::Diff && app.diff_selection.is_some() {
@@ -581,6 +592,26 @@ mod tests {
         let out = map_mouse(down(rect.x + 1, rect.y), &app, &s, &g, DragState::Idle);
         assert_eq!(out.action, Some(Action::SelectFileRow { logical_index: 0 }));
         let _ = phys;
+    }
+
+    #[test]
+    fn click_review_marker_toggles_that_file_without_selecting_the_row() {
+        let s = snap();
+        let app = app_with(&s);
+        let g = geo(&app, &s);
+        let (rect, target) = g.file_review_rects[1].clone();
+        assert_eq!(target, crate::review::ReviewTarget::File("b.go".into()));
+        let out = map_mouse(down(rect.x, rect.y), &app, &s, &g, DragState::Idle);
+        assert_eq!(
+            out.action,
+            Some(Action::ToggleReviewedTarget(
+                crate::review::ReviewTarget::File("b.go".into())
+            ))
+        );
+        assert_eq!(
+            app.file_sel, 0,
+            "pure hit-testing cannot retarget selection"
+        );
     }
 
     #[test]
@@ -1121,7 +1152,7 @@ mod tests {
             expanded_node.rect.height > moved_node.rect.height,
             "complete detail expands only this box"
         );
-        assert_eq!(app.diagram.expanded_node(), Some(&source));
+        assert!(app.diagram.is_node_expanded(&source));
 
         // Overlay is a top layer only: all canvas nodes/routes remain exactly unchanged.
         let relationship = expanded_canvas.relationships[0].target.clone();

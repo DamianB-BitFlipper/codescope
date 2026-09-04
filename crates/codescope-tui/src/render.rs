@@ -24,6 +24,7 @@ use crate::intraline;
 use crate::layout::{
     choose_tier, files_width, impact_left_width, impact_section_heights, Tier, MIN_DIFF_WIDTH,
 };
+use crate::review::{ReviewState, ReviewTarget};
 use crate::snapshot::{
     AiToolCallActivityState, DiffRow, ImpactList, ImpactLoadState, StatusLevel, UiSnapshot,
 };
@@ -385,6 +386,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
         .and_then(|_| app.selected_file_index());
 
     let title = format!(" Changed files{} ", zoom_tag(app, Pane::Files));
+    let review_progress = app.review_progress();
     let (added, removed) = snap.files.iter().fold((0usize, 0usize), |totals, file| {
         (
             totals.0.saturating_add(file.added_lines),
@@ -392,15 +394,31 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
         )
     });
     let count = snap.files.len().to_string();
+    let review_count = if review_progress.total == 0 {
+        String::new()
+    } else {
+        format!(
+            "{}/{} ✓ · ",
+            review_progress.reviewed, review_progress.total
+        )
+    };
     let additions = format!(" +{added}");
     let deletions = format!(" -{removed} ");
-    let full_summary_w = count.width() + additions.width() + deletions.width();
+    let full_summary_w =
+        review_count.width() + count.width() + additions.width() + deletions.width();
     let summary = if title.width() + full_summary_w <= inner_w {
-        Line::from(vec![
+        let mut spans = Vec::new();
+        if !review_count.is_empty() {
+            spans.push(Span::styled(review_count, Style::new().fg(ADD_FG)));
+        }
+        spans.extend([
             Span::styled(count, Style::new().fg(MUTED)),
             Span::styled(additions, Style::new().fg(ADD_FG)),
             Span::styled(deletions, Style::new().fg(DEL_FG)),
-        ])
+        ]);
+        Line::from(spans)
+    } else if !review_count.is_empty() && title.width() + review_count.width() <= inner_w {
+        Line::from(Span::styled(review_count, Style::new().fg(ADD_FG)))
     } else {
         Line::from(Span::styled(
             format!("{} ", snap.files.len()),
@@ -431,6 +449,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                     },
                     label,
                     &right,
+                    app.review_state(&ReviewTarget::Directory(path.clone())),
                     snap.ai_summary_state(&crate::snapshot::AiSummaryKey::Directory(path.clone())),
                     active,
                     false,
@@ -450,6 +469,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                     if file.expanded { "▾" } else { "▸" },
                     name,
                     &right,
+                    app.review_state(&ReviewTarget::File(file.path.clone())),
                     snap.ai_summary_state(&crate::snapshot::AiSummaryKey::File(file.path.clone())),
                     active,
                     owner_idx == Some(*file_index),
@@ -535,6 +555,7 @@ fn tree_row_line(
     disclosure: &str,
     name: &str,
     right: &str,
+    review: ReviewState,
     ai: crate::snapshot::AiSummaryState,
     active: bool,
     owner: bool,
@@ -556,18 +577,21 @@ fn tree_row_line(
         base_style
     };
     let indent = "  ".repeat(depth.min(8));
+    let (review_marker, review_style) = review_marker(review);
+    let review_w = if inner_w > 1 { 2 } else { inner_w };
+    let content_w = inner_w.saturating_sub(review_w);
     let status_w = status.map_or(0, |status| status.width() + 1);
     let prefix_w = indent.width() + disclosure.width() + 3 + status_w;
-    let show_right = inner_w > prefix_w + 8 + right.width();
+    let show_right = content_w > prefix_w + 8 + right.width();
     let right_w = usize::from(show_right) * (right.width() + 1);
-    let name_budget = inner_w.saturating_sub(prefix_w + right_w);
+    let name_budget = content_w.saturating_sub(prefix_w + right_w);
     let shown_name = if middle_elide_directory {
         crate::elide::elide_directory_label(name, name_budget)
     } else {
         truncate_cells(name, name_budget)
     };
     let used = prefix_w + shown_name.width();
-    let pad = inner_w.saturating_sub(used + right_w);
+    let pad = content_w.saturating_sub(used + right_w);
     let (ai_marker, ai_style) = ai_summary_marker(ai);
     let mut spans = vec![
         Span::styled(indent, base_style),
@@ -604,7 +628,25 @@ fn tree_row_line(
             ));
         }
     }
+    if review_w > 1 {
+        spans.push(Span::styled(" ", base_style));
+    }
+    if review_w > 0 {
+        spans.push(Span::styled(review_marker, review_style.bg(bg)));
+    }
     Line::from(spans)
+}
+
+fn review_marker(state: ReviewState) -> (&'static str, Style) {
+    match state {
+        // A filled dot means this exact row owns the mark; inherited/derived states use
+        // different shapes so unmarking a parent is predictable before the click.
+        ReviewState::Explicit => ("●", Style::new().fg(ADD_FG).add_modifier(Modifier::BOLD)),
+        ReviewState::Inherited => ("↳", Style::new().fg(MUTED)),
+        ReviewState::Reviewed => ("✓", Style::new().fg(ADD_FG)),
+        ReviewState::Partial => ("◐", Style::new().fg(WARN)),
+        ReviewState::Unreviewed => ("○", Style::new().fg(MUTED)),
+    }
 }
 
 fn directory_stats(snap: &UiSnapshot, directory: &str) -> (usize, usize, usize) {
@@ -1800,7 +1842,7 @@ fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSn
                 height: area.height,
             },
             app.diagram.positions(),
-            app.diagram.expanded_node(),
+            app.diagram.expanded_nodes(),
             app.diagram.z_order(),
             &leading_annotations,
         );
@@ -2584,6 +2626,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  a               generate AI for the current selection"),
         Line::from("  A               toggle manual / automatic AI generation"),
         Line::from("  Tab             expand / collapse directory or file"),
+        Line::from("  v / click ○     mark directory or file reviewed"),
+        Line::from("  Review marks    ● explicit · ↳ inherited · ✓ complete · ◐ partial"),
         Line::from("  AI summaries    ◆ ready · ◇ not generated · ◌ generating · ! failed"),
         Line::from("  1 / 2 / 3       focus files / diff / impact"),
         Line::from("  j/k · ↑/↓       move selection · scroll"),
@@ -3300,6 +3344,20 @@ mod tests {
         assert!(
             symbol.contains("    ~ ◇ GetDisplayName"),
             "symbol: {symbol:?}"
+        );
+    }
+
+    #[test]
+    fn files_pane_reserves_review_progress_and_row_controls() {
+        let snap = sample();
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app_with(&snap), &snap)).unwrap();
+        assert!(row_text(&t, 1).contains("0/1 ✓"));
+        assert!(row_text(&t, 2).contains('○'), "directory review control");
+        assert!(row_text(&t, 3).contains('○'), "file review control");
+        assert!(
+            !row_text(&t, 4).contains('○'),
+            "symbols reuse the file keybind but do not grow a second marker"
         );
     }
 
@@ -4133,7 +4191,7 @@ mod tests {
             plan,
             viewport,
             app.diagram.positions(),
-            app.diagram.expanded_node(),
+            app.diagram.expanded_nodes(),
             app.diagram.z_order(),
             &crate::diagram::leading_annotations(snap.semantic.report.as_ref()),
         );
@@ -4152,7 +4210,7 @@ mod tests {
             plan,
             viewport,
             app.diagram.positions(),
-            app.diagram.expanded_node(),
+            app.diagram.expanded_nodes(),
             app.diagram.z_order(),
             &crate::diagram::leading_annotations(snap.semantic.report.as_ref()),
         );
@@ -5144,8 +5202,9 @@ mod tests {
             "ready-empty: {text:?}"
         );
         assert!(text.contains("Handle"), "ready symbols: {text:?}");
-        // The unloaded row must not claim `0` symbols (unknown): find its pane row and
-        // assert the count cell (right-aligned before the border) is blank, not a digit.
+        // The unloaded row must not claim `0` symbols (unknown). Line totals and the fixed
+        // review control legitimately live at the right edge, so inspect only the gap between
+        // the filename and those totals rather than relying on an old absolute column.
         let buf = t.backend().buffer();
         let a_y = (0..40u16)
             .find(|&y| {
@@ -5155,10 +5214,19 @@ mod tests {
                     .contains("a_unloaded.go")
             })
             .expect("a_unloaded row rendered");
-        let count_cell = buf.cell((38, a_y)).unwrap().symbol();
+        let rendered_row = (0..42u16)
+            .map(|x| buf.cell((x, a_y)).unwrap().symbol())
+            .collect::<String>();
+        let after_name = rendered_row
+            .split_once("a_unloaded.go")
+            .expect("filename remains visible")
+            .1;
+        let count_gap = after_name.split('+').next().unwrap_or(after_name);
         assert!(
-            count_cell.trim().is_empty() || count_cell == "…",
-            "no fake zero on unloaded (count cell: {count_cell:?})"
+            !count_gap
+                .chars()
+                .any(|character| character.is_ascii_digit()),
+            "no fake symbol count on unloaded row: {rendered_row:?}"
         );
     }
 

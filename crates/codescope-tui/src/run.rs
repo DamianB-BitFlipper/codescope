@@ -325,6 +325,17 @@ fn selection_target_value(target: &SelectionTarget) -> Value {
 }
 
 fn telemetry_state(app: &App) -> Value {
+    let review_progress = app.review_progress();
+    let selected_review = match app.selected_summary_key() {
+        Some(crate::snapshot::AiSummaryKey::Directory(path)) => {
+            Some(app.review_state(&crate::review::ReviewTarget::Directory(path)))
+        }
+        Some(crate::snapshot::AiSummaryKey::File(path))
+        | Some(crate::snapshot::AiSummaryKey::Symbol { file: path, .. }) => {
+            Some(app.review_state(&crate::review::ReviewTarget::File(path)))
+        }
+        None => None,
+    };
     json!({
         "epoch": app.snapshot.epoch.get(),
         "scope": format!("{:?}", app.snapshot.scope).to_ascii_lowercase(),
@@ -334,6 +345,12 @@ fn telemetry_state(app: &App) -> Value {
             "file": app.snapshot.diff.title,
             "symbol": app.snapshot.diff.focused_symbol,
             "hunk": app.current_hunk,
+        },
+        "review": {
+            "available": review_progress.available,
+            "reviewed_files": review_progress.reviewed,
+            "total_files": review_progress.total,
+            "selected_state": selected_review.map(crate::review::ReviewState::as_str),
         },
         "scroll": {
             "files": app.files_scroll,
@@ -668,6 +685,10 @@ mod tests {
         assert_eq!(state["epoch"], 7);
         assert_eq!(state["selection"]["path"], "src/api.rs");
         assert_eq!(state["focused_diff"]["file"], "src/api.rs");
+        assert_eq!(state["review"]["available"], false);
+        assert_eq!(state["review"]["reviewed_files"], 0);
+        assert_eq!(state["review"]["total_files"], 1);
+        assert_eq!(state["review"]["selected_state"], "unreviewed");
         assert_eq!(state["scroll"]["files"], 1);
         assert_eq!(state["scroll"]["diff_vertical"], 2);
         assert_eq!(state["scroll"]["diff_horizontal"], 3);

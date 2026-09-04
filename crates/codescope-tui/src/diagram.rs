@@ -169,7 +169,7 @@ pub struct DiagramState {
     positions: HashMap<PlanNodeTarget, DiagramPosition>,
     z_order: Vec<PlanNodeTarget>,
     scope: Option<DiagramPlanScope>,
-    expanded_node: Option<PlanNodeTarget>,
+    expanded_nodes: HashSet<PlanNodeTarget>,
     expanded_relationship: Option<PlanRelationshipTarget>,
     overlay_scroll: usize,
 }
@@ -200,13 +200,7 @@ impl DiagramState {
             .collect();
         self.positions.retain(|target, _| valid.contains(target));
         self.z_order.retain(|target| valid.contains(target));
-        if self
-            .expanded_node
-            .as_ref()
-            .is_some_and(|target| !valid.contains(target))
-        {
-            self.expanded_node = None;
-        }
+        self.expanded_nodes.retain(|target| valid.contains(target));
         if self
             .expanded_relationship
             .as_ref()
@@ -224,15 +218,22 @@ impl DiagramState {
         self.z_order.push(target);
     }
 
-    /// Toggle one box's in-place expansion. Opening raises it and closes any relationship overlay.
+    /// Toggle one box's independently retained in-place expansion. Opening raises it and closes
+    /// any relationship overlay, but never changes another box's expansion state.
     pub fn toggle_node(&mut self, target: PlanNodeTarget) {
-        if self.expanded_node.as_ref() == Some(&target) {
-            self.expanded_node = None;
-        } else {
+        let expanded = !self.expanded_nodes.contains(&target);
+        self.set_node_expanded(target, expanded);
+    }
+
+    /// Set one box's expansion without changing any other box.
+    pub fn set_node_expanded(&mut self, target: PlanNodeTarget, expanded: bool) {
+        if expanded {
             self.z_order.retain(|item| item != &target);
             self.z_order.push(target.clone());
-            self.expanded_node = Some(target);
+            self.expanded_nodes.insert(target);
             self.expanded_relationship = None;
+        } else {
+            self.expanded_nodes.remove(&target);
         }
     }
 
@@ -243,7 +244,7 @@ impl DiagramState {
             self.overlay_scroll = 0;
         } else {
             // Relationship text is an overlay only. In particular it must not collapse an
-            // already expanded node, because that would change base diagram geometry.
+            // already expanded nodes, because that would change base diagram geometry.
             self.expanded_relationship = Some(target);
             self.overlay_scroll = 0;
         }
@@ -259,9 +260,9 @@ impl DiagramState {
         self.overlay_scroll = offset;
     }
 
-    /// Close either expansion state.
+    /// Close every node expansion and the relationship overlay.
     pub fn clear_expansion(&mut self) {
-        self.expanded_node = None;
+        self.expanded_nodes.clear();
         self.expanded_relationship = None;
         self.overlay_scroll = 0;
     }
@@ -277,10 +278,16 @@ impl DiagramState {
         &self.z_order
     }
 
-    /// The expanded node, if any.
+    /// Independently expanded nodes in the current plan.
     #[must_use]
-    pub fn expanded_node(&self) -> Option<&PlanNodeTarget> {
-        self.expanded_node.as_ref()
+    pub fn expanded_nodes(&self) -> &HashSet<PlanNodeTarget> {
+        &self.expanded_nodes
+    }
+
+    /// Whether one node is independently expanded.
+    #[must_use]
+    pub fn is_node_expanded(&self, target: &PlanNodeTarget) -> bool {
+        self.expanded_nodes.contains(target)
     }
 
     /// The expanded relationship, if any.
@@ -357,9 +364,9 @@ impl DiagramCanvas {
         plan: &VisualizationPlan,
         viewport: DiagramViewport,
         positions: &HashMap<PlanNodeTarget, DiagramPosition>,
-        expanded_node: Option<&PlanNodeTarget>,
+        expanded_nodes: &HashSet<PlanNodeTarget>,
     ) -> Self {
-        Self::build_with_z_order(plan, viewport, positions, expanded_node, &[])
+        Self::build_with_z_order(plan, viewport, positions, expanded_nodes, &[])
     }
 
     /// As [`DiagramCanvas::build`], with persistent back-to-front box ordering.
@@ -368,10 +375,10 @@ impl DiagramCanvas {
         plan: &VisualizationPlan,
         viewport: DiagramViewport,
         positions: &HashMap<PlanNodeTarget, DiagramPosition>,
-        expanded_node: Option<&PlanNodeTarget>,
+        expanded_nodes: &HashSet<PlanNodeTarget>,
         z_order: &[PlanNodeTarget],
     ) -> Self {
-        Self::build_with_annotations(plan, viewport, positions, expanded_node, z_order, &[])
+        Self::build_with_annotations(plan, viewport, positions, expanded_nodes, z_order, &[])
     }
 
     /// Build with fixed leading annotations (for example a validator warning). Call rendering
@@ -381,7 +388,7 @@ impl DiagramCanvas {
         plan: &VisualizationPlan,
         viewport: DiagramViewport,
         positions: &HashMap<PlanNodeTarget, DiagramPosition>,
-        expanded_node: Option<&PlanNodeTarget>,
+        expanded_nodes: &HashSet<PlanNodeTarget>,
         z_order: &[PlanNodeTarget],
         leading_annotations: &[String],
     ) -> Self {
@@ -401,7 +408,7 @@ impl DiagramCanvas {
                     .copied()
                     .or_else(|| default_positions.get(&target).copied())
                     .unwrap_or_default();
-                let lines = canvas_node_lines(node, card_width, expanded_node == Some(&target));
+                let lines = canvas_node_lines(node, card_width, expanded_nodes.contains(&target));
                 let width = lines.iter().map(|line| line.width()).max().unwrap_or(1) as u16;
                 let height = lines.len().max(1) as u16;
                 let max_x = viewport.width.saturating_sub(width);
@@ -1350,7 +1357,7 @@ mod canvas_tests {
                 height: 8,
             },
             state.positions(),
-            state.expanded_node(),
+            state.expanded_nodes(),
             state.z_order(),
         )
     }
@@ -1437,8 +1444,31 @@ mod canvas_tests {
         assert!(expanded_text.contains("expanded detail"));
         assert!(!expanded_text.contains("Source"));
         assert!(!expanded_text.contains("src/diagram.rs:10-24"));
+
+        let state_target = PlanNodeTarget {
+            form: 0,
+            id: "state".into(),
+        };
+        expanded.toggle_node(state_target.clone());
+        assert!(expanded.is_node_expanded(&root));
+        assert!(expanded.is_node_expanded(&state_target));
+        let both_open = built(&plan, &expanded, 96);
+        assert_eq!(
+            both_open
+                .nodes
+                .iter()
+                .find(|node| node.target == root)
+                .unwrap()
+                .lines,
+            rn.lines,
+            "opening another box retains the first box's complete expansion"
+        );
+        expanded.toggle_node(state_target.clone());
+        assert!(expanded.is_node_expanded(&root));
+        assert!(!expanded.is_node_expanded(&state_target));
+
         let edge = e.relationships[0].target.clone();
-        let before = e.clone();
+        let before = built(&plan, &expanded, 96);
         expanded.toggle_relationship(edge.clone());
         assert_eq!(before, built(&plan, &expanded, 96));
         assert!(
@@ -1836,7 +1866,7 @@ mod canvas_tests {
         scoped.toggle_node(a.clone());
         scoped.sync_plan(&plan);
         assert!(scoped.positions().contains_key(&a));
-        assert_eq!(scoped.expanded_node(), Some(&a));
+        assert!(scoped.is_node_expanded(&a));
         let mut incremented = plan.clone();
         incremented.forms[0].nodes.push(PlanNode::new(
             "later",
@@ -1848,9 +1878,8 @@ mod canvas_tests {
             scoped.positions().contains_key(&a),
             "adding a node to the live draft retains user placement"
         );
-        assert_eq!(
-            scoped.expanded_node(),
-            Some(&a),
+        assert!(
+            scoped.is_node_expanded(&a),
             "adding a node to the live draft retains the open card"
         );
         let mut changed = incremented;
@@ -1859,7 +1888,7 @@ mod canvas_tests {
         assert!(
             scoped.positions().is_empty()
                 && scoped.z_order().is_empty()
-                && scoped.expanded_node().is_none()
+                && scoped.expanded_nodes().is_empty()
         );
     }
     #[test]

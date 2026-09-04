@@ -159,6 +159,10 @@ pub enum Action {
     },
     /// Expand / collapse the selected tree node.
     ToggleExpand,
+    /// Toggle the explicit review mark on the selected directory or file.
+    ToggleReviewed,
+    /// Mouse: toggle one review marker without changing the files-pane selection.
+    ToggleReviewedTarget(crate::review::ReviewTarget),
     /// Collapse the selected node.
     Collapse,
     /// Expand the selected node.
@@ -371,6 +375,7 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('n') => Action::NextHunk,
         KeyCode::Char('N') => Action::PrevHunk,
         KeyCode::Char('z') => Action::ToggleZoom,
+        KeyCode::Char('v') if app.focused == Pane::Files => Action::ToggleReviewed,
         KeyCode::Char('v') => Action::None,
         KeyCode::Char('W') => Action::ToggleWrap,
         KeyCode::Char('0') => Action::ResetHScroll,
@@ -608,8 +613,14 @@ mod tests {
     }
 
     #[test]
-    fn retired_view_key_is_unmapped() {
-        assert_eq!(map_key(key(KeyCode::Char('v')), &app()), Action::None);
+    fn v_toggles_review_only_in_the_files_pane() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('v')), &app()),
+            Action::ToggleReviewed
+        );
+        let mut a = app();
+        a.focused = Pane::Diff;
+        assert_eq!(map_key(key(KeyCode::Char('v')), &a), Action::None);
     }
 
     #[test]

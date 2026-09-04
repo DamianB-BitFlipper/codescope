@@ -25,7 +25,13 @@ codescope agent . focus --file crates/codescope/src/main.rs --symbol main
 codescope agent . context
 ```
 
-If connection fails, report that Codescope must be running in that repository. Do not start another TUI unless the user explicitly asks. Multiple TUI instances for one canonical repository are unsupported.
+Handle connection failures according to their cause:
+
+- On `PermissionDenied`, `Operation not permitted`, or `EPERM`, do not infer that Codescope is absent. A coding-agent sandbox can allow access to the socket path while denying the Unix-socket connection itself. Retry the exact `codescope agent` command once using the host agent's normal sandbox-escalation or approval mechanism. If escalation is unavailable or denied, report that the live session may be running but the sandbox blocked access.
+- On `NotFound` or `ConnectionRefused`, report that Codescope must be running in that repository.
+- For another error, preserve and report the actual cause rather than replacing it with missing-session guidance.
+
+Do not start another TUI unless the user explicitly asks. Multiple TUI instances for one canonical repository are unsupported.
 
 ## Research with host tools
 
