@@ -6,6 +6,7 @@ members = [
     "crates/codescope-lsp",
     "crates/codescope-analysis",
     "crates/codescope-ai",
+    "crates/codescope-telemetry",
     "crates/codescope-tui",
     "crates/codescope",
     "crates/codescope-testutil",

@@ -23,7 +23,7 @@
 use crate::error::{Result, TestutilError};
 use codescope_core::{
     DiffSide, EntityRef, Epoch, FileId, FormKind, PlanCodeRef, PlanNode, PlanNodeChange,
-    VisualizationPlan, VizForm,
+    VisualizationPlan, VizForm, MAX_FORMS_PER_PLAN, MAX_PLAN_EVIDENCE,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
@@ -467,7 +467,23 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
 /// OpenAI-shaped completion that reconstructs a typed plan through the public incremental
 /// editor protocol. This keeps service tests representative without a one-shot back door.
 fn diagram_plan_completion(call: u64, plan: Value) -> Value {
-    let mut operations = vec![(DIAGRAM_EDIT_TOOL_NAME, json!({"op": "reset"}))];
+    // A fixture may be used as a repair turn against an existing draft. Clear known draft
+    // members through the same targeted deletion operations available to production models;
+    // failed deletions are harmless when the draft is already empty.
+    let mut operations = (0..=MAX_FORMS_PER_PLAN)
+        .map(|form_index| {
+            (
+                DIAGRAM_EDIT_TOOL_NAME,
+                json!({"op": "delete_form", "form_id": format!("form-{form_index}")}),
+            )
+        })
+        .chain((0..MAX_PLAN_EVIDENCE).map(|_| {
+            (
+                DIAGRAM_EDIT_TOOL_NAME,
+                json!({"op": "delete_evidence", "index": 0}),
+            )
+        }))
+        .collect::<Vec<_>>();
     operations.push((
         DIAGRAM_EDIT_TOOL_NAME,
         json!({"op": "set_intent", "intent": plan["intent"]}),

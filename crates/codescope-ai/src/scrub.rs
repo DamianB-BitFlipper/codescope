@@ -60,6 +60,24 @@ pub fn scrub_secrets(text: &str) -> String {
     out
 }
 
+/// Preserve a provider payload's JSON shape while scrubbing every string value.
+#[must_use]
+pub(crate) fn scrub_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(scrub_secrets(text)),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(scrub_json).collect())
+        }
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), scrub_json(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +157,20 @@ mod tests {
     fn leaves_short_values() {
         let s = "api_key = dev"; // too short to look like a real key
         assert_eq!(scrub_secrets(s), s);
+    }
+
+    #[test]
+    fn structured_scrubbing_preserves_provider_payload_shape() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "token sk-abcdef012345"}],
+            "stream": false
+        });
+        let scrubbed = scrub_json(&body);
+        assert_eq!(scrubbed["messages"][0]["role"], "user");
+        assert_eq!(scrubbed["stream"], false);
+        assert_eq!(
+            scrubbed["messages"][0]["content"],
+            "token [redacted-secret]"
+        );
     }
 }

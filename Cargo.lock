@@ -333,6 +333,7 @@ dependencies = [
  "codescope-core",
  "codescope-git",
  "codescope-lsp",
+ "codescope-telemetry",
  "codescope-testutil",
  "codescope-tui",
  "crossterm",
@@ -358,6 +359,7 @@ dependencies = [
  "backon",
  "camino",
  "codescope-core",
+ "codescope-telemetry",
  "codescope-testutil",
  "futures",
  "governor",
@@ -435,6 +437,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codescope-telemetry"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "codescope-testutil"
 version = "0.1.0"
 dependencies = [
@@ -453,9 +463,11 @@ name = "codescope-tui"
 version = "0.1.0"
 dependencies = [
  "codescope-core",
+ "codescope-telemetry",
  "crossterm",
  "futures",
  "ratatui",
+ "serde_json",
  "similar",
  "thiserror 2.0.20",
  "tokio",

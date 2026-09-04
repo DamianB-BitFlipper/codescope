@@ -6,6 +6,9 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::path::Path;
@@ -28,12 +31,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 
-const PROTOCOL_VERSION: u8 = 2;
+const PROTOCOL_VERSION: u8 = 3;
 #[cfg(unix)]
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const DEFAULT_DIFF_LINES: usize = 160;
 const MAX_DIFF_LINES: usize = 500;
 const MAX_TREE_FILES: usize = 500;
+const DIAGRAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+static AGENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn parse_diff_limit(value: &str) -> std::result::Result<usize, String> {
     let limit = value
@@ -74,24 +79,33 @@ pub(crate) enum AgentOperation {
         #[arg(long, default_value_t = DEFAULT_DIFF_LINES, value_parser = parse_diff_limit)]
         max_diff_lines: usize,
     },
+    /// Read authoritative hunk ids and line coordinates from the captured change-set.
+    Diff(DiffArgs),
     /// Move the visible changed-tree cursor to a directory, file, or symbol.
     Focus(FocusArgs),
-    /// Ask a question about the visible selection and regenerate its validated explanation.
-    Ask {
-        /// Question the generated intent and diagram should answer.
-        question: String,
-    },
-    /// Revise the current generated explanation while retaining its validated prior design.
-    Feedback {
-        /// Feedback for the current selection's next generated explanation.
-        feedback: String,
-    },
     /// Inspect or mutate the live renderer-native diagram draft.
     Diagram(DiagramArgs),
     /// Refresh Git and analysis state in the running application.
     Refresh,
     /// Print the socket path for this repository without connecting.
     Socket,
+}
+
+/// Authoritative focused-diff lookup for validator-compatible code references.
+#[derive(Args, Debug)]
+pub(crate) struct DiffArgs {
+    /// Repo-relative changed file; defaults to the focused file.
+    #[arg(long)]
+    file: Option<String>,
+    /// Zero-based hunk to read. Omit to list all hunk headers.
+    #[arg(long)]
+    hunk: Option<usize>,
+    /// Diff-body row offset within the selected hunk.
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Maximum diff-body rows returned (20-500).
+    #[arg(long, default_value_t = DEFAULT_DIFF_LINES, value_parser = parse_diff_limit)]
+    max_lines: usize,
 }
 
 /// Incremental diagram editor commands.
@@ -106,14 +120,16 @@ pub(crate) struct DiagramArgs {
 #[derive(Subcommand, Debug)]
 enum DiagramOperation {
     /// Return the complete current draft for the visible selection.
-    Show,
+    #[command(alias = "show")]
+    Inspect,
     /// Apply one shared editor command encoded as JSON.
-    Apply {
+    #[command(alias = "apply")]
+    Edit {
         /// JSON object such as `{"op":"set_intent","intent":"Explain the new flow."}`.
         command: String,
     },
-    /// Clear all forms, boxes, relationships, intent, and evidence in the current draft.
-    Reset,
+    /// Print the shared edit and inspection tool schemas without connecting to a TUI.
+    Schema,
     /// Validate and publish the current draft as the visible AI summary.
     Finish,
 }
@@ -141,20 +157,21 @@ enum AgentRequest {
     Context {
         max_diff_lines: usize,
     },
+    Diff {
+        file: Option<String>,
+        hunk: Option<usize>,
+        offset: usize,
+        max_lines: usize,
+    },
     Focus {
         directory: Option<String>,
         file: Option<String>,
         symbol: Option<String>,
         line: Option<u32>,
     },
-    Ask {
-        question: String,
-    },
-    Feedback {
-        feedback: String,
-    },
     DiagramGet,
     DiagramApply {
+        request_id: u64,
         command: DiagramCommand,
     },
     Refresh,
@@ -235,6 +252,7 @@ async fn bind_server(
     };
     set_owner_only(&path)?;
     let task_path = path.clone();
+    let diagram_lock = Arc::new(tokio::sync::Mutex::new(()));
     let task = tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -244,11 +262,13 @@ async fn bind_server(
                     break;
                 }
             };
-            let snapshot = snapshots.borrow().clone();
+            let snapshots = snapshots.clone();
             let controls = controls.clone();
             let repo_root = repo_root.clone();
+            let diagram_lock = diagram_lock.clone();
             tokio::spawn(async move {
-                if let Err(error) = serve_connection(stream, &repo_root, &snapshot, &controls).await
+                if let Err(error) =
+                    serve_connection(stream, &repo_root, snapshots, &controls, &diagram_lock).await
                 {
                     tracing::debug!(%error, "agent protocol request failed");
                 }
@@ -274,14 +294,17 @@ fn set_owner_only(path: &Path) -> Result<()> {
 async fn serve_connection(
     mut stream: UnixStream,
     repo_root: &Utf8PathBuf,
-    snapshot: &UiSnapshot,
+    mut snapshots: watch::Receiver<UiSnapshot>,
     controls: &mpsc::Sender<Action>,
+    diagram_lock: &tokio::sync::Mutex<()>,
 ) -> Result<()> {
     let response = match read_request(&mut stream).await {
-        Ok(request) => match handle_request(request, repo_root, snapshot, controls).await {
-            Ok(result) => response(true, result),
-            Err(error) => response(false, json!({ "error": format!("{error:#}") })),
-        },
+        Ok(request) => {
+            match handle_request(request, repo_root, &mut snapshots, controls, diagram_lock).await {
+                Ok(result) => response(true, result),
+                Err(error) => response(false, json!({ "error": format!("{error:#}") })),
+            }
+        }
         Err(error) => response(false, json!({ "error": format!("{error:#}") })),
     };
     let mut bytes = serde_json::to_vec(&response)?;
@@ -320,22 +343,42 @@ async fn read_request(stream: &mut UnixStream) -> Result<AgentRequest> {
 async fn handle_request(
     request: AgentRequest,
     repo_root: &Utf8PathBuf,
-    snapshot: &UiSnapshot,
+    snapshots: &mut watch::Receiver<UiSnapshot>,
     controls: &mpsc::Sender<Action>,
+    diagram_lock: &tokio::sync::Mutex<()>,
 ) -> Result<Value> {
     match request {
-        AgentRequest::Context { max_diff_lines } => Ok(context_view(
-            repo_root,
-            snapshot,
-            max_diff_lines.clamp(20, MAX_DIFF_LINES),
-        )),
+        AgentRequest::Context { max_diff_lines } => {
+            let snapshot = snapshots.borrow().clone();
+            Ok(context_view(
+                repo_root,
+                &snapshot,
+                max_diff_lines.clamp(20, MAX_DIFF_LINES),
+            ))
+        }
+        AgentRequest::Diff {
+            file,
+            hunk,
+            offset,
+            max_lines,
+        } => {
+            let snapshot = snapshots.borrow().clone();
+            diff_view(
+                &snapshot,
+                file.as_deref(),
+                hunk,
+                offset,
+                max_lines.clamp(20, MAX_DIFF_LINES),
+            )
+        }
         AgentRequest::Focus {
             directory,
             file,
             symbol,
             line,
         } => {
-            let target = resolve_focus(snapshot, directory, file, symbol, line)?;
+            let snapshot = snapshots.borrow().clone();
+            let target = resolve_focus(&snapshot, directory, file, symbol, line)?;
             controls
                 .send(Action::AgentFocus(target.clone()))
                 .await
@@ -346,37 +389,45 @@ async fn handle_request(
                 "note": "focus is applied asynchronously; call context to observe the resulting snapshot"
             }))
         }
-        AgentRequest::Ask { question } => {
-            validate_guidance(&question)?;
-            controls
-                .send(Action::AgentAsk(question))
-                .await
-                .context("the TUI control loop has stopped")?;
-            Ok(accepted_generation(snapshot, "question"))
+        AgentRequest::DiagramGet => {
+            let snapshot = snapshots.borrow().clone();
+            Ok(diagram_view(&snapshot))
         }
-        AgentRequest::Feedback { feedback } => {
-            validate_guidance(&feedback)?;
+        AgentRequest::DiagramApply {
+            request_id,
+            command,
+        } => {
+            // Serialize external writers so the latest-value snapshot cannot skip over an
+            // acknowledgement before its caller observes it.
+            let _guard = diagram_lock.lock().await;
+            let previous_revision = snapshots
+                .borrow()
+                .agent_diagram_result
+                .as_ref()
+                .map_or(0, |result| result.revision);
             controls
-                .send(Action::AgentFeedback(feedback))
+                .send(Action::AgentDiagram {
+                    request_id,
+                    command,
+                })
                 .await
                 .context("the TUI control loop has stopped")?;
-            Ok(accepted_generation(snapshot, "feedback"))
-        }
-        AgentRequest::DiagramGet => Ok(json!({
-            "selection": selected_view(snapshot),
-            "draft": snapshot.diagram_draft,
-            "published_plan": snapshot.semantic.plan,
-            "validation": snapshot.semantic.report,
-        })),
-        AgentRequest::DiagramApply { command } => {
-            controls
-                .send(Action::AgentDiagram(command))
-                .await
-                .context("the TUI control loop has stopped")?;
+            let snapshot =
+                wait_for_diagram_result(snapshots, request_id, previous_revision).await?;
+            let result = snapshot
+                .agent_diagram_result
+                .as_ref()
+                .context("dispatcher omitted the diagram command result")?;
             Ok(json!({
-                "accepted": true,
-                "selection": selected_view(snapshot),
-                "note": "the edit is applied asynchronously; call diagram show to inspect the resulting draft"
+                "accepted": result.accepted,
+                "published": result.published,
+                "revision": result.revision,
+                "summary": result.summary,
+                "error": result.error,
+                "selection": selected_view(&snapshot),
+                "draft": snapshot.diagram_draft,
+                "published_plan": snapshot.semantic.plan,
+                "validation": snapshot.semantic.report,
             }))
         }
         AgentRequest::Refresh => {
@@ -392,22 +443,41 @@ async fn handle_request(
     }
 }
 
-fn accepted_generation(snapshot: &UiSnapshot, kind: &str) -> Value {
+fn diagram_view(snapshot: &UiSnapshot) -> Value {
     json!({
-        "accepted": true,
-        "kind": kind,
         "selection": selected_view(snapshot),
-        "note": "generation is asynchronous; poll context.ai.status and context.ai.plan"
+        "revision": snapshot.agent_diagram_result.as_ref().map(|result| result.revision).unwrap_or(0),
+        "draft": snapshot.diagram_draft,
+        "published_plan": snapshot.semantic.plan,
+        "validation": snapshot.semantic.report,
     })
 }
 
-fn validate_guidance(text: &str) -> Result<()> {
-    anyhow::ensure!(!text.trim().is_empty(), "guidance must not be empty");
-    anyhow::ensure!(
-        text.chars().count() <= 2_000,
-        "guidance exceeds the 2000-character limit"
-    );
-    Ok(())
+async fn wait_for_diagram_result(
+    snapshots: &mut watch::Receiver<UiSnapshot>,
+    request_id: u64,
+    previous_revision: u64,
+) -> Result<UiSnapshot> {
+    tokio::time::timeout(DIAGRAM_RESPONSE_TIMEOUT, async {
+        loop {
+            let snapshot = snapshots.borrow_and_update().clone();
+            if snapshot
+                .agent_diagram_result
+                .as_ref()
+                .is_some_and(|result| {
+                    result.request_id == request_id && result.revision > previous_revision
+                })
+            {
+                return Ok(snapshot);
+            }
+            snapshots
+                .changed()
+                .await
+                .context("the TUI snapshot stream has stopped")?;
+        }
+    })
+    .await
+    .context("timed out waiting for the diagram edit to reach the dispatcher")?
 }
 
 fn resolve_focus(
@@ -471,13 +541,127 @@ fn resolve_focus(
     })
 }
 
+fn diff_view(
+    snapshot: &UiSnapshot,
+    requested_file: Option<&str>,
+    requested_hunk: Option<usize>,
+    offset: usize,
+    max_lines: usize,
+) -> Result<Value> {
+    anyhow::ensure!(
+        snapshot.agent_changeset_epoch == snapshot.epoch,
+        "the captured Git facts are refreshing; wait for context.live.epoch to become current"
+    );
+    let changeset = snapshot
+        .agent_changeset
+        .as_deref()
+        .context("the current Git snapshot is not ready")?;
+    let default_file =
+        (!snapshot.diff.title.ends_with('/')).then_some(snapshot.diff.title.as_str());
+    let file = requested_file.or(default_file).context(
+        "the current selection is a directory; pass --file with a changed path from context",
+    )?;
+    anyhow::ensure!(!file.is_empty(), "there is no focused changed file");
+    let change = changeset
+        .files
+        .iter()
+        .find(|change| change.path.as_str() == file)
+        .with_context(|| {
+            format!(
+                "{file:?} is not a changed file in the live {:?} scope",
+                snapshot.scope
+            )
+        })?;
+
+    let Some(hunk_index) = requested_hunk else {
+        anyhow::ensure!(offset == 0, "--offset requires --hunk");
+        return Ok(json!({
+            "epoch": snapshot.epoch,
+            "scope": snapshot.scope,
+            "selection": selected_view(snapshot),
+            "file": file,
+            "status": change.status,
+            "old_path": change.old_path,
+            "binary": change.binary,
+            "hunk_count": change.hunks.len(),
+            "hunks": change.hunks.iter().enumerate().map(|(index, hunk)| json!({
+                "hunk": index,
+                "old_start": hunk.old_start,
+                "old_len": hunk.old_len,
+                "new_start": hunk.new_start,
+                "new_len": hunk.new_len,
+                "section": hunk.section,
+                "rows": hunk.lines.len(),
+                "added": hunk.count_added(),
+                "removed": hunk.count_deleted(),
+            })).collect::<Vec<_>>(),
+            "note": "pass --hunk N to read exact old/new line coordinates for code_refs"
+        }));
+    };
+
+    let hunk = change
+        .hunks
+        .get(hunk_index)
+        .with_context(|| format!("hunk {hunk_index} does not exist in {file:?}"))?;
+    let page = hunk
+        .lines
+        .iter()
+        .skip(offset)
+        .take(max_lines)
+        .map(|line| {
+            json!({
+                "kind": match line.kind {
+                    codescope_core::DiffLineKind::Add => "add",
+                    codescope_core::DiffLineKind::Del => "delete",
+                    codescope_core::DiffLineKind::Context => "context",
+                },
+                "hunk": hunk_index,
+                "old_line": line.old_ln,
+                "new_line": line.new_ln,
+                "text": line.text,
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_offset = (offset + page.len() < hunk.lines.len()).then_some(offset + page.len());
+    Ok(json!({
+        "epoch": snapshot.epoch,
+        "scope": snapshot.scope,
+        "selection": selected_view(snapshot),
+        "file": file,
+        "hunk": hunk_index,
+        "header": {
+            "old_start": hunk.old_start,
+            "old_len": hunk.old_len,
+            "new_start": hunk.new_start,
+            "new_len": hunk.new_len,
+            "section": hunk.section,
+        },
+        "offset": offset,
+        "rows": page,
+        "next_offset": next_offset,
+        "truncated": next_offset.is_some(),
+        "code_ref": {
+            "file": file,
+            "hunk": hunk_index,
+            "side": "old for delete rows; new for add or post-change context rows",
+            "line_numbers": "one-based and inclusive"
+        }
+    }))
+}
+
 fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usize) -> Value {
+    let mut current_hunk = None;
     let diff_rows = snapshot
         .diff
         .rows
         .iter()
         .take(max_diff_lines)
-        .map(diff_row_view)
+        .map(|row| {
+            if matches!(row, DiffRow::HunkHeader(_)) {
+                current_hunk = Some(current_hunk.map_or(0, |index| index + 1));
+            }
+            diff_row_view(row, current_hunk)
+        })
         .collect::<Vec<_>>();
     let files = snapshot
         .files
@@ -532,6 +716,11 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
         "focused_diff": {
             "file": snapshot.diff.title,
             "symbol": snapshot.diff.focused_symbol,
+            "selected": snapshot.selected_diff.as_ref().filter(|selected| selected.file == snapshot.diff.title).map(|selected| json!({
+                "file": selected.file,
+                "text": selected.text,
+                "truncated": selected.truncated,
+            })),
             "total_hunks": snapshot.diff.total_hunks,
             "rows": diff_rows,
             "truncated": snapshot.diff.rows.len() > max_diff_lines,
@@ -565,7 +754,6 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
                     },
                 })).collect::<Vec<_>>(),
             },
-            "active_agent_guidance": snapshot.semantic.note.strip_prefix("Agent ").map(|_| snapshot.semantic.note.as_str()),
             "plan": snapshot.semantic.plan,
             "validation": snapshot.semantic.report,
             "draft": snapshot.diagram_draft,
@@ -573,25 +761,25 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
         "capabilities": {
             "context": "read this live, bounded view",
             "focus": "focus exactly one changed directory, file, or loaded symbol",
-            "ask": "generate a validated answer for the visible selection",
-            "feedback": "revise that selection's prior validated plan",
-            "diagram": "inspect and incrementally create/update/delete the same boxes and relationships used by the internal AI",
+            "diff": "read authoritative zero-based hunk ids and exact old/new line coordinates for any changed file",
+            "selected": "focused_diff.selected is the exact human-highlighted diff excerpt",
+            "diagram": "inspect and synchronously create/update/delete the same boxes and relationships used by the internal AI",
             "refresh": "refresh Git and analysis state",
             "workflow": [
                 "codescope agent . context",
                 "codescope agent . focus --file path/to/file.rs --symbol symbol_name",
-                "codescope agent . ask 'What is the failure path introduced here?'",
                 "codescope agent . context",
-                "codescope agent . feedback 'Emphasize the boundary with the cache module'",
-                "codescope agent . diagram show",
-                "codescope agent . diagram apply '{\"op\":\"update_edge\",\"form_id\":\"main\",\"from\":\"n1\",\"to\":\"n2\",\"patch\":{\"label\":\"passes parsed request\"}}'",
+                "codescope agent . diff --file path/to/file.rs",
+                "codescope agent . diff --file path/to/file.rs --hunk 0",
+                "codescope agent . diagram inspect",
+                "codescope agent . diagram edit '{\"op\":\"update_edge\",\"form_id\":\"main\",\"from\":\"n1\",\"to\":\"n2\",\"patch\":{\"label\":\"passes parsed request\"}}'",
                 "codescope agent . diagram finish"
             ],
             "constraints": [
                 "local owner-only Unix socket",
                 "read-only repository access",
                 "no shell execution",
-                "questions and feedback are guidance, not evidence",
+                "the external agent researches with its own code, Git, and language tools",
                 "draft edits use the shared typed diagram API",
                 "finish validates AI/controller output before publication"
             ]
@@ -630,20 +818,22 @@ fn summary_key_view(key: &AiSummaryKey) -> Value {
     }
 }
 
-fn diff_row_view(row: &DiffRow) -> Value {
+fn diff_row_view(row: &DiffRow, hunk: Option<usize>) -> Value {
     match row {
-        DiffRow::HunkHeader(text) => json!({ "kind": "hunk", "text": text }),
+        DiffRow::HunkHeader(text) => json!({ "kind": "hunk", "hunk": hunk, "text": text }),
         DiffRow::Add { new_ln, text } => {
-            json!({ "kind": "add", "new_line": new_ln, "text": text })
+            json!({ "kind": "add", "hunk": hunk, "new_line": new_ln, "text": text })
         }
         DiffRow::Del { old_ln, text } => {
-            json!({ "kind": "delete", "old_line": old_ln, "text": text })
+            json!({ "kind": "delete", "hunk": hunk, "old_line": old_ln, "text": text })
         }
         DiffRow::Context {
             old_ln,
             new_ln,
             text,
-        } => json!({ "kind": "context", "old_line": old_ln, "new_line": new_ln, "text": text }),
+        } => {
+            json!({ "kind": "context", "hunk": hunk, "old_line": old_ln, "new_line": new_ln, "text": text })
+        }
     }
 }
 
@@ -704,9 +894,27 @@ pub(crate) fn socket_path(repo_root: &camino::Utf8Path) -> PathBuf {
 }
 
 pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
+    if matches!(
+        &args.operation,
+        AgentOperation::Diagram(DiagramArgs {
+            operation: DiagramOperation::Schema
+        })
+    ) {
+        return emit(
+            &json!({
+                "tools": codescope_ai::diagram_tools(),
+                "finish": {
+                    "command": "codescope agent . diagram finish",
+                    "description": "Validate and publish the current draft after all edits succeed."
+                }
+            }),
+            args.compact,
+        );
+    }
     let repo = GitRepo::discover(&args.path)
         .await
         .context("not a git repository (cannot locate a running codescope session)")?;
+    codescope_telemetry::set_repository(repo.toplevel().to_string());
     let path = args
         .socket
         .clone()
@@ -722,30 +930,30 @@ pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
             AgentOperation::Context { max_diff_lines } => AgentRequest::Context {
                 max_diff_lines: *max_diff_lines,
             },
+            AgentOperation::Diff(diff) => AgentRequest::Diff {
+                file: diff.file.clone(),
+                hunk: diff.hunk,
+                offset: diff.offset,
+                max_lines: diff.max_lines,
+            },
             AgentOperation::Focus(focus) => AgentRequest::Focus {
                 directory: focus.directory.clone(),
                 file: focus.file.clone(),
                 symbol: focus.symbol.clone(),
                 line: focus.line,
             },
-            AgentOperation::Ask { question } => AgentRequest::Ask {
-                question: question.clone(),
-            },
-            AgentOperation::Feedback { feedback } => AgentRequest::Feedback {
-                feedback: feedback.clone(),
-            },
             AgentOperation::Diagram(diagram) => match &diagram.operation {
-                DiagramOperation::Show => AgentRequest::DiagramGet,
-                DiagramOperation::Apply { command } => AgentRequest::DiagramApply {
+                DiagramOperation::Inspect => AgentRequest::DiagramGet,
+                DiagramOperation::Edit { command } => AgentRequest::DiagramApply {
+                    request_id: AGENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
                     command: serde_json::from_str(command)
                         .context("diagram command is not valid shared editor JSON")?,
                 },
-                DiagramOperation::Reset => AgentRequest::DiagramApply {
-                    command: DiagramCommand::Reset,
-                },
                 DiagramOperation::Finish => AgentRequest::DiagramApply {
+                    request_id: AGENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
                     command: DiagramCommand::Finish,
                 },
+                DiagramOperation::Schema => unreachable!("handled before repository discovery"),
             },
             AgentOperation::Refresh => AgentRequest::Refresh,
             AgentOperation::Socket => unreachable!(),
@@ -792,10 +1000,32 @@ fn emit(value: &Value, compact: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codescope_tui::snapshot::{DiffPane, FileRow, SymbolRow};
+    use codescope_tui::snapshot::{
+        AgentDiagramResult, DiffPane, FileRow, SelectedDiffContext, SymbolRow,
+    };
 
     fn live_snapshot() -> UiSnapshot {
         UiSnapshot {
+            agent_changeset: Some(std::sync::Arc::new(codescope_core::ChangeSet::new(
+                codescope_core::ChangeScope::Branch,
+                vec![codescope_core::FileChange {
+                    path: Utf8PathBuf::from("src/api.rs"),
+                    old_path: None,
+                    status: codescope_core::FileStatus::Modified,
+                    hunks: vec![codescope_core::Hunk {
+                        old_start: 12,
+                        old_len: 1,
+                        new_start: 12,
+                        new_len: 2,
+                        section: Some("serve".to_string()),
+                        lines: vec![
+                            codescope_core::DiffLine::context(12, 12, "fn serve() {"),
+                            codescope_core::DiffLine::add(13, "listen();"),
+                        ],
+                    }],
+                    binary: false,
+                }],
+            ))),
             files: vec![FileRow {
                 semantic: FileSemanticLoad::Ready,
                 path: "src/api.rs".to_string(),
@@ -815,10 +1045,18 @@ mod tests {
             diff: DiffPane {
                 title: "src/api.rs".to_string(),
                 focused_symbol: Some("serve".to_string()),
-                rows: vec![DiffRow::Add {
-                    new_ln: 13,
-                    text: "listen();".to_string(),
-                }],
+                rows: vec![
+                    DiffRow::HunkHeader("@@ -12,1 +12,2 @@ serve".to_string()),
+                    DiffRow::Context {
+                        old_ln: 12,
+                        new_ln: 12,
+                        text: "fn serve() {".to_string(),
+                    },
+                    DiffRow::Add {
+                        new_ln: 13,
+                        text: "listen();".to_string(),
+                    },
+                ],
                 current_hunk: 1,
                 total_hunks: 1,
                 syntax: std::sync::Arc::default(),
@@ -881,15 +1119,19 @@ mod tests {
 
     #[test]
     fn context_is_live_bounded_and_documents_agent_workflow() {
-        let view = context_view(
-            camino::Utf8Path::new("/tmp/example/repo"),
-            &live_snapshot(),
-            20,
-        );
+        let mut snapshot = live_snapshot();
+        snapshot.selected_diff = Some(SelectedDiffContext {
+            file: "src/api.rs".to_string(),
+            text: "listen();".to_string(),
+            truncated: false,
+        });
+        let view = context_view(camino::Utf8Path::new("/tmp/example/repo"), &snapshot, 20);
         assert_eq!(view["live"]["selection"]["kind"], "symbol");
-        assert_eq!(view["focused_diff"]["rows"][0]["kind"], "add");
+        assert_eq!(view["focused_diff"]["rows"][0]["kind"], "hunk");
+        assert_eq!(view["focused_diff"]["rows"][1]["hunk"], 0);
         assert_eq!(view["ai"]["activity"]["active"], false);
         assert!(view["ai"]["activity"]["calls"].is_array());
+        assert_eq!(view["focused_diff"]["selected"]["text"], "listen();");
         assert!(view["capabilities"]["workflow"].as_array().unwrap().len() >= 4);
     }
 
@@ -913,46 +1155,79 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn ask_is_forwarded_as_a_typed_ui_action() {
+    #[test]
+    fn diff_lists_hunks_then_returns_exact_code_reference_coordinates() {
         let snapshot = live_snapshot();
-        let (tx, mut rx) = mpsc::channel(1);
-        let result = handle_request(
-            AgentRequest::Ask {
-                question: "What changed?".to_string(),
-            },
-            &Utf8PathBuf::from("/tmp/example/repo"),
-            &snapshot,
-            &tx,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result["accepted"], true);
-        assert_eq!(
-            rx.recv().await,
-            Some(Action::AgentAsk("What changed?".to_string()))
-        );
+        let overview = diff_view(&snapshot, Some("src/api.rs"), None, 0, 20).unwrap();
+        assert_eq!(overview["hunks"][0]["hunk"], 0);
+        assert_eq!(overview["hunks"][0]["added"], 1);
+
+        let hunk = diff_view(&snapshot, Some("src/api.rs"), Some(0), 0, 20).unwrap();
+        assert_eq!(hunk["rows"][1]["kind"], "add");
+        assert_eq!(hunk["rows"][1]["new_line"], 13);
+        assert_eq!(hunk["code_ref"]["hunk"], 0);
+
+        let mut refreshing = snapshot;
+        refreshing.epoch = refreshing.epoch.next();
+        assert!(diff_view(&refreshing, Some("src/api.rs"), None, 0, 20)
+            .unwrap_err()
+            .to_string()
+            .contains("refreshing"));
     }
 
     #[tokio::test]
     async fn diagram_command_is_forwarded_without_translation() {
-        let snapshot = live_snapshot();
+        let mut snapshot = live_snapshot();
+        snapshot.agent_diagram_result = Some(AgentDiagramResult {
+            request_id: 42,
+            revision: 6,
+            accepted: false,
+            published: false,
+            summary: None,
+            error: Some("older process reused its local request id".to_string()),
+        });
         let (tx, mut rx) = mpsc::channel(1);
+        let (snapshot_tx, mut snapshots) = watch::channel(snapshot);
         let command = DiagramCommand::SetIntent {
             intent: "Show the request entering the bounded queue.".to_string(),
         };
+        let expected = command.clone();
+        let responder = tokio::spawn(async move {
+            let Some(Action::AgentDiagram {
+                request_id,
+                command,
+            }) = rx.recv().await
+            else {
+                panic!("expected an agent diagram command");
+            };
+            assert_eq!(command, expected);
+            snapshot_tx.send_modify(|snapshot| {
+                snapshot.agent_diagram_result = Some(AgentDiagramResult {
+                    request_id,
+                    revision: 7,
+                    accepted: true,
+                    published: false,
+                    summary: Some("updated the diagram intent".to_string()),
+                    error: None,
+                });
+            });
+        });
         let result = handle_request(
             AgentRequest::DiagramApply {
+                request_id: 42,
                 command: command.clone(),
             },
             &Utf8PathBuf::from("/tmp/example/repo"),
-            &snapshot,
+            &mut snapshots,
             &tx,
+            &tokio::sync::Mutex::new(()),
         )
         .await
         .unwrap();
         assert_eq!(result["accepted"], true);
-        assert_eq!(rx.recv().await, Some(Action::AgentDiagram(command)));
+        assert_eq!(result["revision"], 7);
+        assert_eq!(result["summary"], "updated the diagram intent");
+        responder.await.unwrap();
     }
 
     #[cfg(unix)]

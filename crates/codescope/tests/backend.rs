@@ -21,8 +21,10 @@ const BIN: &str = env!("CARGO_BIN_EXE_codescope");
 
 /// Run the codescope binary, isolated from any ambient git environment.
 fn codescope(args: &[&str]) -> Output {
+    let config_dir = TempDir::new().expect("isolated config directory");
     Command::new(BIN)
         .args(args)
+        .env("CODESCOPE_CONFIG", config_dir.path().join("config.toml"))
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -112,16 +114,16 @@ fn diagram_step(command: &DiagramCommand) -> AiScriptStep {
     )
 }
 
-/// Number of provider requests in [`incremental_plan_script`]. This deliberately includes
-/// the research handoff and the final tool-less completion. Exact assertions make an unexpected
-/// controller repair loop visible instead of silently accepting extra provider work.
+/// Number of provider requests in [`incremental_plan_script`]. This includes the required
+/// inventory and exact-diff handoffs. Exact assertions make an unexpected controller repair loop
+/// visible instead of silently accepting extra provider work.
 fn incremental_plan_request_count(plan: &VisualizationPlan) -> usize {
-    1 // initial diff research
+    1 // initial status inventory
+        + 1 // exact diff research
         + 1 // focused set_intent
         + plan.forms.len() // create_form (the first one is the focused scaffold step)
         + plan.forms.iter().map(|form| form.nodes.len() + form.edges.len()).sum::<usize>()
         + plan.evidence.len() // canonical full-editor edits after the form exists
-        + 1 // final assistant completion
 }
 
 /// Number of nodes the controller requires before it accepts evidence for a form.
@@ -161,10 +163,16 @@ fn incremental_plan_script(plan: &VisualizationPlan) -> Vec<AiScriptStep> {
         "fixture plan must contain its controller-required structural scaffold"
     );
 
-    let mut script = vec![AiScriptStep::tool_call(
-        "git_diff_file",
-        serde_json::json!({"path": "middleware.go", "hunk_index": 0}),
-    )];
+    let mut script = vec![
+        AiScriptStep::tool_call(
+            "git_status_file",
+            serde_json::json!({"path": "middleware.go"}),
+        ),
+        AiScriptStep::tool_call(
+            "git_diff_file",
+            serde_json::json!({"path": "middleware.go", "hunk_index": 0}),
+        ),
+    ];
     script.push(focused_diagram_step(&DiagramCommand::SetIntent {
         intent: plan.intent.clone(),
     }));
@@ -258,9 +266,6 @@ fn incremental_plan_script(plan: &VisualizationPlan) -> Vec<AiScriptStep> {
             }),
     );
 
-    script.push(AiScriptStep::AssistantText {
-        content: String::new(),
-    });
     assert_eq!(
         script.len(),
         incremental_plan_request_count(plan),
@@ -563,8 +568,10 @@ fn analyze_fixture_full_snapshot() {
 #[test]
 fn analyze_git_only_when_server_binary_missing() {
     let (_tmp, root) = go_fixture();
+    let config_dir = TempDir::new().expect("isolated config directory");
     let out = Command::new(BIN)
         .args(["analyze", &root.to_string_lossy(), "--scope", "unstaged"])
+        .env("CODESCOPE_CONFIG", config_dir.path().join("config.toml"))
         .env("CODESCOPE_GOPLS", "/nonexistent/gopls")
         .output()
         .expect("spawn codescope");
@@ -715,6 +722,8 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
     let (_fixture, root) = go_fixture();
     let config_dir = TempDir::new().unwrap();
     let config_path = config_dir.path().join("missing-config.toml");
+    let debug_log = config_dir.path().join("codescope-debug.log");
+    let debug_log_for_command = debug_log.clone();
     let endpoint = format!("{}/v1", provider.base_url());
     let root_string = root.to_string_lossy().to_string();
 
@@ -731,9 +740,11 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
                 "codescope-fake",
                 "--reasoning-effort",
                 "high",
+                "--debug",
+                "--log-file",
+                debug_log_for_command.to_str().unwrap(),
             ])
             .env("CODESCOPE_CONFIG", config_path)
-            .env("CODESCOPE_AI", "on")
             .env("CODESCOPE_AI_BASE_URL", endpoint)
             .env("CODESCOPE_AI_TIMEOUT_MS", "5000")
             .env("OPENAI_API_KEY", "sk-test-only")
@@ -790,27 +801,23 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        tool_names,
-        [
-            "list_directory",
-            "read_file",
-            "search_changed_files",
-            "git_status_file",
-            "git_diff_file",
-            "edit_visualization",
-            "inspect_visualization",
-        ],
-        "the production executor advertises its scoped mini-shell and shared diagram tools"
-    );
+    assert_eq!(tool_names, ["git_status_file"]);
+    assert_eq!(body["tool_choice"], "required");
     assert!(
         requests[0].body.contains("current research brief"),
         "headless path starts with the compact research assignment"
     );
     assert!(!requests[0].body.contains("focused source evidence"));
-    let second_body = requests[1].body_json().expect("plan-turn request JSON");
+    let diff_body = requests[1].body_json().expect("diff-turn request JSON");
+    assert_eq!(diff_body["tool_choice"], "auto");
+    assert!(diff_body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool"));
+    let plan_body = requests[2].body_json().expect("plan-turn request JSON");
     assert!(
-        second_body["messages"]
+        plan_body["messages"]
             .as_array()
             .unwrap()
             .iter()
@@ -819,6 +826,48 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
                     content.contains("successful_diff_results") && content.contains("[old:")
                 })),
         "the fresh plan turn receives exact annotated diff evidence in its controller handoff"
+    );
+    let debug_trace = std::fs::read_to_string(&debug_log).expect("debug trace file");
+    assert!(
+        debug_trace.contains("debug tracing enabled"),
+        "{debug_trace}"
+    );
+    assert!(
+        debug_trace.contains("codescope_ai::wire")
+            && debug_trace.contains("direction=\"request\"")
+            && debug_trace.contains("direction=\"response\""),
+        "debug mode records both AI wire directions: {debug_trace}"
+    );
+    assert!(
+        debug_trace.contains("reasoning_effort") && debug_trace.contains("current research brief"),
+        "debug wire trace includes the scrubbed provider envelope"
+    );
+    let telemetry = std::fs::read_to_string(config_dir.path().join("telemetry.jsonl"))
+        .expect("always-on LLM telemetry");
+    assert!(
+        !telemetry.contains("sk-test-only"),
+        "API key leaked: {telemetry}"
+    );
+    let telemetry_records = telemetry
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid telemetry JSONL"))
+        .collect::<Vec<_>>();
+    let llm_requests = telemetry_records
+        .iter()
+        .filter(|record| record["event"] == "llm.request")
+        .collect::<Vec<_>>();
+    let llm_responses = telemetry_records
+        .iter()
+        .filter(|record| record["event"] == "llm.response")
+        .collect::<Vec<_>>();
+    assert_eq!(llm_requests.len(), requests.len());
+    assert_eq!(llm_responses.len(), requests.len());
+    assert!(llm_requests[0]["data"]["body"]["messages"]
+        .as_array()
+        .is_some_and(|messages| !messages.is_empty()));
+    assert_eq!(
+        llm_requests[0]["data"]["request_id"],
+        llm_responses[0]["data"]["request_id"]
     );
 }
 
@@ -914,7 +963,6 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
                 "codescope-fake",
             ])
             .env("CODESCOPE_CONFIG", config_path)
-            .env("CODESCOPE_AI", "on")
             .env("CODESCOPE_AI_BASE_URL", endpoint)
             .env("CODESCOPE_AI_TIMEOUT_MS", "5000")
             .env("OPENAI_API_KEY", "sk-test-only")
@@ -1028,6 +1076,50 @@ fn non_repo_path_errors_with_json_and_exit_1() {
 }
 
 #[test]
+fn agent_diagram_schema_exposes_the_shared_tools_without_a_live_tui() {
+    let temp = TempDir::new().expect("temporary non-repository directory");
+    let out = codescope_in(temp.path(), &["agent", ".", "diagram", "schema"]);
+    let value = json_stdout(&out);
+    let tools = value["tools"].as_array().expect("diagram tools array");
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "edit_visualization"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "inspect_visualization"));
+    assert_eq!(
+        value["finish"]["command"],
+        "codescope agent . diagram finish"
+    );
+}
+
+#[test]
+fn every_command_appends_local_session_telemetry() {
+    let config_dir = TempDir::new().expect("isolated config directory");
+    let config_path = config_dir.path().join("config.toml");
+    let out = Command::new(BIN)
+        .args(["agent", ".", "diagram", "schema"])
+        .env("CODESCOPE_CONFIG", &config_path)
+        .output()
+        .expect("spawn codescope");
+    assert!(out.status.success(), "command failed: {}", stderr(&out));
+
+    let telemetry = std::fs::read_to_string(config_dir.path().join("telemetry.jsonl"))
+        .expect("always-on telemetry file");
+    let records = telemetry
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid telemetry JSONL"))
+        .collect::<Vec<_>>();
+    assert!(records
+        .iter()
+        .any(|record| record["event"] == "session.start"));
+    assert!(records
+        .iter()
+        .any(|record| record["event"] == "session.end"));
+    assert!(records.iter().all(|record| record["schema_version"] == 1));
+}
+
+#[test]
 fn compact_is_single_line_and_output_is_deterministic() {
     let (_tmp, root) = go_fixture();
     let root = root.to_string_lossy().to_string();
@@ -1076,8 +1168,10 @@ const GIT_ONLY_ENV: &[(&str, &str)] = &[("CODESCOPE_GOPLS", "/nonexistent/codesc
 
 /// Run the codescope binary with extra environment variables.
 fn codescope_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let config_dir = TempDir::new().expect("isolated config directory");
     let mut cmd = Command::new(BIN);
     cmd.args(args)
+        .env("CODESCOPE_CONFIG", config_dir.path().join("config.toml"))
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
@@ -1089,9 +1183,11 @@ fn codescope_env(args: &[&str], env: &[(&str, &str)]) -> Output {
 
 /// Run the codescope binary with `dir` as the working directory (PATH defaults to ".").
 fn codescope_in(dir: &Path, args: &[&str]) -> Output {
+    let config_dir = TempDir::new().expect("isolated config directory");
     Command::new(BIN)
         .args(args)
         .current_dir(dir)
+        .env("CODESCOPE_CONFIG", config_dir.path().join("config.toml"))
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")

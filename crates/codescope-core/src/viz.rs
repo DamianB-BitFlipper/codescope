@@ -482,14 +482,11 @@ impl ValidationReport {
     }
 }
 
-/// Lifecycle of the AI subsystem, for the status bar. `Disabled` remains an initialization
-/// and library state; the interactive binary rejects it before starting the TUI.
+/// Lifecycle of the AI subsystem, for the status bar.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiStatus {
-    /// No API key configured / explicitly disabled before interactive startup.
-    Disabled,
-    /// Enabled, no plan requested or in flight.
+    /// No plan requested or in flight.
     Idle,
     /// The selected file's asynchronous symbol inventory is not ready yet.
     WaitingForSymbols {
@@ -609,7 +606,6 @@ mod tests {
 
     #[test]
     fn ai_status_plan_availability() {
-        assert!(!AiStatus::Disabled.has_plan());
         assert!(!AiStatus::Idle.has_plan());
         assert!(!AiStatus::Loading {
             since_epoch: Epoch(1)

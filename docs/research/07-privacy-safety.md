@@ -1,9 +1,10 @@
 # 07 — Privacy & Safety (codescope)
 
 > **Historical design research (2026-08), not the current runtime contract.** The proposals and
-> example names/counts below record the original design exploration and may be obsolete. Current
-> behavior is defined by `docs/architecture.md`, `docs/ai-dataflow.md`, and the source/config
-> rustdocs.
+> example names/counts below record the original design exploration and may be obsolete. Its
+> original "no telemetry" recommendation is superseded by the current always-on, local-only JSONL
+> telemetry. Current behavior is defined by `docs/architecture.md`, `docs/ai-dataflow.md`, and the
+> source/config rustdocs.
 
 Scope: secret exclusion, AI opt-in + key handling, read-only guarantees, temp files,
 AI failure modes, recommended Rust types/defaults. Verified locally 2026-08 (macOS,
@@ -67,8 +68,9 @@ Pitfalls:
 
 ## 2. AI opt-in configuration
 
-- **Default: AI off.** No HTTP client is constructed while `ai.enabled = false`; the app is
-  fully functional deterministically. No telemetry, ever.
+- **Original proposal: AI off.** No HTTP client would be constructed while `ai.enabled = false`;
+  the app would remain deterministic. Its no-telemetry recommendation is superseded by the
+  current runtime contract.
 - **Resolution order** (low → high priority, later wins): built-in defaults → user config
   (`~/.config/codescope/config.toml` via `etcetera 0.11`) → project config
   (`<repo>/.codescope.toml`) → env (`CODESCOPE_AI__ENABLED`, `…__MODEL`, …) → CLI flags
@@ -143,5 +145,6 @@ Pitfalls:
 5. `governor` (10 rpm, burst 2) + `backon` (2 retries, jitter, honor Retry-After) + 5/20/60 s
    budgets + 3-strike 60 s circuit breaker; all failures degrade silently to deterministic
    mode with an `AiStatus` status-bar segment.
-6. Enable-time disclosure modal + persistent per-session status (provider, model, request
-   count, redaction count). No telemetry.
+6. Original recommendation: enable-time disclosure modal + persistent per-session status
+   (provider, model, request count, redaction count), with no telemetry. The current local JSONL
+   requirement supersedes this recommendation.

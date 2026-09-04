@@ -154,51 +154,18 @@ pub struct DiagramViewport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiagramPlanScope {
     epoch: codescope_core::Epoch,
-    form_kinds: Vec<FormKind>,
-    nodes: Vec<PlanNodeTarget>,
-    relationships: Vec<PlanRelationshipTarget>,
 }
 
 fn plan_scope(plan: &VisualizationPlan) -> DiagramPlanScope {
-    let nodes = plan
-        .forms
-        .iter()
-        .enumerate()
-        .flat_map(|(form, item)| {
-            item.nodes.iter().map(move |node| PlanNodeTarget {
-                form,
-                id: node.id.clone(),
-            })
-        })
-        .collect();
-    let relationships = plan
-        .forms
-        .iter()
-        .enumerate()
-        .flat_map(|(form, item)| {
-            normalized_edges(item)
-                .into_iter()
-                .enumerate()
-                .map(move |(edge, item)| PlanRelationshipTarget {
-                    form,
-                    edge,
-                    from: item.from,
-                    to: item.to,
-                })
-        })
-        .collect();
-    DiagramPlanScope {
-        epoch: plan.epoch,
-        form_kinds: plan.forms.iter().map(|form| form.kind).collect(),
-        nodes,
-        relationships,
-    }
+    DiagramPlanScope { epoch: plan.epoch }
 }
 
 /// Persistent, current-plan-only diagram interaction state.
 ///
 /// Positions are keyed by plan-local ids, never labels. A plan refresh calls
-/// [`DiagramState::sync_plan`] to remove stale entries while retaining every valid user move.
+/// [`DiagramState::sync_plan`] to remove stale entries while retaining every valid user move
+/// and expansion. Incremental AI edits change the plan's shape repeatedly, so membership is
+/// pruned per target instead of treating every added node or edge as a new interaction scope.
 #[derive(Debug, Clone, Default)]
 pub struct DiagramState {
     positions: HashMap<PlanNodeTarget, DiagramPosition>,
@@ -1491,7 +1458,24 @@ mod canvas_tests {
         scoped.toggle_node(a.clone());
         scoped.sync_plan(&plan);
         assert!(scoped.positions().contains_key(&a));
-        let mut changed = plan.clone();
+        assert_eq!(scoped.expanded_node(), Some(&a));
+        let mut incremented = plan.clone();
+        incremented.forms[0].nodes.push(PlanNode::new(
+            "later",
+            "incremental node",
+            PlanNodeChange::Added,
+        ));
+        scoped.sync_plan(&incremented);
+        assert!(
+            scoped.positions().contains_key(&a),
+            "adding a node to the live draft retains user placement"
+        );
+        assert_eq!(
+            scoped.expanded_node(),
+            Some(&a),
+            "adding a node to the live draft retains the open card"
+        );
+        let mut changed = incremented;
         changed.epoch = Epoch(8);
         scoped.sync_plan(&changed);
         assert!(

@@ -9,6 +9,7 @@ mod config;
 mod dispatcher;
 mod request_coordinator;
 mod research_tools;
+mod skills;
 mod terminal;
 mod watcher;
 
@@ -25,6 +26,8 @@ use codescope_tui::{Action, App, UiSnapshot};
 use dispatcher::{DispatchEvent, Dispatcher};
 use tokio::sync::{mpsc, watch};
 use watcher::RepoWatchers;
+
+const DEFAULT_DEBUG_LOG_FILE: &str = "codescope-debug.log";
 
 /// Understand what your current code changes do to the system.
 ///
@@ -52,24 +55,58 @@ struct Cli {
     reasoning_effort: Option<ReasoningEffort>,
 
     /// Watch the working tree and Git state, refreshing automatically after changes.
-    /// Off by default; without this flag, press R to refresh manually.
+    /// Off by default; without this flag, press g to refresh manually.
     #[arg(long)]
     watch: bool,
 
     /// Write tracing logs to this file (off by default; never logs secrets).
-    #[arg(long)]
+    #[arg(long, global = true)]
     log_file: Option<PathBuf>,
+
+    /// Save verbose application traces and scrubbed AI wire data to a debug log file.
+    #[arg(long, global = true)]
+    debug: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    initialize_telemetry();
+    codescope_telemetry::record(
+        "session.start",
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "args": std::env::args_os()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            "telemetry_path": codescope_telemetry::path()
+                .map(|path| path.display().to_string()),
+        }),
+    );
     let cli = Cli::parse();
+    codescope_telemetry::record(
+        "session.mode",
+        serde_json::json!({
+            "mode": if cli.command.is_some() { "command" } else { "tui" },
+        }),
+    );
     let debug_ai = matches!(&cli.command, Some(backend::BackendCommand::DebugAi(_)));
-    init_tracing(cli.log_file.as_deref(), debug_ai);
+    let log_file = tracing_log_file(&cli);
+    init_tracing(log_file.as_deref(), debug_ai, cli.debug)?;
+    if cli.debug {
+        if let Some(path) = &log_file {
+            tracing::info!(
+                path = %path.display(),
+                "debug tracing enabled"
+            );
+        }
+    }
 
-    // Non-interactive JSON backend: print JSON to stdout and exit, never starting the TUI.
+    // Non-interactive command: run and exit without starting the TUI.
     if let Some(command) = &cli.command {
         let code = backend::run(command).await;
+        codescope_telemetry::record("command.complete", serde_json::json!({ "exit_code": code }));
+        codescope_telemetry::record("session.end", serde_json::json!({ "exit_code": code }));
         if code != 0 {
             std::process::exit(code);
         }
@@ -95,6 +132,7 @@ async fn main() -> Result<()> {
         .await
         .context("not a git repository (codescope needs one)")?;
     let root = repo.toplevel().to_path_buf();
+    codescope_telemetry::set_repository(root.to_string());
     tracing::info!(root = %root, "discovered repository");
 
     // Global-only v1 configuration. Backend commands returned above and therefore never
@@ -112,16 +150,8 @@ async fn main() -> Result<()> {
     let ai_config = config_store
         .resolve_ai_config(cli.model.as_deref(), cli.reasoning_effort)
         .context("AI configuration is required for interactive Codescope")?;
-    if !ai_config.enabled {
-        anyhow::bail!(
-            "AI is required for interactive Codescope; set PRIME_API_KEY, OPENAI_API_KEY, or \
-             ANTHROPIC_API_KEY"
-        );
-    }
-    let ai = Some(
-        AiService::new(ai_config, root.clone())
-            .context("invalid AI configuration for interactive Codescope")?,
-    );
+    let ai = AiService::new(ai_config, root.clone())
+        .context("invalid AI configuration for interactive Codescope")?;
 
     // Channels: dispatcher publishes snapshots (watch = latest-wins); the TUI sends back
     // work actions; optional watchers send change events; spawned jobs report back on the same queue.
@@ -155,7 +185,7 @@ async fn main() -> Result<()> {
     }
 
     // Watching is opt-in. The dispatcher still performs one initial load and explicit
-    // scope/base changes or `R` use the same refresh path regardless of this mode.
+    // scope/base changes or `g` use the same refresh path regardless of this mode.
     let _watchers = if cli.watch {
         tracing::info!("watch mode enabled");
         Some(RepoWatchers::start(&repo, event_tx.clone()).await?)
@@ -189,36 +219,88 @@ async fn main() -> Result<()> {
     // dispatcher a bounded window to finish (it shuts the language server down gracefully).
     drop(event_tx);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(8), disp_handle).await;
+    codescope_telemetry::record(
+        "session.end",
+        serde_json::json!({ "exit_code": if tui_result.is_ok() { 0 } else { 1 } }),
+    );
     tui_result?;
     Ok(())
 }
 
-fn init_tracing(log_file: Option<&std::path::Path>, debug_ai: bool) {
+fn initialize_telemetry() {
+    let preferred = config::telemetry_path();
+    if let Err(preferred_error) = codescope_telemetry::init(&preferred) {
+        let fallback = std::env::temp_dir()
+            .join("codescope")
+            .join("telemetry.jsonl");
+        if fallback == preferred {
+            return;
+        }
+        match codescope_telemetry::init(&fallback) {
+            Ok(_) => codescope_telemetry::record(
+                "telemetry.fallback",
+                serde_json::json!({
+                    "preferred_path": preferred.display().to_string(),
+                    "fallback_path": fallback.display().to_string(),
+                    "error": preferred_error.to_string(),
+                }),
+            ),
+            Err(_fallback_error) => {}
+        }
+    }
+}
+
+fn tracing_log_file(cli: &Cli) -> Option<PathBuf> {
+    cli.log_file
+        .clone()
+        .or_else(|| cli.debug.then(|| PathBuf::from(DEFAULT_DEBUG_LOG_FILE)))
+}
+
+fn init_tracing(log_file: Option<&std::path::Path>, debug_ai: bool, debug: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if debug_ai {
-            EnvFilter::new("codescope::backend=debug,codescope_ai=debug")
-        } else {
-            EnvFilter::new("codescope=info")
-        }
-    });
-    if let Some(path) = log_file {
-        if let Ok(file) = std::fs::File::create(path) {
-            let builder = tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::sync::Mutex::new(file))
-                .with_ansi(false);
+    let filter = if debug {
+        EnvFilter::new(concat!(
+            "codescope=trace,",
+            "codescope_ai=trace,",
+            "codescope_analysis=trace,",
+            "codescope_core=trace,",
+            "codescope_git=trace,",
+            "codescope_lsp=trace,",
+            "codescope_testutil=trace,",
+            "codescope_tui=trace"
+        ))
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             if debug_ai {
-                let _ = builder
-                    .with_span_events(
-                        tracing_subscriber::fmt::format::FmtSpan::NEW
-                            | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
-                    )
-                    .try_init();
+                EnvFilter::new("codescope::backend=debug,codescope_ai=debug")
             } else {
-                let _ = builder.try_init();
+                EnvFilter::new("codescope=info")
             }
+        })
+    };
+    if let Some(path) = log_file {
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("cannot create tracing log {}", path.display()))?;
+        let builder = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .with_target(debug)
+            .with_file(debug)
+            .with_line_number(debug);
+        if debug || debug_ai {
+            builder
+                .with_span_events(
+                    tracing_subscriber::fmt::format::FmtSpan::NEW
+                        | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+                )
+                .try_init()
+                .map_err(|error| anyhow::anyhow!("cannot initialize tracing: {error}"))?;
+        } else {
+            builder
+                .try_init()
+                .map_err(|error| anyhow::anyhow!("cannot initialize tracing: {error}"))?;
         }
     } else if debug_ai && std::io::stderr().is_terminal() {
         // Headless AI debugging must explain apparent stalls without requiring a second
@@ -234,6 +316,7 @@ fn init_tracing(log_file: Option<&std::path::Path>, debug_ai: bool) {
             )
             .try_init();
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -261,6 +344,31 @@ mod tests {
     }
 
     #[test]
+    fn debug_flag_uses_a_default_log_and_log_file_overrides_it() {
+        let cli = Cli::try_parse_from(["codescope", "--debug", "/some/repo"]).unwrap();
+        assert!(cli.debug);
+        assert_eq!(
+            tracing_log_file(&cli),
+            Some(PathBuf::from(DEFAULT_DEBUG_LOG_FILE))
+        );
+
+        let cli = Cli::try_parse_from([
+            "codescope",
+            "debug-ai",
+            "/some/repo",
+            "--debug",
+            "--log-file",
+            "/tmp/custom-codescope.log",
+        ])
+        .unwrap();
+        assert!(cli.debug);
+        assert_eq!(
+            tracing_log_file(&cli),
+            Some(PathBuf::from("/tmp/custom-codescope.log"))
+        );
+    }
+
+    #[test]
     fn no_ai_flag_is_rejected() {
         assert!(Cli::try_parse_from(["codescope", "--no-ai"]).is_err());
     }
@@ -283,6 +391,37 @@ mod tests {
             matches!(cli.command, Some(backend::BackendCommand::Agent(_))),
             "agent must route to the live protocol client"
         );
+        for args in [
+            vec!["codescope", "agent", ".", "diff", "--hunk", "0"],
+            vec!["codescope", "agent", ".", "diagram", "inspect"],
+            vec!["codescope", "agent", ".", "diagram", "schema"],
+            vec![
+                "codescope",
+                "agent",
+                ".",
+                "diagram",
+                "edit",
+                r#"{"op":"set_intent","intent":"Explain the change."}"#,
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["codescope", "agent", ".", "ask", "why?"]).is_err());
+        assert!(Cli::try_parse_from(["codescope", "agent", ".", "feedback", "revise it"]).is_err());
+        let cli = Cli::try_parse_from(["codescope", "skills", "show"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(backend::BackendCommand::Skills(_))),
+            "skills must route to the bundled-skill commands"
+        );
+        assert!(Cli::try_parse_from([
+            "codescope",
+            "skills",
+            "install",
+            "--global",
+            "--yes",
+            "--claude",
+        ])
+        .is_ok());
         let cli =
             Cli::try_parse_from(["codescope", "analyze", "/repo", "--scope", "staged"]).unwrap();
         match cli.command {

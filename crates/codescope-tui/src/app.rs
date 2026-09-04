@@ -1,7 +1,7 @@
 //! Application state and pure `Action` transitions. No I/O — the run loop feeds it
 //! [`UiSnapshot`]s and [`Action`]s; rendering reads it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use codescope_core::ChangeScope;
 
@@ -36,6 +36,46 @@ pub struct UiPreferences {
     pub diff_wrap: bool,
     /// Requested extent of every structural divider.
     pub dividers: DividerSizes,
+}
+
+/// Stable identity of one diagram viewport inside the current repository epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DiagramSessionKey {
+    epoch: codescope_core::Epoch,
+    scope: ChangeScope,
+    target: DiagramSessionTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DiagramSessionTarget {
+    Directory(String),
+    File(String),
+    Symbol { file: String, name: String },
+}
+
+#[derive(Debug, Clone, Default)]
+struct DiagramViewState {
+    diagram: crate::diagram::DiagramState,
+    scroll: usize,
+}
+
+fn diagram_session_key(snapshot: &UiSnapshot) -> Option<DiagramSessionKey> {
+    let selected = snapshot.impact.selected_change.as_ref()?;
+    let target = if snapshot.diff.title.ends_with('/') {
+        DiagramSessionTarget::Directory(selected.file.clone())
+    } else if let Some(name) = &snapshot.diff.focused_symbol {
+        DiagramSessionTarget::Symbol {
+            file: selected.file.clone(),
+            name: name.clone(),
+        }
+    } else {
+        DiagramSessionTarget::File(selected.file.clone())
+    };
+    Some(DiagramSessionKey {
+        epoch: snapshot.epoch,
+        scope: snapshot.scope,
+        target,
+    })
 }
 
 /// View-state for the running app.
@@ -74,9 +114,14 @@ pub struct App {
     /// Generated-plan node currently under the mouse. This is transient view state and
     /// drives both node emphasis and linked diff-row highlighting.
     pub hovered_plan_node: Option<PlanNodeTarget>,
+    /// Diff position captured when the pointer first enters a generated-plan box. Hover may
+    /// temporarily move the diff to linked code; leaving every box restores this anchor.
+    pub diff_scroll_before_plan_hover: Option<u16>,
     /// Persistent free box positions and inline expansion state for the current plan.
     /// [`crate::diagram::DiagramState`] is the sole owner of this interaction state.
     pub diagram: crate::diagram::DiagramState,
+    /// Per-selection interaction state retained while navigating within this TUI session.
+    diagram_sessions: HashMap<DiagramSessionKey, DiagramViewState>,
     /// Independent offset for the deterministic incoming-callers list.
     pub callers_scroll: usize,
     /// Independent offset for the deterministic downstream-relationships list.
@@ -105,6 +150,42 @@ pub struct App {
     pub base_query: String,
     /// Set when the user asked to quit.
     pub should_quit: bool,
+}
+
+/// First logical diff row covered by one of `node`'s exact code references in the
+/// currently displayed file. Hunk identity is included so repeated source line numbers in
+/// a combined diff cannot make hover jump to the wrong change.
+fn first_linked_diff_row(
+    diff: &crate::snapshot::DiffPane,
+    node: &codescope_core::PlanNode,
+) -> Option<usize> {
+    let refs = node
+        .code_refs
+        .iter()
+        .filter(|code_ref| code_ref.file.as_path().as_str() == diff.title);
+    let mut hunk = None;
+    for (index, row) in diff.rows.iter().enumerate() {
+        if matches!(row, DiffRow::HunkHeader(_)) {
+            hunk = Some(hunk.map_or(0, |current: u32| current.saturating_add(1)));
+            continue;
+        }
+        for code_ref in refs.clone() {
+            if hunk != Some(code_ref.hunk) {
+                continue;
+            }
+            let line = match (code_ref.side, row) {
+                (codescope_core::DiffSide::Old, DiffRow::Del { old_ln, .. })
+                | (codescope_core::DiffSide::Old, DiffRow::Context { old_ln, .. }) => Some(*old_ln),
+                (codescope_core::DiffSide::New, DiffRow::Add { new_ln, .. })
+                | (codescope_core::DiffSide::New, DiffRow::Context { new_ln, .. }) => Some(*new_ln),
+                _ => None,
+            };
+            if line.is_some_and(|line| line >= code_ref.start_line && line <= code_ref.end_line) {
+                return Some(index);
+            }
+        }
+    }
+    None
 }
 
 impl App {
@@ -143,9 +224,13 @@ impl App {
         let diff_content_changed = retargeted || self.snapshot.diff.rows != snapshot.diff.rows;
         let impact_retargeted =
             self.snapshot.impact.selected_change != snapshot.impact.selected_change;
+        let previous_diagram_key = diagram_session_key(&self.snapshot);
+        let next_diagram_key = diagram_session_key(&snapshot);
+        let diagram_retargeted = previous_diagram_key != next_diagram_key;
         let activity_started = !self.snapshot.ai_activity.active && snapshot.ai_activity.active;
+        let plan_changed = self.snapshot.semantic.plan != snapshot.semantic.plan;
         let generated_retargeted = self.snapshot.semantic.note != snapshot.semantic.note
-            || self.snapshot.semantic.plan != snapshot.semantic.plan
+            || plan_changed
             || impact_retargeted
             || activity_started;
         if diff_content_changed {
@@ -155,10 +240,34 @@ impl App {
             self.diff_scroll = 0;
             self.diff_hscroll = 0;
             self.current_hunk = usize::from(snapshot.diff.total_hunks > 0);
+            self.hovered_plan_node = None;
+            self.diff_scroll_before_plan_hover = None;
         } else if self.current_hunk == 0 && snapshot.diff.total_hunks > 0 {
             // First diff for this path (hunks just arrived): start at hunk 1.
             self.current_hunk = 1;
         }
+        if diagram_retargeted {
+            if let Some(key) = previous_diagram_key {
+                self.diagram_sessions.insert(
+                    key,
+                    DiagramViewState {
+                        diagram: self.diagram.clone(),
+                        scroll: self.ai_plan_scroll,
+                    },
+                );
+            }
+            let restored = next_diagram_key
+                .as_ref()
+                .and_then(|key| self.diagram_sessions.get(key))
+                .cloned()
+                .unwrap_or_default();
+            self.diagram = restored.diagram;
+            self.ai_plan_scroll = restored.scroll;
+            self.hovered_plan_node = None;
+            self.diff_scroll_before_plan_hover = None;
+        }
+        self.diagram_sessions
+            .retain(|key, _| key.epoch == snapshot.epoch);
         // Selection identity survives the swap: directory insertion and asynchronously
         // arriving symbols both shift flat indices.
         let keep = self.selected_summary_key();
@@ -170,18 +279,11 @@ impl App {
                 .any(|file| file.path.starts_with(&format!("{directory}/")))
         });
         if generated_retargeted {
-            self.ai_plan_scroll = 0;
-            self.hovered_plan_node = None;
-            // A selected-impact change is a new diagram scope even when a generic plan
-            // reuses ids such as n1/n2 in the same epoch. Other equivalent refreshes keep
-            // stable free positions and only prune stale identities.
-            if impact_retargeted {
-                self.diagram = crate::diagram::DiagramState::default();
+            if plan_changed && !diagram_retargeted {
+                self.ai_plan_scroll = 0;
             }
             if let Some(plan) = self.snapshot.semantic.plan.as_ref() {
                 self.diagram.sync_plan(plan);
-            } else {
-                self.diagram = crate::diagram::DiagramState::default();
             }
         }
         if impact_retargeted {
@@ -189,6 +291,9 @@ impl App {
             self.downstream_scroll = 0;
         }
         self.clamp();
+        if !retargeted && !impact_retargeted {
+            self.refresh_plan_hover();
+        }
         if let Some(key) = keep {
             self.restore_selection(&key);
         }
@@ -264,7 +369,7 @@ impl App {
                 self.diff_selection = None;
             }
             Action::HoverPlanNode(target) => {
-                self.hovered_plan_node = target.filter(|target| self.plan_node(target).is_some());
+                self.set_plan_hover(target);
             }
             Action::TogglePlanNode(target) => {
                 self.focused = Pane::Impact;
@@ -298,6 +403,7 @@ impl App {
                 self.focused = Pane::Diff;
                 self.diff_selection = Some(selection);
             }
+            Action::SetAgentDiffSelection(_) => {}
             // Mouse: select a file/symbol row by logical index and focus Files. The
             // selection tracker emits the same SelectionChanged a keyboard move would.
             Action::SelectFileRow { logical_index } => {
@@ -426,16 +532,25 @@ impl App {
             | Action::SelectSymbol { .. }
             | Action::SelectionChanged { .. }
             | Action::DirectorySelectionChanged { .. }
-            | Action::AgentAsk(_)
-            | Action::AgentFeedback(_)
-            | Action::AgentDiagram(_)
+            | Action::AgentDiagram { .. }
             | Action::RefreshGit
+            | Action::GenerateAi
+            | Action::ToggleAiGenerationMode
             | Action::None => {}
         }
         self.clamp();
     }
 
     fn set_scope(&mut self, scope: ChangeScope) {
+        if let Some(key) = diagram_session_key(&self.snapshot) {
+            self.diagram_sessions.insert(
+                key,
+                DiagramViewState {
+                    diagram: self.diagram.clone(),
+                    scroll: self.ai_plan_scroll,
+                },
+            );
+        }
         self.snapshot.scope = scope;
         self.file_sel = 0;
         self.files_scroll = 0;
@@ -446,6 +561,7 @@ impl App {
         self.downstream_scroll = 0;
         self.ai_plan_scroll = 0;
         self.hovered_plan_node = None;
+        self.diff_scroll_before_plan_hover = None;
         self.diagram = crate::diagram::DiagramState::default();
         self.current_hunk = usize::from(self.snapshot.diff.total_hunks > 0);
     }
@@ -472,15 +588,51 @@ impl App {
             .and_then(|target| self.plan_node(target))
     }
 
-    /// Node whose code links are active. Transient hover wins; otherwise the expanded
-    /// inline card remains the pinned source while the pointer moves into the diff.
+    /// Node whose code links are active. Expansion is persistent presentation state, but
+    /// source highlighting is deliberately transient and follows only the mouse pointer.
     #[must_use]
     pub fn active_code_node(&self) -> Option<&codescope_core::PlanNode> {
-        self.hovered_node().or_else(|| {
-            self.diagram
-                .expanded_node()
-                .and_then(|target| self.plan_node(target))
-        })
+        self.hovered_node()
+    }
+
+    /// Apply transient box hover, including a reversible jump to its first linked diff row.
+    fn set_plan_hover(&mut self, target: Option<PlanNodeTarget>) {
+        let target = target.filter(|target| self.plan_node(target).is_some());
+        if target == self.hovered_plan_node {
+            return;
+        }
+        if target.is_some() && self.hovered_plan_node.is_none() {
+            self.diff_scroll_before_plan_hover = Some(self.diff_scroll);
+        }
+        self.hovered_plan_node = target;
+        if self.hovered_plan_node.is_some() {
+            self.refresh_plan_hover();
+        } else if let Some(original) = self.diff_scroll_before_plan_hover.take() {
+            self.diff_scroll = original;
+            self.sync_current_hunk();
+        }
+    }
+
+    /// Re-resolve the hover after an incremental plan publish. A retained node keeps its
+    /// emphasis/expansion; removal restores the diff position captured on pointer entry.
+    fn refresh_plan_hover(&mut self) {
+        let Some(target) = self.hovered_plan_node.clone() else {
+            return;
+        };
+        let Some(node) = self.plan_node(&target) else {
+            self.hovered_plan_node = None;
+            if let Some(original) = self.diff_scroll_before_plan_hover.take() {
+                self.diff_scroll = original;
+                self.sync_current_hunk();
+            }
+            return;
+        };
+        if let Some(anchor) = first_linked_diff_row(&self.snapshot.diff, node) {
+            self.diff_scroll = u16::try_from(anchor).unwrap_or(u16::MAX);
+        } else if let Some(original) = self.diff_scroll_before_plan_hover {
+            self.diff_scroll = original;
+        }
+        self.sync_current_hunk();
     }
 
     fn toggle_plan_node(&mut self, target: PlanNodeTarget) {
@@ -609,7 +761,7 @@ impl App {
             ScrollRegionId::Downstream => self.downstream_scroll = offset,
             ScrollRegionId::GeneratedImpact => {
                 self.ai_plan_scroll = offset;
-                self.hovered_plan_node = None;
+                self.set_plan_hover(None);
             }
         }
     }
@@ -1512,14 +1664,14 @@ mod tests {
     use codescope_core::{AiStatus, Epoch, FormKind, PlanNode, PlanNodeChange, VizForm};
 
     /// The repo-state epoch an AI status describes: Loading/Ready/Stale carry it; the
-    /// epoch-less statuses (Disabled/Idle/Failed) ride whatever repo state is current —
+    /// epoch-less statuses (Idle/Failed) ride whatever repo state is current —
     /// the fixtures below all stay on epoch 1 unless a test says otherwise.
     fn status_epoch(ai: &AiStatus) -> Epoch {
         match ai {
             AiStatus::Loading { since_epoch } => *since_epoch,
             AiStatus::WaitingForSymbols { epoch } | AiStatus::Debouncing { epoch } => *epoch,
             AiStatus::Ready { epoch } | AiStatus::Stale { epoch } => *epoch,
-            AiStatus::Disabled | AiStatus::Idle | AiStatus::Failed { .. } => Epoch(1),
+            AiStatus::Idle | AiStatus::Failed { .. } => Epoch(1),
         }
     }
 
@@ -1585,6 +1737,83 @@ mod tests {
             rows,
         ));
         app
+    }
+
+    #[test]
+    fn plan_hover_temporarily_jumps_to_code_and_expansion_stays_open() {
+        let mut snap = ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 2);
+        snap.diff = crate::snapshot::DiffPane {
+            title: "src/main.rs".into(),
+            focused_symbol: None,
+            rows: vec![
+                DiffRow::HunkHeader("@@ -10,2 +10,2 @@ first".into()),
+                DiffRow::Context {
+                    old_ln: 10,
+                    new_ln: 10,
+                    text: "first".into(),
+                },
+                DiffRow::HunkHeader("@@ -30,1 +30,2 @@ second".into()),
+                DiffRow::Add {
+                    new_ln: 30,
+                    text: "linked".into(),
+                },
+                DiffRow::Context {
+                    old_ln: 30,
+                    new_ln: 31,
+                    text: "tail".into(),
+                },
+            ],
+            current_hunk: 1,
+            total_hunks: 2,
+            syntax: std::sync::Arc::default(),
+        };
+        snap.semantic.plan.as_mut().unwrap().forms[0].nodes[0]
+            .code_refs
+            .push(codescope_core::PlanCodeRef::new(
+                codescope_core::FileId::new("src/main.rs").unwrap(),
+                1,
+                codescope_core::DiffSide::New,
+                30,
+                30,
+            ));
+        let mut app = App::new();
+        app.update(snap.clone());
+        app.diff_scroll = 1;
+        app.sync_current_hunk();
+        let target = PlanNodeTarget {
+            form: 0,
+            id: "n0".into(),
+        };
+
+        app.apply(Action::HoverPlanNode(Some(target.clone())));
+        assert_eq!(app.diff_scroll, 3, "hover jumps to the first linked row");
+        assert_eq!(app.current_hunk, 2);
+        app.apply(Action::TogglePlanNode(target.clone()));
+        assert_eq!(app.diagram.expanded_node(), Some(&target));
+
+        // A live-draft publish may add or refine other boxes while this one remains valid.
+        snap.semantic.plan.as_mut().unwrap().forms[0]
+            .nodes
+            .push(PlanNode::new("n2", "later", PlanNodeChange::Added).with_detail("arrived later"));
+        app.update(snap);
+        assert_eq!(app.hovered_plan_node.as_ref(), Some(&target));
+        assert_eq!(app.diagram.expanded_node(), Some(&target));
+
+        app.apply(Action::HoverPlanNode(None));
+        assert_eq!(
+            app.diff_scroll, 1,
+            "mouse-out restores the original position"
+        );
+        assert_eq!(app.current_hunk, 1);
+        assert!(
+            app.active_code_node().is_none(),
+            "an open box is not highlighted"
+        );
+        assert_eq!(
+            app.diagram.expanded_node(),
+            Some(&target),
+            "mouse-out does not collapse the clicked box"
+        );
     }
 
     #[test]
@@ -1684,5 +1913,48 @@ mod tests {
         app.update(snap);
         // b.go is still selected (its flat index moved from 1 to 3).
         assert_eq!(app.selected_file_path(), Some("b.go"));
+    }
+
+    #[test]
+    fn diagram_layout_and_expansion_restore_when_returning_to_a_file() {
+        fn selected_plan(file: &str) -> UiSnapshot {
+            let mut snapshot = ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 2);
+            snapshot.diff.title = file.to_string();
+            snapshot.impact.selected_change = Some(crate::snapshot::SelectedChange {
+                file: file.to_string(),
+                label: file.to_string(),
+                change: "modified",
+                interpretation: String::new(),
+                interpretation_source: crate::snapshot::InterpretationSource::Deterministic,
+            });
+            snapshot
+        }
+
+        let mut app = App::new();
+        app.update(selected_plan("a.go"));
+        let target = PlanNodeTarget {
+            form: 0,
+            id: "n0".to_string(),
+        };
+        app.apply(Action::MovePlanNode {
+            target: target.clone(),
+            x: 37,
+            y: 19,
+        });
+        app.apply(Action::TogglePlanNode(target.clone()));
+        app.ai_plan_scroll = 11;
+
+        app.update(selected_plan("b.go"));
+        assert!(app.diagram.positions().is_empty());
+        assert!(app.diagram.expanded_node().is_none());
+        assert_eq!(app.ai_plan_scroll, 0);
+
+        app.update(selected_plan("a.go"));
+        assert_eq!(
+            app.diagram.positions().get(&target),
+            Some(&crate::diagram::DiagramPosition { x: 37, y: 19 })
+        );
+        assert_eq!(app.diagram.expanded_node(), Some(&target));
+        assert_eq!(app.ai_plan_scroll, 11);
     }
 }

@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 /// Hard budget of research and diagram-edit tool calls per plan. Incremental construction
 /// needs room to inspect, create, revise, and validate without turning one missed detail
 /// into a terminal failure.
-pub const MAX_TOOL_CALLS: u32 = 48;
+pub const MAX_TOOL_CALLS: u32 = 128;
 
 /// Mutate the in-progress renderer-native diagram with one [`codescope_core::DiagramCommand`].
 pub const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
@@ -122,7 +122,7 @@ pub fn research_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "git_status_file",
-            description: "Show the captured Git status for one changed file: comparison scope, status, rename source, binary flag, line counts, and every hunk header.".into(),
+            description: "Show the captured Git status for one changed file: comparison scope, status, rename source, binary flag, line counts, and every hunk header. For a file or symbol selection, call this before git_diff_file so you do not blindly default to hunk 0.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {"path": file_path_prop},
@@ -132,7 +132,7 @@ pub fn research_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "git_diff_file",
-            description: "Read the captured unified diff for one changed file. Omit hunk_index for a bounded overview or supply a zero-based hunk index for exact annotated lines used by plan code_refs.".into(),
+            description: "Read the captured unified diff for one changed file. First use git_status_file to identify the decisive hunk(s); never choose hunk 0 merely because it is first. Omit hunk_index for a bounded overview, or supply a status-derived zero-based hunk index for exact annotated lines used by plan code_refs.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -199,7 +199,7 @@ pub fn semantic_tools() -> Vec<ToolDef> {
 }
 
 /// Incremental diagram tools. `edit_visualization` accepts the same tagged command JSON as
-/// the live `codescope agent diagram apply` controller endpoint.
+/// the live `codescope agent diagram edit` controller endpoint.
 #[must_use]
 pub fn diagram_tools() -> Vec<ToolDef> {
     let form_id = || {
@@ -229,13 +229,6 @@ pub fn diagram_tools() -> Vec<ToolDef> {
 
     let variants = vec![
         diagram_command_variant(
-            "reset",
-            "Clear the draft while preserving the server-owned epoch.",
-            Vec::new(),
-            &[],
-            json!({"op": "reset"}),
-        ),
-        diagram_command_variant(
             "set_intent",
             "Set the single reviewer-facing sentence displayed above the diagram.",
             vec![(
@@ -255,7 +248,7 @@ pub fn diagram_tools() -> Vec<ToolDef> {
         ),
         diagram_command_variant(
             "create_form",
-            "Create an empty renderer-native form before adding its nodes.",
+            "Create an empty renderer-native form before adding its nodes. Use sequence only for execution/lifecycle order proven by the selected diff; use a non-sequence form for isolated imports, declarations, configuration, or unrelated effects.",
             vec![
                 (
                     "form_id",
@@ -398,14 +391,14 @@ pub fn diagram_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: DIAGRAM_EDIT_TOOL_NAME,
-            description: "Apply exactly one atomic diagram command. Choose the operation-specific schema branch matching `op`; every branch lists its complete required fields, nested types, and a valid example. Build in this order: set_intent, create_form, create_node, create_edge, add_evidence. For create_node, pass `form_id` beside `node`; use `change: \"added\"|...` and only booleans inside `hint`. The arguments are the same JSON accepted by `codescope agent diagram apply`. Use inspect_visualization when ids or current state are uncertain.".into(),
+            description: "Apply exactly one atomic diagram command. Choose the operation-specific schema branch matching `op`; every branch lists its complete required fields, nested types, and a valid example. Build in this order: set_intent, create_form, create_node, create_edge, add_evidence. For create_node, pass `form_id` beside `node`; use `change: \"added\"|...` and only booleans inside `hint`. The arguments are the same JSON accepted by `codescope agent diagram edit`. Use inspect_visualization when ids or current state are uncertain.".into(),
             parameters: json!({
                 "type": "object",
                 "description": "A discriminated union of DiagramCommand objects. Exactly one `oneOf` branch must match the selected `op`.",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["reset", "set_intent", "create_form", "delete_form",
+                        "enum": ["set_intent", "create_form", "delete_form",
                                  "create_node", "update_node", "delete_node", "create_edge",
                                  "update_edge", "delete_edge", "add_evidence", "delete_evidence"],
                         "description": "Atomic edit operation."
@@ -730,6 +723,15 @@ pub trait ToolExecutor: Send + Sync {
         false
     }
 
+    /// Optional controller-selected first research operation.
+    ///
+    /// Production selection-scoped executors use this to establish a compact inventory before
+    /// the model chooses an exact diff. The default keeps lightweight and test executors fully
+    /// model-directed.
+    fn initial_research_tool(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Execute one read-only tool call. `arguments` is the parsed JSON arguments object.
     fn execute<'a>(
         &'a self,
@@ -764,7 +766,6 @@ mod tests {
     #[test]
     fn singleton_editor_uses_the_canonical_branch_for_every_operation() {
         for op in [
-            "reset",
             "set_intent",
             "create_form",
             "delete_form",
@@ -796,6 +797,7 @@ mod tests {
                 "{op} must be exact canonical branch"
             );
         }
+        assert!(diagram_tool_for_op("reset").is_none());
         assert!(diagram_tool_for_op("unknown").is_none());
     }
 
@@ -893,7 +895,7 @@ mod tests {
             "strict editor schema regressed to {wire_bytes} bytes"
         );
         let variants = edit.parameters["oneOf"].as_array().unwrap();
-        assert_eq!(variants.len(), 12);
+        assert_eq!(variants.len(), 11);
         for variant in variants {
             assert_eq!(variant["type"], "object");
             assert_eq!(variant["additionalProperties"], false);
@@ -991,7 +993,7 @@ mod tests {
         assert!(!is_read_only_tool("rm_rf"));
         assert!(is_diagram_tool(DIAGRAM_EDIT_TOOL_NAME));
         assert!(is_diagram_tool(DIAGRAM_INSPECT_TOOL_NAME));
-        assert_eq!(MAX_TOOL_CALLS, 48);
+        assert_eq!(MAX_TOOL_CALLS, 128);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 Scope: how codescope uses an LLM to *choose and parameterize* visualizations of the current
 change. The app owns facts, validation, and rendering; model claims never become authoritative
-without validation. Interactive startup requires an enabled AI provider. Deterministic impact
+without validation. Interactive startup requires a configured AI provider. Deterministic impact
 remains available outside the generated result, but a failed AI view reports failure explicitly
 instead of impersonating a summary with fallback data.
 
@@ -129,8 +129,9 @@ Validation is local, deterministic, and has no AI in the loop. Pipeline:
 4. **Hunk and code-link validation.** Plan evidence references `(file, hunk_index)`. Every
    AI node also carries one or two exact code ranges. The validator confirms the file/hunk and
    each one-based line on the declared old/new side against parsed diff rows before the range can
-   drive hover highlighting. Reversed, oversized, missing, or wrong-side ranges trigger a bounded
-   repair; the model never emits screen coordinates.
+   drive hover highlighting and the temporary diff jump. Leaving the box restores the user's prior
+   diff position; expanding a box does not pin its source highlight. Reversed, oversized, missing,
+   or wrong-side ranges trigger a bounded repair; the model never emits screen coordinates.
 
 Hallucination policy (per form):
 - **Tree forms** (`changed_symbol_tree`, `call_tree`, `type_impl_tree`, `before_after`):
@@ -151,8 +152,10 @@ The current AI flow is bounded differently:
 1. The initial request contains the review assignment only (selection, virtual cwd, comparison
    scope, changed-file count, and assignment), not proactive source, hunks, diagnostics, symbols,
    or relationship lists.
-2. The model obtains selection-scoped facts with tools. `git_diff_file` is authoritative for the
-   comparison and code references.
+2. The model obtains selection-scoped facts with tools. The controller first requires
+   `list_directory` for a directory or `git_status_file` for a file/symbol so hunk choice follows
+   an inventory instead of defaulting blindly to hunk zero. `git_diff_file` is authoritative for
+   the comparison and code references.
 3. Once a nonempty exact diff result is retained, every later request is a fresh compact handoff:
    the original assignment, retained exact diff results first (at most four), bounded successful
    supplementary reads tagged with their originating tool (at most eight), the current draft, and
@@ -161,7 +164,7 @@ The current AI flow is bounded differently:
    priority over supplementary reads even when tools returned them later.
 
 Current tool surface (OpenAI tool-calling format; paths are repo-relative and sandboxed to the
-selection boundary; results are capped; the up-to-eight research/editor tools share at most 48
+selection boundary; results are capped; the up-to-eight research/editor tools share at most 128
 operations):
 
 | tool | purpose |
@@ -188,12 +191,15 @@ Inference (`https://api.pinference.ai/api/v1`), and Anthropic
 (`https://api.anthropic.com/v1`). Compatible local Chat Completions endpoints such as Ollama,
 vLLM, and LM Studio can be selected with an explicit base URL.
 
-Plan construction uses shared incremental diagram tools. Initial research and normal full-schema
-construction turns use `Auto` tool choice. After exact diff evidence is retained, the initial
+Plan construction uses shared incremental diagram tools. The selection-specific initial inventory
+uses `Required`; later research and normal full-schema construction turns use `Auto` tool choice.
+After exact diff evidence is retained, the initial
 intent/form bootstrap and a focused recovery from a provider-truncated response use `Required`
 with one controller-selected canonical editor branch; the following normal turn returns to
 full-schema `Auto`. Atomic edits mutate a bounded draft, inspection returns its current state, and
-a tool-less full `Auto` turn requests deterministic validation/publication. There is no whole-plan
+a tool-less full `Auto` turn requests deterministic validation/publication. A structurally complete
+draft also validates after a small bounded refinement window or before an unsolicited destructive
+rebuild, preventing endless edit cycles. There is no whole-plan
 tool fallback or separate model completion tool.
 
 **Crate choice:** `reqwest` 0.13.4 with the workspace's `json`, `stream`, and `rustls`
@@ -206,10 +212,10 @@ HTTP streaming remains off. Accepted draft edits remain available through the sh
 between ordinary tool turns the TUI shows each research/edit call progressing through
 running/succeeded/failed. Diagram publication remains atomic after validation.
 
-Config resolution remains env-first, but interactive startup requires the result to be enabled:
-- `CODESCOPE_AI=on` supports keyless local endpoints; explicit `off` prevents startup.
-- Supported AI environment settings are `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`, and
-  `CODESCOPE_AI_TIMEOUT_MS`. Key resolution uses a config-file `api_key_env` when named, then
+Config resolution remains env-first, and every resolved configuration names a usable provider:
+- Supported AI environment settings are `CODESCOPE_AI_BASE_URL` and `CODESCOPE_AI_TIMEOUT_MS`.
+  An explicit base URL supports keyless local endpoints. Key resolution uses a config-file
+  `api_key_env` when named, then
   `PRIME_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`; an arbitrary named key requires an
   explicit base URL. `PRIME_TEAM_ID` is optional for Prime Inference. `--model` / `-m` selects the
   model. Defaults follow the resolved key's Prime, OpenAI, or Anthropic provider. Keys are wrapped
@@ -233,7 +239,7 @@ language-server inspection. Absolute paths, credentials, and environment values 
    v0. Drop invalid nodes in tree forms (>20% or bad root → reject), reject broken flow/sequence
    forms outright, and report failure explicitly.
 4. Keep context bounded: retained compact research is at most 64 KiB and the complete fresh
-   handoff at most 128 KiB. The up-to-eight current research/editor tools share at most 48
+   handoff at most 128 KiB. The current research/editor tools share at most 128
    operations; retained exact Git diff results remain authoritative and take priority over tagged
    supplementary reads.
 5. Client: reqwest + serde, OpenAI-compatible chat completions and the shared incremental

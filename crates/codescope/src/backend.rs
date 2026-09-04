@@ -1,11 +1,12 @@
 //! The non-interactive JSON backend and live-agent client:
-//! `codescope <scan|changeset|analyze|digest|bases|debug-ai|agent>`.
+//! `codescope <scan|changeset|analyze|digest|bases|debug-ai|agent|skills>`.
 //!
 //! This module is wiring, not new analysis: every subcommand reuses the existing
 //! [`GitRepo`] / [`AnalysisEngine`] / [`codescope_analysis::ChangeDigest`] APIs and
 //! serializes their results. The backend never starts the TUI (see `main.rs`).
 //!
-//! Contract (stable for LLM/tool consumers):
+//! Analysis and live-agent contract (stable for LLM/tool consumers; `skills` deliberately
+//! emits human-readable skill content and installation status):
 //!
 //! - JSON on **stdout**, pretty-printed by default, single-line with `--compact`.
 //! - `{"error": ...}` on **stderr** and exit code 1 on failure (e.g. a non-git path).
@@ -57,6 +58,8 @@ pub enum BackendCommand {
     DebugAi(DebugAiArgs),
     /// Inspect and control a codescope TUI already running in this repository.
     Agent(crate::agent_protocol::AgentArgs),
+    /// Show, install, or update the bundled Codescope agent skill.
+    Skills(crate::skills::SkillsArgs),
 }
 
 /// Shared arguments for subcommands that only read git state.
@@ -193,6 +196,7 @@ async fn run_inner(cmd: &BackendCommand) -> Result<()> {
         BackendCommand::Bases(args) => bases(args).await,
         BackendCommand::DebugAi(args) => debug_ai(args).await,
         BackendCommand::Agent(args) => crate::agent_protocol::run_client(args).await,
+        BackendCommand::Skills(args) => crate::skills::run(args),
     }
 }
 
@@ -326,10 +330,6 @@ async fn debug_ai_session(args: &DebugAiArgs) -> Result<DebugAiOut> {
     let ai_config = config
         .resolve_ai_config(args.model.as_deref(), args.reasoning_effort)
         .context("cannot resolve AI configuration")?;
-    anyhow::ensure!(
-        ai_config.enabled,
-        "AI is not configured; set PRIME_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY"
-    );
     tracing::info!(
         elapsed = ?phase.elapsed(),
         base_url = %ai_config.base_url,
@@ -362,7 +362,7 @@ async fn debug_ai_session(args: &DebugAiArgs) -> Result<DebugAiOut> {
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<UiSnapshot>();
     let (action_tx, action_rx) = mpsc::channel::<Action>(32);
     let (event_tx, event_rx) = mpsc::channel::<DispatchEvent>(64);
-    let mut dispatcher = Dispatcher::new(repo, engine, Some(ai), output_tx, event_tx.clone());
+    let mut dispatcher = Dispatcher::new(repo, engine, ai, output_tx, event_tx.clone());
     if let Some(reason) = engine_unavailable {
         dispatcher = dispatcher.with_engine_unavailable(reason);
     }
@@ -497,6 +497,10 @@ async fn drive_debug_ai(
         })
         .await
         .context("dispatcher stopped before accepting the debug selection")?;
+    actions
+        .send(Action::GenerateAi)
+        .await
+        .context("dispatcher stopped before accepting debug AI generation")?;
     tracing::info!(
         elapsed = ?started.elapsed(),
         file = %file,
@@ -594,9 +598,11 @@ fn status_suffix(snapshot: &UiSnapshot) -> String {
 
 /// Discover the repository containing `path` (user-supplied; reported verbatim in errors).
 async fn discover(path: &Utf8Path) -> Result<GitRepo> {
-    GitRepo::discover(path)
+    let repo = GitRepo::discover(path)
         .await
-        .with_context(|| format!("not a git repository: {path}"))
+        .with_context(|| format!("not a git repository: {path}"))?;
+    codescope_telemetry::set_repository(repo.toplevel().to_string());
+    Ok(repo)
 }
 
 /// The shared `analyze`/`digest` pipeline: change-set in, snapshot out. When no language

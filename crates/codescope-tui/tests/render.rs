@@ -184,8 +184,11 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
     let mut app = App::new();
 
     // AI generation is automatic; the old manual a/A controls are intentionally inert.
-    assert_eq!(map_key(key(KeyCode::Char('a')), &app), Action::None);
-    assert_eq!(map_key(key(KeyCode::Char('A')), &app), Action::None);
+    assert_eq!(map_key(key(KeyCode::Char('a')), &app), Action::GenerateAi);
+    assert_eq!(
+        map_key(key(KeyCode::Char('A')), &app),
+        Action::ToggleAiGenerationMode
+    );
 
     let mut loading = sample();
     loading.ai = AiStatus::Loading {
@@ -460,7 +463,7 @@ fn picker_renders_models_and_current() {
 }
 
 #[test]
-fn picker_distinguishes_discovery_failure_from_disabled_ai() {
+fn picker_discovery_failure_keeps_the_current_model_available() {
     let backend = TestBackend::new(120, 30);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut app = App::new();

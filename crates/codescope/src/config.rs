@@ -24,6 +24,26 @@ const SCHEMA_VERSION: u32 = 1;
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 const STALE_LOCK_AGE: Duration = Duration::from_secs(30);
 
+/// Always-on local telemetry lives beside the resolved global config. Environments without
+/// a discoverable config directory fall back to a process-independent temporary location.
+pub(crate) fn telemetry_path() -> PathBuf {
+    telemetry_path_for(resolve_config_path(
+        |name| std::env::var(name).ok(),
+        cfg!(windows),
+    ))
+}
+
+fn telemetry_path_for(config_path: Option<PathBuf>) -> PathBuf {
+    config_path.map_or_else(
+        || {
+            std::env::temp_dir()
+                .join("codescope")
+                .join("telemetry.jsonl")
+        },
+        |path| path.with_file_name("telemetry.jsonl"),
+    )
+}
+
 /// Parsed v1 global configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -229,9 +249,6 @@ impl ConfigStore {
         F: Fn(&str) -> Option<String>,
     {
         let mut resolved = AiConfig::resolve(Some(&self.config.ai.runtime), |name| env(name))?;
-        if !resolved.enabled {
-            return Ok(resolved);
-        }
         if let Some(model) = model_override
             .map(str::trim)
             .filter(|model| !model.is_empty())
@@ -534,6 +551,20 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_is_a_sibling_of_the_resolved_config() {
+        assert_eq!(
+            telemetry_path_for(Some(PathBuf::from("/xdg/codescope/custom.toml"))),
+            PathBuf::from("/xdg/codescope/telemetry.jsonl")
+        );
+        assert_eq!(
+            telemetry_path_for(None),
+            std::env::temp_dir()
+                .join("codescope")
+                .join("telemetry.jsonl")
+        );
+    }
+
+    #[test]
     fn partial_config_and_model_precedence_are_provider_specific() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -640,7 +671,7 @@ diff_wrap = true
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "version = 1\n[ai]\nenabled = true\napi_key = \"do-not-store-this\"\n",
+            "version = 1\n[ai]\napi_key = \"do-not-store-this\"\n",
         )
         .unwrap();
         let store = ConfigStore::load_path(path);

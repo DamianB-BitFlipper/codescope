@@ -7,7 +7,7 @@ use codescope_ai::{
     diagram_tools, research_tools, AiActivityObserver, AiActivityUpdate, AiClient, AiClientOptions,
     AiConfig, AiError, AiOutcome, AiService, AiToolActivityState, ChatMessage, DiagramObserver,
     FactView, Lookup, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolDef, ToolExecError,
-    ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
+    ToolExecutor, DIAGRAM_EDIT_TOOL_NAME, MAX_TOOL_CALLS,
 };
 use codescope_core::{
     DiagramCommand, DiagramDraft, DiagramNodePatch, DiffSide, EntityRef, Epoch, FileId, FormKind,
@@ -29,13 +29,12 @@ const REPO_ROOT: &str = "/abs/fixture/root";
 
 fn config_for(provider: &ScriptedProvider, timeout: Duration) -> AiConfig {
     AiConfig {
-        enabled: true,
         base_url: format!("{}/v1", provider.base_url()),
         model: "codescope-test/model".into(),
         reasoning_effort: ReasoningEffort::Default,
         api_key: Some(SecretString::from("sk-test".to_string())),
         timeout,
-        max_tool_calls: 48,
+        max_tool_calls: MAX_TOOL_CALLS,
         prime_team_id: None,
     }
 }
@@ -278,6 +277,34 @@ impl ToolExecutor for IncrementalExecutor {
 
     fn requires_research(&self) -> bool {
         true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: &'a Value,
+    ) -> BoxFuture<'a, Result<String, ToolExecError>> {
+        self.0.execute(name, arguments)
+    }
+}
+
+#[derive(Default)]
+struct InventoryFirstExecutor(RecordingExecutor);
+
+impl ToolExecutor for InventoryFirstExecutor {
+    fn available_tools(&self) -> Vec<ToolDef> {
+        research_tools()
+            .into_iter()
+            .chain(diagram_tools())
+            .collect()
+    }
+
+    fn requires_research(&self) -> bool {
+        true
+    }
+
+    fn initial_research_tool(&self) -> Option<&'static str> {
+        Some("git_status_file")
     }
 
     fn execute<'a>(
@@ -1458,7 +1485,7 @@ async fn incremental_tools_build_and_publish_the_observed_live_draft() {
     assert_eq!(
         requests.len(),
         11,
-        "diff, two required bootstrap calls, six Auto edits, completion"
+        "diff, two required bootstrap calls, seven Auto edits, and completion"
     );
     assert_eq!(requests[0].body_json().unwrap()["tool_choice"], "auto");
     for (index, op) in [(1, "set_intent"), (2, "create_form")] {
@@ -1626,7 +1653,7 @@ async fn bootstrap_then_auto_applies_canonical_commands_on_fresh_turns() {
     assert_eq!(
         requests.len(),
         11,
-        "diff, two required bootstrap calls, six Auto edits, completion"
+        "diff, two required bootstrap calls, seven Auto edits, and completion"
     );
     assert_eq!(requests[0].body_json().unwrap()["tool_choice"], "auto");
     for (index, op) in [(1, "set_intent"), (2, "create_form")] {
@@ -1657,6 +1684,56 @@ async fn bootstrap_then_auto_applies_canonical_commands_on_fresh_turns() {
             .unwrap()
             .contains("CONSTRUCTION PROTOCOL"));
     }
+}
+
+/// Regression for a live Luna trace that repeatedly set the intent, deleted the only form, and
+/// rebuilt the same nodes until all 128 operations were gone. Once a complete draft gets one
+/// final targeted edit, the controller must validate it before the model can start that cycle.
+#[tokio::test]
+async fn complete_candidate_publishes_before_a_scripted_delete_rebuild_loop() {
+    let epoch = Epoch(20);
+    let plan = smallest_plan(FormKind::Sequence, epoch);
+    let commands = construction_commands(&plan);
+    let polish = DiagramCommand::SetIntent {
+        intent: "Explain the selected behavior and its published result.".to_string(),
+    };
+    let provider = ScriptedProvider::start(
+        [AiScriptStep::tool_call(
+            "git_diff_file",
+            json!({"path": MIDDLEWARE_FILE, "hunk_index": 0}),
+        )]
+        .into_iter()
+        .chain(commands.iter().map(diagram_step))
+        .chain([
+            diagram_step(&polish),
+            // This is exactly the destructive next step from the live trace. It must remain
+            // unconsumed because the accepted polish edit triggers controller validation.
+            diagram_step(&DiagramCommand::DeleteForm {
+                form_id: "main".to_string(),
+            }),
+        ]),
+    )
+    .await
+    .unwrap();
+    let service = service_for(&provider);
+
+    let outcome = service
+        .request_plan(
+            "small research brief",
+            &IncrementalExecutor::default(),
+            &FixtureFacts,
+            epoch,
+        )
+        .await;
+    let AiOutcome::Plan(plan, report) = outcome else {
+        panic!("expected the complete candidate to publish, got {outcome:?}");
+    };
+    assert_eq!(report.verdict, ValidationVerdict::Valid);
+    assert_eq!(
+        plan.intent,
+        "Explain the selected behavior and its published result."
+    );
+    assert_eq!(provider.requests().len(), commands.len() + 3);
 }
 
 #[tokio::test]
@@ -1723,9 +1800,9 @@ async fn compact_length_uses_fresh_focused_singleton_without_replay_or_repair() 
     assert!(matches!(outcome, AiOutcome::Plan(_, _)), "got {outcome:?}");
 
     let requests = provider.requests();
-    // One request each for diff, intent, form, capped Auto, focused node, every remaining
-    // command, and the final tool-less completion.
-    assert_eq!(requests.len(), commands.len() + 5);
+    // One request each for diff, intent, form, capped Auto, focused node, and every remaining
+    // command. The bounded finalization gate validates before the scripted tool-less response.
+    assert_eq!(requests.len(), commands.len() + 4);
     let capped_auto = requests[3].body_json().unwrap();
     let focused = requests[4].body_json().unwrap();
     let after_focused = requests[5].body_json().unwrap();
@@ -1766,7 +1843,7 @@ async fn compact_length_uses_fresh_focused_singleton_without_replay_or_repair() 
     );
     assert_eq!(
         compact_handoff(&focused)["controller_state"]["remaining_operations"],
-        45
+        json!(MAX_TOOL_CALLS - 3)
     );
     for body in [&focused, &after_focused] {
         let messages = body["messages"].as_array().unwrap();
@@ -2100,6 +2177,8 @@ async fn completion_repair_uses_a_fresh_compact_handoff_and_clears_feedback_afte
         1_000,
         1_000,
     );
+    let mut invalid_first_node = expected.forms[0].nodes[0].clone();
+    invalid_first_node.code_refs = vec![invalid_outside_hunk];
     let commands = [
         DiagramCommand::SetIntent {
             intent: expected.intent.clone(),
@@ -2110,7 +2189,7 @@ async fn completion_repair_uses_a_fresh_compact_handoff_and_clears_feedback_afte
         },
         DiagramCommand::CreateNode {
             form_id: "main".to_string(),
-            node: expected.forms[0].nodes[0].clone(),
+            node: invalid_first_node,
         },
         DiagramCommand::CreateNode {
             form_id: "main".to_string(),
@@ -2148,24 +2227,10 @@ async fn completion_repair_uses_a_fresh_compact_handoff_and_clears_feedback_afte
         json!({"path": MIDDLEWARE_FILE, "hunk_index": 0}),
     )];
     script.extend(commands.iter().map(diagram_step));
-    let inject_wide = DiagramCommand::UpdateNode {
-        form_id: "main".to_string(),
-        node_id: "n1".to_string(),
-        patch: DiagramNodePatch {
-            code_refs: Some(vec![invalid_outside_hunk]),
-            ..DiagramNodePatch::default()
-        },
-    };
-    script.push(diagram_step(&inject_wide));
-    script.extend([
-        AiScriptStep::AssistantText {
-            content: "tool-less invalid completion must not be replayed".to_string(),
-        },
-        diagram_step(&repair),
-        AiScriptStep::AssistantText {
-            content: String::new(),
-        },
-    ]);
+    script.push(AiScriptStep::AssistantText {
+        content: "validate the invalid complete candidate".to_string(),
+    });
+    script.push(diagram_step(&repair));
     let provider = ScriptedProvider::start(script).await.unwrap();
     let service = service_for(&provider);
 
@@ -2184,8 +2249,8 @@ async fn completion_repair_uses_a_fresh_compact_handoff_and_clears_feedback_afte
     assert_eq!(plan.forms[0].nodes[0].code_refs[0].start_line, 5);
 
     let requests = provider.requests();
-    assert_eq!(requests.len(), 14);
-    let repair_request = requests[12].body_json().unwrap();
+    assert_eq!(requests.len(), 12);
+    let repair_request = requests[11].body_json().unwrap();
     let repair_messages = repair_request["messages"].as_array().unwrap();
     assert_eq!(repair_messages.len(), 2);
     assert_eq!(repair_messages[0]["role"], "system");
@@ -2207,29 +2272,9 @@ async fn completion_repair_uses_a_fresh_compact_handoff_and_clears_feedback_afte
         repair_handoff["current_draft"]["forms"][0]["nodes"][0]["code_refs"][0]["end_line"],
         1_000
     );
-    assert!(
-        !repair_messages
-            .iter()
-            .filter_map(|message| message["content"].as_str())
-            .any(|content| content.contains("tool-less invalid completion")),
-        "completion prose must not survive the fresh repair handoff"
-    );
-
-    let final_request = requests[13].body_json().unwrap();
-    let final_messages = final_request["messages"].as_array().unwrap();
-    assert_eq!(final_messages.len(), 2);
-    assert_eq!(final_messages[0]["role"], "system");
-    assert_eq!(final_messages[1]["role"], "user");
-    assert!(final_request["tools"].as_array().unwrap().len() > 1);
-    assert!(final_messages
+    assert!(repair_messages
         .iter()
         .all(|message| !matches!(message["role"].as_str(), Some("assistant" | "tool"))));
-    let final_handoff = compact_handoff(&final_request);
-    assert!(final_handoff["controller_feedback"].is_null());
-    assert_eq!(
-        final_handoff["current_draft"]["forms"][0]["nodes"][0]["code_refs"][0]["end_line"],
-        8
-    );
 }
 
 #[tokio::test]
@@ -2719,7 +2764,10 @@ async fn precompact_diff_and_four_node_edits_are_staged_without_draft_mutation()
     );
     let handoff = compact_handoff(&bootstrap);
     assert_eq!(handoff["current_draft"]["forms"], json!([]));
-    assert_eq!(handoff["controller_state"]["remaining_operations"], 47);
+    assert_eq!(
+        handoff["controller_state"]["remaining_operations"],
+        json!(MAX_TOOL_CALLS - 1)
+    );
     assert!(observed
         .lock()
         .unwrap()
@@ -2774,7 +2822,10 @@ async fn normal_auto_forced_stage_rejects_multi_calls_atomically_and_is_bounded(
         assert!(body["tools"].as_array().unwrap().len() > 1);
         let handoff = compact_handoff(&body);
         assert_eq!(handoff["current_draft"]["forms"][0]["nodes"], json!([]));
-        assert_eq!(handoff["controller_state"]["remaining_operations"], 45);
+        assert_eq!(
+            handoff["controller_state"]["remaining_operations"],
+            json!(MAX_TOOL_CALLS - 3)
+        );
     }
 }
 
@@ -2963,6 +3014,49 @@ async fn research_executor_rejects_a_plan_until_one_tool_succeeds() {
                     == "set_intent"
         })
     }));
+}
+
+#[tokio::test]
+async fn controller_requires_status_inventory_before_a_file_diff() {
+    let epoch = Epoch(6);
+    let plan = smallest_plan(FormKind::Sequence, epoch);
+    let commands = construction_commands(&plan);
+    let mut script = vec![
+        AiScriptStep::tool_call("git_status_file", json!({"path": MIDDLEWARE_FILE})),
+        AiScriptStep::tool_call(
+            "git_diff_file",
+            json!({"path": MIDDLEWARE_FILE, "hunk_index": 0}),
+        ),
+    ];
+    script.extend(commands.iter().map(diagram_step));
+    script.push(AiScriptStep::AssistantText {
+        content: String::new(),
+    });
+    let provider = ScriptedProvider::start(script).await.unwrap();
+    let service = service_for(&provider);
+    let executor = InventoryFirstExecutor::default();
+
+    let outcome = service
+        .request_plan("file selection brief", &executor, &FixtureFacts, epoch)
+        .await;
+    assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), commands.len() + 3);
+    let inventory = requests[0].body_json().unwrap();
+    assert_eq!(inventory["tool_choice"], "required");
+    assert_eq!(inventory["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(inventory["tools"][0]["function"]["name"], "git_status_file");
+    let diff = requests[1].body_json().unwrap();
+    assert_eq!(diff["tool_choice"], "auto");
+    assert!(diff["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool"));
+    let calls = executor.0.calls.lock().unwrap();
+    assert_eq!(calls[0].0, "git_status_file");
+    assert_eq!(calls[1].0, "git_diff_file");
 }
 
 #[tokio::test]
@@ -3763,8 +3857,9 @@ async fn repeated_toolless_empty_draft_repair_explicitly_requires_editor_call() 
 
 #[tokio::test]
 async fn tool_call_budget_enforced() {
-    // One message requesting 49 calls: the 49th exceeds the configured budget of 48.
-    let names: Vec<&str> = std::iter::repeat_n("list_directory", 49).collect();
+    // One message requesting 129 calls: the final call exceeds the configured budget of 128.
+    let names: Vec<&str> =
+        std::iter::repeat_n("list_directory", (MAX_TOOL_CALLS + 1) as usize).collect();
     let provider = ScriptedProvider::start([tool_call_step(&names)])
         .await
         .unwrap();
@@ -3779,7 +3874,7 @@ async fn tool_call_budget_enforced() {
     assert!(reason.contains("budget exceeded"), "{reason}");
     assert_eq!(
         executor.count.load(Ordering::SeqCst),
-        48,
+        MAX_TOOL_CALLS,
         "exactly the budget may execute"
     );
     assert_eq!(provider.requests().len(), 1);
@@ -3787,10 +3882,10 @@ async fn tool_call_budget_enforced() {
 
 #[tokio::test]
 async fn budget_spans_multiple_turns() {
-    // 25 calls, then 24 more: the final call must trip the 48-operation budget.
+    // 65 calls, then 64 more: the final call must trip the 128-operation budget.
     let provider = ScriptedProvider::start([
-        tool_call_step(&["list_directory"; 25]),
-        tool_call_step(&["read_file"; 24]),
+        tool_call_step(&["list_directory"; 65]),
+        tool_call_step(&["read_file"; 64]),
     ])
     .await
     .unwrap();
@@ -3800,7 +3895,7 @@ async fn budget_spans_multiple_turns() {
         .request_plan("digest", &executor, &FixtureFacts, Epoch(1))
         .await;
     assert!(matches!(outcome, AiOutcome::Failed(_)), "got {outcome:?}");
-    assert_eq!(executor.count.load(Ordering::SeqCst), 48);
+    assert_eq!(executor.count.load(Ordering::SeqCst), MAX_TOOL_CALLS);
     assert_eq!(provider.requests().len(), 2);
 }
 

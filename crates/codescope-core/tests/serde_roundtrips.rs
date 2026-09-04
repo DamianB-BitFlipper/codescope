@@ -366,7 +366,6 @@ fn viz_domain_roundtrips() {
         roundtrip(&verdict);
     }
     for status in [
-        AiStatus::Disabled,
         AiStatus::Idle,
         AiStatus::Loading {
             since_epoch: Epoch(3),

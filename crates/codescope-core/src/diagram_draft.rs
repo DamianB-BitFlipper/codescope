@@ -94,10 +94,6 @@ impl DiagramDraft {
 
     fn apply_inner(&mut self, command: &DiagramCommand) -> Result<String, DiagramEditError> {
         match command {
-            DiagramCommand::Reset => {
-                *self = Self::new(self.epoch);
-                Ok("cleared the diagram draft".into())
-            }
             DiagramCommand::SetIntent { intent } => {
                 ensure_text("intent", intent, 1_000)?;
                 self.intent = intent.trim().to_string();
@@ -273,8 +269,6 @@ pub struct DiagramDraftForm {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DiagramCommand {
-    /// Clear the draft while preserving its server-owned epoch.
-    Reset,
     /// Set the sentence displayed above the diagram.
     SetIntent {
         /// Concrete reviewer-facing sentence.

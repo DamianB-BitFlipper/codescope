@@ -44,7 +44,7 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    overwrite a newer repo state, and a slow subsystem must never freeze the UI. (research 06)
 
    **Refresh policy (TUI)**: startup performs one initial refresh. Repository watching is
-   opt-in with `--watch`; otherwise the repository changes only when the user presses `R`
+   opt-in with `--watch`; otherwise the repository changes only when the user presses `g`
    (scope and base selections also refresh because they are explicit comparison changes).
    Both manual and watcher events enter the same epoch-gated dispatcher path. Headless
    commands are one-shot and never start native watchers.
@@ -55,7 +55,9 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    work immediately. Each row carries a `FileSemanticLoad` state (Unloaded/Loading/Ready/
    Unsupported/Failed), and `Tab` controls directory/file visibility only. Symbol relation
    queries and file/symbol AI generation are gated on the selected file's Ready state;
-   directory AI generation uses the already-available changed-file/hunk facts. The
+   directory AI generation uses the already-available changed-file/hunk facts. Generation is
+   manual by default (`a` triggers the current selection); `A` enables or disables automatic
+   selection-following generation for the session. The
    language-server child is limited to two workers, and content-addressed symbol trees are
    reused across epochs. The non-interactive backend (`analyze`/`digest`) stays eager via
    `refresh_with_ctx`.
@@ -74,23 +76,26 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 
    **Live control protocol**: on Unix, the interactive binary also owns one repository-specific,
    owner-only Unix socket. `codescope agent` projects the latest `UiSnapshot` into a bounded JSON
-   context and translates `focus`/`ask`/`feedback`/`diagram`/`refresh` requests into typed TUI
-   `Action`s.
+   context and translates `focus`/`diagram`/`refresh` requests into typed TUI `Action`s. It also
+   projects authoritative hunks from the dispatcher-captured change-set for external evidence.
    Focus first updates the visible tree cursor and then passes through the normal selection
    tracker, preventing the retained cursor from undoing remote control. The protocol exposes no
-   shell or raw plan injection. Questions and feedback are selection-scoped, untrusted prompt
-   guidance. Diagram edits are typed `DiagramCommand`s shared with the internal model tools;
-   both writers mutate the same draft and cross the existing evidence validator before final
-   publication.
+   shell, internal-AI prompt, or raw plan injection. The external agent researches with its host
+   tools, anchors diagram claims to captured diff coordinates, and applies typed `DiagramCommand`s
+   shared with the internal model tools. Controller edits acknowledge through the published
+   snapshot, so each CLI call returns the resulting draft or validation error synchronously.
 6. **AI**: OpenAI-compatible Chat Completions and native Anthropic Messages via reqwest 0.13. A
    bounded loop researches and
    incrementally builds the renderer-native `DiagramDraft` through create/update/delete tools.
-   Initial research and normal full-schema construction turns use `Auto` tool choice. Once an
-   exact diff is retained, the intent/form bootstrap and a focused recovery from a
-   provider-truncated response use `Required` with one controller-selected canonical editor
+   Production research starts with one selection-specific `Required` inventory call
+   (`list_directory` for a directory, `git_status_file` for a file/symbol), so a multi-hunk file
+   cannot silently collapse to hunk zero. Later research and normal full-schema construction turns
+   use `Auto` tool choice. Once an exact diff is retained, the intent/form bootstrap and a focused
+   recovery from a provider-truncated response use `Required` with one controller-selected canonical editor
    branch; the next normal turn returns to full-schema `Auto`. A tool-less full `Auto` turn
-   validates and publishes the draft. Six structural forms (legacy `impact_summary`/
-   `focused_diff` are rejected at the AI plan boundary); reviewer-first contract (required
+   validates and publishes the draft. Complete drafts also auto-validate after a small bounded
+   finalization window, and before an unsolicited destructive rebuild. Six structural forms
+   (legacy `impact_summary`/`focused_diff` are rejected at the AI plan boundary); reviewer-first contract (required
    intent/forms/evidence, 1–4 evidence, default 4 / hard max 5 nodes and ≤8 edges per form,
    nonempty 1–2 forms — core keeps larger node backstops). Plan schema v6 requires every AI node
    to carry 1–2 exact old/new diff ranges and permits one optional expanded explanation. The
@@ -114,18 +119,20 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    ceiling. The initial context is an assignment-only research brief. After a retained exact diff,
    every later compact handoff is rebuilt from that assignment, retained exact diffs first,
    bounded tool-tagged supplementary reads, the current draft, and controller feedback—never an
-   old tool transcript. Up to eight current research/editor tools share the 48-operation loop.
+   old tool transcript. Up to eight current research/editor tools share the 128-operation loop.
    The headless backend uses the same policy.
-   A live-agent question replaces the current selection's presentation guidance; feedback also
-   supplies that selection's previous validated plan as the revision seed. Replacing guidance
-   may cancel only an older request for that same target. Navigation itself retains the 16-entry
-   active-request behavior above.
+   External-agent diagram edits cancel only an older internal writer for that same selection.
+   Navigation itself retains the 16-entry active-request behavior above.
    Interactive startup requires a resolved AI provider; missing or disabled configuration is a
    startup error rather than a reduced-function mode. (research 05)
 
-7. **Privacy**: 4-layer exclusion (git ignore rules < .codescopeignore < compiled denylist <
-   content sniffing), applied to diff paths too; keys via env name only into secrecy::SecretString.
-   (research 07)
+7. **Privacy and local telemetry**: 4-layer outbound exclusion (git ignore rules <
+   .codescopeignore < compiled denylist < content sniffing), applied to diff paths too; keys via
+   env name only into secrecy::SecretString. Separately, an always-on local JSONL sink beside the
+   global config records session-correlated UI inputs/state and full secret-scrubbed provider
+   request/response envelopes. The sink is append-only, owner-only on Unix, never includes auth
+   headers, and has no upload path. (research 07's original no-telemetry recommendation is
+   superseded by this product requirement.)
 8. **Global configuration**: v1 TOML at the XDG/platform user config path (override with
    `CODESCOPE_CONFIG`), with no repository-local layer. Environment variables override `[ai]`;
    explicit model-picker choices are remembered per provider. Only stable view preferences are

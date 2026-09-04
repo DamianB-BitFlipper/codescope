@@ -193,10 +193,10 @@ fn zoom_tag(app: &App, pane: Pane) -> &'static str {
 
 // -- top bar (docs/review/15 §3.1) ---------------------------------------------
 
-/// The top repository/service bar: `codescope  {repo}  {base} ← {branch}  {N} files`
-/// on the left, and
-/// `{scope}  LSP {status}  {provider} {model} reasoning:{effort} {status}` on the right.
-/// The comparison direction and current change-set size replace the retired summary row.
+/// The top repository/service bar: branch scope shows
+/// `codescope  {repo}  {base} ← {branch}`; working-tree scopes omit the base relationship.
+/// The right side is
+/// `{scope}  LSP {status}  {provider} {model} reasoning:{effort} {status} gen:{mode}`.
 fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     let r = &snap.repo;
     // The comparison base: `base_ref` is authoritative (dispatcher-owned; reflects a
@@ -232,8 +232,7 @@ fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     }
     // `default` is itself useful state: it tells the user that Codescope/provider
     // compatibility logic, rather than an explicit budget, controls this model. Only
-    // suppress it when no AI configuration is present at all; snapshot defaults should
-    // not make an entirely disabled installation look configured.
+    // suppress it when a placeholder snapshot has not received AI configuration yet.
     if (!snap.ai_provider.is_empty() || !snap.ai_model.is_empty())
         && !snap.ai_reasoning_effort.is_empty()
     {
@@ -246,14 +245,24 @@ fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     }
     right.push(Span::raw(" "));
     right.push(Span::styled(ai_g, ai_style));
+    right.push(Span::raw(" "));
+    right.push(Span::styled("gen:", Style::new().fg(MUTED)));
+    right.push(Span::styled(
+        if snap.ai_auto_generate {
+            "auto"
+        } else {
+            "manual"
+        },
+        Style::new().fg(TEXT),
+    ));
     if snap.refreshing {
         right.push(Span::styled("  ⟳", Style::new().fg(WARN)));
     }
     right.push(Span::raw(" "));
     let right_w: usize = right.iter().map(Span::width).sum();
 
-    // Keep the count and comparison direction at every usable width. Product/repository
-    // context is progressively dropped before either of those facts.
+    // Keep the relevant Git context at every usable width. Product/repository context is
+    // progressively dropped first.
     let product = Span::styled(
         " codescope ",
         Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -263,32 +272,26 @@ fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     let reserved = right_w.min(area.width as usize) as u16;
     let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(reserved)]).split(area);
     let budget = chunks[0].width as usize;
-    let file_word = if snap.files.len() == 1 {
-        "file"
+    let git_context = if snap.scope == ChangeScope::Branch {
+        format!(" {base} ← {} ", r.branch)
     } else {
-        "files"
+        format!(" {} ", r.branch)
     };
-    let count = format!(" {} {file_word} ", snap.files.len());
-    let count_w = count.width();
-    let full_comparison = format!(" {base} ← {} ", r.branch);
-    let min_comparison = 8usize;
-    let prefix = if product.width() + repo.width() + count_w + min_comparison <= budget {
+    let min_git_context = 8usize;
+    let prefix = if product.width() + repo.width() + min_git_context <= budget {
         vec![product, repo]
-    } else if product.width() + count_w + min_comparison <= budget {
+    } else if product.width() + min_git_context <= budget {
         vec![product]
     } else {
         Vec::new()
     };
     let prefix_w: usize = prefix.iter().map(Span::width).sum();
-    let comparison_budget = budget.saturating_sub(prefix_w + count_w);
+    let git_context_budget = budget.saturating_sub(prefix_w);
     let mut left = prefix;
     left.push(Span::styled(
-        truncate_cells(&full_comparison, comparison_budget),
+        truncate_cells(&git_context, git_context_budget),
         Style::new().fg(TEXT),
     ));
-    if count_w <= budget.saturating_sub(prefix_w) {
-        left.push(Span::styled(count, Style::new().fg(MUTED)));
-    }
     frame.render_widget(
         Paragraph::new(Line::from(left)).style(Style::new().bg(SURFACE)),
         chunks[0],
@@ -310,9 +313,7 @@ fn ls_status_glyph(ls: LsStatus) -> (&'static str, Style) {
     }
 }
 
-/// AI glyph + style: ready `✓`/green, loading `…`/WARN, stale `~`/WARN, disabled
-/// `×`/MUTED, failed `×`/ERROR. The provider is shown whenever configured, even when
-/// AI is toggled off.
+/// AI glyph + style: ready `✓`/green, loading `…`/WARN, stale `~`/WARN, failed `×`/ERROR.
 fn ai_status_glyph(ai: &AiStatus) -> (&'static str, Style) {
     match ai {
         AiStatus::Ready { .. } => ("✓", Style::new().fg(ADD_FG)),
@@ -321,7 +322,6 @@ fn ai_status_glyph(ai: &AiStatus) -> (&'static str, Style) {
             ("·", Style::new().fg(WARN))
         }
         AiStatus::Stale { .. } => ("~", Style::new().fg(WARN)),
-        AiStatus::Disabled => ("×", Style::new().fg(MUTED)),
         AiStatus::Idle => ("·", Style::new().fg(MUTED)),
         AiStatus::Failed { .. } => ("×", Style::new().fg(ERROR)),
     }
@@ -382,15 +382,32 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
         .filter(|(_, sym)| sym.is_some())
         .and_then(|_| app.selected_file_index());
 
-    let block = pane_block(
+    let title = format!(" Changed files{} ", zoom_tag(app, Pane::Files));
+    let (added, removed) = snap.files.iter().fold((0usize, 0usize), |totals, file| {
+        (
+            totals.0.saturating_add(file.added_lines),
+            totals.1.saturating_add(file.removed_lines),
+        )
+    });
+    let count = snap.files.len().to_string();
+    let additions = format!(" +{added}");
+    let deletions = format!(" -{removed} ");
+    let full_summary_w = count.width() + additions.width() + deletions.width();
+    let summary = if title.width() + full_summary_w <= inner_w {
+        Line::from(vec![
+            Span::styled(count, Style::new().fg(MUTED)),
+            Span::styled(additions, Style::new().fg(ADD_FG)),
+            Span::styled(deletions, Style::new().fg(DEL_FG)),
+        ])
+    } else {
         Line::from(Span::styled(
-            format!(" Changed files{} ", zoom_tag(app, Pane::Files)),
-            Style::new().fg(TEXT),
-        )),
-        Some(Line::from(Span::styled(
             format!("{} ", snap.files.len()),
             Style::new().fg(MUTED),
-        ))),
+        ))
+    };
+    let block = pane_block(
+        Line::from(Span::styled(title, Style::new().fg(TEXT))),
+        Some(summary),
         focused,
     );
 
@@ -416,6 +433,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                     active,
                     false,
                     None,
+                    true,
                     inner_w,
                 )
             }
@@ -434,6 +452,7 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                     active,
                     owner_idx == Some(*file_index),
                     Some(file.status),
+                    false,
                     inner_w,
                 )
             }
@@ -518,6 +537,7 @@ fn tree_row_line(
     active: bool,
     owner: bool,
     status: Option<&str>,
+    middle_elide_directory: bool,
     inner_w: usize,
 ) -> Line<'static> {
     let bg = if active {
@@ -539,7 +559,11 @@ fn tree_row_line(
     let show_right = inner_w > prefix_w + 8 + right.width();
     let right_w = usize::from(show_right) * (right.width() + 1);
     let name_budget = inner_w.saturating_sub(prefix_w + right_w);
-    let shown_name = truncate_cells(name, name_budget);
+    let shown_name = if middle_elide_directory {
+        crate::elide::elide_directory_label(name, name_budget)
+    } else {
+        truncate_cells(name, name_budget)
+    };
     let used = prefix_w + shown_name.width();
     let pad = inner_w.saturating_sub(used + right_w);
     let (ai_marker, ai_style) = ai_summary_marker(ai);
@@ -1885,7 +1909,12 @@ fn render_diagram_canvas(
                                 .and_then(|entity| entity.symbol.as_deref())
                                 == Some(selected_label)))
             });
-        let style = if hovered == Some(&node.target) || selected {
+        let style = if hovered == Some(&node.target) {
+            Style::new()
+                .fg(ACCENT)
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(TEXT)
@@ -2047,6 +2076,21 @@ pub(crate) fn generated_impact_content(
 }
 
 fn ai_progress_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::DiagramLine> {
+    if matches!(snap.ai, AiStatus::Idle) && !snap.ai_auto_generate {
+        return vec![
+            crate::diagram::DiagramLine::plain(
+                truncate_cells("AI not generated", width.into()),
+                DiagramRole::Title,
+            ),
+            crate::diagram::DiagramLine::plain(
+                truncate_cells(
+                    "press a to generate · A enables automatic mode",
+                    width.into(),
+                ),
+                DiagramRole::Muted,
+            ),
+        ];
+    }
     let mut lines = vec![crate::diagram::DiagramLine::plain(
         truncate_cells("AI in progress", width.into()),
         DiagramRole::Title,
@@ -2084,7 +2128,6 @@ fn ai_progress_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::Diagr
             AiStatus::Loading { .. } => "… starting AI research",
             AiStatus::Stale { .. } => "… refreshing summary",
             AiStatus::Ready { .. } => "… finalizing summary",
-            AiStatus::Disabled => "… waiting for AI configuration",
             AiStatus::Idle => "… preparing summary",
             AiStatus::Failed { .. } => "… AI failed",
         };
@@ -2347,7 +2390,8 @@ pub(crate) fn bottom_bar_chunks(area: Rect, app: &App, snap: &UiSnapshot) -> [Re
 fn help_line(width: usize) -> Line<'static> {
     let groups: &[(&str, &str)] = if width >= 83 {
         &[
-            ("R", "refresh"),
+            ("g", "refresh"),
+            ("a/A", "AI"),
             ("Tab", "expand"),
             ("1-3", "pane"),
             ("n/N", "hunk"),
@@ -2357,13 +2401,14 @@ fn help_line(width: usize) -> Line<'static> {
         ]
     } else if width >= 48 {
         &[
-            ("R", "refresh"),
+            ("g", "refresh"),
+            ("a/A", "AI"),
             ("Tab", "expand"),
             ("1-3", "pane"),
             ("?", "help"),
         ]
     } else {
-        &[("R", ""), ("Tab", ""), ("1-3", ""), ("?", "")]
+        &[("g", ""), ("Tab", ""), ("1-3", ""), ("?", "")]
     };
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (key, label)) in groups.iter().enumerate() {
@@ -2502,7 +2547,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("  q / Ctrl-C      quit"),
         Line::from("  ? / Esc         this help / close"),
-        Line::from("  R               refresh repository state"),
+        Line::from("  g               refresh repository state"),
+        Line::from("  a               generate AI for the current selection"),
+        Line::from("  A               toggle manual / automatic AI generation"),
         Line::from("  Tab             expand / collapse directory or file"),
         Line::from("  AI summaries    ◆ ready · ◇ not generated · ◌ generating · ! failed"),
         Line::from("  1 / 2 / 3       focus files / diff / impact"),
@@ -2513,7 +2560,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  b               pick comparison base (default: nearest ancestor)"),
         Line::from("  Enter           jump to symbol / re-center view"),
         Line::from("  Space h l       expand / collapse"),
-        Line::from("  mouse hover     impact node highlights its linked diff code"),
+        Line::from("  mouse hover     jump to + highlight linked diff code"),
         Line::from("  click / Space   expand hovered impact-node details"),
         Line::from("  click arrow     expand / collapse its complete relationship text"),
         Line::from("  mouse wheel     scroll section / page open relationship text"),
@@ -2523,7 +2570,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  n / N           next / previous diff hunk"),
         Line::from("  z               zoom the focused pane (Tab still switches)"),
         Line::from("  W / 0           diff: toggle wrap / reset horizontal scroll"),
-        Line::from("  g / G           top / bottom"),
+        Line::from("  Home / G        top / bottom"),
     ];
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -2560,6 +2607,17 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
             .saturating_add(area.height.saturating_sub(height) / 2),
         width.min(area.width),
         height.min(area.height),
+    )
+}
+
+/// Center a dialog at a stable size, shrinking it only when the terminal cannot fit it.
+fn fixed_dialog(area: Rect, width: u16, height: u16) -> Rect {
+    let available_width = area.width.saturating_sub(4).max(1);
+    let available_height = area.height.saturating_sub(4).max(1);
+    centered_rect(
+        area,
+        width.min(available_width),
+        height.min(available_height),
     )
 }
 
@@ -2686,25 +2744,29 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
 // -- base picker modal --------------------------------------------------------
 
 fn render_base_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
-    let popup = centered(area, 50, 50);
+    // The modal must not jump as candidates arrive or the filter changes.
+    let popup = fixed_dialog(area, 96, 24);
     frame.render_widget(ratatui::widgets::Clear, popup);
     let selected = if snap.base_ref.is_empty() {
         "none"
     } else {
         snap.base_ref.as_str()
     };
-    let bounded = if snap.base_candidates_truncated {
-        " · bounded list"
-    } else {
-        ""
-    };
-    let title = format!(" comparison base (selected: {selected}{bounded}) ");
+    let title = format!(" comparison base (selected: {selected}) ");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(ACCENT))
         .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
     let bases = filter_candidates(&snap.available_bases, &app.base_query);
-    let mut items: Vec<ListItem> = if snap.available_bases.is_empty() {
+    let items: Vec<ListItem> = if snap.available_bases.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  fetching base candidates…",
             Style::new().fg(MUTED),
@@ -2726,28 +2788,26 @@ fn render_base_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsho
             })
             .collect()
     };
-    if snap.base_candidates_truncated {
-        items.push(ListItem::new(Line::from(Span::styled(
-            "  more ancestors omitted by the scan bound",
-            Style::new().fg(WARN),
-        ))));
-    }
-    items.push(ListItem::new(Line::from(Span::styled(
-        format!("  filter: {}", app.base_query),
-        Style::new().fg(WARN),
-    ))));
-    items.push(ListItem::new(Line::from(Span::styled(
-        "  type to filter · ↑/↓ move · Enter select · Esc close",
-        Style::new().fg(MUTED),
-    ))));
     let mut state = ListState::default();
     if !bases.is_empty() {
         state.select(Some(app.base_sel.min(bases.len().saturating_sub(1))));
     }
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::new().bg(SELECTED_BG));
-    frame.render_stateful_widget(list, popup, &mut state);
+    let list = List::new(items).highlight_style(Style::new().bg(SELECTED_BG));
+    frame.render_stateful_widget(list, rows[0], &mut state);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  filter: {}", app.base_query),
+            Style::new().fg(WARN),
+        ))),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  type to filter · ↑/↓ move · Enter select · Esc close",
+            Style::new().fg(MUTED),
+        ))),
+        rows[2],
+    );
 }
 
 #[cfg(test)]
@@ -2796,7 +2856,7 @@ mod tests {
         snap.base_ref = "release/2.0".to_string();
         snap.scope = ChangeScope::Branch;
         snap.ls = LsStatus::Ready;
-        snap.ai = AiStatus::Disabled;
+        snap.ai = AiStatus::Idle;
         snap.ai_provider = "prime".to_string();
         snap.ai_model = "z-ai/glm-5.3".to_string();
         snap.available_bases = vec![
@@ -2865,9 +2925,9 @@ mod tests {
             "top bar: {}",
             row_text(&t, 0)
         );
-        assert!(row_text(&t, 0).contains("1 file"), "count moved to top");
+        assert!(!row_text(&t, 0).contains("1 +1 -1"));
         assert!(
-            row_text(&t, 1).contains("Changed files"),
+            row_text(&t, 1).contains("Changed files") && row_text(&t, 1).contains("1 +1 -1"),
             "files block top: {}",
             row_text(&t, 1)
         );
@@ -2963,16 +3023,22 @@ mod tests {
         let top = row_text(&t, 0);
         assert!(top.contains("codescope"), "{top}");
         assert!(top.contains("demo"), "repo: {top}");
+        assert!(!top.contains("1 +1 -1"), "top bar: {top}");
+        assert!(
+            row_text(&t, 1).contains("1 +1 -1"),
+            "files title: {}",
+            row_text(&t, 1)
+        );
         assert!(
             top.contains("release/2.0 ← feature/x"),
             "explicit branch/base labels: {top}"
         );
         assert!(
-            top.contains("branch  LSP ✓  prime z-ai/glm-5.3 reasoning:default ×"),
+            top.contains("branch  LSP ✓  prime z-ai/glm-5.3 reasoning:default · gen:manual"),
             "right group: {top}"
         );
         // The right group is reserved flush against the terminal's right edge.
-        assert!(top.ends_with("× "), "right-aligned: {top:?}");
+        assert!(top.ends_with("gen:manual "), "right-aligned: {top:?}");
     }
 
     #[test]
@@ -2981,11 +3047,12 @@ mod tests {
         snap.ai = AiStatus::Ready {
             epoch: codescope_core::Epoch(1),
         };
+        snap.ai_auto_generate = true;
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
         let top = row_text(&t, 0);
         assert!(
-            top.contains("prime z-ai/glm-5.3 reasoning:default ✓"),
+            top.contains("prime z-ai/glm-5.3 reasoning:default ✓ gen:auto"),
             "provider/model/reasoning/status order: {top}"
         );
         assert!(!top.contains("AI ✓ prime"), "retired order: {top}");
@@ -3001,7 +3068,7 @@ mod tests {
             let top = row_text(&t, 0);
             assert!(top.contains("LSP ✓"), "{w}: lsp survives: {top}");
             assert!(
-                top.contains("prime") && top.contains('×'),
+                top.contains("prime") && top.contains('·'),
                 "{w}: ai survives: {top}"
             );
         }
@@ -3017,6 +3084,25 @@ mod tests {
         snap.base_ref.clear();
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert!(row_text(&t, 0).contains("origin/main ← feature/x"));
+    }
+
+    #[test]
+    fn working_tree_scopes_show_only_the_checked_out_branch() {
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        let app = App::new();
+        for scope in [
+            ChangeScope::Staged,
+            ChangeScope::Unstaged,
+            ChangeScope::Working,
+        ] {
+            let mut snap = snap_with_base();
+            snap.scope = scope;
+            t.draw(|frame| render(frame, &app, &snap)).unwrap();
+            let top = row_text(&t, 0);
+            assert!(top.contains("feature/x"), "{scope:?}: branch: {top}");
+            assert!(!top.contains('←'), "{scope:?}: no base relationship: {top}");
+            assert!(!top.contains("release/2.0"), "{scope:?}: no base: {top}");
+        }
     }
 
     #[test]
@@ -3041,12 +3127,13 @@ mod tests {
     // -- retired summary row ----------------------------------------------------------
 
     #[test]
-    fn changed_file_count_lives_in_top_bar_and_summary_row_is_gone() {
+    fn changed_file_and_line_totals_live_in_files_title() {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let snap = sample();
         t.draw(|f| render(f, &app_with(&snap), &snap)).unwrap();
-        assert!(row_text(&t, 0).contains("1 file"));
+        assert!(!row_text(&t, 0).contains("1 +1 -1"));
         assert!(row_text(&t, 1).contains("Changed files"));
+        assert!(row_text(&t, 1).contains("1 +1 -1"));
         assert!(!row_text(&t, 1).contains("AI ◆ ready"));
         let text = buffer_text(&t);
         assert!(!text.contains("1 symbol in service.go"));
@@ -3054,14 +3141,14 @@ mod tests {
     }
 
     #[test]
-    fn top_bar_file_count_handles_empty_and_plural() {
+    fn files_title_count_handles_empty_and_plural() {
         let mut snap = snap_with_base();
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
-        assert!(row_text(&t, 0).contains("0 files"));
+        assert!(row_text(&t, 1).contains("0 +0 -0"));
         snap.files = vec![sample().files[0].clone(), sample().files[0].clone()];
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
-        assert!(row_text(&t, 0).contains("2 files"));
+        assert!(row_text(&t, 1).contains("2 +2 -2"));
     }
 
     #[test]
@@ -3111,17 +3198,20 @@ mod tests {
             files_top.contains("Changed files"),
             "left title: {files_top}"
         );
-        // Right title is the active count, right-aligned against the right border (x=41).
+        // Right title carries the complete change total.
         let files_top: String = (0..42u16).map(|x| cell(&t, x, 1).0).collect();
         assert!(
             files_top.contains("Changed files"),
             "left title: {files_top:?}"
         );
-        assert_eq!(
-            cell(&t, 39, 1).0,
-            "2",
-            "count right-aligned before the border: {files_top:?}"
+        assert!(
+            files_top.contains("2 +2 -1"),
+            "change totals in right title: {files_top:?}"
         );
+        let summary_x = 41 - "2 +2 -1 ".width() as u16;
+        assert_eq!(cell(&t, summary_x, 1).1, MUTED, "file count is gray");
+        assert_eq!(cell(&t, summary_x + 2, 1).1, ADD_FG, "additions are green");
+        assert_eq!(cell(&t, summary_x + 5, 1).1, DEL_FG, "deletions are red");
         // Tree rows precede their changed files. Status colors remain M=WARN, A=ADD_FG.
         let service_y = (2..28u16)
             .find(|&y| row_text(&t, y).contains("M service.go"))
@@ -4121,20 +4211,8 @@ mod tests {
             "manual fallback: {text}"
         );
 
-        // Even impossible internal disabled state uses the same presentation; interactive
-        // startup now rejects missing AI configuration before the TUI is constructed.
-        let mut snap = sample(); // ai: Disabled, semantic: default
-        let mut app = App::new();
-        app.update(snap.clone());
-        t.draw(|f| render(f, &app, &snap)).unwrap();
-        let text = buffer_text(&t);
-        assert!(text.contains("AI in progress"), "disabled: {text}");
-        assert!(
-            !text.contains("Known relationships"),
-            "manual fallback: {text}"
-        );
-
         // A stale publish hides the old plan while regeneration is in progress.
+        let mut snap = sample();
         snap.ai = AiStatus::Stale {
             epoch: codescope_core::Epoch(2),
         };
@@ -4332,6 +4410,31 @@ mod tests {
             "the matching node uses the selection style: {}",
             (24..38).map(|y| row_text(&t, y)).collect::<String>()
         );
+    }
+
+    #[test]
+    fn hovered_node_has_a_distinct_lit_background() {
+        let snap = ai_plan_snap(3);
+        let mut app = app_after_ai_landed(&snap);
+        let target = crate::action::PlanNodeTarget {
+            form: 0,
+            id: "n0".into(),
+        };
+        app.apply(crate::action::Action::HoverPlanNode(Some(target.clone())));
+        let geometry = crate::geometry::UiGeometry::build(Rect::new(0, 0, 140, 40), &app, &snap);
+        let node_rect = geometry
+            .plan_node_rects
+            .iter()
+            .find(|(_, item)| item == &target)
+            .map(|(rect, _)| *rect)
+            .expect("hovered box is visible");
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let (_, foreground, background, modifier) = cell(&terminal, node_rect.x, node_rect.y);
+        assert_eq!(foreground, ACCENT);
+        assert_eq!(background, SELECTED_BG);
+        assert!(modifier.contains(Modifier::BOLD));
     }
 
     /// At a 40-column focus-only size no box border is ever clipped: every top border
@@ -4645,7 +4748,7 @@ mod tests {
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
         let help = row_text(&t, 39);
         assert!(
-            help.contains("R refresh"),
+            help.contains("g refresh"),
             "manual mode is discoverable: {help}"
         );
         assert!(!help.contains("resize"), "resize dropped: {help}");
@@ -4659,8 +4762,8 @@ mod tests {
         t.draw(|f| render(f, &app, &sample())).unwrap();
         assert!(row_text(&t, 0).contains("codescope"), "top survives zoom");
         assert!(
-            row_text(&t, 0).contains("1 file"),
-            "file count survives zoom"
+            row_text(&t, 1).contains("1 +1 -1"),
+            "change totals survive zoom"
         );
         assert!(row_text(&t, 39).contains("? help"), "help survives zoom");
         assert!(buffer_text(&t).contains("· ZOOM"), "zoom tag visible");
@@ -4700,6 +4803,18 @@ mod tests {
     }
 
     // -- picker modals (unchanged behavior) ---------------------------------------------
+
+    #[test]
+    fn fixed_dialog_changes_only_when_the_terminal_cannot_fit_it() {
+        assert_eq!(
+            fixed_dialog(Rect::new(0, 0, 180, 80), 96, 24),
+            Rect::new(42, 28, 96, 24)
+        );
+        assert_eq!(
+            fixed_dialog(Rect::new(0, 0, 30, 8), 96, 24),
+            Rect::new(2, 2, 26, 4)
+        );
+    }
 
     #[test]
     fn base_picker_renders_candidates_and_current() {
@@ -4742,6 +4857,24 @@ mod tests {
     }
 
     #[test]
+    fn base_picker_keeps_filter_help_visible_with_many_refs() {
+        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = App::new();
+        app.show_base_picker = true;
+        let mut snap = snap_with_base();
+        snap.available_bases = (0..200)
+            .map(|index| format!("origin/feature-{index:03}"))
+            .collect();
+        t.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let text = buffer_text(&t);
+        assert!(text.contains("filter:"), "filter stays pinned: {text}");
+        assert!(
+            text.contains("type to filter · ↑/↓ move · Enter select · Esc close"),
+            "keyboard help stays pinned: {text}"
+        );
+    }
+
+    #[test]
     fn base_picker_labels_no_selection_explicitly() {
         let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let mut app = App::new();
@@ -4751,22 +4884,6 @@ mod tests {
         snap.repo.base = None;
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert!(buffer_text(&t).contains("selected: none"));
-    }
-
-    #[test]
-    fn base_picker_marks_a_bounded_candidate_scan() {
-        let mut t = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        let mut app = App::new();
-        app.show_base_picker = true;
-        let mut snap = snap_with_base();
-        snap.base_candidates_truncated = true;
-        t.draw(|frame| render(frame, &app, &snap)).unwrap();
-        let text = buffer_text(&t);
-        assert!(text.contains("bounded list"), "picker title: {text}");
-        assert!(
-            text.contains("more ancestors omitted"),
-            "picker note: {text}"
-        );
     }
 
     /// The files pane renders each semantic load state distinctly (asynchronous per-file

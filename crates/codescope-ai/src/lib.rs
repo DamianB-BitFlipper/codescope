@@ -3,8 +3,9 @@
 //! The AI only *chooses and parameterizes* visualizations; codescope owns facts,
 //! validation, and rendering. This crate provides:
 //!
-//! - [`AiConfig`]: env-first opt-in configuration; disabled by default without a key;
-//!   literal keys in config files are rejected ([`AiError::LiteralApiKeyInConfig`]).
+//! - [`AiConfig`]: required env-first provider configuration; keyless local endpoints may be
+//!   configured explicitly, and literal keys in config files are rejected
+//!   ([`AiError::LiteralApiKeyInConfig`]).
 //! - [`AiClient`]: OpenAI-compatible `POST {base}/chat/completions` with controller-selected
 //!   Auto or Required tool choice, an in-flight concurrency guard, a high rate ceiling, and a
 //!   3-strikes/60 s circuit breaker.

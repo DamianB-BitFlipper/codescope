@@ -80,6 +80,39 @@ pub fn elide_paths(paths: &[&str], budget: usize) -> Vec<String> {
     out
 }
 
+/// Shorten one visible directory label in the middle, preserving its first and last
+/// components whenever the available width permits it.
+///
+/// Directory-tree labels carry a trailing slash, which is retained in the shortened form.
+/// For example, `sandbox/vm-sandboxes/packages/actionworker/` becomes
+/// `sandbox/…/actionworker/` instead of losing the leaf directory.
+#[must_use]
+pub fn elide_directory_label(label: &str, budget: usize) -> String {
+    if label.width() <= budget {
+        return label.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let has_trailing_slash = label.ends_with('/');
+    let path = label.trim_end_matches('/');
+    if path.is_empty() {
+        return middle_elide(label, budget);
+    }
+
+    let slash_width = usize::from(has_trailing_slash && budget >= 2);
+    let path_budget = budget.saturating_sub(slash_width);
+    let mut shown = elide_paths(&[path], path_budget)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    if slash_width == 1 {
+        shown.push('/');
+    }
+    shown
+}
+
 /// The 1-based ordinal of row `i` among the rows sharing its display string, by input
 /// order (stable: it never depends on other files being added or removed).
 fn ordinal_for(out: &[String], i: usize) -> usize {
@@ -285,6 +318,21 @@ mod tests {
             out[0].ends_with("executor.go"),
             "basename preserved: {}",
             out[0]
+        );
+    }
+
+    #[test]
+    fn directory_label_elides_the_middle_and_preserves_the_leaf() {
+        let out = elide_directory_label("sandbox/vm-sandboxes/packages/actionworker/", 24);
+        assert_eq!(out, "sandbox/…/actionworker/");
+        assert!(out.width() <= 24);
+    }
+
+    #[test]
+    fn directory_label_passes_through_when_it_fits() {
+        assert_eq!(
+            elide_directory_label("sandbox/packages/", 40),
+            "sandbox/packages/"
         );
     }
 

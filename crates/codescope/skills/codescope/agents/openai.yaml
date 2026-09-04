@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codescope"
+  short_description: "Research and diagram a live Codescope review"
+  default_prompt: "Use $codescope to research the selected change and build its live validated diagram."

@@ -39,7 +39,38 @@ codescope --model z-ai/glm-5.3  # model override for this run (-m is equivalent)
 codescope --reasoning-effort high # reasoning override (-r; default uses automatic behavior)
 codescope --watch          # automatically refresh after repository changes (off by default)
 codescope --log-file /tmp/cs.log   # tracing log (never contains secrets)
+codescope --debug          # verbose trace in ./codescope-debug.log
+codescope --debug --log-file /tmp/cs-debug.log # override the debug log path
 ```
+
+Debug logs include secret-scrubbed AI request and response envelopes, tool arguments/results,
+controller decisions, and any reasoning field returned by the configured provider. They can
+contain repository source and model output, so review them before sharing. Providers do not
+necessarily expose their hidden chain-of-thought; the log records only data they actually return.
+
+Codescope also keeps an always-on, local-only `telemetry.jsonl` beside the global config. Each
+line is a timestamped, session-correlated JSON object. It records command/session metadata; raw
+key presses; typed picker input; file/symbol selection; focused file and hunk; pane and scroll
+offsets; mouse clicks, wheels, drags, and coordinates; control-client actions; and complete
+provider request, response, usage, latency, and error envelopes. LLM bodies retain prompts, tool
+calls/results, returned reasoning fields, and completions after recognizable credential values
+are scrubbed. Authorization headers and API keys are never recorded. The file is append-only,
+owner-readable on Unix, and is not uploaded by Codescope.
+
+## Agent skill
+
+Codescope bundles a skill that teaches coding agents how to inspect and control a running review.
+Its CLI follows the same project/global installation pattern as Modal's skills commands:
+
+```bash
+codescope skills show
+codescope skills install          # .agents/skills/codescope in this project
+codescope skills install --global # ~/.agents/skills/codescope
+codescope skills update --global
+codescope skills install --claude # use .claude/skills instead
+```
+
+Install and update ask for confirmation; pass `--yes` in scripts.
 
 ## Global configuration
 
@@ -47,7 +78,9 @@ Codescope keeps repository-independent preferences in
 `$XDG_CONFIG_HOME/codescope/config.toml`, falling back to
 `$HOME/.config/codescope/config.toml` (or the platform config directory on Windows).
 Set `CODESCOPE_CONFIG` to use an explicit file. There is currently no repository-local
-configuration.
+configuration. Telemetry follows that override and uses a sibling named `telemetry.jsonl`; if
+that directory cannot be written, it falls back to the platform temporary directory under
+`codescope/telemetry.jsonl`.
 
 The v1 TOML file can contain normal `[ai]` defaults plus the model last selected for each
 provider and stable UI preferences:
@@ -115,11 +148,13 @@ default base of `feature-b` is `feature-a`, even when `feature-a` exists only as
 `origin/main`/`origin/master`, or a fork-point guess. If none is meaningful, branch scope
 reports that no base exists; staged, unstaged, and working scopes remain available.
 
-Press `b` to open the base picker: it lists the upstream, ancestor branches, and the usual
-default-branch candidates, marks the current base, and re-runs the whole analysis against
-whichever ref you select (`j`/`k` move, `Enter` selects, `Esc` closes). The top bar always
-labels the comparison as `base-ref ← checked-out-branch`, followed by the changed-file
-count. Branch diffs always run from that resolved merge-base toward the checked-out `HEAD`
+Press `b` to open the base picker: inferred and nearest ancestor branches appear first,
+followed by every remaining local and remote-tracking branch. Type to filter the complete
+list; arrows move, `Enter` selects, and `Esc` closes. The picker marks the current base and
+re-runs the whole analysis against whichever ref you select. In branch scope, the top bar
+labels the comparison as `base-ref ← checked-out-branch`; staged, unstaged, and working
+scopes show only the checked-out branch. The Changed files pane title shows the file count and
+total added/removed lines. Branch diffs always run from that resolved merge-base toward `HEAD`
 (`base → HEAD`).
 
 ## Keyboard controls
@@ -137,10 +172,12 @@ count. Branch diffs always run from that resolved merge-base toward the checked-
 | `Enter` | jump to symbol / re-center semantic view |
 | `Space`, `h`/`l` | expand / collapse |
 | `n` / `N` | next / previous diff hunk |
-| `g` / `G` | top / bottom |
-| `R` | refresh repository state |
+| `Home` / `G` | top / bottom |
+| `g` | refresh repository state |
+| `a` | generate or regenerate AI for the current directory, file, or symbol |
+| `A` | toggle manual / automatic AI generation (manual by default) |
 | `b` | pick the comparison base for the branch scope |
-| mouse hover (AI node) | highlight that node's exact linked old/new diff lines |
+| mouse hover (AI node) | jump to and highlight that node's exact linked old/new diff lines; leaving restores the prior position |
 | click / `Space` (AI node) | expand or collapse that box in place with its full detail and source refs |
 | click AI relationship | toggle its complete text in an overlay without moving the diagram |
 | drag AI node | move the box freely in X/Y; connected arrows follow it |
@@ -160,7 +197,7 @@ by added/deleted lines.
 ## Refresh mode
 
 Codescope loads the repository once at startup and otherwise refreshes only when you press
-`R`. Pass `--watch` to opt into automatic refreshes after working-tree or Git-state changes:
+`g`. Pass `--watch` to opt into automatic refreshes after working-tree or Git-state changes:
 
 ```bash
 codescope --watch /path/to/repo
@@ -174,11 +211,11 @@ off by default.
 AI is required by the interactive application. A global `[ai].api_key_env` may name the key
 variable to resolve first; otherwise set `PRIME_API_KEY`, `OPENAI_API_KEY`, or
 `ANTHROPIC_API_KEY` (first built-in found wins and identifies the provider). An arbitrary named
-key requires an explicit base URL. You may also use the global `[ai]` table,
-`CODESCOPE_AI_BASE_URL`, `--model <model_name>`, or
+key requires an explicit base URL. An explicit base URL may also configure a keyless local
+provider. You may use the global `[ai]` table, `CODESCOPE_AI_BASE_URL`, `--model <model_name>`, or
 `--reasoning-effort <default|none|minimal|low|medium|high|xhigh|max>`. Environment variables
-override the global file. Interactive startup exits with a configuration error when AI is absent
-or explicitly disabled; there is no no-AI mode.
+override the global file. Interactive startup exits with a configuration error when no provider
+credential or explicit base URL is configured; there is no no-AI mode or AI enable switch.
 Press `m` in the TUI to switch models at runtime (fetches the provider's model list); use
 left/right in that picker to stage reasoning effort, then Enter to apply both settings once.
 AI incrementally builds a reviewer-first *visualization draft* — an intent, evidence, and at
@@ -200,22 +237,27 @@ progressing from running to succeeded/failed. The complete call history remains 
 scrollable, and failed calls include their scrubbed error reason. Draft boxes never render. A terminal failure
 shows one clickable `AI failed` banner; it does not replace the unfinished draft with known
 relationships. Hovering a rendered
-node highlights those old/new rows in the main diff; clicking it (or pressing `Space` while it is
-hovered) pins its code highlight and expands the box in place with deeper detail and source locators.
+node temporarily jumps to and highlights those old/new rows in the main diff; leaving the node
+restores the prior diff position. Clicking it (or pressing `Space` while it is hovered) expands the
+box in place with deeper detail and source locators without pinning the diff highlight.
+Moved box positions, expanded cards, relationship overlays, and diagram scroll are remembered per
+directory/file/function while navigating within the current repository epoch and TUI session.
 Every cited file, hunk, source line,
 symbol, or typed graph edge must resolve against the fact store; conceptual entityless nodes and
 hunk-derived links are allowed as interpretation, rendered dashed and clearly marked inferred,
 never as verified graph facts.
-Changed-file symbols load asynchronously in the background. For a selected file/function,
-AI generation starts automatically after its symbol inventory is complete; a selected directory
-can start after the same navigation debounce because its summary does not require every child
-symbol inventory to finish. Both regenerate after the refreshed change-set differs. With default
-manual refresh mode, press `R` after an underlying file change; with `--watch`, that refresh
-happens automatically. Validated results are cached per directory/file/function. A regeneration receives the prior design as a continuity seed,
+Changed-file symbols load asynchronously in the background. AI generation is manual by default:
+press `a` to generate or regenerate the selected directory, file, or function. Press `A` to toggle
+automatic mode, where a selected file/function starts after its symbol inventory is complete and a
+selected directory starts after the navigation debounce. Automatic mode regenerates after a
+refreshed change-set differs; manual mode waits for another `a`. Separately, press `g` after an
+underlying file change, or use `--watch` to refresh automatically. Validated results are cached per
+directory/file/function. A regeneration receives the prior design as a continuity seed,
 preserving useful structure for incremental edits while rebuilding when the change is
 substantial; current repository facts are always revalidated and win over cached content.
-Only the current directory, file, or function is sent for AI generation, after a 250 ms selection
-debounce; there is no prompt prefetch or background generation. The first turn is a small research
+Only the explicitly triggered selection—or, in automatic mode, the selection that survives the
+250 ms navigation debounce—is sent for AI generation; there is no prompt prefetch or unrelated
+background generation. The first turn is a small research
 brief rather than a source dump. A bounded agentic loop can list the selection, read sections of
 changed files, search changed files, inspect captured per-file Git status/diffs, and explore the
 active language server through `inspect_language_server`. That capability-discoverable tool can
@@ -238,9 +280,10 @@ See [docs/ai-dataflow.md](docs/ai-dataflow.md).
 ### Live agent control
 
 On Unix platforms, every running TUI exposes a repository-specific local socket. The `codescope agent`
-client lets another coding agent inspect the exact backend snapshot, move the visible tree
-selection, ask a selection-scoped question, give feedback, incrementally edit the exact same
-diagram draft used by the internal AI, or refresh the repository:
+client gives an external coding agent the live review context and authoritative diff coordinates,
+then lets that agent incrementally edit the exact same diagram draft used by the internal AI. The
+external agent researches with its normal filesystem, Git, and language-aware tools rather than
+delegating that work back into Codescope's bounded AI harness:
 
 ```bash
 # Read the live tree, selected diff, relationships, and validated AI plan/report.
@@ -250,32 +293,39 @@ codescope agent . context
 codescope agent . focus --directory crates/codescope
 codescope agent . focus --file crates/codescope/src/main.rs --symbol main
 
-# Generate an answer in the visible Impact pane, then refine it.
-codescope agent . ask 'How does this change alter request routing?'
-codescope agent . feedback 'Make the queue boundary and failure path more prominent'
+# Read authoritative zero-based hunk ids and exact old/new source coordinates.
+codescope agent . diff --file crates/codescope/src/main.rs
+codescope agent . diff --file crates/codescope/src/main.rs --hunk 0
 
 # Inspect and edit the live renderer-native draft with the shared DiagramCommand JSON API.
-codescope agent . diagram show
-codescope agent . diagram apply '{"op":"update_edge","form_id":"main","from":"n1","to":"n2","patch":{"label":"passes parsed request"}}'
-codescope agent . diagram apply '{"op":"delete_edge","form_id":"main","from":"n1","to":"n3"}'
+codescope agent . diagram inspect
+codescope agent . diagram schema
+codescope agent . diagram edit '{"op":"update_edge","form_id":"main","from":"n1","to":"n2","patch":{"label":"passes parsed request"}}'
+codescope agent . diagram edit '{"op":"delete_edge","form_id":"main","from":"n1","to":"n3"}'
 codescope agent . diagram finish
 
 codescope agent . refresh
 ```
 
-Focus, generation, and refresh are asynchronous; call `context` again to observe the next
-snapshot and check `live.epoch`, `live.refreshing`, `ai.status`, and `ai.plan`. Commands enter
-the same typed action/selection path as keyboard and mouse input, so a CLI focus updates the
-actual visible cursor. Questions and feedback are bounded, explicitly labelled as presentation
-guidance rather than source evidence. `diagram apply` accepts the same tagged command objects as
-the model's `edit_visualization` tool (`set_intent`, form/node/edge create-update-delete, and
-evidence add/delete); `diagram finish` runs the same fact and visualization validators used by
+Transient informational messages in the bottom bar hide automatically after four seconds;
+warnings and errors remain available until superseded.
+
+Focus and refresh are asynchronous; call `context` again to observe the next snapshot and check
+`live.epoch`, `live.refreshing`, and `live.selection`. Focus commands enter the same typed
+selection path as keyboard and mouse input, so CLI focus updates the actual visible cursor. The
+retained human diff highlight is exposed as `focused_diff.selected`. `diff` reads any exact path
+from the TUI's captured change-set without changing focus and supplies the hunk/line identities
+required by diagram evidence. `diagram edit` accepts the same tagged command objects as the
+model's `edit_visualization` tool (`set_intent`, form/node/edge create-update-delete, and evidence
+add/delete). Each edit waits for the dispatcher and returns its updated draft, revision, and
+error; `diagram finish` synchronously runs the same fact and visualization validators used by
 internal inference.
 
 The socket lives in the platform temporary directory, is derived from the canonical repository
 root, and is permissioned for its owner only. The protocol has no shell, file-write, Git-write,
-or raw UI-injection operation. `codescope agent . socket` prints its path; `--compact` produces
-single-line JSON for tool integrations.
+internal-AI prompt, or raw UI-injection operation. `codescope agent . socket` prints its path;
+`--compact` produces single-line JSON for tool integrations. `diagram show`/`diagram apply` remain
+aliases for `diagram inspect`/`diagram edit`.
 
 ### Headless backend debugging
 

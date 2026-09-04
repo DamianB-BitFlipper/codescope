@@ -128,13 +128,13 @@ pub enum Action {
     /// The TUI resolves this stable identity into its current projected row, then its
     /// normal selection tracker emits the corresponding backend selection action.
     AgentFocus(crate::snapshot::AiSummaryKey),
-    /// Ask the AI reviewer a selection-scoped question. The dispatcher treats this as
-    /// presentation guidance, never as repository evidence.
-    AgentAsk(String),
-    /// Revise the current generated explanation using selection-scoped feedback.
-    AgentFeedback(String),
     /// Apply one atomic command to the same diagram draft used by the internal AI tools.
-    AgentDiagram(codescope_core::DiagramCommand),
+    AgentDiagram {
+        /// Identity returned through the published snapshot after the dispatcher applies it.
+        request_id: u64,
+        /// Shared renderer-native mutation.
+        command: codescope_core::DiagramCommand,
+    },
     /// The user selected a changed symbol; the dispatcher lazily expands its callers/callees.
     SelectSymbol {
         /// Repo-relative file of the symbol.
@@ -164,6 +164,10 @@ pub enum Action {
     ScopeCycle,
     /// Refresh repository state from Git and the working tree.
     RefreshGit,
+    /// Generate or regenerate AI output for the currently selected directory, file, or symbol.
+    GenerateAi,
+    /// Toggle between manual-trigger and automatic selection-following AI generation.
+    ToggleAiGenerationMode,
     /// Open/close the AI model picker modal.
     ModelPicker,
     /// Apply the model picker's staged model and reasoning budget together.
@@ -228,6 +232,9 @@ pub enum Action {
         /// Text extracted from the same retained diff frame.
         text: String,
     },
+    /// Publish or clear the retained diff excerpt for local agent clients. Produced by the
+    /// run loop after applying the corresponding local gesture.
+    SetAgentDiffSelection(Option<crate::snapshot::SelectedDiffContext>),
     /// Mouse: select the file/symbol row at this logical index (and focus Files).
     /// The selection tracker emits the same SelectionChanged a keyboard move would.
     SelectFileRow {
@@ -262,8 +269,22 @@ pub enum Action {
 /// keys. When the help modal is open, any key other than `?`/`Esc` is swallowed.
 #[must_use]
 pub fn map_key(key: KeyEvent, app: &App) -> Action {
-    if key.kind != KeyEventKind::Press {
+    if key.kind == KeyEventKind::Release {
         return Action::None;
+    }
+    if key.kind == KeyEventKind::Repeat {
+        if app.status_detail.is_some() || app.show_help {
+            return Action::None;
+        }
+        // Repeats are navigation-only: holding an arrow (or j/k outside a picker) should
+        // move continuously, while commands and toggles must still fire once per press.
+        return match key.code {
+            KeyCode::Up => Action::Up,
+            KeyCode::Down => Action::Down,
+            KeyCode::Char('k') if !app.show_model_picker && !app.show_base_picker => Action::Up,
+            KeyCode::Char('j') if !app.show_model_picker && !app.show_base_picker => Action::Down,
+            _ => Action::None,
+        };
     }
     if app.status_detail.is_some() {
         return match key.code {
@@ -323,7 +344,9 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('B') => Action::ScopeBranch,
         KeyCode::Char('w') => Action::ScopeWorking,
         KeyCode::Char('S') => Action::ScopeCycle,
-        KeyCode::Char('R') => Action::RefreshGit,
+        KeyCode::Char('g') => Action::RefreshGit,
+        KeyCode::Char('a') => Action::GenerateAi,
+        KeyCode::Char('A') => Action::ToggleAiGenerationMode,
         KeyCode::Char('m') => Action::ModelPicker,
         KeyCode::Char('b') => Action::BasePicker,
         KeyCode::Char('j') | KeyCode::Down => Action::Down,
@@ -340,7 +363,7 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('v') => Action::None,
         KeyCode::Char('W') => Action::ToggleWrap,
         KeyCode::Char('0') => Action::ResetHScroll,
-        KeyCode::Char('g') | KeyCode::Home => Action::Top,
+        KeyCode::Home => Action::Top,
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
         _ => Action::None,
     }
@@ -403,6 +426,26 @@ mod tests {
     }
 
     #[test]
+    fn held_navigation_repeats_but_commands_do_not() {
+        let mut down = key(KeyCode::Down);
+        down.kind = KeyEventKind::Repeat;
+        assert_eq!(map_key(down, &app()), Action::Down);
+
+        let mut j = key(KeyCode::Char('j'));
+        j.kind = KeyEventKind::Repeat;
+        assert_eq!(map_key(j, &app()), Action::Down);
+
+        let mut toggle = key(KeyCode::Char('A'));
+        toggle.kind = KeyEventKind::Repeat;
+        assert_eq!(map_key(toggle, &app()), Action::None);
+
+        let mut picker = app();
+        picker.show_base_picker = true;
+        assert_eq!(map_key(down, &picker), Action::Down);
+        assert_eq!(map_key(j, &picker), Action::None);
+    }
+
+    #[test]
     fn quit_keys() {
         assert_eq!(map_key(key(KeyCode::Char('q')), &app()), Action::Quit);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -415,7 +458,7 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Down), &app()), Action::Down);
         assert_eq!(map_key(key(KeyCode::Char('k')), &app()), Action::Up);
         assert_eq!(map_key(key(KeyCode::Up), &app()), Action::Up);
-        assert_eq!(map_key(key(KeyCode::Char('g')), &app()), Action::Top);
+        assert_eq!(map_key(key(KeyCode::Home), &app()), Action::Top);
         assert_eq!(map_key(key(KeyCode::Char('G')), &app()), Action::Bottom);
     }
 
@@ -442,8 +485,8 @@ mod tests {
 
     #[test]
     fn manual_refresh_key() {
-        assert_eq!(map_key(key(KeyCode::Char('R')), &app()), Action::RefreshGit);
-        assert_eq!(map_key(key(KeyCode::Char('r')), &app()), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('g')), &app()), Action::RefreshGit);
+        assert_eq!(map_key(key(KeyCode::Char('R')), &app()), Action::None);
     }
 
     #[test]
@@ -545,10 +588,17 @@ mod tests {
     }
 
     #[test]
-    fn retired_view_and_ai_keys_are_unmapped() {
+    fn ai_generation_keys_use_lowercase_for_trigger_and_uppercase_for_mode() {
+        assert_eq!(map_key(key(KeyCode::Char('a')), &app()), Action::GenerateAi);
+        assert_eq!(
+            map_key(key(KeyCode::Char('A')), &app()),
+            Action::ToggleAiGenerationMode
+        );
+    }
+
+    #[test]
+    fn retired_view_key_is_unmapped() {
         assert_eq!(map_key(key(KeyCode::Char('v')), &app()), Action::None);
-        assert_eq!(map_key(key(KeyCode::Char('a')), &app()), Action::None);
-        assert_eq!(map_key(key(KeyCode::Char('A')), &app()), Action::None);
     }
 
     #[test]

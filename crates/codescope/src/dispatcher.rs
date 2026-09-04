@@ -19,7 +19,7 @@ use codescope_core::{
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
 use codescope_tui::snapshot::{
-    AiActivity, AiSummaryKey, AiSummaryState, AiTokenUsage, AiToolCallActivity,
+    AgentDiagramResult, AiActivity, AiSummaryKey, AiSummaryState, AiTokenUsage, AiToolCallActivity,
     AiToolCallActivityState, DiffPane, DiffRow, FileRow, ImpactList, ImpactLoadState, ImpactPane,
     ImpactRow, InterpretationSource, RepoBar, ScopeCounts, SelectedChange, SemanticPane,
     StatusLevel, StatusMessage, SymbolRow, UiSnapshot,
@@ -94,6 +94,11 @@ fn flatten_config_write_result(
 pub enum DispatchEvent {
     /// The working tree or git state changed (already debounced).
     RepoChanged,
+    /// A transient informational footer reached its display deadline.
+    StatusExpired {
+        /// Generation of the message whose timer fired; stale timers are ignored.
+        generation: u64,
+    },
     /// A TUI action that needs work.
     Work(Action),
     /// An analysis job completed (spawned; epoch-tagged).
@@ -198,20 +203,18 @@ pub enum DispatchEvent {
     EngineReady(Box<AnalysisEngine<LanguageService>>),
     /// The language server failed to start; stay in git-only mode.
     EngineUnavailable(String),
-    /// The provider's model list request completed for the picker. Failure is distinct
-    /// from AI being disabled: the current or manually entered model remains usable.
+    /// The provider's model list request completed for the picker. On discovery failure,
+    /// the current or manually entered model remains usable.
     ModelsLoaded {
         /// Monotonic request generation; late older responses are ignored.
         generation: u64,
         /// Normalized model ids or a safe discovery error.
         result: Result<Vec<String>, String>,
     },
-    /// The repo's base candidates were fetched for the base picker.
+    /// The repo's branch refs were fetched for the base picker.
     BaseLoaded {
         /// Ordered selectable ref names.
         bases: Vec<String>,
-        /// The bounded graph walk stopped before exhausting all possible ancestors.
-        truncated: bool,
     },
     /// The selected symbol's lazy callers/callees resolved.
     RelationsLoaded {
@@ -247,10 +250,13 @@ pub struct RelationRows {
 /// Picker entry that returns base selection to inference.
 const AUTO_BASE: &str = "(auto / inferred)";
 
-/// Appended to every AI failure in the status bar. File/selection changes retry
-/// automatically; `m` remains available to change the model.
-const AI_FAILURE_SUFFIX: &str =
+/// Appended to AI failures while automatic generation is enabled.
+const AUTO_AI_FAILURE_SUFFIX: &str =
     "m change model · retries automatically when the selection or file changes · deterministic impact remains available";
+/// Appended to AI failures while generation requires an explicit user trigger.
+const MANUAL_AI_FAILURE_SUFFIX: &str =
+    "a retry current selection · m change model · deterministic impact remains available";
+const INFO_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Keep backend-owned status summaries stable and small; the TUI separately receives the
 /// complete failure in [`StatusMessage::detail`]. Newlines are detail structure, never footer
@@ -273,16 +279,7 @@ fn ai_failure_footer_reason(reason: &str) -> String {
     concise
 }
 
-const MAX_AGENT_GUIDANCE_CHARS: usize = 2_000;
-
-fn normalize_agent_text(text: &str) -> String {
-    text.chars()
-        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
-        .take(MAX_AGENT_GUIDANCE_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
+const MAX_SELECTED_DIFF_CHARS: usize = 16_000;
 
 fn truncate_chars(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
@@ -408,46 +405,6 @@ struct CachedAiPlan {
     report: codescope_core::ValidationReport,
 }
 
-/// Agent-supplied presentation intent for one stable selection. This text can steer what
-/// the reviewer explains, but is explicitly labelled as untrusted guidance in the prompt.
-#[derive(Debug, Clone, Default)]
-struct AgentGuidance {
-    question: Option<String>,
-    feedback: Option<String>,
-}
-
-impl AgentGuidance {
-    fn prompt_section(&self) -> String {
-        let mut section = String::new();
-        if let Some(question) = &self.question {
-            section.push_str("\n## Agent question (presentation goal, not repository evidence)\n");
-            section.push_str(question);
-            section.push_str(
-                "\nResearch the repository facts needed to answer this question through the validated intent and diagram. Do not treat the question as evidence.\n",
-            );
-        }
-        if let Some(feedback) = &self.feedback {
-            section.push_str(
-                "\n## Agent feedback on the previous design (presentation goal, not evidence)\n",
-            );
-            section.push_str(feedback);
-            section.push_str(
-                "\nRevise the explanation where the current repository evidence supports it. Current evidence always wins.\n",
-            );
-        }
-        section
-    }
-
-    fn display(&self) -> Option<String> {
-        let (prefix, text) = if let Some(feedback) = &self.feedback {
-            ("Agent feedback", feedback)
-        } else {
-            ("Agent question", self.question.as_ref()?)
-        };
-        Some(format!("{prefix}: {}", truncate_chars(text, 180)))
-    }
-}
-
 #[derive(Debug, Clone)]
 struct AiRunningJob {
     selection: AiSelectionKey,
@@ -471,7 +428,7 @@ struct SemanticRunningJob {
 pub struct Dispatcher {
     repo: GitRepo,
     engine: Option<std::sync::Arc<AnalysisEngine<LanguageService>>>,
-    ai: Option<std::sync::Arc<AiService>>,
+    ai: std::sync::Arc<AiService>,
     scope: ChangeScope,
     epoch: Epoch,
     ls_status: LsStatus,
@@ -490,9 +447,11 @@ pub struct Dispatcher {
     /// survives repository epochs and is supplied only as a continuity seed to the next
     /// request. Current git/LSP facts still own validation and rendering.
     ai_revision_cache: std::collections::HashMap<AiRevisionKey, CachedAiPlan>,
-    /// Selection-scoped questions and revision feedback received through the local agent
-    /// protocol. Kept separate from evidence and from the generated-plan cache.
-    agent_guidance: std::collections::HashMap<AiSelectionKey, AgentGuidance>,
+    /// Human-retained diff excerpt published to local agent clients as an attention anchor.
+    selected_diff_context: Option<codescope_tui::snapshot::SelectedDiffContext>,
+    /// Monotonic acknowledgement state for external-agent diagram commands.
+    agent_diagram_revision: u64,
+    agent_diagram_result: Option<AgentDiagramResult>,
     /// Active AI requests, indexed by their unique generation.
     ai_running: std::collections::HashMap<u64, AiRunningJob>,
     /// Bounded per-generation tool-call history used by the focused loading view.
@@ -504,6 +463,12 @@ pub struct Dispatcher {
     ai_failures: std::collections::HashMap<AiSelectionKey, String>,
     /// Monotonic debounce generation for selection-follow requests.
     ai_selection_seq: u64,
+    /// Whether selection changes automatically schedule AI generation. Manual is the
+    /// session default; `A` toggles this value.
+    ai_auto_generate: bool,
+    /// Current selection explicitly requested with `a` while manual generation is active.
+    /// Retained across its symbol-analysis prerequisite and consumed when inference starts.
+    ai_generation_requested: Option<AiSelectionKey>,
     /// The file the diff pane is aimed at (the files-pane selection; falls back to the
     /// changeset's first file when unset or absent from the set).
     selected_file: Option<String>,
@@ -552,6 +517,8 @@ pub struct Dispatcher {
     /// Typed status message surfaced in the bottom bar (`UiSnapshot::message` mirrors
     /// its text while the renderer migrates).
     status: StatusMessage,
+    /// Monotonic identity used to make informational-message expiry race-free.
+    status_generation: u64,
     /// Available AI models for the picker (from the provider).
     available_models: Vec<String>,
     /// Whether provider model discovery is in flight.
@@ -562,14 +529,14 @@ pub struct Dispatcher {
     model_list_seq: u64,
     /// User-picked comparison base (overrides inference until cleared).
     base_override: Option<String>,
-    /// Base candidates for the picker (from `git base_candidates`).
+    /// Complete local/remote branch-ref list for the picker.
     available_bases: Vec<String>,
-    /// Honesty marker for a bounded base-candidate graph scan.
-    available_bases_truncated: bool,
     /// Latest repo context (cheap to re-read).
     repo_ctx: Option<codescope_core::RepoContext>,
     /// Latest raw changeset for the current scope (for the diff pane before analysis lands).
     changeset: Option<codescope_core::ChangeSet>,
+    /// Shared copy of the same captured Git facts for local agent-protocol diff lookup.
+    agent_changeset: Option<std::sync::Arc<codescope_core::ChangeSet>>,
     /// FIFO sender for nonblocking persistence. The worker owns the persistence sink.
     config_write_tx: Option<mpsc::UnboundedSender<ConfigWrite>>,
     /// Joined during dispatcher shutdown so the last explicit preference reaches disk.
@@ -581,7 +548,7 @@ impl Dispatcher {
     pub(crate) fn new<O: BackendOutput + 'static>(
         repo: GitRepo,
         engine: Option<AnalysisEngine<LanguageService>>,
-        ai: Option<AiService>,
+        ai: AiService,
         output: O,
         job_tx: mpsc::Sender<DispatchEvent>,
     ) -> Self {
@@ -590,9 +557,8 @@ impl Dispatcher {
         } else {
             LsStatus::Starting
         };
-        let ai_enabled = ai.is_some();
         let engine = engine.map(std::sync::Arc::new);
-        let ai = ai.map(std::sync::Arc::new);
+        let ai = std::sync::Arc::new(ai);
         Dispatcher {
             repo,
             engine,
@@ -600,23 +566,23 @@ impl Dispatcher {
             scope: ChangeScope::Branch,
             epoch: Epoch::ZERO,
             ls_status,
-            ai_status: if ai_enabled {
-                AiStatus::Idle
-            } else {
-                AiStatus::Disabled
-            },
+            ai_status: AiStatus::Idle,
             analysis: None,
             ai_rows: None,
             ai_cache: std::collections::HashMap::new(),
             ai_drafts: std::collections::HashMap::new(),
             agent_owned_drafts: HashSet::new(),
             ai_revision_cache: std::collections::HashMap::new(),
-            agent_guidance: std::collections::HashMap::new(),
+            selected_diff_context: None,
+            agent_diagram_revision: 0,
+            agent_diagram_result: None,
             ai_running: std::collections::HashMap::new(),
             ai_activity: std::collections::HashMap::new(),
             ai_requests: RequestCoordinator::default(),
             ai_failures: std::collections::HashMap::new(),
             ai_selection_seq: 0,
+            ai_auto_generate: false,
+            ai_generation_requested: None,
             available_models: Vec::new(),
             model_list_loading: false,
             model_list_error: None,
@@ -639,12 +605,13 @@ impl Dispatcher {
             diff_syntax_in_flight: std::collections::HashMap::new(),
             base_override: None,
             available_bases: Vec::new(),
-            available_bases_truncated: false,
             output: std::sync::Arc::new(output),
             job_tx,
             status: StatusMessage::default(),
+            status_generation: 0,
             repo_ctx: None,
             changeset: None,
+            agent_changeset: None,
             config_write_tx: None,
             config_writer: None,
         }
@@ -718,11 +685,11 @@ impl Dispatcher {
     /// Set the bottom-bar status message; `UiSnapshot::message` mirrors the text while
     /// the renderer migrates to the typed [`StatusMessage`].
     fn set_status(&mut self, text: impl Into<String>, level: StatusLevel) {
-        self.status = StatusMessage {
+        self.replace_status(StatusMessage {
             text: text.into(),
             detail: None,
             level,
-        };
+        });
     }
 
     /// Set a concise footer message with a separate full diagnostic for the click-open
@@ -733,17 +700,40 @@ impl Dispatcher {
         detail: impl Into<String>,
         level: StatusLevel,
     ) {
-        self.status = StatusMessage {
+        self.replace_status(StatusMessage {
             text: text.into(),
             detail: Some(detail.into()),
             level,
-        };
+        });
+    }
+
+    fn replace_status(&mut self, status: StatusMessage) {
+        self.status_generation = self.status_generation.saturating_add(1);
+        let generation = self.status_generation;
+        let expires = status.level == StatusLevel::Info && !status.text.is_empty();
+        self.status = status;
+        if expires {
+            let tx = self.job_tx.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    tokio::time::sleep(INFO_STATUS_TTL).await;
+                    let _ = tx.send(DispatchEvent::StatusExpired { generation }).await;
+                });
+            }
+        }
     }
 
     /// Handle one event. Never blocks on git/LSP/AI — those run as spawned jobs.
     pub async fn handle(&mut self, event: DispatchEvent) {
         match event {
             DispatchEvent::RepoChanged => self.bump_and_refresh(),
+            DispatchEvent::StatusExpired { generation } => {
+                if generation == self.status_generation && self.status.level == StatusLevel::Info {
+                    self.status_generation = self.status_generation.saturating_add(1);
+                    self.status = StatusMessage::default();
+                    self.publish();
+                }
+            }
             DispatchEvent::Work(action) => self.on_action(action),
             DispatchEvent::AnalysisDone { epoch, result } => self.on_analysis_done(epoch, result),
             DispatchEvent::ChangesetReady {
@@ -794,7 +784,17 @@ impl Dispatcher {
             DispatchEvent::AiSelectionSettled { epoch, generation } => {
                 if epoch == self.epoch && generation == self.ai_selection_seq {
                     if let Some(selection) = self.current_ai_selection() {
-                        self.spawn_ai_job(selection);
+                        let generation_allowed = self.ai_auto_generate
+                            || self.ai_generation_requested.as_ref() == Some(&selection);
+                        if !generation_allowed {
+                            self.ai_status = AiStatus::Idle;
+                            self.publish();
+                            return;
+                        }
+                        self.spawn_ai_job(selection.clone());
+                        if !self.ai_auto_generate {
+                            self.ai_generation_requested = None;
+                        }
                         self.refresh_current_ai_status();
                         self.publish();
                     }
@@ -874,12 +874,11 @@ impl Dispatcher {
                 self.drain_relation_queue();
                 self.publish();
             }
-            DispatchEvent::BaseLoaded { bases, truncated } => {
+            DispatchEvent::BaseLoaded { bases } => {
                 // The picker always offers "(auto / inferred)" first to escape an override.
                 let mut list = vec![AUTO_BASE.to_string()];
                 list.extend(bases);
                 self.available_bases = list;
-                self.available_bases_truncated = truncated;
                 self.publish();
             }
         }
@@ -923,6 +922,8 @@ impl Dispatcher {
     fn on_action(&mut self, action: Action) {
         match action {
             Action::RefreshGit => self.spawn_refresh(),
+            Action::GenerateAi => self.generate_ai_for_current_selection(),
+            Action::ToggleAiGenerationMode => self.toggle_ai_generation_mode(),
             Action::SetFileExpanded { path, expanded } => self.set_file_expanded(&path, expanded),
             Action::SetDirectoryExpanded { .. } => {}
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
@@ -963,25 +964,89 @@ impl Dispatcher {
             Action::DirectorySelectionChanged { directory } => {
                 self.on_directory_selection_changed(directory)
             }
-            Action::AgentAsk(question) => self.apply_agent_guidance(question, false),
-            Action::AgentFeedback(feedback) => self.apply_agent_guidance(feedback, true),
-            Action::AgentDiagram(command) => self.apply_agent_diagram(command),
+            Action::AgentDiagram {
+                request_id,
+                command,
+            } => self.apply_agent_diagram(request_id, command),
+            Action::SetAgentDiffSelection(selected) => self.set_agent_diff_selection(selected),
             Action::BasePicker => self.spawn_list_bases(),
             Action::BaseSelected(name) => self.set_base(name),
             _ => {}
         }
     }
 
-    /// Fetch the provider's model list for the picker (spawned; non-blocking).
-    fn spawn_list_models(&mut self) {
-        let Some(ai) = self.ai.clone() else {
+    fn generate_ai_for_current_selection(&mut self) {
+        let Some(selection) = self.current_ai_selection() else {
             self.set_status(
-                "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)",
+                "select a changed directory, file, or function before generating AI",
                 StatusLevel::Warning,
             );
             self.publish();
             return;
         };
+        if self
+            .ai_running
+            .values()
+            .any(|job| job.epoch == self.epoch && job.selection == selection)
+        {
+            self.set_status(
+                format!("AI is already generating {}", selection.label()),
+                StatusLevel::Info,
+            );
+            self.publish();
+            return;
+        }
+        self.ai_generation_requested = (!self.ai_auto_generate).then_some(selection.clone());
+        self.retarget_ai_to_current_selection(true);
+        self.set_status(
+            format!("AI generation requested for {}", selection.label()),
+            StatusLevel::Info,
+        );
+        self.publish();
+    }
+
+    fn toggle_ai_generation_mode(&mut self) {
+        self.ai_auto_generate = !self.ai_auto_generate;
+        self.ai_generation_requested = None;
+        // Cancel a selection debounce that was authorized under the previous mode. An
+        // already-started request remains useful and is allowed to finish into its cache.
+        self.ai_selection_seq = self.ai_selection_seq.saturating_add(1);
+        if self.ai_auto_generate {
+            if self.current_ai_selection().is_some() {
+                self.retarget_ai_to_current_selection(false);
+            }
+            self.set_status(
+                "AI generation: automatic · selection changes generate after the debounce",
+                StatusLevel::Info,
+            );
+        } else {
+            if matches!(
+                self.ai_status,
+                AiStatus::WaitingForSymbols { .. }
+                    | AiStatus::Debouncing { .. }
+                    | AiStatus::Stale { .. }
+            ) {
+                self.ai_status = AiStatus::Idle;
+            }
+            self.set_status(
+                "AI generation: manual · press a to generate the current selection",
+                StatusLevel::Info,
+            );
+        }
+        self.publish();
+    }
+
+    fn ai_failure_suffix(&self) -> &'static str {
+        if self.ai_auto_generate {
+            AUTO_AI_FAILURE_SUFFIX
+        } else {
+            MANUAL_AI_FAILURE_SUFFIX
+        }
+    }
+
+    /// Fetch the provider's model list for the picker (spawned; non-blocking).
+    fn spawn_list_models(&mut self) {
+        let ai = self.ai.clone();
         // The currently configured model is always a valid picker fallback, even when the
         // provider has no `/models` endpoint or discovery fails after an inference error.
         self.merge_available_models([ai.model()]);
@@ -1022,34 +1087,23 @@ impl Dispatcher {
                 return;
             }
         };
-        let changed = match self.ai.clone() {
-            Some(ai)
-                if ai.provider_label() == "anthropic" && effort != ReasoningEffort::Default =>
-            {
-                self.set_status(
-                    "reasoning_effort is unavailable through Anthropic's native API",
-                    StatusLevel::Warning,
-                );
-                false
-            }
-            Some(ai) => {
-                let provider = ai.provider_label().to_string();
-                ai.set_model(model);
-                ai.set_reasoning_effort(effort);
-                self.queue_config_write(ConfigWrite::Model {
-                    provider: provider.clone(),
-                    model: model.to_string(),
-                });
-                self.queue_config_write(ConfigWrite::ReasoningEffort { provider, effort });
-                true
-            }
-            None => {
-                self.set_status(
-                    "AI not configured (set PRIME_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY)",
-                    StatusLevel::Warning,
-                );
-                false
-            }
+        let ai = self.ai.clone();
+        let changed = if ai.provider_label() == "anthropic" && effort != ReasoningEffort::Default {
+            self.set_status(
+                "reasoning_effort is unavailable through Anthropic's native API",
+                StatusLevel::Warning,
+            );
+            false
+        } else {
+            let provider = ai.provider_label().to_string();
+            ai.set_model(model);
+            ai.set_reasoning_effort(effort);
+            self.queue_config_write(ConfigWrite::Model {
+                provider: provider.clone(),
+                model: model.to_string(),
+            });
+            self.queue_config_write(ConfigWrite::ReasoningEffort { provider, effort });
+            true
         };
         if changed {
             self.reset_ai_for_settings_change();
@@ -1071,11 +1125,8 @@ impl Dispatcher {
         self.ai_failures.clear();
         self.abort_all_ai_requests();
         self.ai_rows = None;
-        if self.ai.is_some() {
-            self.retarget_ai_to_current_selection(true);
-        } else {
-            self.ai_status = AiStatus::Idle;
-        }
+        self.ai_generation_requested = None;
+        self.retarget_ai_to_current_selection(true);
     }
 
     fn queue_config_write(&mut self, write: ConfigWrite) {
@@ -1096,21 +1147,8 @@ impl Dispatcher {
         let repo = self.repo.clone();
         let tx = self.job_tx.clone();
         tokio::spawn(async move {
-            let result = repo.base_candidates_with_metadata().await;
-            let (bases, truncated) = match result {
-                Ok(candidates) => (
-                    candidates
-                        .entries
-                        .into_iter()
-                        .map(|base| base.ref_name)
-                        .collect(),
-                    candidates.truncated,
-                ),
-                Err(_) => (Vec::new(), false),
-            };
-            let _ = tx
-                .send(DispatchEvent::BaseLoaded { bases, truncated })
-                .await;
+            let bases = repo.base_picker_refs().await.unwrap_or_default();
+            let _ = tx.send(DispatchEvent::BaseLoaded { bases }).await;
         });
     }
 
@@ -1120,11 +1158,18 @@ impl Dispatcher {
     /// selected symbol's callers/callees — the impact lists read `Loading` until the
     /// fetch lands. Moving OFF a symbol (file row / empty list) clears the relations
     /// view and leaves the impact lists `Idle`. The same selection transition retargets
-    /// the automatically generated plan.
+    /// the selected AI plan.
     fn on_selection_changed(&mut self, file: Option<String>, symbol: Option<(String, u32, u32)>) {
         let previous_ai_selection = self.current_ai_selection();
         self.selected_directory = None;
         self.selected_file = file.clone();
+        if self
+            .selected_diff_context
+            .as_ref()
+            .is_some_and(|selected| file.as_deref() != Some(selected.file.as_str()))
+        {
+            self.selected_diff_context = None;
+        }
         self.selected_symbol = match (file, symbol) {
             (Some(file), Some((name, line, col))) => Some((file, name, line, col)),
             _ => None,
@@ -1142,6 +1187,7 @@ impl Dispatcher {
             }
         }
         if self.current_ai_selection() != previous_ai_selection {
+            self.ai_generation_requested = None;
             self.retarget_ai_to_current_selection(false);
         }
         if self.selected_file.is_some() {
@@ -1291,85 +1337,65 @@ impl Dispatcher {
         self.selected_file = None;
         self.selected_symbol = None;
         self.selected_relations = None;
+        self.selected_diff_context = None;
         self.reprioritize_semantic_work();
         if self.current_ai_selection() != previous_ai_selection {
+            self.ai_generation_requested = None;
             self.retarget_ai_to_current_selection(false);
         }
         self.publish();
     }
 
-    fn apply_agent_guidance(&mut self, text: String, feedback: bool) {
-        let Some(selection) = self.current_ai_selection() else {
+    fn set_agent_diff_selection(
+        &mut self,
+        selected: Option<codescope_tui::snapshot::SelectedDiffContext>,
+    ) {
+        let Some(mut selected) = selected else {
+            self.selected_diff_context = None;
+            self.publish();
+            return;
+        };
+        if selected.text.is_empty() {
+            self.selected_diff_context = None;
+            self.publish();
+            return;
+        }
+        if self.selected_file.as_deref() != Some(selected.file.as_str()) {
+            self.selected_diff_context = None;
             self.set_status(
-                "agent request needs a selected directory, file, or function",
+                "diff selection changed before it could become agent context",
                 StatusLevel::Warning,
             );
             self.publish();
             return;
-        };
-        let text = normalize_agent_text(&text);
-        if text.is_empty() {
-            self.set_status("agent request was empty", StatusLevel::Warning);
-            self.publish();
-            return;
         }
-        let guidance = self.agent_guidance.entry(selection.clone()).or_default();
-        if feedback {
-            guidance.feedback = Some(text.clone());
-        } else {
-            guidance.question = Some(text.clone());
-            guidance.feedback = None;
+        if selected.text.chars().count() > MAX_SELECTED_DIFF_CHARS {
+            selected.text = selected
+                .text
+                .chars()
+                .take(MAX_SELECTED_DIFF_CHARS)
+                .collect();
+            selected.truncated = true;
         }
-
-        // A replacement instruction for the same target supersedes its in-flight answer.
-        // Ordinary navigation still never cancels provider work; this is the one explicit
-        // revision path where allowing the old answer to win would ignore the command.
-        let generations = self
-            .ai_running
-            .iter()
-            .filter_map(|(generation, running)| {
-                (running.epoch == self.epoch && running.selection == selection)
-                    .then_some(*generation)
-            })
-            .collect::<Vec<_>>();
-        for generation in generations {
-            self.ai_requests.abort(generation);
-            self.ai_running.remove(&generation);
-            self.ai_activity.remove(&generation);
-        }
-        self.retarget_ai_to_current_selection(true);
-        self.set_status(
-            format!(
-                "agent: {} {}",
-                if feedback {
-                    "revising from"
-                } else {
-                    "answering"
-                },
-                truncate_chars(&text, 120)
-            ),
-            StatusLevel::Info,
-        );
+        self.selected_diff_context = Some(selected);
         self.publish();
     }
 
     /// Apply the controller's command to the exact same draft model exposed to the
     /// provider. A controller mutation takes ownership of this selection's writer, so an
     /// older internal request cannot subsequently overwrite it.
-    fn apply_agent_diagram(&mut self, command: DiagramCommand) {
+    fn apply_agent_diagram(&mut self, request_id: u64, command: DiagramCommand) {
         let Some(selection) = self.current_ai_selection() else {
-            self.set_status(
-                "diagram edit needs a selected directory, file, or function",
-                StatusLevel::Warning,
-            );
+            let error = "diagram edit needs a selected directory, file, or function".to_string();
+            self.record_agent_diagram_result(request_id, false, false, None, Some(error.clone()));
+            self.set_status(error, StatusLevel::Warning);
             self.publish();
             return;
         };
         if self.data_epoch != self.epoch || self.changeset.is_none() {
-            self.set_status(
-                "diagram edit is waiting for the current Git snapshot",
-                StatusLevel::Warning,
-            );
+            let error = "diagram edit is waiting for the current Git snapshot".to_string();
+            self.record_agent_diagram_result(request_id, false, false, None, Some(error.clone()));
+            self.set_status(error, StatusLevel::Warning);
             self.publish();
             return;
         }
@@ -1389,6 +1415,14 @@ impl Dispatcher {
         let summary = match draft.apply(&command) {
             Ok(summary) => summary,
             Err(error) => {
+                let error = error.to_string();
+                self.record_agent_diagram_result(
+                    request_id,
+                    false,
+                    false,
+                    None,
+                    Some(error.clone()),
+                );
                 self.set_status(
                     format!("diagram edit rejected: {error}"),
                     StatusLevel::Warning,
@@ -1410,12 +1444,26 @@ impl Dispatcher {
                     self.agent_owned_drafts.remove(&selection);
                     self.ai_rows = Some((self.epoch, selection, cached));
                     self.ai_status = AiStatus::Ready { epoch: self.epoch };
+                    self.record_agent_diagram_result(
+                        request_id,
+                        true,
+                        true,
+                        Some("validated and published the diagram".to_string()),
+                        None,
+                    );
                     self.set_status("agent diagram validated and published", StatusLevel::Info);
                 }
                 Err(error) => {
                     self.ai_status = AiStatus::Failed {
                         reason: error.clone(),
                     };
+                    self.record_agent_diagram_result(
+                        request_id,
+                        false,
+                        false,
+                        None,
+                        Some(error.clone()),
+                    );
                     self.set_status_with_detail(
                         format!(
                             "agent diagram needs another edit: {}",
@@ -1432,9 +1480,29 @@ impl Dispatcher {
             self.ai_status = AiStatus::Loading {
                 since_epoch: self.epoch,
             };
+            self.record_agent_diagram_result(request_id, true, false, Some(summary.clone()), None);
             self.set_status(format!("agent diagram: {summary}"), StatusLevel::Info);
         }
         self.publish();
+    }
+
+    fn record_agent_diagram_result(
+        &mut self,
+        request_id: u64,
+        accepted: bool,
+        published: bool,
+        summary: Option<String>,
+        error: Option<String>,
+    ) {
+        self.agent_diagram_revision = self.agent_diagram_revision.saturating_add(1);
+        self.agent_diagram_result = Some(AgentDiagramResult {
+            request_id,
+            revision: self.agent_diagram_revision,
+            accepted,
+            published,
+            summary,
+            error,
+        });
     }
 
     fn cancel_ai_for_selection(&mut self, selection: &AiSelectionKey) {
@@ -1542,11 +1610,23 @@ impl Dispatcher {
             };
             return;
         }
-        if self.ai.is_none() {
-            self.ai_status = AiStatus::Disabled;
+        // Manual authorization is consumed when the request starts, but the request and
+        // its accumulated activity remain selection-scoped. Returning to that selection
+        // must restore its progress immediately instead of waiting for another tool event.
+        if self
+            .ai_running
+            .values()
+            .any(|job| job.epoch == self.epoch && job.selection == selection)
+        {
+            self.ai_status = AiStatus::Loading {
+                since_epoch: self.epoch,
+            };
             return;
         }
-
+        if !self.ai_auto_generate && self.ai_generation_requested.as_ref() != Some(&selection) {
+            self.ai_status = AiStatus::Idle;
+            return;
+        }
         // The plan must never race the selected file's symbol inventory. `Unsupported`
         // is terminal and honest (there are no loadable symbols), while Failed remains
         // non-ready until the next repository refresh retries it.
@@ -1602,11 +1682,7 @@ impl Dispatcher {
     fn refresh_current_ai_status(&mut self) {
         let Some(selection) = self.current_ai_selection() else {
             self.ai_rows = None;
-            self.ai_status = if self.ai.is_some() {
-                AiStatus::Idle
-            } else {
-                AiStatus::Disabled
-            };
+            self.ai_status = AiStatus::Idle;
             return;
         };
         if let Some(plan) = self.ai_cache.get(&selection).cloned() {
@@ -1625,8 +1701,21 @@ impl Dispatcher {
             };
             return;
         }
-        if self.ai.is_none() {
-            self.ai_status = AiStatus::Disabled;
+        // A manual trigger is consumed once its provider request starts. Running work is
+        // still first-class UI state after that authorization token is gone: keep showing
+        // the progress pane and stream its tool activity exactly as automatic mode does.
+        if self
+            .ai_running
+            .values()
+            .any(|job| job.epoch == self.epoch && job.selection == selection)
+        {
+            self.ai_status = AiStatus::Loading {
+                since_epoch: self.epoch,
+            };
+            return;
+        }
+        if !self.ai_auto_generate && self.ai_generation_requested.as_ref() != Some(&selection) {
+            self.ai_status = AiStatus::Idle;
             return;
         }
         if let Some(file) = selection.file() {
@@ -1641,16 +1730,6 @@ impl Dispatcher {
                 }
                 Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Unsupported) => {}
             }
-        }
-        if self
-            .ai_running
-            .values()
-            .any(|job| job.epoch == self.epoch && job.selection == selection)
-        {
-            self.ai_status = AiStatus::Loading {
-                since_epoch: self.epoch,
-            };
-            return;
         }
         self.ai_status = AiStatus::Debouncing { epoch: self.epoch };
     }
@@ -1864,6 +1943,8 @@ impl Dispatcher {
         self.epoch = self.epoch.next();
         let epoch = self.epoch;
         self.ai_selection_seq = self.ai_selection_seq.saturating_add(1);
+        self.ai_generation_requested = None;
+        self.selected_diff_context = None;
         self.abort_all_ai_requests();
         self.ai_failures.clear();
         self.ai_rows = None;
@@ -1873,9 +1954,11 @@ impl Dispatcher {
         self.ai_cache.clear();
         self.ai_drafts.clear();
         self.agent_owned_drafts.clear();
-        if self.ai.is_some() {
-            self.ai_status = AiStatus::Stale { epoch };
-        }
+        self.ai_status = if self.ai_auto_generate {
+            AiStatus::Stale { epoch }
+        } else {
+            AiStatus::Idle
+        };
         let repo = self.repo.clone();
         let scope = self.scope;
         let base_override = self.base_override.clone();
@@ -1919,7 +2002,7 @@ impl Dispatcher {
     }
 
     fn spawn_ai_job(&mut self, selection: AiSelectionKey) {
-        let (Some(_ai), Some(changeset)) = (&self.ai, &self.changeset) else {
+        let Some(changeset) = &self.changeset else {
             return;
         };
         let Some(ctx) = &self.repo_ctx else { return };
@@ -1959,10 +2042,7 @@ impl Dispatcher {
         // The initial turn is intentionally an inventory, not an evidence dump. A scoped
         // mini-shell serves the captured Git snapshot and selected worktree files on demand;
         // its virtual cwd is the selected directory or the selected file's parent.
-        let mut brief = research_brief(&selection, &scoped_changeset);
-        if let Some(guidance) = self.agent_guidance.get(&selection) {
-            brief.push_str(&guidance.prompt_section());
-        }
+        let brief = research_brief(&selection, &scoped_changeset);
         let queried_lsp = QueriedLspFacts::default();
         let facts = SnapshotFacts::from_lazy_with_lsp(
             &scoped_changeset,
@@ -2009,21 +2089,17 @@ impl Dispatcher {
         });
         let running_selection = selection.clone();
         let task = tokio::spawn(async move {
-            let outcome = match &ai {
-                Some(ai) => {
-                    ai.request_plan_with_observers(
-                        &brief,
-                        previous_plan.as_ref(),
-                        &research_tools,
-                        &facts,
-                        epoch,
-                        Some(observer),
-                        Some(activity_observer),
-                    )
-                    .await
-                }
-                None => AiOutcome::Unavailable,
-            };
+            let outcome = ai
+                .request_plan_with_observers(
+                    &brief,
+                    previous_plan.as_ref(),
+                    &research_tools,
+                    &facts,
+                    epoch,
+                    Some(observer),
+                    Some(activity_observer),
+                )
+                .await;
             let _ = tx
                 .send(DispatchEvent::AiDone {
                     epoch,
@@ -2366,6 +2442,7 @@ impl Dispatcher {
         if collapsed_selected_symbol {
             self.selected_symbol = None;
             self.selected_relations = None;
+            self.ai_generation_requested = None;
             self.retarget_ai_to_current_selection(false);
         }
         self.publish();
@@ -2383,6 +2460,7 @@ impl Dispatcher {
             return;
         }
         self.repo_ctx = Some(ctx);
+        self.agent_changeset = Some(std::sync::Arc::new(changeset.clone()));
         self.changeset = Some(changeset);
         // The git-fact bundle is now current: per-file analysis and AI digests may launch
         // against it. Replay expansion intent for files that survived the refresh.
@@ -2421,6 +2499,7 @@ impl Dispatcher {
         // No comparison ran, so an empty ChangeSet would be a false fact. Remove every
         // branch-scoped artifact retained while refresh was in flight instead.
         self.changeset = None;
+        self.agent_changeset = None;
         self.analysis = None;
         self.file_semantics.clear();
         self.diff_syntax.clear();
@@ -2463,12 +2542,13 @@ impl Dispatcher {
             Ok(snap) => {
                 self.repo_ctx = Some(snap.repo_ctx.clone());
                 self.changeset = Some(snap.changeset.clone());
+                self.agent_changeset = Some(std::sync::Arc::new(snap.changeset.clone()));
                 // A git-only pipeline (no engine) also lands here as Ok: it must not light
                 // the top bar's LSP glyph nor erase the git-only warning. Semantic status
                 // belongs to the engine lifecycle (EngineReady/EngineUnavailable).
                 if self.engine.is_some() {
                     self.ls_status = LsStatus::Ready;
-                    self.status = StatusMessage::default();
+                    self.replace_status(StatusMessage::default());
                 }
                 self.analysis = Some(*snap);
                 // Relations were cleared at refresh start; resolve them against the new
@@ -2625,11 +2705,10 @@ impl Dispatcher {
                 // deterministic impact pane is unaffected by the failure.
                 if is_focused {
                     let footer_reason = ai_failure_footer_reason(&reason);
+                    let recovery = self.ai_failure_suffix();
                     self.set_status_with_detail(
-                        format!("AI: {footer_reason} · {AI_FAILURE_SUFFIX}"),
-                        format!(
-                            "AI generation failed\n\n{reason}\n\nRecovery: {AI_FAILURE_SUFFIX}"
-                        ),
+                        format!("AI: {footer_reason} · {recovery}"),
+                        format!("AI generation failed\n\n{reason}\n\nRecovery: {recovery}"),
                         StatusLevel::Warning,
                     );
                 }
@@ -2643,13 +2722,6 @@ impl Dispatcher {
             _ => {}
         }
         self.refresh_current_ai_status();
-        if is_current_epoch && is_focused && self.ai_cache.contains_key(&selection) {
-            if let Some(guidance) = self.agent_guidance.get(&selection) {
-                if let Some(display) = guidance.display() {
-                    self.set_status(format!("{display} · answer ready"), StatusLevel::Info);
-                }
-            }
-        }
         self.publish();
     }
 
@@ -2680,15 +2752,11 @@ impl Dispatcher {
             .map(|b| b.ref_name.clone())
             .or_else(|| self.base_override.clone())
             .unwrap_or_default();
-        let ai_tokens = self
-            .ai
-            .as_ref()
-            .map(|ai| ai.token_usage())
-            .map(|usage| AiTokenUsage {
-                input: usage.input,
-                output: usage.output,
-            })
-            .unwrap_or_default();
+        let usage = self.ai.token_usage();
+        let ai_tokens = AiTokenUsage {
+            input: usage.input,
+            output: usage.output,
+        };
         let diagram_draft = self
             .current_ai_selection()
             .and_then(|selection| self.ai_drafts.get(&selection).cloned());
@@ -2710,28 +2778,25 @@ impl Dispatcher {
             scope: self.scope,
             scope_counts: counts,
             files,
+            agent_changeset: self.agent_changeset.clone(),
+            agent_changeset_epoch: self.data_epoch,
             ai_summaries,
             diff,
+            selected_diff: self.selected_diff_context.clone(),
             semantic,
             diagram_draft,
+            agent_diagram_result: self.agent_diagram_result.clone(),
             impact,
             ls: self.ls_status,
             ai: self.ai_status.clone(),
-            ai_model: self.ai.as_ref().map(|a| a.model()).unwrap_or_default(),
-            ai_reasoning_effort: self
-                .ai
-                .as_ref()
-                .map(|ai| ai.reasoning_effort().as_str().to_string())
-                .unwrap_or_else(|| "default".to_string()),
+            ai_auto_generate: self.ai_auto_generate,
+            ai_model: self.ai.model(),
+            ai_reasoning_effort: self.ai.reasoning_effort().as_str().to_string(),
             available_reasoning_efforts: ReasoningEffort::ALL
                 .iter()
                 .map(|effort| effort.as_str().to_string())
                 .collect(),
-            ai_provider: self
-                .ai
-                .as_ref()
-                .map(|a| a.provider_label().to_string())
-                .unwrap_or_default(),
+            ai_provider: self.ai.provider_label().to_string(),
             ai_tokens,
             ai_activity,
             available_models: self.available_models.clone(),
@@ -2739,7 +2804,6 @@ impl Dispatcher {
             model_list_error: self.model_list_error.clone(),
             base_ref,
             available_bases: self.available_bases.clone(),
-            base_candidates_truncated: self.available_bases_truncated,
             message: self.status.text.clone(),
             status: self.status.clone(),
             epoch: self.epoch,
@@ -2826,10 +2890,6 @@ impl Dispatcher {
         // relation rows are gone.
         // AI rows render only while their epoch matches the current repo state (H3).
         let current_ai_selection = self.current_ai_selection();
-        let guidance_note = current_ai_selection
-            .as_ref()
-            .and_then(|selection| self.agent_guidance.get(selection))
-            .and_then(AgentGuidance::display);
         let semantic = match &self.ai_rows {
             Some((ep, selection, plan))
                 if *ep == self.epoch && current_ai_selection.as_ref() == Some(selection) =>
@@ -2839,17 +2899,14 @@ impl Dispatcher {
                     // The report travels with the plan: sanitized content keeps its
                     // verdict/dropped-items trail in every publish, cache hit included.
                     report: Some(plan.report.clone()),
-                    note: guidance_note.unwrap_or_else(|| selection.label().to_string()),
+                    note: selection.label().to_string(),
                     ai_generated: true,
                 }
             }
             // Unfinished drafts remain available through `diagram_draft` for the internal
             // and controller APIs, but never become renderable UI. A stale plan or selection
             // mismatch is equally non-renderable until a complete, current plan is ready.
-            _ => SemanticPane {
-                note: guidance_note.unwrap_or_default(),
-                ..SemanticPane::default()
-            },
+            _ => SemanticPane::default(),
         };
         (diff, semantic)
     }
@@ -4010,21 +4067,6 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    #[test]
-    fn agent_guidance_is_bounded_and_explicitly_not_evidence() {
-        let guidance = AgentGuidance {
-            question: Some("Where does this request fail?".to_string()),
-            feedback: Some("Emphasize the queue boundary.".to_string()),
-        };
-        let prompt = guidance.prompt_section();
-        assert!(prompt.contains("Where does this request fail?"));
-        assert!(prompt.contains("Emphasize the queue boundary."));
-        assert!(prompt.matches("not evidence").count() >= 1);
-
-        let normalized = normalize_agent_text(&"x".repeat(MAX_AGENT_GUIDANCE_CHARS + 50));
-        assert_eq!(normalized.chars().count(), MAX_AGENT_GUIDANCE_CHARS);
-    }
-
     /// Build a throwaway repo: one commit on `main`, one more on `feature` (checked out).
     /// Plain git CLI so the test needs no extra dev-dependencies.
     fn scratch_repo() -> std::path::PathBuf {
@@ -4085,11 +4127,29 @@ mod tests {
             .expect("discover scratch repo");
         let (snapshot_tx, snapshot_rx) = watch::channel(UiSnapshot::placeholder());
         let (job_tx, job_rx) = mpsc::channel(16);
-        (
-            Dispatcher::new(repo, None, None, snapshot_tx, job_tx),
-            snapshot_rx,
-            job_rx,
+        let ai = test_ai_service(root);
+        let mut dispatcher = Dispatcher::new(repo, None, ai, snapshot_tx, job_tx);
+        // Most legacy dispatcher tests exercise selection-following generation. Tests for
+        // the user-facing default explicitly toggle or construct manual mode below.
+        dispatcher.ai_auto_generate = true;
+        (dispatcher, snapshot_rx, job_rx)
+    }
+
+    fn test_ai_service(root: &std::path::Path) -> AiService {
+        let config = codescope_ai::AiConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "test/model".to_string(),
+            reasoning_effort: ReasoningEffort::Default,
+            api_key: None,
+            timeout: std::time::Duration::from_millis(25),
+            max_tool_calls: 1,
+            prime_team_id: None,
+        };
+        AiService::new(
+            config,
+            camino::Utf8PathBuf::from_path_buf(root.to_path_buf()).unwrap(),
         )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -4099,14 +4159,117 @@ mod tests {
         let repo = GitRepo::discover(&repo_root).await.unwrap();
         let (output_tx, mut output_rx) = mpsc::unbounded_channel();
         let (job_tx, _job_rx) = mpsc::channel(4);
-        let disp = Dispatcher::new(repo, None, None, output_tx, job_tx);
+        let ai = test_ai_service(repo_root.as_std_path());
+        let disp = Dispatcher::new(repo, None, ai, output_tx, job_tx);
 
         disp.publish();
         let snapshot = output_rx.recv().await.expect("headless snapshot");
         assert_eq!(snapshot.epoch, Epoch::ZERO);
+        assert!(
+            !snapshot.ai_auto_generate,
+            "manual generation is the default"
+        );
         assert!(snapshot.semantic.plan.is_none());
         // Snapshot default: no AI plan means no report either.
         assert!(snapshot.semantic.report.is_none());
+    }
+
+    #[tokio::test]
+    async fn diff_selection_is_published_for_agents_and_cleared_on_file_change() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.selected_file = Some("a.txt".to_string());
+        disp.set_agent_diff_selection(Some(codescope_tui::snapshot::SelectedDiffContext {
+            file: "a.txt".to_string(),
+            text: "two".to_string(),
+            truncated: false,
+        }));
+        assert_eq!(
+            snapshot_rx
+                .borrow()
+                .selected_diff
+                .as_ref()
+                .map(|selected| selected.text.as_str()),
+            Some("two")
+        );
+
+        disp.on_selection_changed(Some("other.txt".to_string()), None);
+        assert!(snapshot_rx.borrow().selected_diff.is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn external_diagram_edits_publish_synchronous_results() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.changeset = Some(two_file_changeset());
+        disp.data_epoch = disp.epoch;
+        disp.selected_file = Some("a.txt".to_string());
+
+        disp.apply_agent_diagram(
+            41,
+            DiagramCommand::SetIntent {
+                intent: "Explain the selected change.".to_string(),
+            },
+        );
+        {
+            let snapshot = snapshot_rx.borrow().clone();
+            let result = snapshot.agent_diagram_result.unwrap();
+            assert_eq!(result.request_id, 41);
+            assert_eq!(result.revision, 1);
+            assert!(result.accepted);
+            assert!(!result.published);
+            assert_eq!(
+                snapshot.diagram_draft.unwrap().intent,
+                "Explain the selected change."
+            );
+        }
+
+        disp.apply_agent_diagram(
+            42,
+            DiagramCommand::SetIntent {
+                intent: " ".to_string(),
+            },
+        );
+        let snapshot = snapshot_rx.borrow().clone();
+        let result = snapshot.agent_diagram_result.unwrap();
+        assert_eq!(result.request_id, 42);
+        assert_eq!(result.revision, 2);
+        assert!(!result.accepted);
+        assert!(result.error.unwrap().contains("must not be empty"));
+        assert_eq!(
+            snapshot.diagram_draft.unwrap().intent,
+            "Explain the selected change.",
+            "a rejected atomic edit leaves the draft unchanged"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn informational_status_expires_but_warnings_remain() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.set_status("generation requested", StatusLevel::Info);
+        let generation = disp.status_generation;
+        disp.publish();
+
+        disp.handle(DispatchEvent::StatusExpired {
+            generation: generation.saturating_sub(1),
+        })
+        .await;
+        assert_eq!(snapshot_rx.borrow().status.text, "generation requested");
+        disp.handle(DispatchEvent::StatusExpired { generation })
+            .await;
+        assert!(snapshot_rx.borrow().status.text.is_empty());
+
+        disp.set_status("provider unavailable", StatusLevel::Warning);
+        let generation = disp.status_generation;
+        disp.publish();
+        disp.handle(DispatchEvent::StatusExpired { generation })
+            .await;
+        assert_eq!(snapshot_rx.borrow().status.text, "provider unavailable");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     struct SlowFailingConfig;
@@ -4182,7 +4345,6 @@ mod tests {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
         let config = codescope_ai::AiConfig {
-            enabled: true,
             base_url: "http://127.0.0.1:1/v1".to_string(),
             model: "current/model".to_string(),
             reasoning_effort: ReasoningEffort::Default,
@@ -4196,7 +4358,7 @@ mod tests {
             camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
         )
         .unwrap();
-        disp.ai = Some(std::sync::Arc::new(service));
+        disp.ai = std::sync::Arc::new(service);
         disp.ai_status = AiStatus::Idle;
 
         disp.handle(DispatchEvent::Work(Action::ModelPicker)).await;
@@ -4232,7 +4394,6 @@ mod tests {
         let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
         let service = AiService::new(
             codescope_ai::AiConfig {
-                enabled: true,
                 base_url: "http://127.0.0.1:1/v1".to_string(),
                 model: "old/model".to_string(),
                 reasoning_effort: ReasoningEffort::Low,
@@ -4244,7 +4405,7 @@ mod tests {
             camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
         )
         .unwrap();
-        disp.ai = Some(std::sync::Arc::new(service));
+        disp.ai = std::sync::Arc::new(service);
         disp.ai_status = AiStatus::Idle;
 
         disp.handle(DispatchEvent::Work(Action::AiSettingsSelected {
@@ -5301,7 +5462,8 @@ mod tests {
         assert_eq!(snap.impact.callers.state, ImpactLoadState::Unavailable);
         assert_eq!(snap.impact.downstream.state, ImpactLoadState::Unavailable);
 
-        // A file row: the file-level fallback, both lists Idle, no focused symbol.
+        // A file row: the file-level fallback starts its AI prerequisite analysis, while
+        // both relationship lists remain Idle and there is no focused symbol.
         disp.handle(DispatchEvent::Work(Action::SelectionChanged {
             file: Some("b.txt".to_string()),
             symbol: None,
@@ -5316,8 +5478,8 @@ mod tests {
         assert_eq!(selected.label, "b.txt");
         assert_eq!(selected.change, "modified");
         assert_eq!(
-            selected.interpretation, "symbol analysis pending…",
-            "a pending file says so, not a fake zero"
+            selected.interpretation, "analyzing symbols…",
+            "an unanalyzed file reports the work started by the mandatory AI path"
         );
         assert_eq!(snap.impact.callers.state, ImpactLoadState::Idle);
         assert_eq!(snap.impact.downstream.state, ImpactLoadState::Idle);
@@ -5497,23 +5659,6 @@ mod tests {
             base: None,
         });
         disp.data_epoch = disp.epoch;
-        let config = codescope_ai::AiConfig {
-            enabled: true,
-            base_url: "http://127.0.0.1:1/v1".to_string(),
-            model: "test/model".to_string(),
-            reasoning_effort: ReasoningEffort::Default,
-            api_key: None,
-            timeout: std::time::Duration::from_millis(50),
-            max_tool_calls: 1,
-            prime_team_id: None,
-        };
-        disp.ai = Some(std::sync::Arc::new(
-            AiService::new(
-                config,
-                camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
-            )
-            .unwrap(),
-        ));
         let a = AiSelectionKey::File("a.txt".to_string());
         disp.ai_cache.insert(a, cached_ai_plan("plan-a"));
         disp.handle(DispatchEvent::Work(Action::SelectionChanged {
@@ -5546,23 +5691,6 @@ mod tests {
     async fn late_focused_relations_do_not_cancel_a_running_plan() {
         let root = scratch_repo();
         let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
-        let config = codescope_ai::AiConfig {
-            enabled: true,
-            base_url: "http://127.0.0.1:1/v1".to_string(),
-            model: "test/model".to_string(),
-            reasoning_effort: ReasoningEffort::Default,
-            api_key: None,
-            timeout: std::time::Duration::from_millis(25),
-            max_tool_calls: 1,
-            prime_team_id: None,
-        };
-        disp.ai = Some(std::sync::Arc::new(
-            AiService::new(
-                config,
-                camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
-            )
-            .unwrap(),
-        ));
         disp.selected_file = Some("a.txt".to_string());
         disp.selected_symbol = Some(("a.txt".to_string(), "focused".to_string(), 10, 2));
         let selection = disp.current_ai_selection().unwrap();
@@ -5663,6 +5791,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_mode_waits_for_a_before_generating_the_selected_file() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.handle(DispatchEvent::Work(Action::ToggleAiGenerationMode))
+            .await;
+        assert!(!snapshot_rx.borrow().ai_auto_generate);
+
+        disp.changeset = Some(two_file_changeset());
+        disp.repo_ctx = Some(codescope_core::RepoContext {
+            toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            head: codescope_core::HeadState::Branch("feature".to_string()),
+            upstream: None,
+            base: None,
+        });
+        disp.data_epoch = disp.epoch;
+        disp.file_semantics
+            .insert("b.txt".to_string(), ready_semantics("b.txt", Vec::new()));
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        assert_eq!(snapshot_rx.borrow().ai, AiStatus::Idle);
+
+        disp.handle(DispatchEvent::AiSelectionSettled {
+            epoch: disp.epoch,
+            generation: disp.ai_selection_seq,
+        })
+        .await;
+        assert!(
+            disp.ai_running.is_empty(),
+            "selection alone cannot start AI in manual mode"
+        );
+
+        disp.handle(DispatchEvent::Work(Action::GenerateAi)).await;
+        assert_eq!(
+            snapshot_rx.borrow().ai,
+            AiStatus::Debouncing { epoch: disp.epoch }
+        );
+        disp.handle(DispatchEvent::AiSelectionSettled {
+            epoch: disp.epoch,
+            generation: disp.ai_selection_seq,
+        })
+        .await;
+        assert_eq!(
+            disp.ai_running.values().map(|job| &job.selection).next(),
+            Some(&AiSelectionKey::File("b.txt".to_string()))
+        );
+        assert!(
+            matches!(snapshot_rx.borrow().ai, AiStatus::Loading { .. }),
+            "a consumed manual trigger must remain visibly in progress"
+        );
+
+        let generation = *disp.ai_running.keys().next().unwrap();
+        disp.handle(DispatchEvent::AiActivity {
+            epoch: disp.epoch,
+            selection: AiSelectionKey::File("b.txt".to_string()),
+            generation,
+            update: AiActivityUpdate::ToolCall {
+                id: "call-1".to_string(),
+                name: "git_diff_file".to_string(),
+                detail: "b.txt · hunk 0".to_string(),
+                error: None,
+                state: AiToolActivityState::Running,
+            },
+        })
+        .await;
+        let snap = snapshot_rx.borrow().clone();
+        assert!(matches!(snap.ai, AiStatus::Loading { .. }));
+        assert_eq!(snap.ai_activity.calls.len(), 1);
+        assert_eq!(snap.ai_activity.calls[0].name, "git_diff_file");
+
+        // Leaving the row hides its selection-scoped activity. Returning must restore
+        // the already-running request and its existing tool rows without requiring a new
+        // provider event to repair the UI state.
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("a.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        assert_eq!(snapshot_rx.borrow().ai, AiStatus::Idle);
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+        let restored = snapshot_rx.borrow().clone();
+        assert!(matches!(restored.ai, AiStatus::Loading { .. }));
+        assert_eq!(restored.ai_activity.calls.len(), 1);
+        assert_eq!(restored.ai_activity.calls[0].name, "git_diff_file");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn enabling_automatic_mode_schedules_the_current_selection() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.handle(DispatchEvent::Work(Action::ToggleAiGenerationMode))
+            .await;
+        disp.changeset = Some(two_file_changeset());
+        disp.repo_ctx = Some(codescope_core::RepoContext {
+            toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            head: codescope_core::HeadState::Branch("feature".to_string()),
+            upstream: None,
+            base: None,
+        });
+        disp.data_epoch = disp.epoch;
+        disp.file_semantics
+            .insert("b.txt".to_string(), ready_semantics("b.txt", Vec::new()));
+        disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+            file: Some("b.txt".to_string()),
+            symbol: None,
+        }))
+        .await;
+
+        disp.handle(DispatchEvent::Work(Action::ToggleAiGenerationMode))
+            .await;
+        assert!(snapshot_rx.borrow().ai_auto_generate);
+        assert_eq!(
+            snapshot_rx.borrow().ai,
+            AiStatus::Debouncing { epoch: disp.epoch }
+        );
+        disp.handle(DispatchEvent::AiSelectionSettled {
+            epoch: disp.epoch,
+            generation: disp.ai_selection_seq,
+        })
+        .await;
+        assert_eq!(disp.ai_running.len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn automatic_ai_waits_for_selected_file_symbols_then_starts() {
         let root = scratch_repo();
         let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
@@ -5676,23 +5936,6 @@ mod tests {
         disp.data_epoch = disp.epoch;
         disp.file_semantics
             .insert("b.txt".to_string(), FileSemanticState::Loading);
-        let config = codescope_ai::AiConfig {
-            enabled: true,
-            base_url: "http://127.0.0.1:1/v1".to_string(),
-            model: "test/model".to_string(),
-            reasoning_effort: ReasoningEffort::Default,
-            api_key: None,
-            timeout: std::time::Duration::from_millis(25),
-            max_tool_calls: 1,
-            prime_team_id: None,
-        };
-        disp.ai = Some(std::sync::Arc::new(
-            AiService::new(
-                config,
-                camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
-            )
-            .unwrap(),
-        ));
 
         disp.handle(DispatchEvent::Work(Action::SelectionChanged {
             file: Some("b.txt".to_string()),
@@ -5738,23 +5981,6 @@ mod tests {
     async fn repository_change_invalidates_symbols_and_automatically_regenerates() {
         let root = scratch_repo();
         let (mut disp, _snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
-        let config = codescope_ai::AiConfig {
-            enabled: true,
-            base_url: "http://127.0.0.1:1/v1".to_string(),
-            model: "test/model".to_string(),
-            reasoning_effort: ReasoningEffort::Default,
-            api_key: None,
-            timeout: std::time::Duration::from_millis(25),
-            max_tool_calls: 1,
-            prime_team_id: None,
-        };
-        disp.ai = Some(std::sync::Arc::new(
-            AiService::new(
-                config,
-                camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
-            )
-            .unwrap(),
-        ));
         disp.selected_file = Some("a.txt".to_string());
         disp.file_semantics
             .insert("a.txt".to_string(), ready_semantics("a.txt", Vec::new()));

@@ -501,7 +501,7 @@ async fn local_branch_wins_same_tip_remote_twin() {
     );
     assert_eq!(base.merge_base.as_str(), a_sha.trim());
 
-    // Picker: the local twin is first and the remote spelling is collapsed.
+    // Automatic candidates: the local twin is first and the remote spelling is collapsed.
     let candidates = repo.base_candidates().await.expect("candidates");
     assert_eq!(candidates[0].source, BaseSource::Ancestor);
     assert_eq!(candidates[0].ref_name, "a");
@@ -514,6 +514,12 @@ async fn local_branch_wins_same_tip_remote_twin() {
     assert!(
         !candidates.iter().any(|c| c.ref_name == "origin/a"),
         "origin/a is represented by local a: {candidates:?}"
+    );
+    let picker_refs = repo.base_picker_refs().await.expect("picker refs");
+    assert_eq!(picker_refs[0], "a", "the inferred spelling stays first");
+    assert!(
+        picker_refs.contains(&"origin/a".to_string()),
+        "the interactive picker exposes every selectable ref spelling: {picker_refs:?}"
     );
 
     // If the configured upstream is the remote twin, its priority/source survives while
@@ -696,11 +702,8 @@ async fn bounded_picker_reports_truncation_without_deduping_unrelated_names() {
         );
     }
 
-    let candidates = open_repo(&top)
-        .await
-        .base_candidates_with_metadata()
-        .await
-        .unwrap();
+    let repo = open_repo(&top).await;
+    let candidates = repo.base_candidates_with_metadata().await.unwrap();
     assert!(candidates.truncated);
     assert_eq!(
         candidates.entries.len(),
@@ -712,6 +715,45 @@ async fn bounded_picker_reports_truncation_without_deduping_unrelated_names() {
         .map(|base| base.ref_name.as_str())
         .collect();
     assert_eq!(distinct.len(), candidates.entries.len());
+
+    let picker_refs = repo.base_picker_refs().await.unwrap();
+    assert_eq!(picker_refs.len(), 301, "main plus every review ref");
+    assert!(
+        picker_refs.contains(&"review/base-299".to_string()),
+        "refs omitted by topology ranking remain selectable: {picker_refs:?}"
+    );
+}
+
+#[tokio::test]
+async fn base_picker_includes_divergent_branches_after_ranked_ancestors() {
+    let (_tmp, top) = scratch_repo();
+    git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
+    write(top.as_std_path(), "feature.txt", "feature\n");
+    git(top.as_std_path(), &["add", "feature.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "feature"]);
+    git(top.as_std_path(), &["checkout", "-q", "main"]);
+    git(
+        top.as_std_path(),
+        &["checkout", "-q", "-b", "preview/sibling"],
+    );
+    write(top.as_std_path(), "preview.txt", "preview\n");
+    git(top.as_std_path(), &["add", "preview.txt"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "preview"]);
+    git(top.as_std_path(), &["checkout", "-q", "feature"]);
+
+    let repo = open_repo(&top).await;
+    let meaningful = repo.base_candidates().await.unwrap();
+    assert!(
+        meaningful
+            .iter()
+            .all(|base| base.ref_name != "preview/sibling"),
+        "a divergent branch must not influence automatic inference"
+    );
+    let picker_refs = repo.base_picker_refs().await.unwrap();
+    assert!(
+        picker_refs.contains(&"preview/sibling".to_string()),
+        "divergent branches should still be available to an explicit picker selection"
+    );
 }
 
 #[tokio::test]

@@ -18,7 +18,7 @@ remain explicit rather than being replaced by deterministic summary content.
 
 ## The pipeline
 
-1. **Detect** — by default the user presses `R` to refresh repository state. With the
+1. **Detect** — by default the user presses `g` to refresh repository state. With the
    TUI-only `--watch` flag, working-tree and git-dir watchers feed one coalescer. After a
    quiet window, one repository fingerprint decides whether anything actually changed;
    only then does the dispatcher bump the repo-state **epoch** once.
@@ -33,24 +33,28 @@ remain explicit rather than being replaced by deterministic summary content.
    working directory, comparison scope, changed-file count, and the review assignment. It does
    not proactively include source bodies, hunks, diagnostics, symbols, or relationship lists.
    Absolute paths are stripped.
-5. **Schedule + request** — only the current directory, file, or symbol can start automatic
-   generation. Selection changes use a 250 ms debounce. File/symbol requests wait for that
-   file's symbol inventory; directory requests can proceed from the changed-file/hunk facts
-   already available and include only files below the selected directory. There is no prompt
-   prefetch, background generation, sibling warming, or file-summary queue. Moving away cancels
-   only the unsent debounce: a provider request that has started keeps running and caches its
-   result under the original selection. The coordinator retains at most 16 active requests; a
+5. **Schedule + request** — manual generation is the default: `a` requests the current directory,
+   file, or symbol, and `A` toggles automatic selection-following generation for the session.
+   Automatic selection changes use a 250 ms debounce. File/symbol requests wait for that file's
+   symbol inventory; directory requests can proceed from the changed-file/hunk facts already
+   available and include only files below the selected directory. There is no prompt prefetch,
+   sibling warming, or file-summary queue. Moving away cancels only an unsent request: a provider
+   request that has started keeps running and caches its result under the original selection. The
+   coordinator retains at most 16 active requests; a
    17th request aborts the oldest active generation and takes its place. Aborted work is not
    requeued. The TUI and headless backend use this same selection-only policy. Each job returns
-   a reviewer-first `DiagramDraft` through a bounded agentic loop (at most 48 total research and
+   a reviewer-first `DiagramDraft` through a bounded agentic loop (at most 128 total research and
    diagram operations). `edit_visualization` applies atomic intent/form/node/edge/evidence
    create-update-delete commands, and `inspect_visualization` returns the current draft. The model
-   never needs to resend the complete plan after each correction. Initial research and normal
+   never needs to resend the complete plan after each correction. Production research first
+   requires `list_directory` for a directory selection or `git_status_file` for a file/symbol;
+   this exposes the inventory before the model chooses an exact diff hunk. Later research and normal
    full-schema turns use `Auto` tool choice. After an exact diff is retained, the initial
    intent/form bootstrap, and a focused recovery after a provider-truncated response, use
    `Required` tool choice with one controller-selected canonical editor branch; the next normal
    turn returns to full-schema `Auto`. Ending a full `Auto` turn without another tool call
-   implicitly requests validation and publication of the accumulated draft.
+   requests validation and publication. The controller also validates after a bounded number of
+   complete-draft refinements and before accepting an unsolicited delete/rebuild cycle.
    `intent`, `forms`, and `evidence` are required, and the primary form
    must be structural — one of changed-symbol tree, call tree, type/impl tree, relationship
    flow, before/after, or sequence; the legacy `impact_summary` and `focused_diff` forms
@@ -126,9 +130,10 @@ remain explicit rather than being replaced by deterministic summary content.
 
 `codescope-core::DiagramCommand` is the common mutation contract. Internal inference receives it
 as `edit_visualization`; an external coding agent sends the identical tagged JSON through
-`codescope agent . diagram apply '<json>'`. Both edit the dispatcher-owned `DiagramDraft`, and
+`codescope agent . diagram edit '<json>'`. Both edit the dispatcher-owned `DiagramDraft`, and
 both finish through the same parser, epoch gate, fact validator, and renderer. The controller can
-also use `diagram show`, `diagram reset`, and `diagram finish`. A controller edit cancels only an
+also use `diagram inspect`, `diagram schema`, and `diagram finish`; each edit waits for its
+dispatcher acknowledgement and returns the resulting draft. A controller edit cancels only an
 older internal writer for that same selection so two agents cannot race one draft; ordinary tree
 navigation still leaves started requests running under the 16-entry queue policy.
 
@@ -137,7 +142,8 @@ navigation still leaves started requests running under the 16-entry queue policy
 `codescope debug-ai` runs this same dispatcher pipeline without initializing Ratatui. The
 dispatcher publishes `UiSnapshot` through a shared `BackendOutput` abstraction: a watch-channel
 implementation feeds the interactive TUI, while an mpsc implementation feeds the debug command.
-The command selects a changed file/function using normal `Action`s and prints the validated plan
+The command selects a changed file/function and explicitly triggers generation using normal
+`Action`s, then prints the validated plan
 and its full validation report from `UiSnapshot.semantic.plan` / `.report`, so it cannot
 silently drift into a second prompt or validator. A one-shot debug run requests only that
 explicit selection.
@@ -159,12 +165,13 @@ the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` re
 ## Provider neutrality
 
 The client speaks OpenAI-compatible Chat Completions for OpenAI, Prime, and custom endpoints,
-and native Anthropic Messages for Anthropic. Initial research and normal full-schema turns use
-`Auto` tool choice. Only the initial intent/form bootstrap after retained diff evidence,
+and native Anthropic Messages for Anthropic. A selection-specific initial inventory, the initial
+intent/form bootstrap after retained diff evidence,
 and a focused recovery from a provider-truncated response, use `Required` with one
-controller-selected canonical editor branch. A tool-less full `Auto` turn is the completion signal;
-if its accumulated draft is invalid, the service uses one of its bounded repair turns to return
-exact validation feedback. Verified against Prime
+controller-selected canonical branch. Other research/construction turns use `Auto`. A tool-less
+full `Auto` turn is one completion signal; bounded finalization is another. If the accumulated
+draft is invalid, the service uses one of its bounded repair turns to return exact validation
+feedback. Verified against Prime
 Inference (`https://api.pinference.ai/api/v1`) and OpenAI; anything compatible (Ollama, vLLM, …)
 works by setting the base URL. The default model is a small, schema-constrained one — plans are
 structured, so they don't need a frontier model.
@@ -176,6 +183,13 @@ structured, so they don't need a frontier model.
   `ANTHROPIC_API_KEY` and infers the provider from the built-in name. An arbitrary named key
   requires an explicit base URL; a literal key in a config file is a hard error.
 - Keys are wrapped in `secrecy::SecretString`; never logged, never shown.
+- Every provider request, response, usage record, latency, and error is appended to the local
+  `telemetry.jsonl` beside global config. Prompt, tool, completion, and provider-returned reasoning
+  content is retained after recognizable secret values are scrubbed. Headers and key material are
+  excluded, and Codescope does not upload the file.
+- The same local stream correlates LLM turns with raw keys, typed picker input, selections,
+  focused files/hunks, scroll offsets, mouse coordinates/gestures, external control actions, and
+  snapshot transitions from the TUI session.
 - What leaves initially is the bounded research assignment. Later fresh handoffs can include
   retained exact diffs and tagged tool results, the current diagram draft, bounded controller
   feedback/state, and an explicitly untrusted prior validated revision seed. These values use

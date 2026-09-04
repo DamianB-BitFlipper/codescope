@@ -15,6 +15,7 @@ codescope-git = { path = "../codescope-git" }
 codescope-lsp = { path = "../codescope-lsp" }
 codescope-analysis = { path = "../codescope-analysis" }
 codescope-ai = { path = "../codescope-ai" }
+codescope-telemetry = { path = "../codescope-telemetry" }
 codescope-tui = { path = "../codescope-tui" }
 anyhow.workspace = true
 clap.workspace = true

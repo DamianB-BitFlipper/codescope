@@ -18,8 +18,10 @@
 //!   [`AiService`](crate::AiService) honors it.
 //!
 //! Privacy: the `Authorization` header is built from the [`secrecy`]-wrapped key at request
-//! time and marked sensitive; message/tool contents are never logged (counts only); reqwest
-//! errors are sanitized with [`reqwest::Error::without_url`].
+//! time and marked sensitive. Provider request/response bodies are retained in Codescope's
+//! owner-only local telemetry after recognizable secret values are scrubbed; explicit debug
+//! mode also emits scrubbed `trace` events. Reqwest errors are sanitized with
+//! [`reqwest::Error::without_url`].
 
 use crate::config::{AiConfig, ProviderKind, ReasoningEffort};
 use crate::error::AiError;
@@ -188,7 +190,6 @@ struct BreakerState {
 type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, QuantaClock>;
 
 /// Provider request client for Chat Completions or native Anthropic Messages.
-/// Constructed only when AI is enabled.
 pub struct AiClient {
     http: reqwest::Client,
     endpoint: String,
@@ -204,6 +205,7 @@ pub struct AiClient {
     breaker: Mutex<BreakerState>,
     input_tokens: AtomicU64,
     output_tokens: AtomicU64,
+    telemetry_request_seq: AtomicU64,
     options: AiClientOptions,
 }
 
@@ -221,19 +223,13 @@ impl std::fmt::Debug for AiClient {
 }
 
 impl AiClient {
-    /// Build a client from an enabled config with default [`AiClientOptions`].
-    ///
-    /// Errors with [`AiError::Disabled`] when `config.enabled` is false — no HTTP client
-    /// exists while AI is off (research 07 §2).
+    /// Build a client from a resolved config with default [`AiClientOptions`].
     pub fn new(config: &AiConfig) -> Result<Self, AiError> {
         Self::with_options(config, AiClientOptions::default())
     }
 
     /// Build a client with explicit options (tests tighten timeouts/limits).
     pub fn with_options(config: &AiConfig, options: AiClientOptions) -> Result<Self, AiError> {
-        if !config.enabled {
-            return Err(AiError::Disabled);
-        }
         let rpm = NonZeroU32::new(options.requests_per_minute)
             .ok_or_else(|| AiError::Config("requests_per_minute must be > 0".into()))?;
         let burst = NonZeroU32::new(options.burst)
@@ -279,6 +275,7 @@ impl AiClient {
             breaker: Mutex::new(BreakerState::default()),
             input_tokens: AtomicU64::new(0),
             output_tokens: AtomicU64::new(0),
+            telemetry_request_seq: AtomicU64::new(1),
             options,
         })
     }
@@ -569,8 +566,24 @@ impl AiClient {
         require_tool: bool,
         max_tokens_override: Option<u64>,
     ) -> Result<RawPlanResponse, AiError> {
+        let telemetry_request_id = self.telemetry_request_seq.fetch_add(1, Ordering::Relaxed);
+        let telemetry_started = Instant::now();
         let tool_values: Vec<Value> = tools.iter().map(ToolDef::to_openai).collect();
         let body = self.build_body(messages, &tool_values, require_tool, max_tokens_override);
+        codescope_telemetry::record(
+            "llm.request",
+            json!({
+                "request_id": telemetry_request_id,
+                "provider": format!("{:?}", self.provider),
+                "endpoint": sanitized_endpoint(&self.endpoint),
+                "model": self.model(),
+                "reasoning_effort": self.reasoning_effort().to_string(),
+                "require_tool": require_tool,
+                "max_tokens_override": max_tokens_override,
+                "body": crate::scrub::scrub_json(&body),
+            }),
+        );
+        Self::trace_wire_json("request", &body);
 
         let mut request = self
             .http
@@ -584,10 +597,28 @@ impl AiClient {
             Err(e) => {
                 self.record_failure();
                 if e.is_timeout() {
+                    codescope_telemetry::record(
+                        "llm.error",
+                        json!({
+                            "request_id": telemetry_request_id,
+                            "kind": "timeout",
+                            "elapsed_ms": telemetry_started.elapsed().as_millis(),
+                            "timeout_ms": self.timeout.as_millis(),
+                        }),
+                    );
                     tracing::warn!(timeout = ?self.timeout, "ai request timed out");
                     return Err(AiError::Timeout(self.timeout));
                 }
                 let sanitized = e.without_url();
+                codescope_telemetry::record(
+                    "llm.error",
+                    json!({
+                        "request_id": telemetry_request_id,
+                        "kind": "transport",
+                        "elapsed_ms": telemetry_started.elapsed().as_millis(),
+                        "error": crate::scrub::scrub_secrets(&sanitized.to_string()),
+                    }),
+                );
                 tracing::warn!(error = %sanitized, "ai transport error");
                 return Err(AiError::Transport(sanitized.to_string()));
             }
@@ -596,11 +627,33 @@ impl AiClient {
         let status = response.status();
         if status.as_u16() == 429 {
             let retry_after = parse_retry_after(response.headers());
+            codescope_telemetry::record(
+                "llm.error",
+                json!({
+                    "request_id": telemetry_request_id,
+                    "kind": "rate_limited",
+                    "status": status.as_u16(),
+                    "elapsed_ms": telemetry_started.elapsed().as_millis(),
+                    "retry_after_ms": retry_after.map(|duration| duration.as_millis()),
+                }),
+            );
             tracing::warn!(?retry_after, "ai provider rate limited the request");
             return Err(AiError::RateLimited { retry_after });
         }
         if !status.is_success() {
-            let message = body_snippet(response.text().await.unwrap_or_default());
+            let response_body = response.text().await.unwrap_or_default();
+            Self::trace_wire_text("error_response", &response_body);
+            codescope_telemetry::record(
+                "llm.error",
+                json!({
+                    "request_id": telemetry_request_id,
+                    "kind": "http",
+                    "status": status.as_u16(),
+                    "elapsed_ms": telemetry_started.elapsed().as_millis(),
+                    "body": crate::scrub::scrub_secrets(&response_body),
+                }),
+            );
+            let message = body_snippet(response_body);
             if status.is_server_error() {
                 self.record_failure();
             }
@@ -618,13 +671,42 @@ impl AiClient {
                 // body is a protocol problem, not availability.
                 if e.is_timeout() {
                     self.record_failure();
+                    codescope_telemetry::record(
+                        "llm.error",
+                        json!({
+                            "request_id": telemetry_request_id,
+                            "kind": "response_timeout",
+                            "elapsed_ms": telemetry_started.elapsed().as_millis(),
+                        }),
+                    );
                     return Err(AiError::Timeout(self.timeout));
                 }
-                return Err(AiError::MalformedResponse(e.without_url().to_string()));
+                let sanitized = e.without_url();
+                codescope_telemetry::record(
+                    "llm.error",
+                    json!({
+                        "request_id": telemetry_request_id,
+                        "kind": "malformed_response",
+                        "elapsed_ms": telemetry_started.elapsed().as_millis(),
+                        "error": crate::scrub::scrub_secrets(&sanitized.to_string()),
+                    }),
+                );
+                return Err(AiError::MalformedResponse(sanitized.to_string()));
             }
         };
+        Self::trace_wire_json("response", &completion);
         self.record_success();
         let usage = parse_token_usage(&completion);
+        codescope_telemetry::record(
+            "llm.response",
+            json!({
+                "request_id": telemetry_request_id,
+                "status": status.as_u16(),
+                "elapsed_ms": telemetry_started.elapsed().as_millis(),
+                "usage": { "input_tokens": usage.input, "output_tokens": usage.output },
+                "body": crate::scrub::scrub_json(&completion),
+            }),
+        );
         self.input_tokens.fetch_add(usage.input, Ordering::Relaxed);
         self.output_tokens
             .fetch_add(usage.output, Ordering::Relaxed);
@@ -633,9 +715,39 @@ impl AiClient {
             output_tokens = usage.output,
             "provider completion token usage"
         );
-        match self.provider {
+        let parsed = match self.provider {
             ProviderKind::OpenAiCompatible => parse_completion(completion),
             ProviderKind::Anthropic => parse_anthropic_response(completion),
+        };
+        if let Err(error) = &parsed {
+            codescope_telemetry::record(
+                "llm.error",
+                json!({
+                    "request_id": telemetry_request_id,
+                    "kind": "response_protocol",
+                    "elapsed_ms": telemetry_started.elapsed().as_millis(),
+                    "error": crate::scrub::scrub_secrets(&error.to_string()),
+                }),
+            );
+        }
+        parsed
+    }
+
+    fn trace_wire_json(direction: &'static str, value: &Value) {
+        if tracing::enabled!(target: "codescope_ai::wire", tracing::Level::TRACE) {
+            Self::trace_wire_text(direction, &value.to_string());
+        }
+    }
+
+    fn trace_wire_text(direction: &'static str, value: &str) {
+        if tracing::enabled!(target: "codescope_ai::wire", tracing::Level::TRACE) {
+            let payload = crate::scrub::scrub_secrets(value);
+            tracing::trace!(
+                target: "codescope_ai::wire",
+                direction,
+                payload = %payload,
+                "ai provider wire payload"
+            );
         }
     }
 
@@ -693,6 +805,17 @@ impl AiClient {
         breaker.failures.clear();
         breaker.open_until = None;
     }
+}
+
+fn sanitized_endpoint(endpoint: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return crate::scrub::scrub_secrets(endpoint);
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 /// Read the two common provider usage shapes. OpenAI-compatible responses report
@@ -1013,7 +1136,6 @@ mod tests {
 
     fn enabled_config() -> AiConfig {
         AiConfig {
-            enabled: true,
             base_url: "http://127.0.0.1:1/v1/".into(),
             model: "test/model".into(),
             reasoning_effort: ReasoningEffort::Default,
@@ -1022,12 +1144,6 @@ mod tests {
             max_tool_calls: 8,
             prime_team_id: None,
         }
-    }
-
-    #[test]
-    fn disabled_config_builds_no_client() {
-        let cfg = AiConfig::disabled();
-        assert!(matches!(AiClient::new(&cfg), Err(AiError::Disabled)));
     }
 
     #[test]
@@ -1043,6 +1159,14 @@ mod tests {
     fn endpoint_join_trims_trailing_slash() {
         let client = AiClient::new(&enabled_config()).unwrap();
         assert_eq!(client.endpoint(), "http://127.0.0.1:1/v1/chat/completions");
+    }
+
+    #[test]
+    fn telemetry_endpoint_omits_credentials_query_and_fragment() {
+        assert_eq!(
+            sanitized_endpoint("https://user:password@example.test/v1/chat?token=secret#debug"),
+            "https://example.test/v1/chat"
+        );
     }
 
     #[test]

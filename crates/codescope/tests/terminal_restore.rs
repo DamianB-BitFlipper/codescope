@@ -21,7 +21,9 @@ fn terminal_is_restored_on_panic() {
         .expect("open pty");
 
     let mut cmd = portable_pty::CommandBuilder::new(binary);
+    let config_dir = tempfile::tempdir().expect("isolated config directory");
     cmd.env("CODESCOPE_TEST_PANIC", "1");
+    cmd.env("CODESCOPE_CONFIG", config_dir.path().join("config.toml"));
     cmd.env("TERM", "xterm-256color");
     cmd.cwd("/tmp");
     let mut child = pair.slave.spawn_command(cmd).expect("spawn codescope");

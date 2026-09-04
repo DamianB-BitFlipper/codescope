@@ -1,14 +1,12 @@
-//! AI opt-in configuration (research 05 §5, research 07 §2).
+//! Required AI-provider configuration.
 //!
 //! Environment-over-file resolution: [`AiConfig::from_env`] reads environment only, while
 //! [`AiConfig::from_env_with_file`] accepts the binary's global `[ai]` configuration and then
 //! applies the same environment variables as higher-precedence overrides. Supported vars are
-//! `CODESCOPE_AI`, `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_TIMEOUT_MS`, optional `PRIME_TEAM_ID`,
-//! and the API key from the first of `PRIME_API_KEY`, `OPENAI_API_KEY`, or
-//! `ANTHROPIC_API_KEY` that is set. **AI is disabled by
-//! default**: with no explicit `CODESCOPE_AI=on|off` the subsystem enables itself only when
-//! an API key is found (auto mode). The default `base_url` follows the key's provider
-//! (Prime Inference / OpenAI / Anthropic); `CODESCOPE_AI_BASE_URL` overrides it.
+//! `CODESCOPE_AI_BASE_URL`, `CODESCOPE_AI_TIMEOUT_MS`, optional `PRIME_TEAM_ID`, and the API key
+//! from the first of `PRIME_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY` that is set. A
+//! credential selects its provider's default URL; an explicit base URL may instead configure a
+//! keyless local provider. Resolution fails when neither a credential nor a base URL is available.
 //!
 //! Key handling follows research 07 §2 exactly:
 //!
@@ -156,12 +154,10 @@ impl<'de> serde::Deserialize<'de> for ReasoningEffort {
 
 /// Resolved AI configuration.
 ///
-/// Construct via [`AiConfig::from_env`] / [`AiConfig::resolve`]; the `api_key` is `None`
-/// whenever the subsystem is disabled, so no key material is held while AI is off.
+/// Construct via [`AiConfig::from_env`] / [`AiConfig::resolve`]. A resolved value always
+/// describes a usable provider configuration; there is no disabled AI state.
 #[derive(Clone)]
 pub struct AiConfig {
-    /// Whether the AI subsystem may run at all. `false` ⇒ no HTTP client is constructed.
-    pub enabled: bool,
     /// Provider base URL. The client derives an OpenAI-compatible Chat Completions endpoint or
     /// uses the native Anthropic Messages endpoint according to the resolved provider.
     pub base_url: String,
@@ -183,21 +179,6 @@ pub struct AiConfig {
 }
 
 impl AiConfig {
-    /// A disabled configuration (the built-in default: AI off, no key material).
-    #[must_use]
-    pub fn disabled() -> Self {
-        AiConfig {
-            enabled: false,
-            base_url: OPENAI_BASE_URL.to_string(),
-            model: DEFAULT_MODEL.to_string(),
-            reasoning_effort: ReasoningEffort::Default,
-            api_key: None,
-            timeout: DEFAULT_TIMEOUT,
-            max_tool_calls: MAX_TOOL_CALLS,
-            prime_team_id: None,
-        }
-    }
-
     /// Resolve from process environment variables only (no config file). The Codescope binary
     /// uses [`AiConfig::from_env_with_file`] after loading its global user configuration.
     ///
@@ -216,9 +197,6 @@ impl AiConfig {
     ///
     /// Rules:
     ///
-    /// - `CODESCOPE_AI` = `on`/`1`/`true` | `off`/`0`/`false` | `auto` (default). `auto`
-    ///   enables AI iff a key resolves; explicit `on` enables even keyless (local
-    ///   providers); `off` disables and drops any key material.
     /// - Key resolution order: [`AiFileConfig::api_key_env`]-named var, then
     ///   `PRIME_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. A named `api_key_env` var
     ///   that is unset is a hard [`AiError::Config`] (silent misconfiguration is worse than
@@ -227,9 +205,10 @@ impl AiConfig {
     ///   endpoint.
     /// - Default `base_url` follows the key's provider: [`PRIME_BASE_URL`] from
     ///   `PRIME_API_KEY`, [`ANTHROPIC_BASE_URL`] from `ANTHROPIC_API_KEY`, otherwise
-    ///   [`OPENAI_BASE_URL`]. `CODESCOPE_AI_BASE_URL` overrides.
+    ///   [`OPENAI_BASE_URL`]. `CODESCOPE_AI_BASE_URL` overrides and is required for a
+    ///   keyless provider.
     /// - A literal [`AiFileConfig::api_key`] in the file layer is
-    ///   [`AiError::LiteralApiKeyInConfig`], even when AI ends up disabled.
+    ///   [`AiError::LiteralApiKeyInConfig`], regardless of the rest of the provider settings.
     ///
     /// Empty / whitespace-only env values are treated as unset.
     pub fn resolve(
@@ -248,38 +227,18 @@ impl AiConfig {
             }
         }
 
-        let mode = match env("CODESCOPE_AI") {
-            None => file.and_then(|f| f.enabled).map_or(AiMode::Auto, |on| {
-                if on {
-                    AiMode::On
-                } else {
-                    AiMode::Off
-                }
-            }),
-            Some(v) => AiMode::parse(&v)?,
-        };
-
-        if mode == AiMode::Off {
-            tracing::debug!("ai disabled by configuration");
-            return Ok(AiConfig::disabled());
-        }
-
         let (key, key_source) = resolve_key(file, &env)?;
-        let enabled = match mode {
-            AiMode::On => true,
-            AiMode::Auto => key.is_some(),
-            AiMode::Off => unreachable!("handled above"),
-        };
-        if !enabled {
-            tracing::debug!("ai disabled: auto mode and no api key found");
-            return Ok(AiConfig::disabled());
-        }
-
         let configured_base =
             env("CODESCOPE_AI_BASE_URL").or_else(|| file.and_then(|f| f.base_url.clone()));
         if matches!(key_source, Some(KeySource::FileNamedEnv)) && configured_base.is_none() {
             return Err(AiError::Config(
                 "an arbitrary api_key_env requires an explicit base_url so its credential is not sent to an inferred provider"
+                    .into(),
+            ));
+        }
+        if key.is_none() && configured_base.is_none() {
+            return Err(AiError::Config(
+                "an AI provider is required; set PRIME_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY, or set CODESCOPE_AI_BASE_URL for a keyless local provider"
                     .into(),
             ));
         }
@@ -344,10 +303,9 @@ impl AiConfig {
             timeout_ms,
             max_tool_calls,
             keyed = key.is_some(),
-            "ai enabled"
+            "ai provider configured"
         );
         Ok(AiConfig {
-            enabled: true,
             base_url,
             model,
             reasoning_effort,
@@ -381,7 +339,7 @@ impl AiConfig {
     /// A short display label for which credential/provider is active (for the UI).
     ///
     /// Derived from a normalized match with a provider's official default base URL, or
-    /// "custom" for an overridden/unknown base. Only meaningful for an enabled config.
+    /// "custom" for an overridden/unknown base.
     #[must_use]
     pub fn provider_label(&self) -> &'static str {
         let Ok(base_url) = Url::parse(&self.base_url) else {
@@ -412,7 +370,6 @@ pub enum ProviderKind {
 impl fmt::Debug for AiConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AiConfig")
-            .field("enabled", &self.enabled)
             .field("base_url", &self.base_url)
             .field("model", &self.model)
             .field("reasoning_effort", &self.reasoning_effort)
@@ -430,9 +387,6 @@ impl fmt::Debug for AiConfig {
 /// committed into config files (research 07 §2).
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct AiFileConfig {
-    /// Explicit on/off; absent = auto (on iff a key is found).
-    #[serde(default)]
-    pub enabled: Option<bool>,
     /// Base URL override.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -455,27 +409,6 @@ pub struct AiFileConfig {
     /// Combined research and diagram-operation budget override (clamped to [`MAX_TOOL_CALLS`]).
     #[serde(default)]
     pub max_tool_calls: Option<u32>,
-}
-
-/// Tri-state enable mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AiMode {
-    On,
-    Off,
-    Auto,
-}
-
-impl AiMode {
-    fn parse(v: &str) -> Result<Self, AiError> {
-        match v.to_ascii_lowercase().as_str() {
-            "on" | "1" | "true" => Ok(AiMode::On),
-            "off" | "0" | "false" => Ok(AiMode::Off),
-            "auto" => Ok(AiMode::Auto),
-            other => Err(AiError::Config(format!(
-                "CODESCOPE_AI must be on|off|auto (or 1|0|true|false), got {other:?}"
-            ))),
-        }
-    }
 }
 
 /// Where the resolved key came from (drives the default base URL).
@@ -602,6 +535,18 @@ mod tests {
         move |name: &str| map.get(name).cloned()
     }
 
+    fn config_at(base_url: &str) -> AiConfig {
+        AiConfig {
+            base_url: base_url.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+            reasoning_effort: ReasoningEffort::Default,
+            api_key: None,
+            timeout: DEFAULT_TIMEOUT,
+            max_tool_calls: MAX_TOOL_CALLS,
+            prime_team_id: None,
+        }
+    }
+
     #[test]
     fn prime_team_id_reads_from_env() {
         let cfg = AiConfig::resolve(
@@ -617,8 +562,7 @@ mod tests {
 
     #[test]
     fn provider_label_follows_the_base_url() {
-        let mut c = AiConfig::disabled();
-        c.base_url = PRIME_BASE_URL.to_string();
+        let mut c = config_at(PRIME_BASE_URL);
         assert_eq!(c.provider_label(), "prime");
         c.base_url = OPENAI_BASE_URL.to_string();
         assert_eq!(c.provider_label(), "openai");
@@ -643,7 +587,7 @@ mod tests {
 
     #[test]
     fn provider_uses_anthropic_dns_boundaries_not_url_substrings() {
-        let mut config = AiConfig::disabled();
+        let mut config = config_at(ANTHROPIC_BASE_URL);
         for base_url in [
             "https://anthropic.com/v1",
             "https://api.anthropic.com/v1",
@@ -679,7 +623,7 @@ mod tests {
         assert_eq!(cfg.provider_label(), "custom");
         assert_eq!(cfg.model, DEFAULT_MODEL);
 
-        let mut config = AiConfig::disabled();
+        let mut config = config_at(OPENAI_BASE_URL);
         config.base_url = "https://api.openai.com/v1/proxy".into();
         assert_eq!(config.provider_label(), "custom");
     }
@@ -687,11 +631,8 @@ mod tests {
     #[test]
     fn base_url_requires_an_http_or_https_url_with_a_host() {
         for base_url in ["https://", "http://", "not a URL", "ftp://example.test/v1"] {
-            let err = AiConfig::resolve(
-                None,
-                env_of(&[("CODESCOPE_AI", "on"), ("CODESCOPE_AI_BASE_URL", base_url)]),
-            )
-            .unwrap_err();
+            let err = AiConfig::resolve(None, env_of(&[("CODESCOPE_AI_BASE_URL", base_url)]))
+                .unwrap_err();
             assert!(matches!(err, AiError::Config(_)), "{base_url}");
         }
     }
@@ -702,24 +643,21 @@ mod tests {
             "https://user:password@example.test/v1",
             "https://example.test/v1#fragment",
         ] {
-            let err = AiConfig::resolve(
-                None,
-                env_of(&[("CODESCOPE_AI", "on"), ("CODESCOPE_AI_BASE_URL", base_url)]),
-            )
-            .unwrap_err();
+            let err = AiConfig::resolve(None, env_of(&[("CODESCOPE_AI_BASE_URL", base_url)]))
+                .unwrap_err();
             assert!(matches!(err, AiError::Config(_)), "{base_url}");
         }
     }
 
     #[test]
-    fn disabled_by_default_without_key() {
-        let cfg = AiConfig::resolve(None, env_of(&[])).unwrap();
-        assert!(!cfg.enabled);
-        assert!(cfg.api_key.is_none());
+    fn missing_provider_is_a_config_error() {
+        let err = AiConfig::resolve(None, env_of(&[])).unwrap_err();
+        assert!(matches!(err, AiError::Config(_)));
+        assert!(err.to_string().contains("an AI provider is required"));
     }
 
     #[test]
-    fn auto_enables_with_key_and_prefers_prime_key() {
+    fn key_resolution_prefers_prime_key() {
         let cfg = AiConfig::resolve(
             None,
             env_of(&[
@@ -729,7 +667,6 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert!(cfg.enabled);
         assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-prime");
         // Key came from PRIME_API_KEY → Prime default base.
         assert_eq!(cfg.base_url, PRIME_BASE_URL);
@@ -742,7 +679,6 @@ mod tests {
     #[test]
     fn prime_key_fallback_selects_prime_base_url() {
         let cfg = AiConfig::resolve(None, env_of(&[("PRIME_API_KEY", "sk-prime")])).unwrap();
-        assert!(cfg.enabled);
         assert_eq!(cfg.base_url, PRIME_BASE_URL);
         assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-prime");
     }
@@ -750,7 +686,6 @@ mod tests {
     #[test]
     fn openai_key_selects_openai_base_url() {
         let cfg = AiConfig::resolve(None, env_of(&[("OPENAI_API_KEY", "sk-openai")])).unwrap();
-        assert!(cfg.enabled);
         assert_eq!(cfg.base_url, OPENAI_BASE_URL);
         assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-openai");
         assert_eq!(cfg.provider(), ProviderKind::OpenAiCompatible);
@@ -759,7 +694,6 @@ mod tests {
     #[test]
     fn anthropic_key_selects_anthropic_base_url_and_provider() {
         let cfg = AiConfig::resolve(None, env_of(&[("ANTHROPIC_API_KEY", "sk-ant")])).unwrap();
-        assert!(cfg.enabled);
         assert_eq!(cfg.base_url, ANTHROPIC_BASE_URL);
         assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-ant");
         assert_eq!(cfg.provider(), ProviderKind::Anthropic);
@@ -804,27 +738,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_off_wins_over_key() {
+    fn explicit_base_url_configures_a_keyless_local_provider() {
         let cfg = AiConfig::resolve(
             None,
-            env_of(&[("CODESCOPE_AI", "off"), ("OPENAI_API_KEY", "sk-x")]),
+            env_of(&[("CODESCOPE_AI_BASE_URL", "http://127.0.0.1:11434/v1")]),
         )
         .unwrap();
-        assert!(!cfg.enabled);
-        assert!(cfg.api_key.is_none(), "off must drop key material");
-    }
-
-    #[test]
-    fn explicit_on_enables_keyless_local_providers() {
-        let cfg = AiConfig::resolve(
-            None,
-            env_of(&[
-                ("CODESCOPE_AI", "on"),
-                ("CODESCOPE_AI_BASE_URL", "http://127.0.0.1:11434/v1"),
-            ]),
-        )
-        .unwrap();
-        assert!(cfg.enabled);
         assert!(cfg.api_key.is_none());
         assert_eq!(cfg.base_url, "http://127.0.0.1:11434/v1");
     }
@@ -834,7 +753,6 @@ mod tests {
         let cfg = AiConfig::resolve(
             None,
             env_of(&[
-                ("CODESCOPE_AI", "on"),
                 ("CODESCOPE_AI_BASE_URL", "https://example.test/v1"),
                 ("CODESCOPE_AI_TIMEOUT_MS", "1500"),
                 ("OPENAI_API_KEY", "sk-x"),
@@ -849,20 +767,19 @@ mod tests {
     #[test]
     fn bad_values_are_config_errors() {
         assert!(matches!(
-            AiConfig::resolve(None, env_of(&[("CODESCOPE_AI", "maybe")])),
-            Err(AiError::Config(_))
-        ));
-        assert!(matches!(
             AiConfig::resolve(
                 None,
-                env_of(&[("CODESCOPE_AI", "on"), ("CODESCOPE_AI_TIMEOUT_MS", "soon")]),
+                env_of(&[
+                    ("OPENAI_API_KEY", "sk-x"),
+                    ("CODESCOPE_AI_TIMEOUT_MS", "soon"),
+                ]),
             ),
             Err(AiError::Config(_))
         ));
         assert!(matches!(
             AiConfig::resolve(
                 None,
-                env_of(&[("CODESCOPE_AI", "on"), ("CODESCOPE_AI_TIMEOUT_MS", "0")]),
+                env_of(&[("OPENAI_API_KEY", "sk-x"), ("CODESCOPE_AI_TIMEOUT_MS", "0"),]),
             ),
             Err(AiError::Config(_))
         ));
@@ -870,7 +787,6 @@ mod tests {
             AiConfig::resolve(
                 None,
                 env_of(&[
-                    ("CODESCOPE_AI", "on"),
                     ("CODESCOPE_AI_BASE_URL", "ftp://nope"),
                     ("OPENAI_API_KEY", "sk-x"),
                 ]),
@@ -881,12 +797,10 @@ mod tests {
 
     #[test]
     fn empty_env_values_are_unset() {
-        let cfg = AiConfig::resolve(
-            None,
-            env_of(&[("PRIME_API_KEY", "   "), ("CODESCOPE_AI", "auto")]),
-        )
-        .unwrap();
-        assert!(!cfg.enabled);
+        assert!(matches!(
+            AiConfig::resolve(None, env_of(&[("PRIME_API_KEY", "   ")])),
+            Err(AiError::Config(_))
+        ));
     }
 
     #[test]
@@ -897,7 +811,7 @@ mod tests {
         };
         let err = AiConfig::resolve(Some(&file), env_of(&[("OPENAI_API_KEY", "sk-x")]));
         assert!(matches!(err, Err(AiError::LiteralApiKeyInConfig)));
-        // Rejected even when AI would end up disabled.
+        // Rejected before checking whether a provider is otherwise configured.
         let err = AiConfig::resolve(Some(&file), env_of(&[]));
         assert!(matches!(err, Err(AiError::LiteralApiKeyInConfig)));
     }
@@ -911,9 +825,8 @@ mod tests {
         };
         let cfg =
             AiConfig::resolve(Some(&file), env_of(&[("MY_CUSTOM_KEY", "sk-custom")])).unwrap();
-        assert!(cfg.enabled);
         assert_eq!(cfg.api_key.as_ref().unwrap().expose_secret(), "sk-custom");
-        // Named but unset → hard error, not silent disable.
+        // Named but unset → hard error.
         assert!(matches!(
             AiConfig::resolve(Some(&file), env_of(&[])),
             Err(AiError::Config(_))
@@ -963,7 +876,6 @@ mod tests {
     #[test]
     fn file_layer_is_overridden_by_env() {
         let file = AiFileConfig {
-            enabled: Some(true),
             base_url: Some("https://file.example/v1".into()),
             model: Some("file/model".into()),
             timeout_ms: Some(9000),
@@ -971,7 +883,6 @@ mod tests {
             ..AiFileConfig::default()
         };
         let cfg = AiConfig::resolve(Some(&file), env_of(&[("OPENAI_API_KEY", "sk-x")])).unwrap();
-        assert!(cfg.enabled);
         assert_eq!(cfg.base_url, "https://file.example/v1"); // no env override
         assert_eq!(cfg.model, "file/model");
         assert_eq!(cfg.timeout, Duration::from_millis(9000));
@@ -981,8 +892,7 @@ mod tests {
     #[test]
     fn max_tool_calls_clamped_to_budget() {
         let file = AiFileConfig {
-            enabled: Some(true),
-            max_tool_calls: Some(99),
+            max_tool_calls: Some(MAX_TOOL_CALLS + 1),
             ..AiFileConfig::default()
         };
         let cfg = AiConfig::resolve(Some(&file), env_of(&[("OPENAI_API_KEY", "sk-x")])).unwrap();

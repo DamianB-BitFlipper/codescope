@@ -7,6 +7,7 @@ description = "codescope AI layer: provider-neutral chat-completions client, inc
 
 [dependencies]
 codescope-core = { path = "../codescope-core" }
+codescope-telemetry = { path = "../codescope-telemetry" }
 backon.workspace = true
 camino.workspace = true
 futures.workspace = true

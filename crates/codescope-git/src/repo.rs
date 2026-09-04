@@ -277,6 +277,41 @@ impl GitRepo {
         Ok(self.base_candidates_with_metadata().await?.entries)
     }
 
+    /// Every branch ref that can be selected in the interactive base picker.
+    ///
+    /// The inferred and graph-ranked meaningful bases stay first. Remaining local and
+    /// remote-tracking branches are appended in deterministic namespace/name order so a
+    /// user can filter to divergent branches without making the automatic inference walk
+    /// rank every ref. Automatic inference still canonicalizes local/remote twins, while
+    /// the picker exposes each short ref spelling. Refs equivalent to HEAD remain excluded
+    /// because they cannot produce a comparison.
+    pub async fn base_picker_refs(&self) -> Result<Vec<String>> {
+        let meaningful = self.base_candidates_with_metadata().await?.entries;
+        let status = self.status_snapshot().await?;
+        let candidates = self.branch_ref_candidates(&status).await?;
+
+        let mut refs = Vec::with_capacity(candidates.len().max(meaningful.len()));
+        let mut seen = HashSet::new();
+        for base in meaningful {
+            if seen.insert(base.ref_name.clone()) {
+                refs.push(base.ref_name);
+            }
+        }
+        for candidate in candidates {
+            for ref_name in std::iter::once(candidate.ref_name).chain(
+                candidate
+                    .aliases
+                    .into_iter()
+                    .filter(|alias| !alias.starts_with("refs/")),
+            ) {
+                if seen.insert(ref_name.clone()) {
+                    refs.push(ref_name);
+                }
+            }
+        }
+        Ok(refs)
+    }
+
     /// Base picker entries with an explicit marker when the bounded ancestor scan stopped
     /// before exhausting the graph.
     pub async fn base_candidates_with_metadata(&self) -> Result<BaseCandidates> {

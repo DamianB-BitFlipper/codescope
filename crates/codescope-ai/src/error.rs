@@ -10,16 +10,12 @@ use std::time::Duration;
 /// Errors produced by the codescope AI layer.
 #[derive(Debug, thiserror::Error)]
 pub enum AiError {
-    /// AI is disabled by configuration; no client may be constructed (research 07 §2).
-    #[error("ai is disabled by configuration")]
-    Disabled,
-
     /// Invalid configuration (bad env value, unusable base URL, …).
     #[error("invalid ai configuration: {0}")]
     Config(String),
 
     /// A literal `api_key` value appeared in a config file. Config files may only name an
-    /// env var (`api_key_env`); refusing to enable AI prevents keys committed into config
+    /// env var (`api_key_env`); rejecting literals prevents keys committed into config
     /// (research 07 §2).
     #[error("literal api_key in a config file is not allowed; set api_key_env to an env var name instead")]
     LiteralApiKeyInConfig,
@@ -138,7 +134,6 @@ mod tests {
         }
         .is_retryable());
         assert!(!AiError::NoToolCall.is_retryable());
-        assert!(!AiError::Disabled.is_retryable());
         assert!(!AiError::CircuitOpen {
             retry_in: Duration::from_secs(60)
         }

@@ -7,6 +7,7 @@ description = "codescope Ratatui interface: renders UiSnapshot, emits Actions"
 
 [dependencies]
 codescope-core = { path = "../codescope-core" }
+codescope-telemetry = { path = "../codescope-telemetry" }
 ratatui.workspace = true
 crossterm.workspace = true
 tui-tree-widget.workspace = true
@@ -17,3 +18,4 @@ tracing.workspace = true
 unicode-width.workspace = true
 unicode-segmentation = "1.13"
 similar.workspace = true
+serde_json.workspace = true

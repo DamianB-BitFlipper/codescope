@@ -4,6 +4,7 @@
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
 use codescope_core::ChangeScope;
@@ -62,6 +63,8 @@ pub async fn run(
             command = control_rx.recv(), if control_open => {
                 match command {
                     Some(action) => {
+                        let before = telemetry_state(&app);
+                        let action_name = format!("{action:?}");
                         preferences_dirty |= dispatch(
                             &mut app,
                             action,
@@ -70,6 +73,14 @@ pub async fn run(
                             &mut selection,
                         )
                         .await;
+                        codescope_telemetry::record(
+                            "input.control",
+                            json!({
+                                "action": action_name,
+                                "state_before": before,
+                                "state_after": telemetry_state(&app),
+                            }),
+                        );
                         dirty = true;
                     }
                     None => control_open = false,
@@ -80,6 +91,8 @@ pub async fn run(
                 match maybe {
                     Some(Ok(Event::Key(key))) => {
                         let action = map_key(key, &app);
+                        let before = telemetry_state(&app);
+                        let action_name = format!("{action:?}");
                         preferences_dirty |= dispatch(
                             &mut app,
                             action,
@@ -88,6 +101,17 @@ pub async fn run(
                             &mut selection,
                         )
                         .await;
+                        codescope_telemetry::record(
+                            "input.key",
+                            json!({
+                                "code": format!("{:?}", key.code),
+                                "modifiers": format!("{:?}", key.modifiers),
+                                "kind": format!("{:?}", key.kind),
+                                "mapped_action": action_name,
+                                "state_before": before,
+                                "state_after": telemetry_state(&app),
+                            }),
+                        );
                         if app.should_quit && preferences_dirty {
                             persist_preferences(&app, &tx).await;
                             preferences_dirty = false;
@@ -99,6 +123,7 @@ pub async fn run(
                         // existing SelectionTracker: the returned action is dispatched
                         // through the same path as a keypress.
                         let previous_drag = drag.clone();
+                        let before = telemetry_state(&app);
                         let outcome = crate::mouse::map_mouse(
                             mouse,
                             &app,
@@ -106,6 +131,12 @@ pub async fn run(
                             &last_geometry,
                             drag,
                         );
+                        let action_name = outcome.action.as_ref().map(|action| format!("{action:?}"));
+                        let next_drag = format!("{:?}", outcome.drag);
+                        let record_mouse = !matches!(
+                            mouse.kind,
+                            crossterm::event::MouseEventKind::Moved
+                        ) || outcome.action.is_some();
                         drag = outcome.drag;
                         dirty |= outcome.dirty;
                         if let Some(action) = outcome.action {
@@ -118,6 +149,21 @@ pub async fn run(
                             )
                             .await;
                         }
+                        if record_mouse {
+                            codescope_telemetry::record(
+                                "input.mouse",
+                                json!({
+                                    "kind": format!("{:?}", mouse.kind),
+                                    "button_modifiers": format!("{:?}", mouse.modifiers),
+                                    "column": mouse.column,
+                                    "row": mouse.row,
+                                    "mapped_action": action_name,
+                                    "drag_after": next_drag,
+                                    "state_before": before,
+                                    "state_after": telemetry_state(&app),
+                                }),
+                            );
+                        }
                         if !matches!(previous_drag, crate::mouse::DragState::Idle)
                             && matches!(drag, crate::mouse::DragState::Idle)
                             && preferences_dirty
@@ -126,7 +172,7 @@ pub async fn run(
                             preferences_dirty = false;
                         }
                     }
-                    Some(Ok(Event::Resize(_, _))) => {
+                    Some(Ok(Event::Resize(columns, rows))) => {
                         // A resize invalidates the retained geometry, hover target, and any
                         // drag anchored to it. The next draw rebuilds the whole frame plan.
                         drag = crate::mouse::DragState::Idle;
@@ -136,6 +182,14 @@ pub async fn run(
                             preferences_dirty = false;
                         }
                         dirty = true;
+                        codescope_telemetry::record(
+                            "input.resize",
+                            json!({
+                                "columns": columns,
+                                "rows": rows,
+                                "state": telemetry_state(&app),
+                            }),
+                        );
                     }
                     // Event stream ended or errored: the loop cannot stay interactive; exit
                     // cleanly rather than hot-loop on a permanently-ready source.
@@ -162,6 +216,7 @@ pub async fn run(
                 // The new state may have moved the selection (clamp / re-expanded rows):
                 // keep the dispatcher's diff + relations aimed at it.
                 selection.sync(&app, &tx).await;
+                codescope_telemetry::record("ui.snapshot", telemetry_state(&app));
                 dirty = true;
             }
         }
@@ -232,6 +287,10 @@ impl SelectionTracker {
             return;
         }
         self.0 = Some(target.clone());
+        codescope_telemetry::record(
+            "ui.selection",
+            json!({ "selection": selection_target_value(&target) }),
+        );
         let action = match target {
             SelectionTarget::Empty => Action::SelectionChanged {
                 file: None,
@@ -247,6 +306,60 @@ impl SelectionTracker {
         };
         let _ = tx.send(action).await;
     }
+}
+
+fn selection_target_value(target: &SelectionTarget) -> Value {
+    match target {
+        SelectionTarget::Empty => Value::Null,
+        SelectionTarget::Directory(path) => json!({ "kind": "directory", "path": path }),
+        SelectionTarget::File { path, symbol } => json!({
+            "kind": if symbol.is_some() { "symbol" } else { "file" },
+            "path": path,
+            "symbol": symbol.as_ref().map(|(name, line, column)| json!({
+                "name": name,
+                "line": line,
+                "column": column,
+            })),
+        }),
+    }
+}
+
+fn telemetry_state(app: &App) -> Value {
+    json!({
+        "epoch": app.snapshot.epoch.get(),
+        "scope": format!("{:?}", app.snapshot.scope).to_ascii_lowercase(),
+        "focused_pane": format!("{:?}", app.focused).to_ascii_lowercase(),
+        "selection": selection_target_value(&selection_target(app)),
+        "focused_diff": {
+            "file": app.snapshot.diff.title,
+            "symbol": app.snapshot.diff.focused_symbol,
+            "hunk": app.current_hunk,
+        },
+        "scroll": {
+            "files": app.files_scroll,
+            "diff_vertical": app.diff_scroll,
+            "diff_horizontal": app.diff_hscroll,
+            "callers": app.callers_scroll,
+            "downstream": app.downstream_scroll,
+            "generated_impact": app.ai_plan_scroll,
+        },
+        "view": {
+            "zoomed": app.zoomed,
+            "diff_wrap": app.diff_wrap,
+            "help_open": app.show_help,
+            "status_detail_open": app.status_detail.is_some(),
+            "model_picker_open": app.show_model_picker,
+            "base_picker_open": app.show_base_picker,
+        },
+        "user_input": {
+            "model_query": app.model_query,
+            "base_query": app.base_query,
+            "diff_selection": app.diff_selection.map(|selection| json!({
+                "start": { "row": selection.start.row, "column": selection.start.column },
+                "end": { "row": selection.end.row, "column": selection.end.column },
+            })),
+        },
+    })
 }
 
 /// Resolve the flattened files-pane selection to its `(file, symbol)` target: a file row
@@ -328,7 +441,7 @@ async fn dispatch(
                 app.apply(action);
             }
         }
-        Action::RefreshGit => {
+        Action::RefreshGit | Action::GenerateAi | Action::ToggleAiGenerationMode => {
             let _ = tx.send(action).await;
         }
         Action::AgentFocus(target) => {
@@ -345,8 +458,12 @@ async fn dispatch(
             }
             app.apply(Action::AgentFocus(target));
         }
-        Action::AgentAsk(_) | Action::AgentFeedback(_) | Action::AgentDiagram(_) => {
+        Action::AgentDiagram { .. } => {
             let _ = tx.send(action).await;
+        }
+        Action::ClearDiffSelection => {
+            app.apply(Action::ClearDiffSelection);
+            let _ = tx.send(Action::SetAgentDiffSelection(None)).await;
         }
         Action::CommitDiffSelection {
             selection,
@@ -357,6 +474,16 @@ async fn dispatch(
                 text: text.clone(),
             });
             copy_osc52(text);
+            let context = crate::snapshot::SelectedDiffContext {
+                file: app.snapshot.diff.title.clone(),
+                text: text.clone(),
+                truncated: false,
+            };
+            let _ = tx.send(Action::SetAgentDiffSelection(Some(context))).await;
+        }
+        Action::ToggleWrap | Action::ResetHScroll => {
+            app.apply(action);
+            let _ = tx.send(Action::SetAgentDiffSelection(None)).await;
         }
         Action::SetFileExpanded { .. } => {
             // Optimistic local apply (responsive expand/collapse), then the dispatcher
@@ -504,6 +631,127 @@ mod tests {
         assert_eq!(base64(b"copy this"), "Y29weSB0aGlz");
         assert_eq!(base64(b"a"), "YQ==");
         assert_eq!(base64(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn telemetry_state_names_selection_input_and_every_scroll_axis() {
+        let mut app = App::new();
+        app.update(UiSnapshot {
+            epoch: codescope_core::Epoch(7),
+            files: vec![crate::snapshot::FileRow {
+                semantic: crate::snapshot::FileSemanticLoad::Ready,
+                path: "src/api.rs".into(),
+                status: "M",
+                changed_symbol_count: 0,
+                added_lines: 1,
+                removed_lines: 0,
+                symbols: Vec::new(),
+                expanded: false,
+            }],
+            diff: crate::snapshot::DiffPane {
+                title: "src/api.rs".into(),
+                ..crate::snapshot::DiffPane::default()
+            },
+            ..UiSnapshot::default()
+        });
+        app.file_sel = 1; // synthesized `src` directory is row zero
+        app.files_scroll = 1;
+        app.diff_scroll = 2;
+        app.diff_hscroll = 3;
+        app.callers_scroll = 4;
+        app.downstream_scroll = 5;
+        app.ai_plan_scroll = 6;
+        app.model_query = "typed-model".into();
+
+        let state = telemetry_state(&app);
+        assert_eq!(state["epoch"], 7);
+        assert_eq!(state["selection"]["path"], "src/api.rs");
+        assert_eq!(state["focused_diff"]["file"], "src/api.rs");
+        assert_eq!(state["scroll"]["files"], 1);
+        assert_eq!(state["scroll"]["diff_vertical"], 2);
+        assert_eq!(state["scroll"]["diff_horizontal"], 3);
+        assert_eq!(state["scroll"]["callers"], 4);
+        assert_eq!(state["scroll"]["downstream"], 5);
+        assert_eq!(state["scroll"]["generated_impact"], 6);
+        assert_eq!(state["user_input"]["model_query"], "typed-model");
+    }
+
+    #[tokio::test]
+    async fn ai_generation_controls_are_forwarded_to_the_dispatcher() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut app = App::new();
+        let mut pending = PendingScope::default();
+        let mut selection = SelectionTracker::default();
+
+        dispatch(
+            &mut app,
+            Action::GenerateAi,
+            &tx,
+            &mut pending,
+            &mut selection,
+        )
+        .await;
+        assert_eq!(rx.recv().await, Some(Action::GenerateAi));
+
+        dispatch(
+            &mut app,
+            Action::ToggleAiGenerationMode,
+            &tx,
+            &mut pending,
+            &mut selection,
+        )
+        .await;
+        assert_eq!(rx.recv().await, Some(Action::ToggleAiGenerationMode));
+    }
+
+    #[tokio::test]
+    async fn committed_diff_selection_is_published_for_agent_context() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut app = App::new();
+        app.update(UiSnapshot {
+            diff: crate::snapshot::DiffPane {
+                title: "src/api.rs".to_string(),
+                ..crate::snapshot::DiffPane::default()
+            },
+            ..UiSnapshot::default()
+        });
+        let mut pending = PendingScope::default();
+        let mut selection = SelectionTracker::default();
+        let selected = crate::action::DiffTextSelection::default();
+
+        dispatch(
+            &mut app,
+            Action::CommitDiffSelection {
+                selection: selected,
+                text: "queue.push(request);".to_string(),
+            },
+            &tx,
+            &mut pending,
+            &mut selection,
+        )
+        .await;
+        assert_eq!(
+            rx.recv().await,
+            Some(Action::SetAgentDiffSelection(Some(
+                crate::snapshot::SelectedDiffContext {
+                    file: "src/api.rs".to_string(),
+                    text: "queue.push(request);".to_string(),
+                    truncated: false,
+                }
+            )))
+        );
+        assert_eq!(app.diff_selection, Some(selected));
+
+        dispatch(
+            &mut app,
+            Action::ClearDiffSelection,
+            &tx,
+            &mut pending,
+            &mut selection,
+        )
+        .await;
+        assert_eq!(rx.recv().await, Some(Action::SetAgentDiffSelection(None)));
+        assert!(app.diff_selection.is_none());
     }
 
     /// Bug 2 regression: a scope set via action must persist across refresh snapshots,

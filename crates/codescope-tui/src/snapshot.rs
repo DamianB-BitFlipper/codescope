@@ -5,6 +5,7 @@
 //! or `ai` crates. The binary assembles it; `codescope-tui` only consumes it.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use codescope_core::{AiStatus, ChangeScope, DiagramDraft, Epoch, LsStatus};
 
@@ -19,10 +20,18 @@ pub struct UiSnapshot {
     pub scope_counts: ScopeCounts,
     /// Left pane: changed files and the symbols inside them.
     pub files: Vec<FileRow>,
+    /// Immutable captured Git facts backing external-agent diff/evidence lookup. Kept behind
+    /// an `Arc` so publishing UI snapshots does not repeatedly clone every diff hunk.
+    pub agent_changeset: Option<Arc<codescope_core::ChangeSet>>,
+    /// Repository epoch that produced `agent_changeset`.
+    pub agent_changeset_epoch: Epoch,
     /// Generation state for every selectable directory, file, and symbol summary.
     pub ai_summaries: HashMap<AiSummaryKey, AiSummaryState>,
     /// Center pane: the focused diff for the current selection.
     pub diff: DiffPane,
+    /// Exact diff text the human most recently selected in the focused file. This is
+    /// published as an attention anchor for local `codescope agent` clients.
+    pub selected_diff: Option<SelectedDiffContext>,
     /// Right pane: the semantic view for the current selection.
     ///
     /// Legacy flattened view — superseded by [`UiSnapshot::impact`] (spec §4); both are
@@ -31,12 +40,18 @@ pub struct UiSnapshot {
     /// Editable renderer-native diagram for the current selection, when an internal or
     /// external agent is still constructing/revising it.
     pub diagram_draft: Option<DiagramDraft>,
+    /// Result of the latest external-agent diagram command. The local protocol waits for
+    /// its request id to appear here, making CLI edits synchronous with the dispatcher.
+    pub agent_diagram_result: Option<AgentDiagramResult>,
     /// Right pane: the impact view (selected change, callers, downstream).
     pub impact: ImpactPane,
     /// Language-server status for the top bar.
     pub ls: LsStatus,
     /// AI status for the top bar.
     pub ai: AiStatus,
+    /// Whether moving the selection automatically schedules AI generation. `false` means
+    /// generation is manual and starts only after the user presses `a`.
+    pub ai_auto_generate: bool,
     /// The AI model currently selected (empty before AI initialization).
     pub ai_model: String,
     /// Selected Chat Completions reasoning budget (`default` uses automatic behavior).
@@ -62,8 +77,6 @@ pub struct UiSnapshot {
     pub base_ref: String,
     /// Base candidates for the picker modal (empty until fetched).
     pub available_bases: Vec<String>,
-    /// `true` when the base picker list was bounded before every ancestor was visited.
-    pub base_candidates_truncated: bool,
     /// Transient status/help message for the bottom bar.
     ///
     /// Legacy plain-text mirror of [`UiSnapshot::status`] (`status.text`); kept while the
@@ -84,13 +97,18 @@ impl Default for UiSnapshot {
             scope: ChangeScope::Branch,
             scope_counts: ScopeCounts::default(),
             files: Vec::new(),
+            agent_changeset: None,
+            agent_changeset_epoch: Epoch::ZERO,
             ai_summaries: HashMap::new(),
             diff: DiffPane::default(),
+            selected_diff: None,
             semantic: SemanticPane::default(),
             diagram_draft: None,
+            agent_diagram_result: None,
             impact: ImpactPane::default(),
             ls: LsStatus::Starting,
-            ai: AiStatus::Disabled,
+            ai: AiStatus::Idle,
+            ai_auto_generate: false,
             ai_model: String::new(),
             ai_reasoning_effort: "default".to_string(),
             available_reasoning_efforts: Vec::new(),
@@ -102,13 +120,40 @@ impl Default for UiSnapshot {
             model_list_error: None,
             base_ref: String::new(),
             available_bases: Vec::new(),
-            base_candidates_truncated: false,
             message: String::new(),
             status: StatusMessage::default(),
             epoch: Epoch::ZERO,
             refreshing: false,
         }
     }
+}
+
+/// Dispatcher acknowledgement for one external-agent diagram command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDiagramResult {
+    /// Protocol-server request identity.
+    pub request_id: u64,
+    /// Monotonic diagram mutation result within this TUI session.
+    pub revision: u64,
+    /// Whether the edit, or finish validation, succeeded.
+    pub accepted: bool,
+    /// Whether `finish` published a validated plan.
+    pub published: bool,
+    /// Successful edit summary.
+    pub summary: Option<String>,
+    /// Complete rejection or validation reason.
+    pub error: Option<String>,
+}
+
+/// Bounded, agent-readable copy of the human's retained diff selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectedDiffContext {
+    /// Repo-relative file displayed when the selection was committed.
+    pub file: String,
+    /// Exact visible source text selected by the human (diff gutters excluded).
+    pub text: String,
+    /// Whether Codescope shortened the selection to keep live context bounded.
+    pub truncated: bool,
 }
 
 /// Stable identity of a selectable row in the changed-files tree.

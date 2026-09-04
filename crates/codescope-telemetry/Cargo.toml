@@ -1,0 +1,12 @@
+[package]
+name = "codescope-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codescope local append-only usage and LLM telemetry"
+
+[dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

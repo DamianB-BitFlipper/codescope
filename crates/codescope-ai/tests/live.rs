@@ -77,10 +77,6 @@ async fn live_plan_smoke() {
         return;
     }
     let config = AiConfig::from_env().expect("ai config from env");
-    if !config.enabled {
-        eprintln!("SKIP: no API key found in env");
-        return;
-    }
     let service = AiService::new(config, "/tmp/codescope-live-smoke").expect("service");
     let outcome = service
         .request_plan(DIGEST, &NoToolExecutor, &AcceptAll, Epoch(1))
