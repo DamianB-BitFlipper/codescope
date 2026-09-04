@@ -601,6 +601,7 @@ mod tests {
         RepoContext {
             toplevel: Utf8PathBuf::from("/repo"),
             head: HeadState::Branch("feature".to_string()),
+            head_oid: None,
             upstream: None,
             base: Some(BaseInfo {
                 source: BaseSource::Upstream,

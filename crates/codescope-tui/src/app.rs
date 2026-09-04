@@ -38,40 +38,108 @@ pub struct UiPreferences {
     pub dividers: DividerSizes,
 }
 
-/// Stable identity of one diagram viewport inside the current repository epoch.
+/// Stable identity of one selection viewport inside the current repository epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DiagramSessionKey {
+struct SelectionViewKey {
     epoch: codescope_core::Epoch,
     scope: ChangeScope,
-    target: DiagramSessionTarget,
+    target: SelectionViewTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum DiagramSessionTarget {
+enum SelectionViewTarget {
     Directory(String),
     File(String),
     Symbol { file: String, name: String },
 }
 
-#[derive(Debug, Clone, Default)]
-struct DiagramViewState {
-    diagram: crate::diagram::DiagramState,
-    scroll: usize,
+/// How the logical diff row stored in [`App::diff_scroll`] is placed in the visible viewport.
+/// Manual navigation uses `Top`; diagram code links use `Center` so rendering can account for
+/// the current pane height and wrapped-row geometry without baking screen dimensions into App.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DiffScrollAlignment {
+    #[default]
+    Top,
+    Center,
 }
 
-fn diagram_session_key(snapshot: &UiSnapshot) -> Option<DiagramSessionKey> {
-    let selected = snapshot.impact.selected_change.as_ref()?;
-    let target = if snapshot.diff.title.ends_with('/') {
-        DiagramSessionTarget::Directory(selected.file.clone())
+/// Complete location of the diff viewport. Keeping row and alignment together makes hover
+/// restoration and per-selection memory preserve the exact view rather than only its row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DiffViewportAnchor {
+    row: u16,
+    alignment: DiffScrollAlignment,
+}
+
+/// Persistent viewport location for one directory, file, or symbol selection.
+///
+/// Diagram coordinates and pane scroll offsets are captured and restored together so adding a
+/// new location-bearing view does not create another ad-hoc per-selection cache.
+#[derive(Debug, Clone, Default)]
+struct SelectionViewState {
+    diagram: crate::diagram::DiagramState,
+    generated_scroll: usize,
+    diff_anchor: DiffViewportAnchor,
+    diff_hscroll: u16,
+}
+
+/// Owns the active selection identity and every saved composite viewport state.
+#[derive(Debug, Default)]
+struct SelectionViewMemory {
+    active: Option<SelectionViewKey>,
+    saved: HashMap<SelectionViewKey, SelectionViewState>,
+}
+
+impl SelectionViewMemory {
+    /// Save the outgoing viewport and return the incoming one. `None` means the requested
+    /// selection is already active and no view fields should be replaced.
+    fn switch_to(
+        &mut self,
+        next: Option<SelectionViewKey>,
+        current: SelectionViewState,
+    ) -> Option<SelectionViewState> {
+        if self.active == next {
+            return None;
+        }
+        if let Some(previous) = self.active.take() {
+            self.saved.insert(previous, current);
+        }
+        let restored = next
+            .as_ref()
+            .and_then(|key| self.saved.get(key))
+            .cloned()
+            .unwrap_or_default();
+        self.active = next;
+        Some(restored)
+    }
+
+    /// Save and detach the active viewport while an asynchronous scope switch is pending.
+    fn suspend(&mut self, current: SelectionViewState) {
+        if let Some(previous) = self.active.take() {
+            self.saved.insert(previous, current);
+        }
+    }
+
+    fn retain_epoch(&mut self, epoch: codescope_core::Epoch) {
+        self.saved.retain(|key, _| key.epoch == epoch);
+    }
+}
+
+fn selection_view_key(snapshot: &UiSnapshot) -> Option<SelectionViewKey> {
+    if snapshot.diff.title.is_empty() {
+        return None;
+    }
+    let target = if let Some(directory) = snapshot.diff.title.strip_suffix('/') {
+        SelectionViewTarget::Directory(directory.to_string())
     } else if let Some(name) = &snapshot.diff.focused_symbol {
-        DiagramSessionTarget::Symbol {
-            file: selected.file.clone(),
+        SelectionViewTarget::Symbol {
+            file: snapshot.diff.title.clone(),
             name: name.clone(),
         }
     } else {
-        DiagramSessionTarget::File(selected.file.clone())
+        SelectionViewTarget::File(snapshot.diff.title.clone())
     };
-    Some(DiagramSessionKey {
+    Some(SelectionViewKey {
         epoch: snapshot.epoch,
         scope: snapshot.scope,
         target,
@@ -97,6 +165,9 @@ pub struct App {
     /// Vertical scroll of the diff pane (a logical-row anchor; the renderer maps it to a
     /// visual line).
     pub diff_scroll: u16,
+    /// Placement of `diff_scroll` in the current viewport. Kept separate from the public row
+    /// for compatibility, but always captured and restored with it through `DiffViewportAnchor`.
+    pub(crate) diff_scroll_alignment: DiffScrollAlignment,
     /// Horizontal scroll of the diff pane (raw mode: long lines are clipped + scrolled).
     pub diff_hscroll: u16,
     /// Mouse-selected display cells in the diff, retained after clipboard copy.
@@ -115,13 +186,14 @@ pub struct App {
     /// drives both node emphasis and linked diff-row highlighting.
     pub hovered_plan_node: Option<PlanNodeTarget>,
     /// Diff position captured when the pointer first enters a generated-plan box. Hover may
-    /// temporarily move the diff to linked code; leaving every box restores this anchor.
-    pub diff_scroll_before_plan_hover: Option<u16>,
+    /// temporarily move the diff to linked code; leaving every box restores this anchor. Clicking
+    /// a box replaces it with the linked position, committing that jump.
+    diff_scroll_before_plan_hover: Option<DiffViewportAnchor>,
     /// Persistent free box positions and inline expansion state for the current plan.
     /// [`crate::diagram::DiagramState`] is the sole owner of this interaction state.
     pub diagram: crate::diagram::DiagramState,
-    /// Per-selection interaction state retained while navigating within this TUI session.
-    diagram_sessions: HashMap<DiagramSessionKey, DiagramViewState>,
+    /// Unified per-selection viewport memory retained while navigating within this TUI session.
+    selection_view_memory: SelectionViewMemory,
     /// Independent offset for the deterministic incoming-callers list.
     pub callers_scroll: usize,
     /// Independent offset for the deterministic downstream-relationships list.
@@ -214,19 +286,46 @@ impl App {
         }
     }
 
+    fn current_selection_view(&self) -> SelectionViewState {
+        SelectionViewState {
+            diagram: self.diagram.clone(),
+            generated_scroll: self.ai_plan_scroll,
+            diff_anchor: self.diff_viewport_anchor(),
+            diff_hscroll: self.diff_hscroll,
+        }
+    }
+
+    fn apply_selection_view(&mut self, restored: SelectionViewState) {
+        self.diagram = restored.diagram;
+        self.ai_plan_scroll = restored.generated_scroll;
+        self.set_diff_viewport_anchor(restored.diff_anchor);
+        self.diff_hscroll = restored.diff_hscroll;
+    }
+
+    fn diff_viewport_anchor(&self) -> DiffViewportAnchor {
+        DiffViewportAnchor {
+            row: self.diff_scroll,
+            alignment: self.diff_scroll_alignment,
+        }
+    }
+
+    fn set_diff_viewport_anchor(&mut self, anchor: DiffViewportAnchor) {
+        self.diff_scroll = anchor.row;
+        self.diff_scroll_alignment = anchor.alignment;
+    }
+
+    fn set_diff_scroll(&mut self, row: u16, alignment: DiffScrollAlignment) {
+        self.set_diff_viewport_anchor(DiffViewportAnchor { row, alignment });
+    }
+
     /// Replace the snapshot, clamping selection into the new bounds.
     pub fn update(&mut self, snapshot: UiSnapshot) {
-        // The diff pane follows the files-pane selection: when the dispatcher retargets it
-        // to a different file, start at the top of the new diff instead of keeping a scroll
-        // offset computed against the old one. `DiffPane::title` is the file path today
-        // (MERGE: the dispatcher half renames it to `file_path`; the comparison stays).
         let retargeted = self.snapshot.diff.title != snapshot.diff.title;
         let diff_content_changed = retargeted || self.snapshot.diff.rows != snapshot.diff.rows;
         let impact_retargeted =
             self.snapshot.impact.selected_change != snapshot.impact.selected_change;
-        let previous_diagram_key = diagram_session_key(&self.snapshot);
-        let next_diagram_key = diagram_session_key(&snapshot);
-        let diagram_retargeted = previous_diagram_key != next_diagram_key;
+        let next_view_key = selection_view_key(&snapshot);
+        let selection_retargeted = self.selection_view_memory.active != next_view_key;
         let activity_started = !self.snapshot.ai_activity.active && snapshot.ai_activity.active;
         let plan_changed = self.snapshot.semantic.plan != snapshot.semantic.plan;
         let generated_retargeted = self.snapshot.semantic.note != snapshot.semantic.note
@@ -236,38 +335,19 @@ impl App {
         if diff_content_changed {
             self.diff_selection = None;
         }
-        if retargeted {
-            self.diff_scroll = 0;
-            self.diff_hscroll = 0;
-            self.current_hunk = usize::from(snapshot.diff.total_hunks > 0);
-            self.hovered_plan_node = None;
-            self.diff_scroll_before_plan_hover = None;
-        } else if self.current_hunk == 0 && snapshot.diff.total_hunks > 0 {
+        if !selection_retargeted && self.current_hunk == 0 && snapshot.diff.total_hunks > 0 {
             // First diff for this path (hunks just arrived): start at hunk 1.
             self.current_hunk = 1;
         }
-        if diagram_retargeted {
-            if let Some(key) = previous_diagram_key {
-                self.diagram_sessions.insert(
-                    key,
-                    DiagramViewState {
-                        diagram: self.diagram.clone(),
-                        scroll: self.ai_plan_scroll,
-                    },
-                );
+        if selection_retargeted {
+            let current = self.current_selection_view();
+            if let Some(restored) = self.selection_view_memory.switch_to(next_view_key, current) {
+                self.apply_selection_view(restored);
             }
-            let restored = next_diagram_key
-                .as_ref()
-                .and_then(|key| self.diagram_sessions.get(key))
-                .cloned()
-                .unwrap_or_default();
-            self.diagram = restored.diagram;
-            self.ai_plan_scroll = restored.scroll;
             self.hovered_plan_node = None;
             self.diff_scroll_before_plan_hover = None;
         }
-        self.diagram_sessions
-            .retain(|key, _| key.epoch == snapshot.epoch);
+        self.selection_view_memory.retain_epoch(snapshot.epoch);
         // Selection identity survives the swap: directory insertion and asynchronously
         // arriving symbols both shift flat indices.
         let keep = self.selected_summary_key();
@@ -279,7 +359,7 @@ impl App {
                 .any(|file| file.path.starts_with(&format!("{directory}/")))
         });
         if generated_retargeted {
-            if plan_changed && !diagram_retargeted {
+            if plan_changed && !selection_retargeted {
                 self.ai_plan_scroll = 0;
             }
             if let Some(plan) = self.snapshot.semantic.plan.as_ref() {
@@ -293,6 +373,9 @@ impl App {
         self.clamp();
         if !retargeted && !impact_retargeted {
             self.refresh_plan_hover();
+        }
+        if selection_retargeted {
+            self.sync_current_hunk();
         }
         if let Some(key) = keep {
             self.restore_selection(&key);
@@ -533,6 +616,7 @@ impl App {
             | Action::SelectionChanged { .. }
             | Action::DirectorySelectionChanged { .. }
             | Action::AgentDiagram { .. }
+            | Action::AgentDiagramRejected { .. }
             | Action::RefreshGit
             | Action::GenerateAi
             | Action::ToggleAiGenerationMode
@@ -542,27 +626,17 @@ impl App {
     }
 
     fn set_scope(&mut self, scope: ChangeScope) {
-        if let Some(key) = diagram_session_key(&self.snapshot) {
-            self.diagram_sessions.insert(
-                key,
-                DiagramViewState {
-                    diagram: self.diagram.clone(),
-                    scroll: self.ai_plan_scroll,
-                },
-            );
-        }
+        let current = self.current_selection_view();
+        self.selection_view_memory.suspend(current);
         self.snapshot.scope = scope;
         self.file_sel = 0;
         self.files_scroll = 0;
         self.files_scroll_detached = false;
-        self.diff_scroll = 0;
-        self.diff_hscroll = 0;
         self.callers_scroll = 0;
         self.downstream_scroll = 0;
-        self.ai_plan_scroll = 0;
+        self.apply_selection_view(SelectionViewState::default());
         self.hovered_plan_node = None;
         self.diff_scroll_before_plan_hover = None;
-        self.diagram = crate::diagram::DiagramState::default();
         self.current_hunk = usize::from(self.snapshot.diff.total_hunks > 0);
     }
 
@@ -602,13 +676,13 @@ impl App {
             return;
         }
         if target.is_some() && self.hovered_plan_node.is_none() {
-            self.diff_scroll_before_plan_hover = Some(self.diff_scroll);
+            self.diff_scroll_before_plan_hover = Some(self.diff_viewport_anchor());
         }
         self.hovered_plan_node = target;
         if self.hovered_plan_node.is_some() {
             self.refresh_plan_hover();
         } else if let Some(original) = self.diff_scroll_before_plan_hover.take() {
-            self.diff_scroll = original;
+            self.set_diff_viewport_anchor(original);
             self.sync_current_hunk();
         }
     }
@@ -622,23 +696,49 @@ impl App {
         let Some(node) = self.plan_node(&target) else {
             self.hovered_plan_node = None;
             if let Some(original) = self.diff_scroll_before_plan_hover.take() {
-                self.diff_scroll = original;
+                self.set_diff_viewport_anchor(original);
                 self.sync_current_hunk();
             }
             return;
         };
         if let Some(anchor) = first_linked_diff_row(&self.snapshot.diff, node) {
-            self.diff_scroll = u16::try_from(anchor).unwrap_or(u16::MAX);
+            self.set_diff_scroll(
+                u16::try_from(anchor).unwrap_or(u16::MAX),
+                DiffScrollAlignment::Center,
+            );
         } else if let Some(original) = self.diff_scroll_before_plan_hover {
-            self.diff_scroll = original;
+            self.set_diff_viewport_anchor(original);
         }
         self.sync_current_hunk();
     }
 
     fn toggle_plan_node(&mut self, target: PlanNodeTarget) {
-        if self.plan_node(&target).is_some() {
-            self.diagram.toggle_node(target);
+        let Some(linked_row) = self
+            .plan_node(&target)
+            .and_then(|node| first_linked_diff_row(&self.snapshot.diff, node))
+        else {
+            if self.plan_node(&target).is_some() {
+                // Even a box without a link commits the current hover result, which is the
+                // pre-hover position restored by `refresh_plan_hover`.
+                if self.hovered_plan_node.as_ref() == Some(&target) {
+                    self.diff_scroll_before_plan_hover = Some(self.diff_viewport_anchor());
+                }
+                self.diagram.toggle_node(target);
+            }
+            return;
+        };
+
+        self.set_diff_scroll(
+            u16::try_from(linked_row).unwrap_or(u16::MAX),
+            DiffScrollAlignment::Center,
+        );
+        self.sync_current_hunk();
+        if self.hovered_plan_node.as_ref() == Some(&target) {
+            // Mouse-out now restores to the clicked link instead of the position from before
+            // hover. A direct hover of another box remains reversible to this committed location.
+            self.diff_scroll_before_plan_hover = Some(self.diff_viewport_anchor());
         }
+        self.diagram.toggle_node(target);
     }
 
     fn plan_relationship_exists(&self, target: &PlanRelationshipTarget) -> bool {
@@ -743,7 +843,10 @@ impl App {
     fn scroll_diff(&mut self, delta: i32) {
         let len = self.snapshot.diff.rows.len() as i32;
         let cur = self.diff_scroll as i32;
-        self.diff_scroll = (cur + delta).clamp(0, len.saturating_sub(1).max(0)) as u16;
+        self.set_diff_scroll(
+            (cur + delta).clamp(0, len.saturating_sub(1).max(0)) as u16,
+            DiffScrollAlignment::Top,
+        );
         self.sync_current_hunk();
     }
 
@@ -754,7 +857,10 @@ impl App {
                 self.files_scroll_detached = true;
             }
             ScrollRegionId::Diff => {
-                self.diff_scroll = u16::try_from(offset).unwrap_or(u16::MAX);
+                self.set_diff_scroll(
+                    u16::try_from(offset).unwrap_or(u16::MAX),
+                    DiffScrollAlignment::Top,
+                );
                 self.sync_current_hunk();
             }
             ScrollRegionId::Callers => self.callers_scroll = offset,
@@ -774,7 +880,7 @@ impl App {
             }
             Pane::Impact => self.scroll_ai_plan_to(0),
             Pane::Diff => {
-                self.diff_scroll = 0;
+                self.set_diff_scroll(0, DiffScrollAlignment::Top);
                 self.sync_current_hunk();
             }
         }
@@ -788,7 +894,10 @@ impl App {
             }
             Pane::Impact => self.scroll_ai_plan_to(usize::MAX),
             Pane::Diff => {
-                self.diff_scroll = self.snapshot.diff.rows.len().saturating_sub(1) as u16;
+                self.set_diff_scroll(
+                    self.snapshot.diff.rows.len().saturating_sub(1) as u16,
+                    DiffScrollAlignment::Top,
+                );
                 self.sync_current_hunk();
             }
         }
@@ -846,7 +955,7 @@ impl App {
             if matches!(row, DiffRow::HunkHeader(_)) {
                 seen += 1;
                 if seen == next {
-                    self.diff_scroll = i as u16;
+                    self.set_diff_scroll(i as u16, DiffScrollAlignment::Top);
                     break;
                 }
             }
@@ -1552,8 +1661,14 @@ mod tests {
     #[test]
     fn current_hunk_resets_when_the_diff_retargets() {
         let mut app = App::new();
-        app.snapshot.diff.title = "a.go".to_string();
-        app.snapshot.diff.total_hunks = 5;
+        app.update(UiSnapshot {
+            diff: crate::snapshot::DiffPane {
+                title: "a.go".to_string(),
+                total_hunks: 5,
+                ..crate::snapshot::DiffPane::default()
+            },
+            ..UiSnapshot::default()
+        });
         app.current_hunk = 4;
         // Same path: the hunk cursor survives a refresh publish.
         app.update(UiSnapshot {
@@ -1740,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_hover_temporarily_jumps_to_code_and_expansion_stays_open() {
+    fn plan_hover_restores_until_a_box_click_commits_the_linked_diff_position() {
         let mut snap = ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 2);
         snap.diff = crate::snapshot::DiffPane {
             title: "src/main.rs".into(),
@@ -1787,9 +1902,17 @@ mod tests {
 
         app.apply(Action::HoverPlanNode(Some(target.clone())));
         assert_eq!(app.diff_scroll, 3, "hover jumps to the first linked row");
+        assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Center);
         assert_eq!(app.current_hunk, 2);
+        app.apply(Action::HoverPlanNode(None));
+        assert_eq!(app.diff_scroll, 1, "hover alone remains reversible");
+        assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Top);
+        assert_eq!(app.current_hunk, 1);
+
+        app.apply(Action::HoverPlanNode(Some(target.clone())));
         app.apply(Action::TogglePlanNode(target.clone()));
         assert_eq!(app.diagram.expanded_node(), Some(&target));
+        assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Center);
 
         // A live-draft publish may add or refine other boxes while this one remains valid.
         snap.semantic.plan.as_mut().unwrap().forms[0]
@@ -1801,10 +1924,11 @@ mod tests {
 
         app.apply(Action::HoverPlanNode(None));
         assert_eq!(
-            app.diff_scroll, 1,
-            "mouse-out restores the original position"
+            app.diff_scroll, 3,
+            "mouse-out keeps the linked position committed by the click"
         );
-        assert_eq!(app.current_hunk, 1);
+        assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Center);
+        assert_eq!(app.current_hunk, 2);
         assert!(
             app.active_code_node().is_none(),
             "an open box is not highlighted"
@@ -1916,10 +2040,25 @@ mod tests {
     }
 
     #[test]
-    fn diagram_layout_and_expansion_restore_when_returning_to_a_file() {
+    fn selection_view_restores_diff_and_diagram_locations_together() {
         fn selected_plan(file: &str) -> UiSnapshot {
             let mut snapshot = ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 2);
             snapshot.diff.title = file.to_string();
+            snapshot.diff.rows = vec![
+                DiffRow::HunkHeader("@@ -1,1 +1,1 @@ first".into()),
+                DiffRow::Context {
+                    old_ln: 1,
+                    new_ln: 1,
+                    text: "first".into(),
+                },
+                DiffRow::HunkHeader("@@ -20,1 +20,1 @@ second".into()),
+                DiffRow::Context {
+                    old_ln: 20,
+                    new_ln: 20,
+                    text: "second".into(),
+                },
+            ];
+            snapshot.diff.total_hunks = 2;
             snapshot.impact.selected_change = Some(crate::snapshot::SelectedChange {
                 file: file.to_string(),
                 label: file.to_string(),
@@ -1943,11 +2082,22 @@ mod tests {
         });
         app.apply(Action::TogglePlanNode(target.clone()));
         app.ai_plan_scroll = 11;
+        app.diff_scroll = 3;
+        app.diff_scroll_alignment = DiffScrollAlignment::Center;
+        app.diff_hscroll = 7;
+        app.sync_current_hunk();
+        assert_eq!(app.current_hunk, 2);
 
         app.update(selected_plan("b.go"));
         assert!(app.diagram.positions().is_empty());
         assert!(app.diagram.expanded_node().is_none());
         assert_eq!(app.ai_plan_scroll, 0);
+        assert_eq!(app.diff_scroll, 0);
+        assert_eq!(app.diff_hscroll, 0);
+        assert_eq!(app.current_hunk, 1);
+
+        app.diff_scroll = 1;
+        app.diff_hscroll = 2;
 
         app.update(selected_plan("a.go"));
         assert_eq!(
@@ -1956,5 +2106,14 @@ mod tests {
         );
         assert_eq!(app.diagram.expanded_node(), Some(&target));
         assert_eq!(app.ai_plan_scroll, 11);
+        assert_eq!(app.diff_scroll, 3);
+        assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Center);
+        assert_eq!(app.diff_hscroll, 7);
+        assert_eq!(app.current_hunk, 2);
+
+        app.update(selected_plan("b.go"));
+        assert_eq!(app.diff_scroll, 1);
+        assert_eq!(app.diff_hscroll, 2);
+        assert_eq!(app.current_hunk, 1);
     }
 }

@@ -124,6 +124,9 @@ pub struct RepoContext {
     pub toplevel: Utf8PathBuf,
     /// HEAD state.
     pub head: HeadState,
+    /// Resolved commit object currently named by HEAD; `None` for an unborn repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<Oid>,
     /// Upstream tracking info, if configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<Upstream>,
@@ -160,6 +163,21 @@ pub struct ChangeSet {
     /// must not misattribute these as committed branch changes (review 11 F2).
     #[serde(default)]
     pub fallback: bool,
+    /// Exact per-file unified-diff sections captured by the Git command that produced `files`.
+    /// This sidecar is intentionally omitted from general `ChangeSet` serialization; it exists so
+    /// trusted local consumers can reconstruct the complete comparison without running Git again.
+    #[serde(skip)]
+    pub diff_sections: Option<Vec<UnifiedDiffSection>>,
+}
+
+/// One complete canonical section from the unified patch that produced a [`FileChange`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnifiedDiffSection {
+    /// Current/new repo-relative path used to join this section back to `ChangeSet::files`.
+    pub path: Utf8PathBuf,
+    /// Complete section text, including extended headers, hunks, no-newline markers, and a final
+    /// newline. It is retained without line or byte truncation.
+    pub text: String,
 }
 
 impl ChangeSet {
@@ -170,7 +188,15 @@ impl ChangeSet {
             scope,
             files,
             fallback: false,
+            diff_sections: None,
         }
+    }
+
+    /// Attach the exact unified sections returned by the same Git invocation parsed into `files`.
+    #[must_use]
+    pub fn with_diff_sections(mut self, sections: Vec<UnifiedDiffSection>) -> Self {
+        self.diff_sections = Some(sections);
+        self
     }
 
     /// Mark this set as a working-tree fallback for an empty committed diff.

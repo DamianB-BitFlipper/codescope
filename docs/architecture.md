@@ -128,11 +128,19 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 
 7. **Privacy and local telemetry**: 4-layer outbound exclusion (git ignore rules <
    .codescopeignore < compiled denylist < content sniffing), applied to diff paths too; keys via
-   env name only into secrecy::SecretString. Separately, an always-on local JSONL sink beside the
-   global config records session-correlated UI inputs/state and full secret-scrubbed provider
-   request/response envelopes. The sink is append-only, owner-only on Unix, never includes auth
-   headers, and has no upload path. (research 07's original no-telemetry recommendation is
-   superseded by this product requirement.)
+   env name only into secrecy::SecretString. Separately, an always-on local telemetry directory
+   beside the global config holds one JSONL stream per process/session and records
+   session-correlated UI inputs/state and full secret-scrubbed provider
+   request/response envelopes. The accepted dispatcher `ChangeSet` also produces a
+   content-addressed `diff.snapshot` from its retained parser output—not a second Git command.
+   It contains the complete post-exclusion/post-scrub unified patch, resolved comparison
+   identifiers, and byte-addressable file/hunk metadata. Its SHA-256 `diff_snapshot_id` is attached
+   to later UI, controller, snapshot, and LLM records; identical payloads are stored once per
+   session stream. An epoch bump clears correlation before stale UI is republished, and each LLM future
+   retains the ID present when it launched. The sink is append-only, owner-only on Unix, never
+   includes auth headers, credential material, excluded files, or absolute repository paths, and
+   has no upload path. The full event contract is in [`telemetry.md`](telemetry.md). (research 07's
+   original no-telemetry recommendation is superseded by this product requirement.)
 8. **Global configuration**: v1 TOML at the XDG/platform user config path (override with
    `CODESCOPE_CONFIG`), with no repository-local layer. Environment variables override `[ai]`;
    explicit model-picker choices are remembered per provider. Only stable view preferences are

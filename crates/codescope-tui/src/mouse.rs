@@ -513,6 +513,38 @@ mod tests {
         }
     }
 
+    fn relationship_snap() -> UiSnapshot {
+        let mut snapshot = snap();
+        snapshot.impact.selected_change = Some(crate::snapshot::SelectedChange {
+            file: "a.go".to_string(),
+            label: "Selected".to_string(),
+            change: "modified",
+            interpretation: "Coordinates related work.".to_string(),
+            interpretation_source: crate::snapshot::InterpretationSource::Deterministic,
+        });
+        snapshot
+            .impact
+            .callers
+            .rows
+            .push(crate::snapshot::ImpactRow {
+                label: "caller".to_string(),
+                relation: "calls",
+                changed: false,
+                has_diagnostic: false,
+            });
+        snapshot
+            .impact
+            .downstream
+            .rows
+            .push(crate::snapshot::ImpactRow {
+                label: "callee".to_string(),
+                relation: "calls",
+                changed: false,
+                has_diagnostic: false,
+            });
+        snapshot
+    }
+
     fn app_with(snap: &UiSnapshot) -> App {
         let mut app = App::new();
         app.update(snap.clone());
@@ -659,7 +691,7 @@ mod tests {
 
     #[test]
     fn impact_vertical_divider_drag_resizes_relationship_stack() {
-        let s = snap();
+        let s = relationship_snap();
         let app = app_with(&s);
         let g = geo(&app, &s);
         let h = g
@@ -690,7 +722,7 @@ mod tests {
 
     #[test]
     fn every_internal_horizontal_sectional_uses_the_same_drag_path() {
-        let s = snap();
+        let s = relationship_snap();
         let app = app_with(&s);
         let g = geo(&app, &s);
         for divider in [DividerId::SelectedCallers, DividerId::CallersDownstream] {
@@ -1185,6 +1217,60 @@ mod tests {
             DragState::Idle,
         );
         assert_eq!(hover.action, Some(Action::HoverPlanNode(None)));
+    }
+
+    #[test]
+    fn fully_visible_relationship_is_not_an_expansion_hit_target() {
+        let mut s = snap();
+        let mut plan = codescope_core::VisualizationPlan::new(codescope_core::Epoch(1));
+        plan.forms.push(codescope_core::VizForm {
+            kind: codescope_core::FormKind::Sequence,
+            nodes: vec![
+                codescope_core::PlanNode::new(
+                    "before",
+                    "Before",
+                    codescope_core::PlanNodeChange::Modified,
+                ),
+                codescope_core::PlanNode::new(
+                    "after",
+                    "After",
+                    codescope_core::PlanNodeChange::Modified,
+                ),
+            ],
+            edges: vec![codescope_core::PlanEdge {
+                from: "before".into(),
+                to: "after".into(),
+                kind: codescope_core::PlanEdgeKind::FlowsTo,
+                label: Some("then evaluates the new state".into()),
+            }],
+        });
+        s.semantic.plan = Some(plan);
+        s.semantic.ai_generated = true;
+        s.ai = codescope_core::AiStatus::Ready {
+            epoch: codescope_core::Epoch(1),
+        };
+        let app = app_with(&s);
+        let geometry = geo(&app, &s);
+        let content = geometry.generated_content.expect("generated viewport");
+        let relationship = &geometry
+            .diagram_canvas
+            .as_ref()
+            .expect("diagram")
+            .relationships[0];
+        assert!(!relationship.has_hidden_label);
+        let x = content.x.saturating_add(relationship.label_rect.x);
+        let y = content.y.saturating_add(
+            relationship
+                .label_rect
+                .y
+                .saturating_sub(geometry.ai_plan_scroll as u16),
+        );
+        assert!(geometry.plan_relationship_at(x, y).is_none());
+        let click = map_mouse(down(x, y), &app, &s, &geometry, DragState::Idle);
+        assert!(!matches!(
+            click.action,
+            Some(Action::TogglePlanRelationship(_))
+        ));
     }
 
     #[test]

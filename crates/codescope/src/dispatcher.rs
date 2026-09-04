@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use codescope_ai::{
     parse_plan, validate, AiActivityObserver, AiActivityUpdate, AiOutcome, AiService,
-    AiToolActivityState, DiagramObserver, FactView, ReasoningEffort,
+    AiToolActivityState, DiagramObserver, FactView, ReasoningEffort, DIAGRAM_EDIT_TOOL_NAME,
 };
 use codescope_analysis::{AnalysisEngine, AnalysisSnapshot};
 use codescope_core::{
@@ -294,6 +294,28 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     shortened
 }
 
+/// Match the concise operation/subject label produced for the internal diagram tool so a CLI
+/// controller's edits read as a continuation of the same call chain.
+fn diagram_activity_detail(command: &DiagramCommand) -> String {
+    let Ok(arguments) = serde_json::to_value(command) else {
+        return "edit".to_string();
+    };
+    let operation = arguments
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("edit");
+    let subject = arguments
+        .pointer("/node/label")
+        .or_else(|| arguments.get("form_id"))
+        .or_else(|| arguments.get("from"))
+        .and_then(serde_json::Value::as_str);
+    let detail = match subject {
+        Some(subject) => format!("{operation} · {subject}"),
+        None => operation.to_string(),
+    };
+    truncate_chars(&detail, 96)
+}
+
 /// Lazy per-file semantic state (the interactive counterpart of the eager
 /// `AnalysisSnapshot.files`). The files pane renders this directly.
 #[derive(Debug, Clone)]
@@ -456,6 +478,10 @@ pub struct Dispatcher {
     ai_running: std::collections::HashMap<u64, AiRunningJob>,
     /// Bounded per-generation tool-call history used by the focused loading view.
     ai_activity: std::collections::HashMap<u64, AiActivity>,
+    /// Selection-scoped continuation of the visible tool history after an external agent takes
+    /// ownership of a draft. Unlike an internal generation, controller commands arrive through
+    /// independent CLI processes, so their shared timeline is keyed by the diagram selection.
+    agent_activity: std::collections::HashMap<AiSelectionKey, AiActivity>,
     /// FIFO window of active requests. Selection changes do not cancel work; starting a
     /// seventeenth request cancels the oldest active generation.
     ai_requests: RequestCoordinator,
@@ -537,6 +563,9 @@ pub struct Dispatcher {
     changeset: Option<codescope_core::ChangeSet>,
     /// Shared copy of the same captured Git facts for local agent-protocol diff lookup.
     agent_changeset: Option<std::sync::Arc<codescope_core::ChangeSet>>,
+    /// Content identity of the current privacy-filtered telemetry diff. Cleared before every
+    /// refresh so retained UI data can never lend a stale identity to new interaction records.
+    diff_snapshot_id: Option<String>,
     /// FIFO sender for nonblocking persistence. The worker owns the persistence sink.
     config_write_tx: Option<mpsc::UnboundedSender<ConfigWrite>>,
     /// Joined during dispatcher shutdown so the last explicit preference reaches disk.
@@ -578,6 +607,7 @@ impl Dispatcher {
             agent_diagram_result: None,
             ai_running: std::collections::HashMap::new(),
             ai_activity: std::collections::HashMap::new(),
+            agent_activity: std::collections::HashMap::new(),
             ai_requests: RequestCoordinator::default(),
             ai_failures: std::collections::HashMap::new(),
             ai_selection_seq: 0,
@@ -612,6 +642,7 @@ impl Dispatcher {
             repo_ctx: None,
             changeset: None,
             agent_changeset: None,
+            diff_snapshot_id: None,
             config_write_tx: None,
             config_writer: None,
         }
@@ -968,6 +999,11 @@ impl Dispatcher {
                 request_id,
                 command,
             } => self.apply_agent_diagram(request_id, command),
+            Action::AgentDiagramRejected {
+                request_id,
+                detail,
+                error,
+            } => self.reject_agent_diagram(request_id, detail, error),
             Action::SetAgentDiffSelection(selected) => self.set_agent_diff_selection(selected),
             Action::BasePicker => self.spawn_list_bases(),
             Action::BaseSelected(name) => self.set_base(name),
@@ -1121,6 +1157,7 @@ impl Dispatcher {
         self.ai_cache.clear();
         self.ai_drafts.clear();
         self.agent_owned_drafts.clear();
+        self.agent_activity.clear();
         self.ai_revision_cache.clear();
         self.ai_failures.clear();
         self.abort_all_ai_requests();
@@ -1392,9 +1429,14 @@ impl Dispatcher {
             self.publish();
             return;
         };
+        // A controller may take over after Codescope's internal researcher has already made
+        // useful calls. Snapshot that visible chain before cancelling its writer, then let each
+        // independent CLI invocation append to the same selection-scoped activity.
+        self.begin_agent_activity(&selection);
         if self.data_epoch != self.epoch || self.changeset.is_none() {
             let error = "diagram edit is waiting for the current Git snapshot".to_string();
             self.record_agent_diagram_result(request_id, false, false, None, Some(error.clone()));
+            self.append_agent_activity(&selection, request_id, &command, Some(error.clone()));
             self.set_status(error, StatusLevel::Warning);
             self.publish();
             return;
@@ -1423,6 +1465,7 @@ impl Dispatcher {
                     None,
                     Some(error.clone()),
                 );
+                self.append_agent_activity(&selection, request_id, &command, Some(error.clone()));
                 self.set_status(
                     format!("diagram edit rejected: {error}"),
                     StatusLevel::Warning,
@@ -1442,7 +1485,7 @@ impl Dispatcher {
                     self.ai_revision_cache
                         .insert(AiRevisionKey::from(&selection), cached.clone());
                     self.agent_owned_drafts.remove(&selection);
-                    self.ai_rows = Some((self.epoch, selection, cached));
+                    self.ai_rows = Some((self.epoch, selection.clone(), cached));
                     self.ai_status = AiStatus::Ready { epoch: self.epoch };
                     self.record_agent_diagram_result(
                         request_id,
@@ -1451,6 +1494,7 @@ impl Dispatcher {
                         Some("validated and published the diagram".to_string()),
                         None,
                     );
+                    self.append_agent_activity(&selection, request_id, &command, None);
                     self.set_status("agent diagram validated and published", StatusLevel::Info);
                 }
                 Err(error) => {
@@ -1462,6 +1506,12 @@ impl Dispatcher {
                         false,
                         false,
                         None,
+                        Some(error.clone()),
+                    );
+                    self.append_agent_activity(
+                        &selection,
+                        request_id,
+                        &command,
                         Some(error.clone()),
                     );
                     self.set_status_with_detail(
@@ -1481,8 +1531,37 @@ impl Dispatcher {
                 since_epoch: self.epoch,
             };
             self.record_agent_diagram_result(request_id, true, false, Some(summary.clone()), None);
+            self.append_agent_activity(&selection, request_id, &command, None);
             self.set_status(format!("agent diagram: {summary}"), StatusLevel::Info);
         }
+        self.publish();
+    }
+
+    /// Surface a malformed controller edit through the same acknowledgement and activity paths
+    /// as a well-shaped command rejected by [`DiagramDraft::apply`].
+    fn reject_agent_diagram(&mut self, request_id: u64, detail: String, error: String) {
+        let error = codescope_ai::scrub_secrets(&error);
+        let Some(selection) = self.current_ai_selection() else {
+            let selection_error = "diagram edit needs a selected directory, file, or function";
+            self.record_agent_diagram_result(
+                request_id,
+                false,
+                false,
+                None,
+                Some(selection_error.to_string()),
+            );
+            self.set_status(selection_error, StatusLevel::Warning);
+            self.publish();
+            return;
+        };
+        self.begin_agent_activity(&selection);
+        self.cancel_ai_for_selection(&selection);
+        self.record_agent_diagram_result(request_id, false, false, None, Some(error.clone()));
+        self.append_agent_activity_row(&selection, request_id, detail, Some(error.clone()));
+        self.set_status(
+            format!("diagram edit rejected: {}", truncate_chars(&error, 140)),
+            StatusLevel::Warning,
+        );
         self.publish();
     }
 
@@ -1505,6 +1584,76 @@ impl Dispatcher {
         });
     }
 
+    /// Continue the currently visible internal research chain when an external controller takes
+    /// ownership. The copy must happen before [`Self::cancel_ai_for_selection`] removes the
+    /// generation ledger used to resolve internal activity.
+    fn begin_agent_activity(&mut self, selection: &AiSelectionKey) {
+        if self.agent_activity.contains_key(selection) {
+            return;
+        }
+        let latest_generation = self
+            .ai_running
+            .iter()
+            .filter_map(|(generation, running)| {
+                (running.epoch == self.epoch && running.selection == *selection)
+                    .then_some(*generation)
+            })
+            .max();
+        let mut activity = latest_generation
+            .and_then(|generation| self.ai_activity.get(&generation).cloned())
+            .unwrap_or_default();
+        activity.active = true;
+        activity.waiting_for_model = false;
+        self.agent_activity.insert(selection.clone(), activity);
+    }
+
+    fn append_agent_activity(
+        &mut self,
+        selection: &AiSelectionKey,
+        request_id: u64,
+        command: &DiagramCommand,
+        error: Option<String>,
+    ) {
+        self.append_agent_activity_row(
+            selection,
+            request_id,
+            diagram_activity_detail(command),
+            error,
+        );
+    }
+
+    fn append_agent_activity_row(
+        &mut self,
+        selection: &AiSelectionKey,
+        request_id: u64,
+        detail: String,
+        error: Option<String>,
+    ) {
+        // CLI invocations are separate processes, so their process-local request ids may repeat.
+        // The dispatcher revision is session-monotonic and keeps activity row identities unique.
+        let revision = self.agent_diagram_revision;
+        let activity = self
+            .agent_activity
+            .entry(selection.clone())
+            .or_insert_with(|| AiActivity {
+                active: true,
+                ..AiActivity::default()
+            });
+        activity.active = true;
+        activity.waiting_for_model = false;
+        activity.calls.push(AiToolCallActivity {
+            id: format!("agent-diagram-{revision}-{request_id}"),
+            name: DIAGRAM_EDIT_TOOL_NAME.to_string(),
+            detail: truncate_chars(&codescope_ai::scrub_secrets(&detail), 96),
+            state: if error.is_some() {
+                AiToolCallActivityState::Failed
+            } else {
+                AiToolCallActivityState::Succeeded
+            },
+            error: error.map(|error| truncate_chars(&codescope_ai::scrub_secrets(&error), 320)),
+        });
+    }
+
     fn cancel_ai_for_selection(&mut self, selection: &AiSelectionKey) {
         let generations = self
             .ai_running
@@ -1517,6 +1666,7 @@ impl Dispatcher {
         for generation in generations {
             self.ai_requests.abort(generation);
             self.ai_running.remove(&generation);
+            self.ai_activity.remove(&generation);
         }
     }
 
@@ -1599,6 +1749,7 @@ impl Dispatcher {
             self.ai_cache.remove(&selection);
             self.ai_drafts.remove(&selection);
             self.agent_owned_drafts.remove(&selection);
+            self.agent_activity.remove(&selection);
             self.ai_failures.remove(&selection);
         } else if let Some(plan) = self.ai_cache.get(&selection).cloned() {
             self.ai_rows = Some((self.epoch, selection, plan));
@@ -1942,6 +2093,8 @@ impl Dispatcher {
         // newest base/scope/repo state always wins.
         self.epoch = self.epoch.next();
         let epoch = self.epoch;
+        self.diff_snapshot_id = None;
+        codescope_telemetry::mark_diff_snapshot_unavailable(epoch.get(), "comparison_refreshing");
         self.ai_selection_seq = self.ai_selection_seq.saturating_add(1);
         self.ai_generation_requested = None;
         self.selected_diff_context = None;
@@ -1954,6 +2107,7 @@ impl Dispatcher {
         self.ai_cache.clear();
         self.ai_drafts.clear();
         self.agent_owned_drafts.clear();
+        self.agent_activity.clear();
         self.ai_status = if self.ai_auto_generate {
             AiStatus::Stale { epoch }
         } else {
@@ -2029,6 +2183,9 @@ impl Dispatcher {
             }
             self.ai_activity.remove(&generation);
         }
+        // A newly authorized provider run starts a fresh chain for this selection. Any earlier
+        // external-controller chain belongs to the superseded draft.
+        self.agent_activity.remove(&selection);
         // A validated plan from an older epoch is not current UI state, but it is a useful
         // design draft for the same directory/file/symbol. The AI service labels it as untrusted
         // continuity context and requires the new facts to win.
@@ -2037,6 +2194,7 @@ impl Dispatcher {
             .get(&AiRevisionKey::from(&selection))
             .map(|cached| cached.plan.clone());
         let epoch = self.epoch;
+        let diff_snapshot_id = self.diff_snapshot_id.clone();
         self.ai_request_seq = self.ai_request_seq.saturating_add(1);
         let generation = self.ai_request_seq;
         // The initial turn is intentionally an inventory, not an evidence dump. A scoped
@@ -2089,8 +2247,9 @@ impl Dispatcher {
         });
         let running_selection = selection.clone();
         let task = tokio::spawn(async move {
-            let outcome = ai
-                .request_plan_with_observers(
+            let outcome = codescope_telemetry::scope_diff_snapshot(
+                diff_snapshot_id,
+                ai.request_plan_with_observers(
                     &brief,
                     previous_plan.as_ref(),
                     &research_tools,
@@ -2098,8 +2257,9 @@ impl Dispatcher {
                     epoch,
                     Some(observer),
                     Some(activity_observer),
-                )
-                .await;
+                ),
+            )
+            .await;
             let _ = tx
                 .send(DispatchEvent::AiDone {
                     epoch,
@@ -2459,6 +2619,17 @@ impl Dispatcher {
         if epoch != self.epoch {
             return;
         }
+        self.diff_snapshot_id = match crate::telemetry_diff::activate(&ctx, &changeset, epoch) {
+            Ok(id) => id,
+            Err(error) => {
+                codescope_telemetry::mark_diff_snapshot_unavailable(
+                    epoch.get(),
+                    "snapshot_build_failed",
+                );
+                tracing::warn!(%error, "could not record current diff telemetry snapshot");
+                None
+            }
+        };
         self.repo_ctx = Some(ctx);
         self.agent_changeset = Some(std::sync::Arc::new(changeset.clone()));
         self.changeset = Some(changeset);
@@ -2495,6 +2666,8 @@ impl Dispatcher {
             return;
         }
         debug_assert!(ctx.base.is_none());
+        self.diff_snapshot_id = None;
+        codescope_telemetry::mark_diff_snapshot_unavailable(epoch.get(), "comparison_unavailable");
         self.repo_ctx = Some(ctx);
         // No comparison ran, so an empty ChangeSet would be a false fact. Remove every
         // branch-scoped artifact retained while refresh was in flight instead.
@@ -2592,6 +2765,7 @@ impl Dispatcher {
 
         self.ai_drafts.insert(selection.clone(), draft);
         self.agent_owned_drafts.remove(&selection);
+        self.agent_activity.remove(&selection);
         if self.current_ai_selection().as_ref() == Some(&selection) {
             self.ai_status = AiStatus::Loading { since_epoch: epoch };
             self.publish();
@@ -2763,15 +2937,17 @@ impl Dispatcher {
         let ai_activity = self
             .current_ai_selection()
             .and_then(|selection| {
-                self.ai_running
-                    .iter()
-                    .filter_map(|(generation, running)| {
-                        (running.epoch == self.epoch && running.selection == selection)
-                            .then_some(*generation)
-                    })
-                    .max()
+                self.agent_activity.get(&selection).cloned().or_else(|| {
+                    self.ai_running
+                        .iter()
+                        .filter_map(|(generation, running)| {
+                            (running.epoch == self.epoch && running.selection == selection)
+                                .then_some(*generation)
+                        })
+                        .max()
+                        .and_then(|generation| self.ai_activity.get(&generation).cloned())
+                })
             })
-            .and_then(|generation| self.ai_activity.get(&generation).cloned())
             .unwrap_or_default();
         UiSnapshot {
             repo: repo_bar,
@@ -3112,6 +3288,13 @@ fn changeset_for_selection(
             .cloned()
             .collect(),
         fallback: changeset.fallback,
+        diff_sections: changeset.diff_sections.as_ref().map(|sections| {
+            sections
+                .iter()
+                .filter(|section| selection.contains_file(section.path.as_str()))
+                .cloned()
+                .collect()
+        }),
     }
 }
 
@@ -4205,6 +4388,29 @@ mod tests {
         disp.changeset = Some(two_file_changeset());
         disp.data_epoch = disp.epoch;
         disp.selected_file = Some("a.txt".to_string());
+        let selection = disp.current_ai_selection().unwrap();
+        disp.ai_running.insert(
+            40,
+            AiRunningJob {
+                selection: selection.clone(),
+                epoch: disp.epoch,
+                generation: 40,
+            },
+        );
+        disp.ai_activity.insert(
+            40,
+            AiActivity {
+                active: true,
+                calls: vec![AiToolCallActivity {
+                    id: "internal-call".to_string(),
+                    name: "git_diff_file".to_string(),
+                    detail: "a.txt · hunk 0".to_string(),
+                    error: None,
+                    state: AiToolCallActivityState::Succeeded,
+                }],
+                waiting_for_model: true,
+            },
+        );
 
         disp.apply_agent_diagram(
             41,
@@ -4223,7 +4429,18 @@ mod tests {
                 snapshot.diagram_draft.unwrap().intent,
                 "Explain the selected change."
             );
+            assert_eq!(snapshot.ai_activity.calls.len(), 2);
+            assert_eq!(snapshot.ai_activity.calls[0].name, "git_diff_file");
+            assert_eq!(snapshot.ai_activity.calls[1].name, DIAGRAM_EDIT_TOOL_NAME);
+            assert_eq!(snapshot.ai_activity.calls[1].detail, "set_intent");
+            assert_eq!(
+                snapshot.ai_activity.calls[1].state,
+                AiToolCallActivityState::Succeeded
+            );
+            assert!(!snapshot.ai_activity.waiting_for_model);
         }
+        assert!(disp.ai_running.is_empty());
+        assert!(disp.ai_activity.is_empty());
 
         disp.apply_agent_diagram(
             42,
@@ -4241,6 +4458,32 @@ mod tests {
             snapshot.diagram_draft.unwrap().intent,
             "Explain the selected change.",
             "a rejected atomic edit leaves the draft unchanged"
+        );
+        assert_eq!(snapshot.ai_activity.calls.len(), 3);
+        assert_eq!(snapshot.ai_activity.calls[2].detail, "set_intent");
+        assert_eq!(
+            snapshot.ai_activity.calls[2].state,
+            AiToolCallActivityState::Failed
+        );
+        assert!(snapshot.ai_activity.calls[2]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("must not be empty")));
+
+        disp.reject_agent_diagram(
+            43,
+            "set_intent · form-1".to_string(),
+            "diagram command is not valid shared editor JSON: unknown field `form_id`".to_string(),
+        );
+        let snapshot = snapshot_rx.borrow().clone();
+        let result = snapshot.agent_diagram_result.unwrap();
+        assert_eq!(result.request_id, 43);
+        assert!(!result.accepted);
+        assert_eq!(snapshot.ai_activity.calls.len(), 4);
+        assert_eq!(snapshot.ai_activity.calls[3].detail, "set_intent · form-1");
+        assert_eq!(
+            snapshot.ai_activity.calls[3].state,
+            AiToolCallActivityState::Failed
         );
 
         std::fs::remove_dir_all(&root).ok();
@@ -4426,6 +4669,7 @@ mod tests {
         let ctx = codescope_core::RepoContext {
             toplevel: camino::Utf8PathBuf::from("/tmp/demo"),
             head: codescope_core::HeadState::Branch("feature".to_string()),
+            head_oid: None,
             upstream: Some(codescope_core::Upstream {
                 name: "origin/feature".to_string(),
                 ahead: 0,
@@ -5655,6 +5899,7 @@ mod tests {
         disp.repo_ctx = Some(codescope_core::RepoContext {
             toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
             head: codescope_core::HeadState::Branch("feature".to_string()),
+            head_oid: None,
             upstream: None,
             base: None,
         });
@@ -5802,6 +6047,7 @@ mod tests {
         disp.repo_ctx = Some(codescope_core::RepoContext {
             toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
             head: codescope_core::HeadState::Branch("feature".to_string()),
+            head_oid: None,
             upstream: None,
             base: None,
         });
@@ -5894,6 +6140,7 @@ mod tests {
         disp.repo_ctx = Some(codescope_core::RepoContext {
             toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
             head: codescope_core::HeadState::Branch("feature".to_string()),
+            head_oid: None,
             upstream: None,
             base: None,
         });
@@ -5930,6 +6177,7 @@ mod tests {
         disp.repo_ctx = Some(codescope_core::RepoContext {
             toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
             head: codescope_core::HeadState::Branch("feature".to_string()),
+            head_oid: None,
             upstream: None,
             base: None,
         });

@@ -10,6 +10,7 @@ mod dispatcher;
 mod request_coordinator;
 mod research_tools;
 mod skills;
+mod telemetry_diff;
 mod terminal;
 mod watcher;
 
@@ -76,11 +77,7 @@ async fn main() -> Result<()> {
         serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
-            "args": std::env::args_os()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            "telemetry_path": codescope_telemetry::path()
-                .map(|path| path.display().to_string()),
+            "args": telemetry_args(),
         }),
     );
     let cli = Cli::parse();
@@ -227,23 +224,35 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn telemetry_args() -> Vec<String> {
+    std::env::args_os().map(|arg| telemetry_arg(&arg)).collect()
+}
+
+fn telemetry_arg(arg: &std::ffi::OsStr) -> String {
+    let path = std::path::Path::new(arg);
+    if path.is_absolute() {
+        return "[absolute-path]".to_string();
+    }
+    let text = arg.to_string_lossy();
+    if let Some((name, value)) = text.split_once('=') {
+        if std::path::Path::new(value).is_absolute() {
+            return format!("{name}=[absolute-path]");
+        }
+    }
+    text.into_owned()
+}
+
 fn initialize_telemetry() {
-    let preferred = config::telemetry_path();
-    if let Err(preferred_error) = codescope_telemetry::init(&preferred) {
-        let fallback = std::env::temp_dir()
-            .join("codescope")
-            .join("telemetry.jsonl");
+    let preferred = config::telemetry_dir();
+    if codescope_telemetry::init(&preferred).is_err() {
+        let fallback = std::env::temp_dir().join("codescope").join("telemetry");
         if fallback == preferred {
             return;
         }
         match codescope_telemetry::init(&fallback) {
             Ok(_) => codescope_telemetry::record(
                 "telemetry.fallback",
-                serde_json::json!({
-                    "preferred_path": preferred.display().to_string(),
-                    "fallback_path": fallback.display().to_string(),
-                    "error": preferred_error.to_string(),
-                }),
+                serde_json::json!({ "reason": "preferred_directory_unavailable" }),
             ),
             Err(_fallback_error) => {}
         }
@@ -365,6 +374,24 @@ mod tests {
         assert_eq!(
             tracing_log_file(&cli),
             Some(PathBuf::from("/tmp/custom-codescope.log"))
+        );
+    }
+
+    #[test]
+    fn telemetry_arguments_hide_absolute_paths_in_both_cli_forms() {
+        assert_eq!(
+            telemetry_arg(std::ffi::OsStr::new("/private/repository")),
+            "[absolute-path]"
+        );
+        assert_eq!(
+            telemetry_arg(std::ffi::OsStr::new(
+                "--log-file=/private/repository/debug.log"
+            )),
+            "--log-file=[absolute-path]"
+        );
+        assert_eq!(
+            telemetry_arg(std::ffi::OsStr::new("src/lib.rs")),
+            "src/lib.rs"
         );
     }
 

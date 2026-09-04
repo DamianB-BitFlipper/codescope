@@ -5,11 +5,9 @@
 //! for the pane width available during the current frame. Connectors distinguish
 //! validator-verifiable relationships from hunk-derived interpretation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use codescope_core::{
-    FormKind, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode, VisualizationPlan, VizForm,
-};
+use codescope_core::{FormKind, PlanEdge, PlanEdgeKind, PlanNode, VisualizationPlan, VizForm};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -314,6 +312,8 @@ pub struct DiagramRelationship {
     pub label_rect: DiagramRect,
     /// Compact, display-width-bounded label.
     pub label: String,
+    /// Whether the compact rendering omits relationship text that can be expanded.
+    pub has_hidden_label: bool,
     /// `true` when the relationship is validator-verifiable; inferred routes are dashed.
     pub verified: bool,
 }
@@ -341,7 +341,7 @@ pub struct DiagramOverlay {
 pub struct DiagramCanvas {
     /// Scrollable base-canvas dimensions. Relationship overlays never affect these values.
     pub size: DiagramViewport,
-    /// Plan intent and evidence rows above the box canvas. These are base geometry, not an overlay.
+    /// Plan intent rows above the box canvas. These are base geometry, not an overlay.
     pub annotations: Vec<String>,
     /// Boxes in stable plan order; later boxes draw on top during an overlap.
     pub nodes: Vec<DiagramNode>,
@@ -522,6 +522,7 @@ impl DiagramCanvas {
         self.relationships
             .iter()
             .rev()
+            .filter(|relationship| relationship.has_hidden_label)
             .find(|relationship| {
                 relationship.label_rect.contains(position)
                     || relationship
@@ -572,16 +573,26 @@ impl DiagramCanvas {
         if edge.from != target.from || edge.to != target.to {
             return None;
         }
-        self.relationships
+        let relationship = self
+            .relationships
             .iter()
             .find(|relationship| &relationship.target == target)?;
-        let source = node_label(plan, target.form, &target.from).unwrap_or(&target.from);
-        let destination = node_label(plan, target.form, &target.to).unwrap_or(&target.to);
-        let text = format!("{source} → {destination}\n{}", edge.overlay_label);
-        let width_budget = usize::from(self.viewport.width.max(1));
-        let content = wrap_all(&text, width_budget);
+        if !relationship.has_hidden_label {
+            return None;
+        }
+
+        // Expand the compact description itself. The endpoints are already unambiguous from
+        // the connected cards, and prefixing them made the overlay look like unrelated text.
+        let text = &edge.overlay_label;
+        let anchor = relationship.label_rect;
+        let visible_bottom = scroll_y.saturating_add(visible_height);
+        if anchor.y < scroll_y || anchor.y >= visible_bottom || anchor.x >= self.viewport.width {
+            return None;
+        }
+        let width_budget = usize::from(self.viewport.width.saturating_sub(anchor.x).max(1));
+        let content = wrap_all(text, width_budget);
         let total_lines = content.len();
-        let capacity = usize::from(visible_height.max(1));
+        let capacity = usize::from(visible_bottom.saturating_sub(anchor.y).max(1));
         let needs_paging = total_lines > capacity;
         // A one-row viewport must show content rather than consuming its only cell on chrome.
         let show_paging_header = needs_paging && capacity >= 2;
@@ -605,9 +616,9 @@ impl DiagramCanvas {
         Some(DiagramOverlay {
             target: target.clone(),
             rect: DiagramRect {
-                x: 0,
-                y: scroll_y,
-                width: width.min(self.viewport.width.max(1)),
+                x: anchor.x,
+                y: anchor.y,
+                width: width.min(self.viewport.width.saturating_sub(anchor.x).max(1)),
                 height,
             },
             lines,
@@ -722,15 +733,6 @@ pub fn relationship_exists(plan: &VisualizationPlan, target: &PlanRelationshipTa
     })
 }
 
-fn node_label<'a>(plan: &'a VisualizationPlan, form: usize, id: &str) -> Option<&'a str> {
-    plan.forms
-        .get(form)?
-        .nodes
-        .iter()
-        .find(|node| node.id == id)
-        .map(|node| node.label.trim())
-}
-
 /// Width chosen for automatic cards. At two-column widths it derives from the actual
 /// viewport, so the column stride always leaves a gap rather than overlapping cards.
 fn canvas_card_width(viewport: DiagramViewport) -> u16 {
@@ -745,19 +747,10 @@ fn canvas_card_width(viewport: DiagramViewport) -> u16 {
 /// and retained geometry all reserve exactly the same vertical origin before any box.
 fn canvas_annotations(plan: &VisualizationPlan, width: u16) -> Vec<String> {
     let width = usize::from(width).max(1);
-    let mut rows = wrap_text(plan.intent.trim(), width, 2);
-    if !plan.evidence.is_empty() {
-        rows.push(String::new());
-        for evidence in &plan.evidence {
-            let row = format!(
-                "{} — {}",
-                evidence_source(evidence, width >= EVIDENCE_REASON_MIN_WIDTH),
-                evidence.reason.trim()
-            );
-            rows.push(truncate(&row, width));
-        }
-    }
-    rows
+    // Evidence remains part of the validated plan for grounding and revision continuity, but it
+    // is deliberately not projected into reviewer-facing canvas rows. Nodes and relationships
+    // already carry the useful explanation; repeating model-written citation prose adds noise.
+    wrap_text(plan.intent.trim(), width, 2)
 }
 
 /// Deterministic, non-overlapping placement for every currently unpositioned node.
@@ -783,10 +776,27 @@ fn automatic_positions(
     let mut positions = HashMap::new();
     let mut form_y = annotation_height;
     for (form_index, form) in plan.forms.iter().enumerate() {
+        let directed_layers = directed_form_layers(form);
+        let layout_rows = directed_layers.as_ref().map_or_else(
+            || {
+                (0..form.nodes.len())
+                    .collect::<Vec<_>>()
+                    .chunks(columns)
+                    .map(<[usize]>::to_vec)
+                    .collect::<Vec<_>>()
+            },
+            |layers| {
+                layers
+                    .iter()
+                    .flat_map(|layer| layer.chunks(columns).map(<[usize]>::to_vec))
+                    .collect::<Vec<_>>()
+            },
+        );
         let mut row_y = form_y;
-        for row in form.nodes.chunks(columns) {
+        for row in layout_rows {
             let row_height = row
                 .iter()
+                .filter_map(|index| form.nodes.get(*index))
                 .map(|node| {
                     let target = PlanNodeTarget {
                         form: form_index,
@@ -796,14 +806,22 @@ fn automatic_positions(
                 })
                 .max()
                 .unwrap_or(0);
-            for (column, node) in row.iter().enumerate() {
+            let centered_single = directed_layers.is_some() && columns == 2 && row.len() == 1;
+            for (column, index) in row.iter().enumerate() {
+                let Some(node) = form.nodes.get(*index) else {
+                    continue;
+                };
                 positions.insert(
                     PlanNodeTarget {
                         form: form_index,
                         id: node.id.clone(),
                     },
                     DiagramPosition {
-                        x: (column as u16).saturating_mul(stride),
+                        x: if centered_single {
+                            viewport.width.saturating_sub(card_width) / 2
+                        } else {
+                            (column as u16).saturating_mul(stride)
+                        },
                         y: row_y,
                     },
                 );
@@ -813,6 +831,69 @@ fn automatic_positions(
         form_y = row_y;
     }
     positions
+}
+
+/// Topological layers for forms whose edges describe directional flow. Keeping every edge aimed
+/// from an earlier row to a later row avoids the ambiguous left-right / right-left zigzag produced
+/// by a document-order grid. Cycles fall back to that neutral grid because they have no truthful
+/// top-to-bottom ordering.
+fn directed_form_layers(form: &VizForm) -> Option<Vec<Vec<usize>>> {
+    if !matches!(form.kind, FormKind::Sequence | FormKind::RelationshipFlow) || form.nodes.len() < 3
+    {
+        return None;
+    }
+    let node_indices = form
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut outgoing = vec![Vec::<usize>::new(); form.nodes.len()];
+    let mut indegree = vec![0_usize; form.nodes.len()];
+    let mut distinct_edges = HashSet::new();
+    for edge in normalized_edges(form) {
+        let (Some(&from), Some(&to)) = (
+            node_indices.get(edge.from.as_str()),
+            node_indices.get(edge.to.as_str()),
+        ) else {
+            continue;
+        };
+        if from == to || !distinct_edges.insert((from, to)) {
+            continue;
+        }
+        outgoing[from].push(to);
+        indegree[to] = indegree[to].saturating_add(1);
+    }
+    if distinct_edges.is_empty() {
+        return None;
+    }
+
+    let mut queue = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut ranks = vec![0_usize; form.nodes.len()];
+    let mut visited = 0_usize;
+    while let Some(from) = queue.pop_front() {
+        visited = visited.saturating_add(1);
+        for &to in &outgoing[from] {
+            ranks[to] = ranks[to].max(ranks[from].saturating_add(1));
+            indegree[to] = indegree[to].saturating_sub(1);
+            if indegree[to] == 0 {
+                queue.push_back(to);
+            }
+        }
+    }
+    if visited != form.nodes.len() {
+        return None;
+    }
+
+    let mut layers = vec![Vec::new(); ranks.iter().copied().max().unwrap_or(0) + 1];
+    for (node, rank) in ranks.into_iter().enumerate() {
+        layers[rank].push(node);
+    }
+    Some(layers)
 }
 
 fn canvas_node_lines(node: &PlanNode, viewport_width: u16, expanded: bool) -> Vec<String> {
@@ -855,29 +936,6 @@ fn canvas_node_lines(node: &PlanNode, viewport_width: u16, expanded: bool) -> Ve
                 .map(|line| format!("│{}│", pad(&line, inner))),
         );
     }
-    if !node.code_refs.is_empty() {
-        lines.push(format!("│{}│", " ".repeat(inner)));
-        lines.push(format!("│{}│", pad("Source", inner)));
-        for code_ref in &node.code_refs {
-            let side = match code_ref.side {
-                codescope_core::DiffSide::Old => "old",
-                codescope_core::DiffSide::New => "new",
-            };
-            let reference = format!(
-                "{}:{}-{} · {side} · hunk {}",
-                code_ref.file,
-                code_ref.start_line,
-                code_ref.end_line,
-                code_ref.hunk.saturating_add(1)
-            );
-            lines.extend(
-                wrap_all(&reference, inner)
-                    .into_iter()
-                    .map(|line| format!("│{}│", pad(&line, inner))),
-            );
-        }
-    }
-
     // Expansion always has a visible geometric effect, even where the full text happened to
     // fit in the compact card. The padding remains inside the same anchored border.
     let minimum_expanded_height = node_box_text(&node.label, compact_detail, width).len() + 1;
@@ -904,12 +962,24 @@ fn canvas_relationship(
         x: destination.x.saturating_add(destination.width / 2),
         y: destination.y.saturating_add(destination.height / 2),
     };
-    let vertical =
-        source_center.x == destination_center.x && source_center.y != destination_center.y;
-    let (path, label_rect) = if vertical {
-        let down = source_center.y < destination_center.y;
+    let source_above = source.bottom() < destination.y;
+    let destination_above = destination.bottom() < source.y;
+    let horizontal_overlap_left = source.x.max(destination.x);
+    let horizontal_overlap_right = source.right().min(destination.right());
+    let has_horizontal_overlap = horizontal_overlap_left <= horizontal_overlap_right;
+
+    // Cards that are visibly stacked should have a vertical connector even if one card was
+    // dragged a few columns sideways. Center equality classified that common case as a
+    // horizontal route, leaving its label underneath the source card.
+    if has_horizontal_overlap && (source_above || destination_above) {
+        let down = source_above;
+        let centers_midpoint = source_center
+            .x
+            .min(destination_center.x)
+            .saturating_add(source_center.x.abs_diff(destination_center.x) / 2);
+        let route_x = centers_midpoint.clamp(horizontal_overlap_left, horizontal_overlap_right);
         let start = DiagramPosition {
-            x: source_center.x,
+            x: route_x,
             y: if down {
                 source.bottom().saturating_add(1)
             } else {
@@ -917,7 +987,7 @@ fn canvas_relationship(
             },
         };
         let end = DiagramPosition {
-            x: destination_center.x,
+            x: route_x,
             y: if down {
                 destination.y.saturating_sub(1)
             } else {
@@ -928,97 +998,146 @@ fn canvas_relationship(
             .y
             .min(end.y)
             .saturating_add((start.y.max(end.y).saturating_sub(start.y.min(end.y))) / 2);
-        (
-            vec![start, end],
-            DiagramRect {
-                x: start.x,
-                y: label_y,
-                width: 1,
-                height: 1,
-            },
-        )
-    } else {
-        let goes_right = source_center.x <= destination_center.x;
-        // End one cell outside each border. Nodes draw after paths, so a border endpoint
-        // would hide the directed head. Deliberate user overlap is resolved by node z-order.
-        let start = DiagramPosition {
-            x: if goes_right {
-                source.right().saturating_add(1)
-            } else {
-                source.x.saturating_sub(1)
-            },
-            y: source_center.y,
-        };
-        let end = DiagramPosition {
-            x: if goes_right {
-                destination.x.saturating_sub(1)
-            } else {
-                destination.right().saturating_add(1)
-            },
-            y: destination_center.y,
-        };
-        let middle_x = if goes_right {
-            start.x.saturating_add((end.x.saturating_sub(start.x)) / 2)
-        } else {
-            end.x.saturating_add((start.x.saturating_sub(end.x)) / 2)
-        };
-        let path = if start.y == end.y {
-            vec![start, end]
-        } else {
-            vec![
-                start,
-                DiagramPosition {
-                    x: middle_x,
-                    y: start.y,
-                },
-                DiagramPosition {
-                    x: middle_x,
-                    y: end.y,
-                },
-                end,
-            ]
-        };
-        // A normal label is restricted to the actual free route lane. It never sits over a
-        // node, and leaves both endpoint cells free for arrowheads.
-        let lane_left = start.x.min(end.x).saturating_add(1);
-        let lane_right = start.x.max(end.x).saturating_sub(1);
-        let lane_width = usize::from(lane_right.saturating_sub(lane_left).saturating_add(1));
-        // Keep two route glyphs on either side of compact text; endpoint cells are reserved
-        // separately for directed heads. Wide panes devote their spare width to this lane.
-        let budget = lane_width
-            .saturating_sub(4)
-            .max(1)
-            .min(usize::from(viewport_width).max(1));
-        let compact = truncate(label.trim(), budget.max(1));
-        let width = compact.width() as u16;
-        let x = lane_left.saturating_add(
-            lane_right
-                .saturating_sub(lane_left)
-                .saturating_sub(width.saturating_sub(1))
-                / 2,
-        );
+        let (compact, x, width) =
+            vertical_relationship_label(label.trim(), route_x, viewport_width);
         return DiagramRelationship {
             target,
-            path,
+            path: vec![start, end],
             label_rect: DiagramRect {
                 x,
-                y: start.y,
-                width: width.max(1),
+                y: label_y,
+                width,
                 height: 1,
             },
+            has_hidden_label: label.trim().is_empty() || compact != label.trim(),
             label: compact,
             verified,
         };
+    }
+
+    let source_left = source.right() < destination.x;
+    let destination_left = destination.right() < source.x;
+    let vertical_overlap_top = source.y.max(destination.y);
+    let vertical_overlap_bottom = source.bottom().min(destination.bottom());
+    let has_vertical_overlap = vertical_overlap_top <= vertical_overlap_bottom;
+    let goes_right = if source_left {
+        true
+    } else if destination_left {
+        false
+    } else {
+        source_center.x <= destination_center.x
     };
-    // A vertical route has only one cell of horizontal lane; show the compact relation glyph
-    // there while retaining the full description in the click-to-expand overlay.
+    let route_y = if has_vertical_overlap && (source_left || destination_left) {
+        vertical_overlap_top
+            .saturating_add(vertical_overlap_bottom.saturating_sub(vertical_overlap_top) / 2)
+    } else {
+        source_center.y
+    };
+    // End one cell outside each border. Nodes draw after paths, so a border endpoint would
+    // hide the directed head. Deliberate user overlap is resolved by node z-order.
+    let start = DiagramPosition {
+        x: if goes_right {
+            source.right().saturating_add(1)
+        } else {
+            source.x.saturating_sub(1)
+        },
+        y: route_y,
+    };
+    let end = DiagramPosition {
+        x: if goes_right {
+            destination.x.saturating_sub(1)
+        } else {
+            destination.right().saturating_add(1)
+        },
+        y: if has_vertical_overlap && (source_left || destination_left) {
+            route_y
+        } else {
+            destination_center.y
+        },
+    };
+    let middle_x = if goes_right {
+        start.x.saturating_add((end.x.saturating_sub(start.x)) / 2)
+    } else {
+        end.x.saturating_add((start.x.saturating_sub(end.x)) / 2)
+    };
+    let path = if start.y == end.y {
+        vec![start, end]
+    } else {
+        vec![
+            start,
+            DiagramPosition {
+                x: middle_x,
+                y: start.y,
+            },
+            DiagramPosition {
+                x: middle_x,
+                y: end.y,
+            },
+            end,
+        ]
+    };
+    // A horizontal label stays inside the actual free lane and leaves route glyphs on both
+    // sides. The vertically stacked case above deliberately uses the whole surrounding row.
+    let lane_left = start.x.min(end.x).saturating_add(1);
+    let lane_right = start.x.max(end.x).saturating_sub(1);
+    let lane_width = usize::from(lane_right.saturating_sub(lane_left).saturating_add(1));
+    let budget = lane_width
+        .saturating_sub(4)
+        .max(1)
+        .min(usize::from(viewport_width).max(1));
+    let compact_label = truncate(label.trim(), budget);
+    let width = compact_label.width() as u16;
+    let x = lane_left.saturating_add(
+        lane_right
+            .saturating_sub(lane_left)
+            .saturating_sub(width.saturating_sub(1))
+            / 2,
+    );
     DiagramRelationship {
         target,
         path,
-        label_rect,
-        label: truncate(label.trim(), 1),
+        label_rect: DiagramRect {
+            x,
+            y: start.y,
+            width: width.max(1),
+            height: 1,
+        },
+        has_hidden_label: label.trim().is_empty() || compact_label != label.trim(),
+        label: compact_label,
         verified,
     }
+}
+
+/// Place a vertical relationship label in the surrounding row, not inside the route's single
+/// column. Prefer the right or left side with a one-cell gap. When neither half is wide enough
+/// but the complete viewport is, center the text across the route; the line then reads as entering
+/// and leaving the label instead of collapsing useful text to a single ellipsis.
+fn vertical_relationship_label(
+    label: &str,
+    route_x: u16,
+    viewport_width: u16,
+) -> (String, u16, u16) {
+    if label.is_empty() || viewport_width == 0 {
+        return (String::new(), route_x, 1);
+    }
+
+    let compact = truncate(label, usize::from(viewport_width));
+    let width = u16::try_from(compact.width())
+        .unwrap_or(viewport_width)
+        .min(viewport_width)
+        .max(1);
+    let right_x = route_x.saturating_add(2);
+    let right_room = viewport_width.saturating_sub(right_x);
+    if width <= right_room {
+        return (compact, right_x, width);
+    }
+
+    let left_room = route_x.saturating_sub(1);
+    if width <= left_room {
+        return (compact, left_room.saturating_sub(width), width);
+    }
+
+    (compact, viewport_width.saturating_sub(width) / 2, width)
 }
 
 fn point_on_segment(point: DiagramPosition, a: DiagramPosition, b: DiagramPosition) -> bool {
@@ -1122,9 +1241,23 @@ fn node_box_text(label: &str, detail: &str, width: usize) -> Vec<String> {
     let width = width.max(4);
     let inner = width - 2;
     let mut rows = vec![format!("┌{}┐", "─".repeat(inner))];
-    rows.push(format!("│{}│", pad(&truncate(label.trim(), inner), inner)));
-    let mut detail_rows = wrap_text(detail.trim(), inner, 2);
-    detail_rows.resize(2, String::new());
+    let label_rows = wrap_all(label.trim(), inner);
+    rows.extend(
+        label_rows
+            .into_iter()
+            .map(|line| format!("│{}│", pad(&line, inner))),
+    );
+    let mut detail_rows = if detail.trim().is_empty() {
+        Vec::new()
+    } else {
+        wrap_all(detail.trim(), inner)
+    };
+    // Preserve the familiar minimum card height while allowing both fields to grow losslessly.
+    let body_rows = rows.len().saturating_sub(1) + detail_rows.len();
+    detail_rows.resize(
+        detail_rows.len() + 3_usize.saturating_sub(body_rows),
+        String::new(),
+    );
     rows.extend(
         detail_rows
             .into_iter()
@@ -1135,29 +1268,6 @@ fn node_box_text(label: &str, detail: &str, width: usize) -> Vec<String> {
 }
 
 const MAX_BOX_WIDTH: usize = 32;
-const EVIDENCE_REASON_MIN_WIDTH: usize = 60;
-
-fn evidence_source(evidence: &PlanEvidence, include_hunk: bool) -> String {
-    let mut source = evidence
-        .file
-        .to_string()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    if let Some(range) = evidence.range {
-        source.push_str(&format!(":{}", range.start_line.saturating_add(1)));
-    }
-    if let Some(hunk) = evidence.hunk {
-        if include_hunk {
-            source.push_str(&format!(" (hunk {})", hunk.saturating_add(1)));
-        } else if evidence.range.is_none() {
-            source.push_str(&format!("[h{}]", hunk.saturating_add(1)));
-        }
-    }
-    source
-}
-
 fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     if text.trim().is_empty() || max_lines == 0 {
         return Vec::new();
@@ -1197,7 +1307,9 @@ fn pad(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod canvas_tests {
     use super::*;
-    use codescope_core::{DiffSide, EntityRef, Epoch, FileId, PlanCodeRef, PlanNodeChange};
+    use codescope_core::{
+        DiffSide, EntityRef, Epoch, FileId, LineRange, PlanCodeRef, PlanEvidence, PlanNodeChange,
+    };
 
     fn live_shape() -> VisualizationPlan {
         let mut plan = VisualizationPlan::new(Epoch(7));
@@ -1242,8 +1354,36 @@ mod canvas_tests {
             state.z_order(),
         )
     }
+
     #[test]
-    fn live_tree_canvas_has_nonoverlap_routes_expansion_and_source() {
+    fn canvas_hides_evidence_descriptions_but_preserves_plan_grounding() {
+        let mut plan = VisualizationPlan::new(Epoch(7));
+        plan.intent = "Explain the reporter cleanup flow.".to_string();
+        let evidence = PlanEvidence {
+            file: FileId::new("internal/reporter.go").unwrap(),
+            hunk: Some(0),
+            symbol: Some("reportDeath".to_string()),
+            range: Some(LineRange::new(41, 2, 44, 8)),
+            reason: "unexpected deaths close the route before acknowledgement".to_string(),
+        };
+        plan.evidence.push(evidence.clone());
+
+        let canvas = built(&plan, &DiagramState::default(), 96);
+
+        assert_eq!(
+            canvas.annotations,
+            vec!["Explain the reporter cleanup flow."],
+            "only the diagram title is projected above the canvas"
+        );
+        assert_eq!(
+            plan.evidence,
+            vec![evidence],
+            "rendering must not remove grounding from the plan"
+        );
+    }
+
+    #[test]
+    fn live_tree_canvas_has_nonoverlap_routes_and_expansion_without_source_footer() {
         let plan = live_shape();
         let state = DiagramState::default();
         let base = built(&plan, &state, 96);
@@ -1293,23 +1433,19 @@ mod canvas_tests {
                 .rect,
             other
         );
-        let source = rn.lines.join("\n");
-        assert!(
-            source.contains("Source")
-                && source.contains("src/diagram.rs:10-24")
-                && source.contains("new")
-                && source.contains("hunk 3")
-                && source.contains("expanded detail")
-        );
+        let expanded_text = rn.lines.join("\n");
+        assert!(expanded_text.contains("expanded detail"));
+        assert!(!expanded_text.contains("Source"));
+        assert!(!expanded_text.contains("src/diagram.rs:10-24"));
         let edge = e.relationships[0].target.clone();
         let before = e.clone();
         expanded.toggle_relationship(edge.clone());
         assert_eq!(before, built(&plan, &expanded, 96));
-        let page = e
-            .relationship_overlay_in_viewport(&plan, &edge, 0, 1, 0)
-            .unwrap();
-        assert_eq!(page.rect.height, 1);
-        assert!(page.total_lines >= 1);
+        assert!(
+            e.relationship_overlay_in_viewport(&plan, &edge, 0, 8, 0)
+                .is_none(),
+            "a fully visible relationship has nothing to expand"
+        );
         assert!(e
             .relationship_overlay_in_viewport(&plan, &edge, 0, 0, 0)
             .is_none());
@@ -1367,6 +1503,248 @@ mod canvas_tests {
             .relationship_overlay(&plan, &relationship.target)
             .expect("transition has a fallback overlay");
         assert!(overlay.lines.join("\n").contains("flows to"));
+    }
+
+    #[test]
+    fn compact_cards_wrap_all_title_and_detail_text_without_ellipsis() {
+        let node = PlanNode::new(
+            "reservation",
+            "Validate launch reservation identity",
+            PlanNodeChange::Modified,
+        )
+        .with_detail("Skips empty nodes; requires launch UUID");
+
+        let lines = canvas_node_lines(&node, 18, false);
+        let text = lines.join("\n");
+        assert!(
+            !text.contains('…'),
+            "compact cards do not discard text: {text}"
+        );
+        for part in [
+            "Validate launch",
+            "reservation",
+            "identity",
+            "Skips empty",
+            "nodes; requires",
+            "launch UUID",
+        ] {
+            assert!(
+                text.contains(part),
+                "missing `{part}` from wrapped card: {text}"
+            );
+        }
+        assert!(lines.len() > 5, "wrapped content grows the card");
+        assert!(
+            lines.iter().all(|line| line.width() == 18),
+            "every boxed row retains the requested width"
+        );
+    }
+
+    #[test]
+    fn vertical_relationship_labels_use_the_full_viewport_before_eliding() {
+        let label = "reclaims expired conflicting ownership before publishing the reservation";
+        let mut plan = VisualizationPlan::new(Epoch(7));
+        plan.forms.push(VizForm {
+            kind: FormKind::RelationshipFlow,
+            nodes: ["validate", "reap", "publish"]
+                .into_iter()
+                .map(|id| PlanNode::new(id, id, PlanNodeChange::Modified))
+                .collect(),
+            edges: vec![
+                PlanEdge {
+                    from: "validate".into(),
+                    to: "reap".into(),
+                    kind: PlanEdgeKind::FlowsTo,
+                    label: Some(label.into()),
+                },
+                PlanEdge {
+                    from: "reap".into(),
+                    to: "publish".into(),
+                    kind: PlanEdgeKind::FlowsTo,
+                    label: None,
+                },
+            ],
+        });
+
+        let canvas = built(&plan, &DiagramState::default(), 96);
+        let relationship = &canvas.relationships[0];
+        assert_eq!(relationship.label, label);
+        assert_eq!(usize::from(relationship.label_rect.width), label.width());
+        assert!(
+            relationship.label_rect.x < relationship.path[0].x
+                && relationship.label_rect.right() > relationship.path[0].x,
+            "a long-but-fitting label may span the route instead of being truncated"
+        );
+    }
+
+    #[test]
+    fn offset_stacks_route_vertically_and_only_clipped_labels_expand_in_place() {
+        let mut plan = VisualizationPlan::new(Epoch(7));
+        plan.forms.push(VizForm {
+            kind: FormKind::RelationshipFlow,
+            nodes: vec![
+                PlanNode::new("persist", "Persist state", PlanNodeChange::Modified),
+                PlanNode::new("abort", "Abort update", PlanNodeChange::Modified),
+            ],
+            edges: vec![PlanEdge {
+                from: "persist".into(),
+                to: "abort".into(),
+                kind: PlanEdgeKind::FlowsTo,
+                label: Some("on persistence error".into()),
+            }],
+        });
+        let persist = PlanNodeTarget {
+            form: 0,
+            id: "persist".into(),
+        };
+        let abort = PlanNodeTarget {
+            form: 0,
+            id: "abort".into(),
+        };
+        let mut stacked = DiagramState::default();
+        stacked.move_node(persist.clone(), DiagramPosition { x: 5, y: 2 });
+        stacked.move_node(abort.clone(), DiagramPosition { x: 12, y: 16 });
+        let canvas = built(&plan, &stacked, 96);
+        let source = canvas
+            .nodes
+            .iter()
+            .find(|node| node.target == persist)
+            .unwrap();
+        let destination = canvas
+            .nodes
+            .iter()
+            .find(|node| node.target == abort)
+            .unwrap();
+        let relationship = &canvas.relationships[0];
+        assert_eq!(relationship.path.len(), 2);
+        assert_eq!(relationship.path[0].x, relationship.path[1].x);
+        assert!(relationship.label_rect.y > source.rect.bottom());
+        assert!(relationship.label_rect.y < destination.rect.y);
+        assert!(!relationship.has_hidden_label);
+        assert!(canvas
+            .relationship_at(DiagramPosition {
+                x: relationship.label_rect.x,
+                y: relationship.label_rect.y,
+            })
+            .is_none());
+        assert!(canvas
+            .relationship_overlay(&plan, &relationship.target)
+            .is_none());
+
+        // A narrow horizontal lane genuinely clips this description. Its expanded text owns
+        // the same canvas anchor rather than jumping to the viewport origin.
+        let label = "on persistence error, abort the state commit and retain the retry marker";
+        plan.forms[0].edges[0].label = Some(label.into());
+        let mut side_by_side = DiagramState::default();
+        side_by_side.move_node(persist, DiagramPosition { x: 2, y: 2 });
+        side_by_side.move_node(abort, DiagramPosition { x: 58, y: 2 });
+        let clipped = built(&plan, &side_by_side, 96);
+        let relationship = &clipped.relationships[0];
+        assert!(relationship.has_hidden_label);
+        assert!(relationship.label_rect.x > 0);
+        assert_eq!(relationship.path[0].y, relationship.path[1].y);
+        assert_eq!(
+            clipped.relationship_at(DiagramPosition {
+                x: relationship.label_rect.x,
+                y: relationship.label_rect.y,
+            }),
+            Some(relationship.target.clone())
+        );
+        let overlay = clipped
+            .relationship_overlay_in_viewport(&plan, &relationship.target, 0, 20, 0)
+            .unwrap();
+        assert_eq!(overlay.rect.x, relationship.label_rect.x);
+        assert_eq!(overlay.rect.y, relationship.label_rect.y);
+        assert_eq!(overlay.lines.join(" "), label);
+    }
+
+    #[test]
+    fn four_node_flow_uses_edge_order_instead_of_an_ambiguous_grid() {
+        let mut plan = VisualizationPlan::new(Epoch(7));
+        plan.forms.push(VizForm {
+            kind: FormKind::RelationshipFlow,
+            // Deliberately scramble document order: placement should follow relationships.
+            nodes: ["third", "first", "fourth", "second"]
+                .into_iter()
+                .map(|id| PlanNode::new(id, id, PlanNodeChange::Modified))
+                .collect(),
+            edges: [
+                ("first", "second"),
+                ("second", "third"),
+                ("third", "fourth"),
+            ]
+            .into_iter()
+            .map(|(from, to)| PlanEdge {
+                from: from.into(),
+                to: to.into(),
+                kind: PlanEdgeKind::FlowsTo,
+                label: None,
+            })
+            .collect(),
+        });
+
+        let canvas = built(&plan, &DiagramState::default(), 96);
+        let rect = |id: &str| {
+            canvas
+                .nodes
+                .iter()
+                .find(|node| node.target.id == id)
+                .expect("flow node is placed")
+                .rect
+        };
+        let ordered = [rect("first"), rect("second"), rect("third"), rect("fourth")];
+        assert!(ordered.windows(2).all(|pair| pair[0].y < pair[1].y));
+        assert!(ordered
+            .windows(2)
+            .all(|pair| pair[0].x + pair[0].width / 2 == pair[1].x + pair[1].width / 2));
+        assert!(canvas.relationships.iter().all(|relationship| {
+            relationship.path.len() == 2
+                && relationship.path[0].x == relationship.path[1].x
+                && relationship.path[0].y < relationship.path[1].y
+        }));
+    }
+
+    #[test]
+    fn branching_flow_layers_sources_branches_and_sink() {
+        let mut plan = VisualizationPlan::new(Epoch(7));
+        plan.forms.push(VizForm {
+            kind: FormKind::RelationshipFlow,
+            nodes: ["sink", "right", "source", "left"]
+                .into_iter()
+                .map(|id| PlanNode::new(id, id, PlanNodeChange::Modified))
+                .collect(),
+            edges: [
+                ("source", "left"),
+                ("source", "right"),
+                ("left", "sink"),
+                ("right", "sink"),
+            ]
+            .into_iter()
+            .map(|(from, to)| PlanEdge {
+                from: from.into(),
+                to: to.into(),
+                kind: PlanEdgeKind::FlowsTo,
+                label: None,
+            })
+            .collect(),
+        });
+
+        let canvas = built(&plan, &DiagramState::default(), 96);
+        let rect = |id: &str| {
+            canvas
+                .nodes
+                .iter()
+                .find(|node| node.target.id == id)
+                .expect("flow node is placed")
+                .rect
+        };
+        let source = rect("source");
+        let left = rect("left");
+        let right = rect("right");
+        let sink = rect("sink");
+        assert!(source.y < left.y && left.y == right.y && right.y < sink.y);
+        assert!(left.x.min(right.x) < source.x && source.x < left.x.max(right.x));
+        assert_eq!(source.x, sink.x);
     }
 
     #[test]
@@ -1505,17 +1883,18 @@ mod canvas_tests {
         plan.forms[0].edges[0].label = Some("very long relationship ".repeat(80));
         let c = built(&plan, &DiagramState::default(), 40);
         let target = c.relationships[0].target.clone();
+        let label_y = c.relationships[0].label_rect.y;
         let p0 = c
-            .relationship_overlay_in_viewport(&plan, &target, 0, 1, 0)
+            .relationship_overlay_in_viewport(&plan, &target, label_y, 1, 0)
             .unwrap();
         let p1 = c
-            .relationship_overlay_in_viewport(&plan, &target, 0, 1, 1)
+            .relationship_overlay_in_viewport(&plan, &target, label_y, 1, 1)
             .unwrap();
         assert_eq!(p0.rect.height, 1);
         assert_ne!(p0.lines, p1.lines);
         assert!(!p0.lines[0].starts_with("relationship details"));
         let max = c
-            .relationship_overlay_in_viewport(&plan, &target, 0, 3, usize::MAX)
+            .relationship_overlay_in_viewport(&plan, &target, label_y, 3, usize::MAX)
             .unwrap();
         assert_eq!(max.scroll, max.max_scroll);
     }

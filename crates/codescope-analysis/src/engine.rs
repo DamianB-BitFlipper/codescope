@@ -904,6 +904,7 @@ mod tests {
         let ctx = |base: Option<codescope_core::BaseInfo>, head: HeadState| RepoContext {
             toplevel: Utf8PathBuf::from("/repo"),
             head,
+            head_oid: None,
             upstream: None,
             base,
         };

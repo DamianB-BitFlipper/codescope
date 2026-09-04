@@ -100,19 +100,25 @@ fn wide_layout_shows_all_panes() {
         text.contains("+        prefix + name"),
         "tab-indented diff add line"
     );
-    assert!(text.contains("SELECTED CHANGE"), "impact header");
+    assert!(text.contains("AI in progress"), "generated Impact viewport");
+    assert!(
+        !text.contains("SELECTED CHANGE"),
+        "no relationship sidebar before rows arrive"
+    );
 }
 
 #[test]
-fn impact_pane_is_always_present_at_normal_size() {
-    // The deterministic Impact pane is permanent (docs/review/15): it renders in the
-    // normal layout regardless of focus.
+fn impact_pane_defaults_to_generated_content_at_normal_size() {
+    // Impact is permanent, but its relationship sidebar is data-driven rather than default
+    // chrome while the selection is unresolved.
     let backend = TestBackend::new(100, 30);
     let mut t = Terminal::new(backend).unwrap();
     let app = App::new();
     let snap = sample();
     t.draw(|f| render(f, &app, &snap)).unwrap();
-    assert!(buffer_text(&t).contains("SELECTED CHANGE"));
+    let text = buffer_text(&t);
+    assert!(text.contains("AI in progress"));
+    assert!(!text.contains("SELECTED CHANGE"));
 }
 
 #[test]
@@ -280,7 +286,10 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
         !text.contains("inferred from cited diff"),
         "retired provenance legend: {text}"
     );
-    assert!(text.contains("hunk 1"), "one-based evidence hunk: {text}");
+    assert!(
+        !text.contains("retry.rs") && !text.contains("defines the retry budget"),
+        "grounding evidence stays out of the diagram UI: {text}"
+    );
     assert!(!text.contains("diff modified"), "old change badge: {text}");
     assert!(
         !text.contains("LSP warning"),
@@ -291,8 +300,8 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
         "opaque diagnostic marker removed: {text}"
     );
     assert!(
-        text.contains("SELECTED CHANGE"),
-        "deterministic context remains visible: {text}"
+        !text.contains("SELECTED CHANGE"),
+        "an empty relationship sidebar stays absent: {text}"
     );
 }
 

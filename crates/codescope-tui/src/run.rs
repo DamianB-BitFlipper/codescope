@@ -338,6 +338,7 @@ fn telemetry_state(app: &App) -> Value {
         "scroll": {
             "files": app.files_scroll,
             "diff_vertical": app.diff_scroll,
+            "diff_vertical_alignment": format!("{:?}", app.diff_scroll_alignment).to_ascii_lowercase(),
             "diff_horizontal": app.diff_hscroll,
             "callers": app.callers_scroll,
             "downstream": app.downstream_scroll,
@@ -458,7 +459,7 @@ async fn dispatch(
             }
             app.apply(Action::AgentFocus(target));
         }
-        Action::AgentDiagram { .. } => {
+        Action::AgentDiagram { .. } | Action::AgentDiagramRejected { .. } => {
             let _ = tx.send(action).await;
         }
         Action::ClearDiffSelection => {

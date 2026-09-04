@@ -183,10 +183,15 @@ structured, so they don't need a frontier model.
   `ANTHROPIC_API_KEY` and infers the provider from the built-in name. An arbitrary named key
   requires an explicit base URL; a literal key in a config file is a hard error.
 - Keys are wrapped in `secrecy::SecretString`; never logged, never shown.
-- Every provider request, response, usage record, latency, and error is appended to the local
-  `telemetry.jsonl` beside global config. Prompt, tool, completion, and provider-returned reasoning
-  content is retained after recognizable secret values are scrubbed. Headers and key material are
-  excluded, and Codescope does not upload the file.
+- Every provider request, response, usage record, latency, and error is appended to that process's
+  JSONL file under the local `telemetry/` directory beside global config. Prompt, tool, completion,
+  and provider-returned reasoning content is retained after recognizable secret values are
+  scrubbed. Headers and key material are excluded, and Codescope does not upload the file.
+- After the dispatcher accepts a parsed comparison, a deduplicated `diff.snapshot` stores its
+  complete privacy-filtered unified patch, resolved scope/base/head, and file/hunk byte mappings.
+  Its SHA-256 `diff_snapshot_id` hashes the exact stored payload and correlates later UI,
+  controller, snapshot, and LLM events. Refresh invalidation removes the active ID immediately;
+  an in-flight LLM request keeps the ID with which it began.
 - The same local stream correlates LLM turns with raw keys, typed picker input, selections,
   focused files/hunks, scroll offsets, mouse coordinates/gestures, external control actions, and
   snapshot transitions from the TUI session.

@@ -174,6 +174,12 @@ enum AgentRequest {
         request_id: u64,
         command: DiagramCommand,
     },
+    /// Raw CLI edit. The live server performs schema decoding so malformed calls can be
+    /// acknowledged and displayed alongside accepted controller activity.
+    DiagramApplyRaw {
+        request_id: u64,
+        command: String,
+    },
     Refresh,
 }
 
@@ -397,38 +403,36 @@ async fn handle_request(
             request_id,
             command,
         } => {
-            // Serialize external writers so the latest-value snapshot cannot skip over an
-            // acknowledgement before its caller observes it.
-            let _guard = diagram_lock.lock().await;
-            let previous_revision = snapshots
-                .borrow()
-                .agent_diagram_result
-                .as_ref()
-                .map_or(0, |result| result.revision);
-            controls
-                .send(Action::AgentDiagram {
+            apply_diagram_action(
+                request_id,
+                Action::AgentDiagram {
                     request_id,
                     command,
-                })
-                .await
-                .context("the TUI control loop has stopped")?;
-            let snapshot =
-                wait_for_diagram_result(snapshots, request_id, previous_revision).await?;
-            let result = snapshot
-                .agent_diagram_result
-                .as_ref()
-                .context("dispatcher omitted the diagram command result")?;
-            Ok(json!({
-                "accepted": result.accepted,
-                "published": result.published,
-                "revision": result.revision,
-                "summary": result.summary,
-                "error": result.error,
-                "selection": selected_view(&snapshot),
-                "draft": snapshot.diagram_draft,
-                "published_plan": snapshot.semantic.plan,
-                "validation": snapshot.semantic.report,
-            }))
+                },
+                snapshots,
+                controls,
+                diagram_lock,
+            )
+            .await
+        }
+        AgentRequest::DiagramApplyRaw {
+            request_id,
+            command,
+        } => {
+            let action = match serde_json::from_str::<DiagramCommand>(&command) {
+                Ok(command) => Action::AgentDiagram {
+                    request_id,
+                    command,
+                },
+                Err(error) => Action::AgentDiagramRejected {
+                    request_id,
+                    detail: codescope_ai::scrub_secrets(&raw_diagram_activity_detail(&command)),
+                    error: codescope_ai::scrub_secrets(&format!(
+                        "diagram command is not valid shared editor JSON: {error}"
+                    )),
+                },
+            };
+            apply_diagram_action(request_id, action, snapshots, controls, diagram_lock).await
         }
         AgentRequest::Refresh => {
             controls
@@ -440,6 +444,62 @@ async fn handle_request(
                 "note": "refresh is asynchronous; call context until refreshing is false and epoch advances"
             }))
         }
+    }
+}
+
+async fn apply_diagram_action(
+    request_id: u64,
+    action: Action,
+    snapshots: &mut watch::Receiver<UiSnapshot>,
+    controls: &mpsc::Sender<Action>,
+    diagram_lock: &tokio::sync::Mutex<()>,
+) -> Result<Value> {
+    // Serialize external writers so the latest-value snapshot cannot skip over an
+    // acknowledgement before its caller observes it.
+    let _guard = diagram_lock.lock().await;
+    let previous_revision = snapshots
+        .borrow()
+        .agent_diagram_result
+        .as_ref()
+        .map_or(0, |result| result.revision);
+    controls
+        .send(action)
+        .await
+        .context("the TUI control loop has stopped")?;
+    let snapshot = wait_for_diagram_result(snapshots, request_id, previous_revision).await?;
+    let result = snapshot
+        .agent_diagram_result
+        .as_ref()
+        .context("dispatcher omitted the diagram command result")?;
+    Ok(json!({
+        "accepted": result.accepted,
+        "published": result.published,
+        "revision": result.revision,
+        "summary": result.summary,
+        "error": result.error,
+        "selection": selected_view(&snapshot),
+        "draft": snapshot.diagram_draft,
+        "published_plan": snapshot.semantic.plan,
+        "validation": snapshot.semantic.report,
+    }))
+}
+
+fn raw_diagram_activity_detail(command: &str) -> String {
+    let Ok(arguments) = serde_json::from_str::<Value>(command) else {
+        return "invalid arguments".to_string();
+    };
+    let operation = arguments
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or("edit");
+    let subject = arguments
+        .pointer("/node/label")
+        .or_else(|| arguments.get("form_id"))
+        .or_else(|| arguments.get("from"))
+        .and_then(Value::as_str);
+    match subject {
+        Some(subject) => format!("{operation} · {subject}"),
+        None => operation.to_string(),
     }
 }
 
@@ -944,10 +1004,9 @@ pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
             },
             AgentOperation::Diagram(diagram) => match &diagram.operation {
                 DiagramOperation::Inspect => AgentRequest::DiagramGet,
-                DiagramOperation::Edit { command } => AgentRequest::DiagramApply {
+                DiagramOperation::Edit { command } => AgentRequest::DiagramApplyRaw {
                     request_id: AGENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
-                    command: serde_json::from_str(command)
-                        .context("diagram command is not valid shared editor JSON")?,
+                    command: command.clone(),
                 },
                 DiagramOperation::Finish => AgentRequest::DiagramApply {
                     request_id: AGENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
@@ -1211,6 +1270,27 @@ mod tests {
                     error: None,
                 });
             });
+
+            let Some(Action::AgentDiagramRejected {
+                request_id,
+                detail,
+                error,
+            }) = rx.recv().await
+            else {
+                panic!("expected a rejected raw agent diagram command");
+            };
+            assert_eq!(detail, "set_intent · form-1");
+            assert!(error.contains("unknown field `form_id`"));
+            snapshot_tx.send_modify(|snapshot| {
+                snapshot.agent_diagram_result = Some(AgentDiagramResult {
+                    request_id,
+                    revision: 8,
+                    accepted: false,
+                    published: false,
+                    summary: None,
+                    error: Some(error),
+                });
+            });
         });
         let result = handle_request(
             AgentRequest::DiagramApply {
@@ -1227,6 +1307,25 @@ mod tests {
         assert_eq!(result["accepted"], true);
         assert_eq!(result["revision"], 7);
         assert_eq!(result["summary"], "updated the diagram intent");
+
+        let rejected = handle_request(
+            AgentRequest::DiagramApplyRaw {
+                request_id: 43,
+                command: r#"{"op":"set_intent","form_id":"form-1","intent":"Explain it"}"#
+                    .to_string(),
+            },
+            &Utf8PathBuf::from("/tmp/example/repo"),
+            &mut snapshots,
+            &tx,
+            &tokio::sync::Mutex::new(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected["accepted"], false);
+        assert_eq!(rejected["revision"], 8);
+        assert!(rejected["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unknown field `form_id`")));
         responder.await.unwrap();
     }
 

@@ -135,6 +135,17 @@ pub enum Action {
         /// Shared renderer-native mutation.
         command: codescope_core::DiagramCommand,
     },
+    /// Record a controller edit that could not be decoded into the shared diagram schema.
+    /// Parsing happens beside the live socket so malformed CLI calls still join the visible
+    /// activity chain instead of disappearing inside a short-lived client process.
+    AgentDiagramRejected {
+        /// Identity returned through the published snapshot after the dispatcher rejects it.
+        request_id: u64,
+        /// Bounded operation/subject label derived from the untrusted JSON when possible.
+        detail: String,
+        /// Scrubbed parse failure returned to the controller and displayed under the call row.
+        error: String,
+    },
     /// The user selected a changed symbol; the dispatcher lazily expands its callers/callees.
     SelectSymbol {
         /// Repo-relative file of the symbol.
@@ -214,7 +225,7 @@ pub enum Action {
         /// Requested content-local row.
         y: u16,
     },
-    /// Mouse click: show or hide the full relationship text in the canvas overlay.
+    /// Mouse click: show or hide clipped relationship text in an in-place canvas overlay.
     TogglePlanRelationship(PlanRelationshipTarget),
     /// Mouse wheel: set the absolute page offset of the visible relationship overlay.
     ScrollPlanRelationshipOverlay {

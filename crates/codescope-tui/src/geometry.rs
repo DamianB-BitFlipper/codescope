@@ -124,11 +124,13 @@ impl UiGeometry {
                 }
                 Pane::Diff => {
                     geo.diff = Some(body);
-                    geo.diff_copy = Some(crate::render::diff_copy_frame(app, snap, body));
+                    let diff_copy = crate::render::diff_copy_frame(app, snap, body);
+                    let first_visible = diff_copy.first_visible_logical;
+                    geo.diff_copy = Some(diff_copy);
                     geo.register_scroll_region(
                         ScrollRegionId::Diff,
                         body,
-                        usize::from(app.diff_scroll),
+                        first_visible,
                         snap.diff.rows.len().saturating_sub(1),
                     );
                 }
@@ -164,13 +166,15 @@ impl UiGeometry {
         geo.files = Some(work_split[0]);
         geo.files_inner = Some(inner(work_split[0]));
         geo.diff = Some(work_split[1]);
-        geo.diff_copy = Some(crate::render::diff_copy_frame(app, snap, work_split[1]));
+        let diff_copy = crate::render::diff_copy_frame(app, snap, work_split[1]);
+        let diff_first_visible = diff_copy.first_visible_logical;
+        geo.diff_copy = Some(diff_copy);
         geo.impact = Some(impact);
         geo.add_impact_regions(impact, app, snap);
         geo.register_scroll_region(
             ScrollRegionId::Diff,
             work_split[1],
-            usize::from(app.diff_scroll),
+            diff_first_visible,
             snap.diff.rows.len().saturating_sub(1),
         );
 
@@ -444,62 +448,81 @@ impl UiGeometry {
         if content.width < 2 || content.height == 0 {
             return;
         }
-        let left_width = impact_left_width(
-            app.dividers.get(DividerId::RelationshipsGenerated),
-            content.width,
-        );
-        let divider_x = content.x.saturating_add(left_width);
-        self.dividers.push(DividerHandle::new(
-            DividerId::RelationshipsGenerated,
-            Rect::new(
-                divider_x.saturating_sub(1),
-                content.y,
-                2.min(content.width),
+        let (generated, generated_inner) = if !snap.impact.has_relationships() {
+            // Match render_impact: no divider, padding, or stale relationship hit regions when
+            // the generated viewport is the only visible content.
+            (content, content)
+        } else {
+            let left_width = impact_left_width(
+                app.dividers.get(DividerId::RelationshipsGenerated),
+                content.width,
+            );
+            let divider_x = content.x.saturating_add(left_width);
+            self.dividers.push(DividerHandle::new(
+                DividerId::RelationshipsGenerated,
+                Rect::new(
+                    divider_x.saturating_sub(1),
+                    content.y,
+                    2.min(content.width),
+                    content.height,
+                ),
+                left_width,
+            ));
+
+            let [selected, callers, downstream] = impact_section_heights(
+                app.dividers.get(DividerId::SelectedCallers),
+                app.dividers.get(DividerId::CallersDownstream),
                 content.height,
-            ),
-            left_width,
-        ));
+            );
+            let left = Rect::new(content.x, content.y, left_width, content.height);
+            let rows = ratatui::layout::Layout::vertical([
+                ratatui::layout::Constraint::Length(selected),
+                ratatui::layout::Constraint::Length(callers),
+                ratatui::layout::Constraint::Length(downstream),
+            ])
+            .split(left);
+            let callers_capacity = impact_list_capacity(rows[1].height, true);
+            let downstream_capacity = impact_list_capacity(rows[2].height, false);
+            self.register_scroll_region(
+                ScrollRegionId::Callers,
+                rows[1],
+                app.callers_scroll,
+                scroll_max(snap.impact.callers.rows.len(), callers_capacity),
+            );
+            self.register_scroll_region(
+                ScrollRegionId::Downstream,
+                rows[2],
+                app.downstream_scroll,
+                scroll_max(snap.impact.downstream.rows.len(), downstream_capacity),
+            );
+            register_horizontal_sectional(
+                &mut self.dividers,
+                DividerId::SelectedCallers,
+                rows[0],
+                rows[1],
+            );
+            register_horizontal_sectional(
+                &mut self.dividers,
+                DividerId::CallersDownstream,
+                rows[1],
+                rows[2],
+            );
 
-        let [selected, callers, downstream] = impact_section_heights(
-            app.dividers.get(DividerId::SelectedCallers),
-            app.dividers.get(DividerId::CallersDownstream),
-            content.height,
-        );
-        let left = Rect::new(content.x, content.y, left_width, content.height);
-        let rows = ratatui::layout::Layout::vertical([
-            ratatui::layout::Constraint::Length(selected),
-            ratatui::layout::Constraint::Length(callers),
-            ratatui::layout::Constraint::Length(downstream),
-        ])
-        .split(left);
-        let callers_capacity = impact_list_capacity(rows[1].height, true);
-        let downstream_capacity = impact_list_capacity(rows[2].height, false);
-        self.register_scroll_region(
-            ScrollRegionId::Callers,
-            rows[1],
-            app.callers_scroll,
-            scroll_max(snap.impact.callers.rows.len(), callers_capacity),
-        );
-        self.register_scroll_region(
-            ScrollRegionId::Downstream,
-            rows[2],
-            app.downstream_scroll,
-            scroll_max(snap.impact.downstream.rows.len(), downstream_capacity),
-        );
-
-        let generated = Rect::new(
-            divider_x,
-            content.y,
-            content.width.saturating_sub(left_width),
-            content.height,
-        );
-        // The generated Block owns a left border and one cell of left padding.
-        let generated_inner = Rect::new(
-            generated.x.saturating_add(2),
-            generated.y,
-            generated.width.saturating_sub(2),
-            generated.height,
-        );
+            let generated = Rect::new(
+                divider_x,
+                content.y,
+                content.width.saturating_sub(left_width),
+                content.height,
+            );
+            // The generated Block owns a left border and one cell of left padding.
+            let generated_inner = Rect::new(
+                generated.x.saturating_add(2),
+                generated.y,
+                generated.width.saturating_sub(2),
+                generated.height,
+            );
+            (generated, generated_inner)
+        };
         self.generated_content = Some(generated_inner);
         self.ai_plan_scroll = app.ai_plan_scroll;
         let canvas = snap
@@ -535,6 +558,9 @@ impl UiGeometry {
                 }
             }
             for relationship in &canvas.relationships {
+                if !relationship.has_hidden_label {
+                    continue;
+                }
                 if let Some(rect) =
                     canvas_rect_on_screen(relationship.label_rect, generated_inner, first)
                 {
@@ -607,18 +633,6 @@ impl UiGeometry {
                 max_scroll,
             );
         }
-        register_horizontal_sectional(
-            &mut self.dividers,
-            DividerId::SelectedCallers,
-            rows[0],
-            rows[1],
-        );
-        register_horizontal_sectional(
-            &mut self.dividers,
-            DividerId::CallersDownstream,
-            rows[1],
-            rows[2],
-        );
     }
 }
 

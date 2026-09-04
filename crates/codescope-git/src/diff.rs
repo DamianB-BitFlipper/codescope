@@ -16,10 +16,23 @@
 
 use crate::error::{GitError, Result};
 use camino::Utf8PathBuf;
-use codescope_core::{DiffLine, FileChange, FileStatus, Hunk};
+use codescope_core::{DiffLine, FileChange, FileStatus, Hunk, UnifiedDiffSection};
+
+/// Parsed facts plus the exact sections from the same command output. The sections remain paired
+/// with the domain model so telemetry never needs to execute a second comparison.
+pub(crate) struct ParsedUnifiedDiff {
+    pub(crate) files: Vec<FileChange>,
+    pub(crate) sections: Vec<UnifiedDiffSection>,
+}
 
 /// Parse a full `git diff` patch into per-file changes, in git output order.
+#[cfg(test)]
 pub(crate) fn parse_unified_diff(text: &str) -> Result<Vec<FileChange>> {
+    Ok(parse_unified_diff_with_sections(text)?.files)
+}
+
+/// Parse a patch while retaining each complete source section for lossless reconstruction.
+pub(crate) fn parse_unified_diff_with_sections(text: &str) -> Result<ParsedUnifiedDiff> {
     let mut lines: Vec<&str> = text.split('\n').collect();
     if lines.last() == Some(&"") {
         lines.pop();
@@ -44,29 +57,41 @@ impl<'a> DiffParser<'a> {
         Some(line)
     }
 
-    fn parse_all(&mut self) -> Result<Vec<FileChange>> {
+    fn parse_all(&mut self) -> Result<ParsedUnifiedDiff> {
         let mut files = Vec::new();
+        let mut sections = Vec::new();
         while let Some(line) = self.peek() {
-            if line.starts_with("diff --git ") {
-                files.push(self.parse_git_section()?);
+            let start = self.pos;
+            let parsed = if line.starts_with("diff --git ") {
+                Some(self.parse_git_section()?)
             } else if let Some(rest) = line
                 .strip_prefix("diff --cc ")
                 .or_else(|| line.strip_prefix("diff --combined "))
             {
-                files.push(self.parse_cc_section(rest)?);
+                Some(self.parse_cc_section(rest)?)
             } else if let Some(path) = line.strip_prefix("* Unmerged path ") {
                 self.pos += 1;
-                files.push(unmerged_change(unquote_path(path)?));
+                Some(unmerged_change(unquote_path(path)?))
             } else if line.is_empty() || line.starts_with("Submodule ") {
                 // Stray blank line / "Submodule <p> contains modified content" notices.
                 self.pos += 1;
+                None
             } else {
                 return Err(GitError::ParseDiff {
                     detail: format!("unexpected top-level line: {line:?}"),
                 });
+            };
+            if let Some(file) = parsed {
+                let mut text = self.lines[start..self.pos].join("\n");
+                text.push('\n');
+                sections.push(UnifiedDiffSection {
+                    path: file.path.clone(),
+                    text,
+                });
+                files.push(file);
             }
         }
-        Ok(files)
+        Ok(ParsedUnifiedDiff { files, sections })
     }
 
     /// `diff --cc <path>`: combined diff for an unmerged path. Skip the whole section.
@@ -626,6 +651,61 @@ index 1234567..89abcde 100644
         assert_eq!(h.lines.len(), 2);
         assert_eq!(h.count_added(), 1);
         assert_eq!(h.count_deleted(), 1);
+    }
+
+    #[test]
+    fn retained_sections_round_trip_multiple_files_hunks_renames_and_unicode() {
+        let text = concat!(
+            "diff --git a/old.txt b/src/renamed.txt\n",
+            "similarity index 80%\n",
+            "rename from old.txt\n",
+            "rename to src/renamed.txt\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/old.txt\n",
+            "+++ b/src/renamed.txt\n",
+            "@@ -1 +1 @@\n",
+            "-café\n",
+            "+雪\n",
+            "\\ No newline at end of file\n",
+            "@@ -4 +4 @@ second\n",
+            "-before\n",
+            "+after\n",
+            "diff --git a/gone.rs b/gone.rs\n",
+            "deleted file mode 100644\n",
+            "index 3333333..0000000\n",
+            "--- a/gone.rs\n",
+            "+++ /dev/null\n",
+            "@@ -1,2 +0,0 @@\n",
+            "-one\n",
+            "-two\n",
+            "\\ No newline at end of file\n",
+        );
+        let parsed = parse_unified_diff_with_sections(text).unwrap();
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.sections.len(), 2);
+        assert_eq!(parsed.files[0].path, "src/renamed.txt");
+        assert_eq!(
+            parsed.files[0]
+                .old_path
+                .as_deref()
+                .map(camino::Utf8Path::as_str),
+            Some("old.txt")
+        );
+        assert_eq!(parsed.files[0].hunks.len(), 2);
+        assert_eq!(parsed.files[1].status, FileStatus::Deleted);
+        assert_eq!(parsed.files[1].hunks.len(), 1);
+        assert_eq!(
+            parsed
+                .sections
+                .iter()
+                .map(|section| section.text.as_str())
+                .collect::<String>(),
+            text
+        );
+        assert!(parsed.sections[0].text.contains("café\n+雪\n"));
+        assert!(parsed.sections[1]
+            .text
+            .ends_with("\\ No newline at end of file\n"));
     }
 
     #[test]

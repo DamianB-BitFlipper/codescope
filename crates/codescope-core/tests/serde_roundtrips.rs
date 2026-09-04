@@ -52,6 +52,7 @@ fn git_domain_roundtrips() {
     roundtrip(&RepoContext {
         toplevel: Utf8PathBuf::from("/repo"),
         head: HeadState::Branch("main".to_string()),
+        head_oid: Some(Oid::new("cafebabe")),
         upstream: Some(Upstream {
             name: "origin/main".to_string(),
             ahead: 0,

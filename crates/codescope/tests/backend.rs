@@ -40,6 +40,20 @@ fn stderr(out: &Output) -> String {
     String::from_utf8(out.stderr.clone()).expect("utf8 stderr")
 }
 
+fn telemetry_text(config_directory: &Path) -> String {
+    let telemetry_directory = config_directory.join("telemetry");
+    let files = std::fs::read_dir(&telemetry_directory)
+        .unwrap_or_else(|error| panic!("read {}: {error}", telemetry_directory.display()))
+        .map(|entry| entry.expect("telemetry directory entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 1, "one telemetry file per command session");
+    std::fs::read_to_string(&files[0]).expect("read telemetry session")
+}
+
 /// Parse stdout as JSON, requiring exit code 0 first.
 fn json_stdout(out: &Output) -> Value {
     assert!(
@@ -726,6 +740,26 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
     let debug_log_for_command = debug_log.clone();
     let endpoint = format!("{}/v1", provider.base_url());
     let root_string = root.to_string_lossy().to_string();
+    let root_string_for_assert = root_string.clone();
+    let expected_diff = Command::new("git")
+        .current_dir(&root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "diff",
+            "-M",
+            "-U3",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--submodule=short",
+            "main...HEAD",
+        ])
+        .output()
+        .expect("read the fixture's canonical branch diff");
+    assert!(expected_diff.status.success());
+    let expected_diff = String::from_utf8(expected_diff.stdout).unwrap();
 
     let out = tokio::task::spawn_blocking(move || {
         Command::new(BIN)
@@ -842,8 +876,7 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         debug_trace.contains("reasoning_effort") && debug_trace.contains("current research brief"),
         "debug wire trace includes the scrubbed provider envelope"
     );
-    let telemetry = std::fs::read_to_string(config_dir.path().join("telemetry.jsonl"))
-        .expect("always-on LLM telemetry");
+    let telemetry = telemetry_text(config_dir.path());
     assert!(
         !telemetry.contains("sk-test-only"),
         "API key leaked: {telemetry}"
@@ -852,6 +885,34 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("valid telemetry JSONL"))
         .collect::<Vec<_>>();
+    assert!(
+        !telemetry.contains(&root_string_for_assert),
+        "absolute repository root leaked: {telemetry}"
+    );
+    let diff_snapshots = telemetry_records
+        .iter()
+        .filter(|record| record["event"] == "diff.snapshot")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        diff_snapshots.len(),
+        1,
+        "the initial comparison stores one payload"
+    );
+    let diff_snapshot = diff_snapshots[0];
+    let diff_snapshot_id = diff_snapshot["diff_snapshot_id"].as_str().unwrap();
+    assert_eq!(diff_snapshot["data"]["diff_snapshot_id"], diff_snapshot_id);
+    assert_eq!(diff_snapshot["data"]["epoch"], 1);
+    assert_eq!(
+        diff_snapshot["data"]["payload"]["canonical_diff"], expected_diff,
+        "telemetry retains the complete patch used by the dispatcher"
+    );
+    assert_eq!(
+        diff_snapshot["data"]["payload"]["comparison"]["scope"],
+        "branch"
+    );
+    assert!(diff_snapshot["data"]["payload"]["files"]
+        .as_array()
+        .is_some_and(|files| !files.is_empty()));
     let llm_requests = telemetry_records
         .iter()
         .filter(|record| record["event"] == "llm.request")
@@ -862,6 +923,16 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         .collect::<Vec<_>>();
     assert_eq!(llm_requests.len(), requests.len());
     assert_eq!(llm_responses.len(), requests.len());
+    assert!(
+        telemetry_records
+            .iter()
+            .filter(|record| matches!(
+                record["event"].as_str(),
+                Some("llm.request" | "llm.response" | "llm.tool")
+            ))
+            .all(|record| record["diff_snapshot_id"].as_str() == Some(diff_snapshot_id)),
+        "all provider/controller records correlate to the accepted comparison"
+    );
     assert!(llm_requests[0]["data"]["body"]["messages"]
         .as_array()
         .is_some_and(|messages| !messages.is_empty()));
@@ -1104,8 +1175,7 @@ fn every_command_appends_local_session_telemetry() {
         .expect("spawn codescope");
     assert!(out.status.success(), "command failed: {}", stderr(&out));
 
-    let telemetry = std::fs::read_to_string(config_dir.path().join("telemetry.jsonl"))
-        .expect("always-on telemetry file");
+    let telemetry = telemetry_text(config_dir.path());
     let records = telemetry
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("valid telemetry JSONL"))

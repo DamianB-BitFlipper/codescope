@@ -59,6 +59,7 @@ rstest = "0.26.1"
 portable-pty = "0.9"
 
 regex = "1.11"
+sha2 = "0.10.9"
 
 [profile.dev]
 opt-level = 1

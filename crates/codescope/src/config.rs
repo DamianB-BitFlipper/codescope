@@ -24,23 +24,20 @@ const SCHEMA_VERSION: u32 = 1;
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 const STALE_LOCK_AGE: Duration = Duration::from_secs(30);
 
-/// Always-on local telemetry lives beside the resolved global config. Environments without
-/// a discoverable config directory fall back to a process-independent temporary location.
-pub(crate) fn telemetry_path() -> PathBuf {
-    telemetry_path_for(resolve_config_path(
+/// Always-on local telemetry session files live in a directory beside the resolved global config.
+/// Environments without a discoverable config directory use a process-independent temporary
+/// directory.
+pub(crate) fn telemetry_dir() -> PathBuf {
+    telemetry_dir_for(resolve_config_path(
         |name| std::env::var(name).ok(),
         cfg!(windows),
     ))
 }
 
-fn telemetry_path_for(config_path: Option<PathBuf>) -> PathBuf {
+fn telemetry_dir_for(config_path: Option<PathBuf>) -> PathBuf {
     config_path.map_or_else(
-        || {
-            std::env::temp_dir()
-                .join("codescope")
-                .join("telemetry.jsonl")
-        },
-        |path| path.with_file_name("telemetry.jsonl"),
+        || std::env::temp_dir().join("codescope").join("telemetry"),
+        |path| path.with_file_name("telemetry"),
     )
 }
 
@@ -551,16 +548,14 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_is_a_sibling_of_the_resolved_config() {
+    fn telemetry_directory_is_a_sibling_of_the_resolved_config() {
         assert_eq!(
-            telemetry_path_for(Some(PathBuf::from("/xdg/codescope/custom.toml"))),
-            PathBuf::from("/xdg/codescope/telemetry.jsonl")
+            telemetry_dir_for(Some(PathBuf::from("/xdg/codescope/custom.toml"))),
+            PathBuf::from("/xdg/codescope/telemetry")
         );
         assert_eq!(
-            telemetry_path_for(None),
-            std::env::temp_dir()
-                .join("codescope")
-                .join("telemetry.jsonl")
+            telemetry_dir_for(None),
+            std::env::temp_dir().join("codescope").join("telemetry")
         );
     }
 

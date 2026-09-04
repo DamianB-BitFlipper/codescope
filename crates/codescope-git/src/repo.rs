@@ -1,6 +1,6 @@
 //! [`GitRepo`]: discovery plus the high-level read-only queries.
 
-use crate::diff::{parse_unified_diff, unmerged_change};
+use crate::diff::{parse_unified_diff_with_sections, unmerged_change, ParsedUnifiedDiff};
 use crate::error::{GitError, Result};
 use crate::runner::GitCommand;
 use crate::status::{parse_status_z, StatusSnapshot};
@@ -238,6 +238,7 @@ impl GitRepo {
         Ok(RepoContext {
             toplevel: self.toplevel.clone(),
             head,
+            head_oid: status.oid,
             upstream,
             base,
         })
@@ -758,24 +759,26 @@ impl GitRepo {
             let base = self.infer_base(&status).await?.ok_or(GitError::NoBase)?;
             return self.branch_changeset_from_base(&base).await;
         }
-        let mut files = match scope {
+        let (mut files, mut diff_sections) = match scope {
             ChangeScope::Branch => unreachable!("returned above"),
             ChangeScope::Staged => {
                 let mut args = vec!["diff", "--cached"];
                 args.extend_from_slice(DIFF_FLAGS);
                 let out = self.cmd(&args).run().await?;
                 let text = String::from_utf8_lossy(out.stdout_bytes());
-                let mut files = parse_unified_diff(&text)?;
+                let parsed = parse_unified_diff_with_sections(&text)?;
+                let mut files = parsed.files;
                 let status = self.status_snapshot().await?;
                 merge_unmerged(&mut files, &status);
-                files
+                (files, parsed.sections)
             }
             ChangeScope::Unstaged => {
                 let mut args = vec!["diff"];
                 args.extend_from_slice(DIFF_FLAGS);
                 let out = self.cmd(&args).run().await?;
                 let text = String::from_utf8_lossy(out.stdout_bytes());
-                let mut files = parse_unified_diff(&text)?;
+                let parsed = parse_unified_diff_with_sections(&text)?;
+                let mut files = parsed.files;
                 let status = self.status_snapshot().await?;
                 merge_unmerged(&mut files, &status);
                 for path in status.untracked_paths() {
@@ -789,19 +792,23 @@ impl GitRepo {
                         });
                     }
                 }
-                files
+                (files, parsed.sections)
             }
-            ChangeScope::Working => self.working_tree_files().await?,
+            ChangeScope::Working => {
+                let parsed = self.working_tree_diff().await?;
+                (parsed.files, parsed.sections)
+            }
         };
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(ChangeSet::new(scope, files))
+        diff_sections.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(ChangeSet::new(scope, files).with_diff_sections(diff_sections))
     }
 
     /// All uncommitted changes as one list: `git diff HEAD` (staged + unstaged) plus
     /// untracked paths from porcelain status ([`FileStatus::Untracked`], no hunks), with
     /// unmerged paths marked. On an unborn HEAD, diffs against the empty tree instead
     /// (HEAD does not resolve).
-    async fn working_tree_files(&self) -> Result<Vec<FileChange>> {
+    async fn working_tree_diff(&self) -> Result<ParsedUnifiedDiff> {
         // All uncommitted changes: worktree vs HEAD (staged + unstaged), plus untracked.
         // On an unborn HEAD, diff against the empty tree instead (HEAD doesn't resolve).
         let target = if self
@@ -819,12 +826,12 @@ impl GitRepo {
         args.extend_from_slice(DIFF_FLAGS);
         let out = self.cmd(&args).run().await?;
         let text = String::from_utf8_lossy(out.stdout_bytes());
-        let mut files = parse_unified_diff(&text)?;
+        let mut parsed = parse_unified_diff_with_sections(&text)?;
         let status = self.status_snapshot().await?;
-        merge_unmerged(&mut files, &status);
+        merge_unmerged(&mut parsed.files, &status);
         for path in status.untracked_paths() {
-            if !files.iter().any(|f| &f.path == path) {
-                files.push(FileChange {
+            if !parsed.files.iter().any(|f| &f.path == path) {
+                parsed.files.push(FileChange {
                     path: path.clone(),
                     old_path: None,
                     status: FileStatus::Untracked,
@@ -833,7 +840,7 @@ impl GitRepo {
                 });
             }
         }
-        Ok(files)
+        Ok(parsed)
     }
 
     /// Branch-scope changeset against an explicit base ref (a picker override).
@@ -861,9 +868,11 @@ impl GitRepo {
         args.push(&range);
         let out = self.cmd(&args).run().await?;
         let text = String::from_utf8_lossy(out.stdout_bytes());
-        let mut files = parse_unified_diff(&text)?;
+        let mut parsed = parse_unified_diff_with_sections(&text)?;
+        let mut files = parsed.files;
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(ChangeSet::new(ChangeScope::Branch, files))
+        parsed.sections.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(ChangeSet::new(ChangeScope::Branch, files).with_diff_sections(parsed.sections))
     }
 
     /// Content of `path` at revision `base` (`git show <base>:<path>`).

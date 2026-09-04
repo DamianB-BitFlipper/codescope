@@ -182,6 +182,16 @@ async fn staged_vs_unstaged_modification() {
     assert_eq!(f.hunks.len(), 1);
     assert_eq!(f.hunks[0].count_added(), 1);
     assert_eq!(f.hunks[0].count_deleted(), 1);
+    let staged_sections = staged
+        .diff_sections
+        .as_ref()
+        .expect("captured staged patch");
+    assert_eq!(staged_sections.len(), 1);
+    assert_eq!(staged_sections[0].path, "a.go");
+    assert!(staged_sections[0]
+        .text
+        .starts_with("diff --git a/a.go b/a.go\n"));
+    assert!(staged_sections[0].text.ends_with('\n'));
 
     let unstaged = repo
         .changeset(ChangeScope::Unstaged)
@@ -194,6 +204,14 @@ async fn staged_vs_unstaged_modification() {
     // Change on line 5 with U3 context: old lines 2..=8.
     assert_eq!(f.hunks[0].old_start, 2);
     assert_eq!(f.hunks[0].old_len, 7);
+    assert_eq!(
+        unstaged
+            .diff_sections
+            .as_ref()
+            .expect("captured unstaged patch")[0]
+            .path,
+        "b.txt"
+    );
 }
 
 #[tokio::test]
@@ -215,6 +233,14 @@ async fn working_scope_combines_staged_unstaged_and_untracked() {
     assert_eq!(cs.scope, ChangeScope::Working);
     let paths: Vec<_> = cs.files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, vec!["a.go", "b.txt", "c.txt"]);
+    let section_paths = cs
+        .diff_sections
+        .as_ref()
+        .expect("captured working patch")
+        .iter()
+        .map(|section| section.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(section_paths, vec!["a.go", "b.txt"]);
 
     // Staged edit shows up as a real diff hunk against HEAD.
     let a = &cs.files[0];

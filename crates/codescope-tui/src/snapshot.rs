@@ -206,10 +206,10 @@ pub struct AiTokenUsage {
     pub output: u64,
 }
 
-/// Tool-call activity for the focused in-flight AI request.
+/// Tool-call activity for the focused AI/controller request chain.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AiActivity {
-    /// `true` when the focused selection is owned by an internal provider request.
+    /// `true` when the focused selection is being built by an internal provider or controller.
     pub active: bool,
     /// Calls in model order, updated in place as each one finishes.
     pub calls: Vec<AiToolCallActivity>,
@@ -444,6 +444,16 @@ pub struct ImpactPane {
     pub downstream: ImpactList,
     /// One-line caveat when any data behind the pane is partial or approximate.
     pub note: String,
+}
+
+impl ImpactPane {
+    /// Whether the selected item has concrete relationship data worth giving screen space.
+    /// Loading state alone is intentionally insufficient: the generated viewport is the default,
+    /// and the relationship stack appears only after at least one real row arrives.
+    pub(crate) fn has_relationships(&self) -> bool {
+        self.selected_change.is_some()
+            && (!self.callers.rows.is_empty() || !self.downstream.rows.is_empty())
+    }
 }
 
 /// One impact column (callers or downstream): rows plus a load state that distinguishes

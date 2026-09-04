@@ -33,6 +33,7 @@ tracing-subscriber.workspace = true
 camino.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+ignore.workspace = true
 
 [dev-dependencies]
 codescope-testutil = { path = "../codescope-testutil" }

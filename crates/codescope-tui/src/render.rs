@@ -792,13 +792,10 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let linked_rows = linked_diff_rows(d, app.active_code_node());
     let mut built = build_diff_for_view(app, snap, inner_w);
     apply_diff_selection(&mut built, app.diff_selection);
-    // `diff_scroll` is a logical-row anchor (resize-stable); map it to the first visual
-    // line of that row. Raw mode is 1:1, so the map is the identity there.
-    let scroll_y = built
-        .first_visual
-        .get(app.diff_scroll as usize)
-        .copied()
-        .unwrap_or(0);
+    // `diff_scroll` is a resize-stable logical-row anchor. Diagram links request centered
+    // placement; ordinary navigation keeps the row at the top. This is resolved only here,
+    // where wrapped-line geometry and the actual viewport height are both known.
+    let scroll_y = diff_first_visual(app, &built, usize::from(area.height.saturating_sub(2)));
 
     // -- title: basename left, state right; preserve hunk/wrap, elide symbol, then path.
     let mut right_parts: Vec<String> = Vec::new();
@@ -977,6 +974,9 @@ pub(crate) struct DiffCopyFrame {
     /// First selectable code cell on each visual row. Hunk headers are not code.
     pub(crate) code_starts: Vec<Option<usize>>,
     pub(crate) first_visible: usize,
+    /// Logical row at the actual viewport top. Wheel scrolling starts here even when a
+    /// diagram link has centered a different focal row.
+    pub(crate) first_visible_logical: usize,
 }
 
 pub(crate) fn diff_copy_frame(app: &App, snap: &UiSnapshot, area: Rect) -> DiffCopyFrame {
@@ -987,12 +987,11 @@ pub(crate) fn diff_copy_frame(app: &App, snap: &UiSnapshot, area: Rect) -> DiffC
         area.height.saturating_sub(2),
     );
     let built = build_diff_for_view(app, snap, usize::from(rect.width));
-    let first_visible = built
+    let first_visible = usize::from(diff_first_visual(app, &built, usize::from(rect.height)));
+    let first_visible_logical = built
         .first_visual
-        .get(usize::from(app.diff_scroll))
-        .copied()
-        .map(usize::from)
-        .unwrap_or_default();
+        .partition_point(|visual| usize::from(*visual) <= first_visible)
+        .saturating_sub(1);
     let lines = built
         .lines
         .iter()
@@ -1008,7 +1007,26 @@ pub(crate) fn diff_copy_frame(app: &App, snap: &UiSnapshot, area: Rect) -> DiffC
         lines,
         code_starts: built.code_starts,
         first_visible,
+        first_visible_logical,
     }
+}
+
+/// Translate the app's logical focal row into the top visual row for this exact render.
+/// Centering is clamped at both ends, so a diff shorter than its viewport remains pinned at zero.
+fn diff_first_visual(app: &App, built: &BuiltDiff, visible_height: usize) -> u16 {
+    let anchor = built
+        .first_visual
+        .get(usize::from(app.diff_scroll))
+        .copied()
+        .map(usize::from)
+        .unwrap_or_default();
+    let first = match app.diff_scroll_alignment {
+        crate::app::DiffScrollAlignment::Top => anchor,
+        crate::app::DiffScrollAlignment::Center => anchor
+            .saturating_sub(visible_height / 2)
+            .min(built.lines.len().saturating_sub(visible_height)),
+    };
+    u16::try_from(first).unwrap_or(u16::MAX)
 }
 
 fn apply_diff_selection(
@@ -1674,9 +1692,9 @@ fn is_soft_break(g: &str) -> bool {
 // Deterministic relationships and the generated breakdown describe the same selection,
 // so they stay visible together instead of competing for a tabbed bottom pane.
 
-/// The full-width Impact pane. The left column stacks the deterministic selected change,
-/// callers, and downstream relationships; a vertical divider separates the generated,
-/// selection-scoped breakdown on the right.
+/// The full-width Impact pane. The generated viewport owns the full pane by default. Once a
+/// selected item has at least one concrete caller or downstream row, a left relationship stack
+/// appears beside it; unresolved and empty lookups never reserve blank screen space.
 fn render_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let focused = app.focused == Pane::Impact;
     // The contents already identify the selected change and generated explanation. A
@@ -1692,6 +1710,11 @@ fn render_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 6 || inner.height == 0 {
+        return;
+    }
+
+    if !snap.impact.has_relationships() {
+        render_generated_impact(frame, inner, app, snap);
         return;
     }
 
@@ -1941,7 +1964,8 @@ fn render_diagram_canvas(
         ) {
             let rect = Rect::new(
                 area.x.saturating_add(overlay.rect.x),
-                area.y,
+                area.y
+                    .saturating_add(overlay.rect.y.saturating_sub(scroll_y)),
                 overlay
                     .rect
                     .width
@@ -1949,6 +1973,7 @@ fn render_diagram_canvas(
                 overlay.rect.height.min(area.height),
             );
             frame.render_widget(ratatui::widgets::Clear, rect);
+            frame.render_widget(Block::default().style(Style::new().bg(SURFACE_ALT)), rect);
             for (row, line) in overlay.lines.iter().enumerate() {
                 draw_canvas_text(
                     frame,
@@ -2562,7 +2587,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("  Space h l       expand / collapse"),
         Line::from("  mouse hover     jump to + highlight linked diff code"),
         Line::from("  click / Space   expand hovered impact-node details"),
-        Line::from("  click arrow     expand / collapse its complete relationship text"),
+        Line::from("  click arrow     expand / collapse clipped relationship text"),
         Line::from("  mouse wheel     scroll section / page open relationship text"),
         Line::from("  drag divider    resize adjacent panes"),
         Line::from("  drag AI box     move freely on the canvas"),
@@ -2992,8 +3017,9 @@ mod tests {
             app.apply(crate::action::Action::Focus(crate::app::Pane::Impact));
             t.draw(|f| render(f, &app, &snap)).unwrap();
             assert!(
-                buffer_text(&t).contains("SELECTED CHANGE"),
-                "{w}x{h} impact after focus"
+                buffer_text(&t).contains("AI not generated")
+                    && !buffer_text(&t).contains("SELECTED CHANGE"),
+                "{w}x{h} empty relationship state uses the generated viewport"
             );
         }
     }
@@ -3659,6 +3685,38 @@ mod tests {
     }
 
     #[test]
+    fn centered_diff_anchor_uses_the_middle_and_clamps_at_both_ends() {
+        let mut snap = UiSnapshot::default();
+        snap.diff.rows = (0..60)
+            .map(|line| DiffRow::Context {
+                old_ln: line + 1,
+                new_ln: line + 1,
+                text: format!("line {line}"),
+            })
+            .collect();
+        let mut app = App::new();
+        app.update(snap.clone());
+        app.diff_scroll = 30;
+        app.diff_scroll_alignment = crate::app::DiffScrollAlignment::Center;
+
+        let built = build_diff_for_view(&app, &snap, 80);
+        assert_eq!(diff_first_visual(&app, &built, 11), 25);
+        let retained = diff_copy_frame(&app, &snap, Rect::new(0, 0, 100, 13));
+        assert_eq!(retained.first_visible, 25);
+        assert_eq!(retained.first_visible_logical, 25);
+
+        app.diff_scroll = 2;
+        assert_eq!(diff_first_visual(&app, &built, 11), 0);
+        app.diff_scroll = 59;
+        assert_eq!(diff_first_visual(&app, &built, 11), 49);
+        assert_eq!(
+            diff_first_visual(&app, &built, 100),
+            0,
+            "a diff shorter than the viewport remains pinned to the top"
+        );
+    }
+
+    #[test]
     fn diff_title_basename_and_state() {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let app = app_with(&sample());
@@ -3699,14 +3757,15 @@ mod tests {
     // -- §3.5 / §7.11: impact pane ---------------------------------------------------
 
     #[test]
-    fn impact_three_headers_always_present() {
+    fn impact_headers_are_hidden_without_relationship_data() {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app_with(&sample()), &sample()))
             .unwrap();
         let text = buffer_text(&t);
-        assert!(text.contains("SELECTED CHANGE"), "{text}");
-        assert!(text.contains("CALLERS ·"), "{text}");
-        assert!(text.contains("DOWNSTREAM ·"), "{text}");
+        assert!(!text.contains("SELECTED CHANGE"), "{text}");
+        assert!(!text.contains("CALLERS ·"), "{text}");
+        assert!(!text.contains("DOWNSTREAM ·"), "{text}");
+        assert!(text.contains("AI not generated"), "{text}");
     }
 
     /// An impact pane for a selected symbol with callers/downstream.
@@ -3787,6 +3846,85 @@ mod tests {
     }
 
     #[test]
+    fn relationship_loading_without_rows_does_not_open_the_sidebar() {
+        let mut snap = sample();
+        let mut impact = impact_sample();
+        impact.callers.rows.clear();
+        impact.downstream.rows.clear();
+        impact.callers.state = ImpactLoadState::Loading;
+        impact.downstream.state = ImpactLoadState::Loading;
+        snap.impact = impact;
+
+        let app = app_with(&snap);
+        let geometry = crate::geometry::UiGeometry::build(Rect::new(0, 0, 140, 40), &app, &snap);
+        assert!(
+            geometry
+                .divider(DividerId::RelationshipsGenerated)
+                .is_none(),
+            "loading without data must not reserve relationship space"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("SELECTED CHANGE"), "{text}");
+        assert!(!text.contains("CALLERS ·"), "{text}");
+        assert!(!text.contains("DOWNSTREAM ·"), "{text}");
+        assert!(text.contains("AI not generated"), "{text}");
+    }
+
+    #[test]
+    fn zero_relationship_selection_gives_generated_viewport_the_full_width() {
+        let mut snap = ai_plan_snap(2);
+        let mut impact = impact_sample();
+        impact.callers.rows.clear();
+        impact.downstream.rows.clear();
+        snap.impact = impact;
+        let mut app = App::new();
+        app.update(snap.clone());
+
+        let geometry = crate::geometry::UiGeometry::build(Rect::new(0, 0, 140, 40), &app, &snap);
+        let impact_area = geometry.impact.expect("impact pane");
+        assert_eq!(
+            geometry.generated_content,
+            Some(Rect::new(
+                impact_area.x + 1,
+                impact_area.y + 1,
+                impact_area.width - 2,
+                impact_area.height - 2,
+            )),
+            "the diagram occupies the complete inner impact pane"
+        );
+        assert!(
+            [
+                DividerId::RelationshipsGenerated,
+                DividerId::SelectedCallers,
+                DividerId::CallersDownstream,
+            ]
+            .into_iter()
+            .all(|divider| geometry.divider(divider).is_none()),
+            "hidden relationship sections have no draggable dividers"
+        );
+        assert!(
+            geometry.scroll_regions.iter().all(|region| !matches!(
+                region.id,
+                crate::scroll::ScrollRegionId::Callers | crate::scroll::ScrollRegionId::Downstream
+            )),
+            "hidden relationship sections have no wheel targets"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let impact_text = (impact_area.y + 1..impact_area.y + impact_area.height - 1)
+            .map(|row| row_text(&terminal, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!impact_text.contains("SELECTED CHANGE"), "{impact_text}");
+        assert!(!impact_text.contains("CALLERS ·"), "{impact_text}");
+        assert!(!impact_text.contains("DOWNSTREAM ·"), "{impact_text}");
+        assert!(impact_text.contains("PlanStep0"), "{impact_text}");
+    }
+
+    #[test]
     fn impact_relationship_lists_render_their_independent_scroll_offsets() {
         let mut snap = sample();
         let mut impact = impact_sample();
@@ -3820,16 +3958,18 @@ mod tests {
     }
 
     #[test]
-    fn impact_empty_selection_is_graceful() {
+    fn impact_empty_selection_keeps_the_relationship_stack_absent() {
         let mut snap = sample();
         snap.impact = crate::snapshot::ImpactPane::default();
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &App::new(), &snap)).unwrap();
         let text = buffer_text(&t);
-        assert!(text.contains("SELECTED CHANGE"), "header stays: {text}");
+        assert!(!text.contains("SELECTED CHANGE"), "no empty chrome: {text}");
+        assert!(!text.contains("CALLERS ·"), "no empty chrome: {text}");
+        assert!(!text.contains("DOWNSTREAM ·"), "no empty chrome: {text}");
         assert!(
-            text.contains("select a changed file or symbol"),
-            "guidance: {text}"
+            text.contains("AI not generated"),
+            "viewport remains: {text}"
         );
     }
 
@@ -3955,9 +4095,12 @@ mod tests {
             !generated.contains("AI-selected"),
             "old legend: {generated}"
         );
-        // The deterministic context stays visible beside generated Impact.
+        // With no relationship rows, generated Impact owns the complete pane.
         let body: String = (24..38).map(|y| row_text(&t, y)).collect();
-        assert!(body.contains("SELECTED CHANGE"), "impact context: {body}");
+        assert!(
+            !body.contains("SELECTED CHANGE"),
+            "no empty sidebar: {body}"
+        );
     }
 
     #[test]
@@ -4010,10 +4153,24 @@ mod tests {
             "overlay state is outside base Canvas geometry"
         );
         assert_eq!(app.ai_plan_scroll, base_scroll);
+        let geometry = crate::geometry::UiGeometry::build(Rect::new(0, 0, 140, 40), &app, &snap);
+        let content = geometry.generated_content.expect("generated viewport");
+        let overlay = geometry
+            .plan_relationship_overlay
+            .expect("visible relationship overlay");
+        assert!(
+            overlay.rect.x > content.x,
+            "expanded text remains anchored at the relationship instead of the viewport origin"
+        );
         terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
         assert!(
             buffer_text(&terminal).contains("UNIQUE_RELATIONSHIP_TAIL"),
             "the top-layer overlay renders the complete relationship text"
+        );
+        assert_eq!(
+            cell(&terminal, overlay.rect.x, overlay.rect.y).2,
+            SURFACE_ALT,
+            "the in-place overlay paints an opaque readable background"
         );
 
         app.apply(crate::action::Action::TogglePlanRelationship(target));
@@ -4022,7 +4179,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_impact_has_no_section_title_and_keeps_both_halves() {
+    fn combined_impact_has_no_section_title_or_empty_relationship_half() {
         let plan = ai_plan_snap(2);
         let mut app = App::new();
         app.update(plan.clone());
@@ -4031,8 +4188,14 @@ mod tests {
         assert!(!row_text(&t, 22).contains("Impact"));
         let text = buffer_text(&t);
         assert!(!text.contains("AI Plan"), "retired tab name: {text}");
-        assert!(text.contains("SELECTED CHANGE"), "left half: {text}");
-        assert!(text.contains("PlanStep0"), "right half: {text}");
+        assert!(
+            !text.contains("SELECTED CHANGE"),
+            "no empty left half: {text}"
+        );
+        assert!(
+            text.contains("PlanStep0"),
+            "full generated viewport: {text}"
+        );
     }
 
     #[test]
@@ -4315,10 +4478,10 @@ mod tests {
         );
     }
 
-    /// A validated sequence starts in a two-column card grid. Relationship rows remain
-    /// in the same vertically scrollable canvas below the cards.
+    /// A validated multi-step sequence starts as an edge-ordered top-to-bottom flow rather than
+    /// an ambiguous two-column zigzag. Later steps remain in the same scrollable canvas.
     #[test]
-    fn default_impact_pane_shows_a_two_dimensional_card_grid() {
+    fn default_impact_pane_shows_an_obvious_top_to_bottom_sequence() {
         let mut plan = ai_plan_snap(7);
         {
             let viz = plan.semantic.plan.as_mut().unwrap();
@@ -4338,7 +4501,8 @@ mod tests {
         app.update(plan.clone());
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
-        let pane: String = (24..38).map(|y| format!("{}\n", row_text(&t, y))).collect();
+        let pane_rows = (24..38).map(|y| row_text(&t, y)).collect::<Vec<_>>();
+        let pane = pane_rows.join("\n");
         assert!(
             pane.contains("Stop new traffic before waiting for in-flight requests."),
             "description: {pane}"
@@ -4356,9 +4520,22 @@ mod tests {
             pane.contains("Step1"),
             "the second step is visible without scrolling: {pane}"
         );
+        let locate = |label: &str| {
+            pane_rows
+                .iter()
+                .enumerate()
+                .find_map(|(row, text)| text.find(label).map(|column| (row, column)))
+                .expect("visible sequence step")
+        };
+        let first = locate("Step0");
+        let second = locate("Step1");
         assert!(
-            pane.contains("Step2") && pane.contains("Step3"),
-            "the next grid row is visible without scrolling: {pane}"
+            first.1.abs_diff(second.1) <= 1,
+            "sequence cards share one flow axis"
+        );
+        assert!(
+            first.0 < second.0,
+            "edge direction reads from top to bottom"
         );
         // With the retired summary/status rows gone, 80x20 gives Impact 11 rows while
         // still preserving the seven-row work minimum.
@@ -4378,8 +4555,8 @@ mod tests {
     /// wiring passed the dispatcher's data-quality note, which could never match.
     #[test]
     fn selected_node_label_is_highlighted() {
-        let mut plan = ai_plan_snap(5);
-        plan.semantic.plan.as_mut().unwrap().forms[0].nodes[2].label = "WiredTarget".into();
+        let mut plan = ai_plan_snap(2);
+        plan.semantic.plan.as_mut().unwrap().forms[0].nodes[0].label = "WiredTarget".into();
         plan.impact.selected_change = Some(crate::snapshot::SelectedChange {
             file: "internal/service/service.go".to_string(),
             label: "WiredTarget".to_string(),
@@ -4391,7 +4568,6 @@ mod tests {
         app.update(plan.clone());
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &plan)).unwrap();
-        // Five boxes cannot fit side by side, so the automatic layout stacks them.
         let mut highlighted = false;
         for y in 24..38u16 {
             let row = row_text(&t, y);

@@ -1931,7 +1931,7 @@ fn construction_protocol(op: &str, required_misses: Option<usize>) -> String {
 /// repository-derived text, so the controller can safely repeat it after a capped response.
 fn controller_operation_guidance(op: &str) -> &'static str {
     match op {
-        "create_node" => "Add the next distinct, unrepresented decisive selected-code behavior. In a sequence, follow actual selected-code execution/lifecycle order.",
+        "create_node" => "Add the next distinct, unrepresented decisive selected-code behavior. In a sequence, follow actual selected-code execution/lifecycle order. If controller_feedback reports a rejected code_ref, preserve the intended node and repair the specifically identified reference: copy a one-based inclusive range of at most 12 lines from the retained git_diff_file evidence, and do not reuse, invent, or calculate the rejected range.",
         "create_edge" => "Add one missing sequence or connectivity relation between existing nodes. For a Sequence lifecycle adjacency, set `kind` to `flows_to`. Use `calls` only for actual proven calls, never as a synonym for “then”. Do not duplicate an existing relation.",
         "add_evidence" => "Add hunk-local evidence only. Its reason may describe only its cited hunk.",
         _ => "Apply the controller-selected operation now.",
@@ -2001,7 +2001,7 @@ fn observe_tool_activity(
     let detail = crate::scrub::scrub_secrets(&redact_repo_root(&detail, repo_root));
     let arguments = crate::scrub::scrub_secrets(&redact_repo_root(&call.arguments, repo_root));
     let arguments = serde_json::from_str::<serde_json::Value>(&arguments)
-        .unwrap_or_else(|_| serde_json::Value::String(arguments));
+        .unwrap_or(serde_json::Value::String(arguments));
     codescope_telemetry::record(
         "llm.tool",
         serde_json::json!({
@@ -2038,7 +2038,7 @@ fn observe_tool_failure(
     let error = crate::scrub::scrub_secrets(&redact_repo_root(&error, repo_root));
     let arguments = crate::scrub::scrub_secrets(&redact_repo_root(&call.arguments, repo_root));
     let arguments = serde_json::from_str::<serde_json::Value>(&arguments)
-        .unwrap_or_else(|_| serde_json::Value::String(arguments));
+        .unwrap_or(serde_json::Value::String(arguments));
     codescope_telemetry::record(
         "llm.tool",
         serde_json::json!({
@@ -2168,22 +2168,51 @@ fn parse_diagram_command(arguments: &str) -> Result<DiagramCommand, String> {
 /// editor's nested create/update shapes, so a bad span remains
 /// repairable instead of becoming a terminal plan parse failure after scaffold completion.
 fn validate_command_code_ref_spans(command: &DiagramCommand) -> Result<(), String> {
-    let refs = match command {
-        DiagramCommand::CreateNode { node, .. } => Some(node.code_refs.as_slice()),
-        DiagramCommand::UpdateNode { patch, .. } => patch.code_refs.as_deref(),
+    let Some((op, field, refs)) = (match command {
+        DiagramCommand::CreateNode { node, .. } => Some((
+            "create_node",
+            "node.code_refs",
+            Some(node.code_refs.as_slice()),
+        )),
+        DiagramCommand::UpdateNode { patch, .. } => {
+            Some(("update_node", "patch.code_refs", patch.code_refs.as_deref()))
+        }
         _ => None,
+    }) else {
+        return Ok(());
     };
-    for reference in refs.into_iter().flatten() {
+    for (index, reference) in refs.into_iter().flatten().enumerate() {
         let span = reference
             .end_line
             .checked_sub(reference.start_line)
             .and_then(|delta| delta.checked_add(1));
-        if reference.start_line == 0
-            || reference.end_line == 0
-            || span.is_none_or(|span| span > MAX_CODE_REF_LINES)
-        {
+        let invalid_reason = if reference.start_line == 0 {
+            Some("start_line is 0, but source lines are one-based".to_string())
+        } else if reference.end_line == 0 {
+            Some("end_line is 0, but source lines are one-based".to_string())
+        } else if reference.end_line < reference.start_line {
+            Some(format!(
+                "end_line {} precedes start_line {}; the inclusive range must be nonempty",
+                reference.end_line, reference.start_line
+            ))
+        } else {
+            span.filter(|span| *span > MAX_CODE_REF_LINES).map(|span| {
+                format!(
+                    "the submitted span contains {span} inclusive lines, exceeding the maximum of {MAX_CODE_REF_LINES}"
+                )
+            })
+        };
+        if let Some(invalid_reason) = invalid_reason {
+            let side = match reference.side {
+                codescope_core::DiffSide::Old => "old",
+                codescope_core::DiffSide::New => "new",
+            };
             return Err(format!(
-                "diagram command code_ref must be one-based inclusive and at most {MAX_CODE_REF_LINES} lines"
+                "diagram command field `{field}[{index}]` is invalid: {invalid_reason}; submitted {}#h{} {side} {}..{}. Retry the same `{op}` with this reference corrected from retained git_diff_file evidence: copy exact one-based annotated line numbers on one side of one hunk, keep the inclusive span at most {MAX_CODE_REF_LINES} lines, and do not invent or calculate line numbers",
+                reference.file,
+                reference.hunk,
+                reference.start_line,
+                reference.end_line,
             ));
         }
     }
@@ -3352,6 +3381,11 @@ mod tests {
             let focused = focused_recovery_protocol("create_node", Some(1), Some(guidance));
             assert!(normal.contains(guidance));
             assert!(focused.contains(guidance));
+            for protocol in [&normal, &focused] {
+                assert!(protocol.contains("specifically identified reference"));
+                assert!(protocol.contains("preserve the intended node"));
+                assert!(protocol.contains("do not reuse, invent, or calculate"));
+            }
         }
 
         assert_eq!(
@@ -3503,8 +3537,43 @@ mod tests {
                 serde_json::json!({"op":op,"form_id":"main","node_id":"n1","patch":{"code_refs":[{"file":"main.go","hunk":0,"side":"new","start_line":1,"end_line":MAX_CODE_REF_LINES + 1}]}})
             };
             let error = parse_provider_diagram_command(&oversized.to_string()).unwrap_err();
-            assert!(error.contains("at most"), "{op}: {error}");
+            let field = if op == "create_node" {
+                "node.code_refs[0]"
+            } else {
+                "patch.code_refs[0]"
+            };
+            assert!(error.contains(field), "{op}: {error}");
+            assert!(error.contains("main.go#h0 new 1..13"), "{op}: {error}");
+            assert!(
+                error.contains("contains 13 inclusive lines, exceeding the maximum of 12"),
+                "{op}: {error}"
+            );
+            assert!(
+                error.contains(&format!("Retry the same `{op}`")),
+                "{op}: {error}"
+            );
+            assert!(
+                error.contains("do not invent or calculate"),
+                "{op}: {error}"
+            );
         }
+
+        let mut zero_based = canonical.clone();
+        zero_based["node"]["code_refs"][0]["start_line"] = serde_json::json!(0);
+        let error = parse_provider_diagram_command(&zero_based.to_string()).unwrap_err();
+        assert!(
+            error.contains("start_line is 0, but source lines are one-based"),
+            "{error}"
+        );
+
+        let mut reversed = canonical;
+        reversed["node"]["code_refs"][0]["start_line"] = serde_json::json!(9);
+        reversed["node"]["code_refs"][0]["end_line"] = serde_json::json!(4);
+        let error = parse_provider_diagram_command(&reversed.to_string()).unwrap_err();
+        assert!(
+            error.contains("end_line 4 precedes start_line 9"),
+            "{error}"
+        );
     }
 
     #[test]

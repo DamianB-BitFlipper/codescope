@@ -154,6 +154,7 @@ fn pure_pipeline_produces_digest() {
     let repo_ctx = RepoContext {
         toplevel: Utf8PathBuf::from("/repo"),
         head: HeadState::Branch("feature/spanish".to_string()),
+        head_oid: None,
         upstream: None,
         base: Some(BaseInfo {
             source: BaseSource::OriginHead,

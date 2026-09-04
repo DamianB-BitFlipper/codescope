@@ -48,14 +48,20 @@ controller decisions, and any reasoning field returned by the configured provide
 contain repository source and model output, so review them before sharing. Providers do not
 necessarily expose their hidden chain-of-thought; the log records only data they actually return.
 
-Codescope also keeps an always-on, local-only `telemetry.jsonl` beside the global config. Each
-line is a timestamped, session-correlated JSON object. It records command/session metadata; raw
+Codescope also keeps an always-on, local-only `telemetry/` directory beside the global config,
+with one JSONL file per process/session. Each line is a timestamped, session-correlated JSON
+object. It records command/session metadata; raw
 key presses; typed picker input; file/symbol selection; focused file and hunk; pane and scroll
 offsets; mouse clicks, wheels, drags, and coordinates; control-client actions; and complete
 provider request, response, usage, latency, and error envelopes. LLM bodies retain prompts, tool
 calls/results, returned reasoning fields, and completions after recognizable credential values
-are scrubbed. Authorization headers and API keys are never recorded. The file is append-only,
-owner-readable on Unix, and is not uploaded by Codescope.
+are scrubbed. Once a comparison loads, one content-addressed `diff.snapshot` records the complete
+privacy-filtered unified diff plus base/head and file/hunk mapping metadata. Later UI, controller,
+snapshot, and LLM records carry its `diff_snapshot_id`; identical refreshes reuse the payload
+instead of writing it again, and correlation is cleared while a comparison is stale or unavailable.
+Authorization headers, API keys, excluded files, and absolute repository paths are never recorded.
+Each session file is append-only, owner-readable on Unix, and is not uploaded by Codescope. See
+[`docs/telemetry.md`](docs/telemetry.md) for the event contract.
 
 ## Agent skill
 
@@ -78,9 +84,9 @@ Codescope keeps repository-independent preferences in
 `$XDG_CONFIG_HOME/codescope/config.toml`, falling back to
 `$HOME/.config/codescope/config.toml` (or the platform config directory on Windows).
 Set `CODESCOPE_CONFIG` to use an explicit file. There is currently no repository-local
-configuration. Telemetry follows that override and uses a sibling named `telemetry.jsonl`; if
-that directory cannot be written, it falls back to the platform temporary directory under
-`codescope/telemetry.jsonl`.
+configuration. Telemetry follows that override and uses a sibling directory named `telemetry/`;
+if that directory cannot be written, it falls back to the platform temporary directory under
+`codescope/telemetry/`. Session files are named `<timestamp>-<pid>-<nonce>.jsonl`.
 
 The v1 TOML file can contain normal `[ai]` defaults plus the model last selected for each
 provider and stable UI preferences:
@@ -128,10 +134,10 @@ guessed endpoint.
 Open a Go repository with uncommitted or branch changes. The left pane lists changed files
 and the symbols inside them; the center shows a focused diff. Syntax colors arrive
 asynchronously from the language server for the visible file and fall back silently to the plain
-diff when unavailable. The combined Impact pane
-stacks the selected change, callers, and downstream relationships on the left and keeps
-the generated selection breakdown visible on the right. Every structural boundary is
-draggable: files/diff, work/review, relationships/generated, selected/callers, and
+diff when unavailable. The combined Impact pane gives its full width to the generated selection
+breakdown by default. When the selected item has caller or downstream relationship rows, their
+stack appears on the left. Every visible structural boundary is draggable: files/diff,
+work/review, and—when relationships exist—relationships/generated, selected/callers, and
 callers/downstream. Divider positions are remembered globally.
 The mouse wheel scrolls whichever section is under the pointer—Files, Diff, Callers,
 Downstream, or the generated breakdown—without changing keyboard focus or the selected change.
