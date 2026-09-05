@@ -2699,31 +2699,20 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
         .border_style(Style::new().fg(ACCENT))
         .title(title);
     let models = filter_candidates(&snap.available_models, &app.model_query);
-    let supports_reasoning_effort = snap.ai_provider != "anthropic";
     let selected_effort = app.selected_reasoning_effort();
-    let mut items = if supports_reasoning_effort {
-        vec![
-            ListItem::new(Line::from(vec![
-                Span::styled("  reasoning effort  ", Style::new().fg(MUTED)),
-                Span::styled(
-                    format!("← {selected_effort} →"),
-                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-            ])),
-            ListItem::new(Line::from(Span::styled(
-                "  default is automatic; explicit support varies by model",
-                Style::new().fg(MUTED),
-            ))),
-        ]
-    } else {
-        vec![
-            ListItem::new(Line::from(Span::styled(
-                "  reasoning effort is unavailable through Anthropic's native API",
-                Style::new().fg(MUTED),
-            ))),
-            ListItem::new(Line::from("")),
-        ]
-    };
+    let mut items = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled("  reasoning effort  ", Style::new().fg(MUTED)),
+            Span::styled(
+                format!("← {selected_effort} →"),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        ListItem::new(Line::from(Span::styled(
+            "  default is automatic; explicit support varies by model",
+            Style::new().fg(MUTED),
+        ))),
+    ];
     let model_items: Vec<ListItem> = if snap.available_models.is_empty() {
         let message = if snap.ai_model.is_empty() && snap.ai_provider.is_empty() {
             "  AI is not configured; set a provider API key".to_string()
@@ -2782,11 +2771,7 @@ fn render_model_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsh
         Style::new().fg(WARN),
     ))));
     items.push(ListItem::new(Line::from(Span::styled(
-        if supports_reasoning_effort {
-            "  ←/→ reasoning · type to filter · ↑/↓ move · Enter apply · Esc close"
-        } else {
-            "  type to filter · ↑/↓ move · Enter model · Esc close"
-        },
+        "  ←/→ reasoning · type to filter · ↑/↓ move · Enter apply · Esc close",
         Style::new().fg(MUTED),
     ))));
     let mut state = ListState::default();

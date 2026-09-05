@@ -476,9 +476,7 @@ async fn dispatch(
             app.model_query.clear();
         }
         Action::ReasoningEffortPrevious | Action::ReasoningEffortNext => {
-            if app.snapshot.ai_provider != "anthropic" {
-                app.apply(action);
-            }
+            app.apply(action);
         }
         Action::RefreshGit | Action::GenerateAi | Action::ToggleAiGenerationMode => {
             let _ = tx.send(action).await;
@@ -941,9 +939,9 @@ mod tests {
         let mut app = App::new();
         let mut pending = PendingScope::default();
         app.update(UiSnapshot {
-            ai_provider: "openai".to_string(),
-            ai_model: "gpt-test".to_string(),
-            available_models: vec!["gpt-test".to_string()],
+            ai_provider: "anthropic".to_string(),
+            ai_model: "claude-test".to_string(),
+            available_models: vec!["claude-test".to_string()],
             ai_reasoning_effort: "low".to_string(),
             available_reasoning_efforts: ["default", "low", "medium", "high"]
                 .map(str::to_string)
@@ -981,7 +979,7 @@ mod tests {
         assert_eq!(
             rx.recv().await,
             Some(Action::AiSettingsSelected {
-                model: "gpt-test".to_string(),
+                model: "claude-test".to_string(),
                 reasoning_effort: "medium".to_string(),
             })
         );

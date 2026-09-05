@@ -92,15 +92,19 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    snapshot, so each CLI call returns the resulting draft or validation error synchronously.
 6. **AI**: OpenAI Responses, compatible Chat Completions, and native Anthropic Messages via reqwest
    0.13. Direct OpenAI tool turns replay returned output items (including encrypted reasoning)
-   without provider-side storage. A
+   without provider-side storage. Anthropic requests use native authentication/version headers,
+   `tool_use`/`tool_result`, and `output_config.effort`; continuations replay complete signed
+   thinking content and identify failed tool results with `is_error`. A
    bounded loop researches and
    incrementally builds the renderer-native `DiagramDraft` through create/update/delete tools.
-   Production research starts with one selection-specific `Required` inventory call
+   Production research starts with one selection-specific controller-required inventory call
    (`list_directory` for a directory, `git_status_file` for a file/symbol), so a multi-hunk file
    cannot silently collapse to hunk zero. Later research and normal full-schema construction turns
    use `Auto` tool choice. Once an exact diff is retained, the intent/form bootstrap and a focused
-   recovery from a provider-truncated response use `Required` with one controller-selected canonical editor
-   branch; the next normal turn returns to full-schema `Auto`. A tool-less full `Auto` turn
+   recovery from a provider-truncated response use one controller-selected canonical editor
+   branch; the next normal turn returns to full-schema `Auto`. OpenAI transports express required
+   turns in `tool_choice`; Anthropic remains `auto` for thinking-model compatibility and enforces
+   the singleton requirement at the controller boundary. A tool-less full `Auto` turn
    validates and publishes the draft. Complete drafts also auto-validate after a small bounded
    finalization window, and before an unsolicited destructive rebuild. Six structural forms
    (legacy `impact_summary`/`focused_diff` are rejected at the AI plan boundary); reviewer-first contract (required

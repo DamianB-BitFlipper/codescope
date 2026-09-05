@@ -9,7 +9,8 @@ use std::collections::HashSet;
 
 use codescope_ai::{
     parse_plan, validate, AiActivityObserver, AiActivityUpdate, AiOutcome, AiService,
-    AiToolActivityState, DiagramObserver, FactView, ReasoningEffort, DIAGRAM_EDIT_TOOL_NAME,
+    AiToolActivityState, DiagramObserver, FactView, ProviderKind, ReasoningEffort,
+    DIAGRAM_EDIT_TOOL_NAME,
 };
 use codescope_analysis::{AnalysisEngine, AnalysisSnapshot};
 use codescope_core::{
@@ -1220,9 +1221,11 @@ impl Dispatcher {
             }
         };
         let ai = self.ai.clone();
-        let changed = if ai.provider_label() == "anthropic" && effort != ReasoningEffort::Default {
+        let changed = if ai.client().provider() == ProviderKind::Anthropic
+            && matches!(effort, ReasoningEffort::None | ReasoningEffort::Minimal)
+        {
             self.set_status(
-                "reasoning_effort is unavailable through Anthropic's native API",
+                "Anthropic reasoning effort supports default, low, medium, high, xhigh, or max",
                 StatusLevel::Warning,
             );
             false
@@ -3313,6 +3316,10 @@ impl Dispatcher {
             ai_reasoning_effort: self.ai.reasoning_effort().as_str().to_string(),
             available_reasoning_efforts: ReasoningEffort::ALL
                 .iter()
+                .filter(|effort| {
+                    self.ai.client().provider() != ProviderKind::Anthropic
+                        || !matches!(effort, ReasoningEffort::None | ReasoningEffort::Minimal)
+                })
                 .map(|effort| effort.as_str().to_string())
                 .collect(),
             ai_provider: self.ai.provider_label().to_string(),

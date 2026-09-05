@@ -1482,10 +1482,12 @@ fn completion_feedback(completion: &DraftCompletion, repo_root: &Utf8Path) -> St
 /// True when a provider explicitly says it exhausted its output budget.
 ///
 /// Chat Completions uses `length`; Responses' `max_output_tokens` reason is normalized to
-/// `length`; Anthropic Messages uses `max_tokens`. The controller policy deliberately does not
-/// inspect model names.
+/// `length`; Anthropic Messages uses `max_tokens` or `model_context_window_exceeded`. The
+/// controller policy deliberately does not inspect model names.
 fn finish_reason_is_length(reason: Option<&str>) -> bool {
-    matches!(reason, Some(value) if value.eq_ignore_ascii_case("length") || value.eq_ignore_ascii_case("max_tokens"))
+    matches!(reason, Some(value) if value.eq_ignore_ascii_case("length")
+        || value.eq_ignore_ascii_case("max_tokens")
+        || value.eq_ignore_ascii_case("model_context_window_exceeded"))
 }
 
 /// Whether a provider response tries to remove accepted live-draft structure.
@@ -3802,5 +3804,14 @@ mod tests {
     fn tool_error_result_is_json() {
         let v: serde_json::Value = serde_json::from_str(&error_result("boom".into())).unwrap();
         assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn provider_output_limit_reasons_include_anthropic_context_window() {
+        for reason in ["length", "max_tokens", "model_context_window_exceeded"] {
+            assert!(finish_reason_is_length(Some(reason)), "{reason}");
+        }
+        assert!(!finish_reason_is_length(Some("end_turn")));
+        assert!(!finish_reason_is_length(None));
     }
 }

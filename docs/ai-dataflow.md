@@ -172,13 +172,19 @@ the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` re
 The client speaks OpenAI Responses for the official OpenAI endpoint, OpenAI-compatible Chat
 Completions for Prime and custom endpoints, and native Anthropic Messages for Anthropic. Responses
 turns use nested `reasoning.effort`, flat function tools, and stateless replay of every returned
-output item; provider-side storage is disabled. A selection-specific initial inventory, the initial
-intent/form bootstrap after retained diff evidence,
-and a focused recovery from a provider-truncated response, use `Required` with one
-controller-selected canonical branch. Other research/construction turns use `Auto`. A tool-less
-full `Auto` turn is one completion signal; bounded finalization is another. If the accumulated
-draft is invalid, the service uses one of its bounded repair turns to return exact validation
-feedback. Verified against Prime
+output item; provider-side storage is disabled. Anthropic turns use `x-api-key`, the stable
+`anthropic-version` header, native `tool_use`/`tool_result` blocks, and
+`output_config.effort`. Codescope replays Anthropic's complete assistant content—including signed
+thinking blocks—unchanged when returning tool results, and marks failed results with `is_error`.
+
+A selection-specific initial inventory, the initial intent/form bootstrap after retained diff
+evidence, and a focused recovery from a provider-truncated response are controller-required turns
+with one selected canonical branch. OpenAI and compatible transports send provider-level
+`Required`; Anthropic keeps `tool_choice: auto` because current thinking models can reject forced
+tool choice, then the same controller validates the required singleton call locally. Other
+research/construction turns use `Auto`. A tool-less full `Auto` turn is one completion signal;
+bounded finalization is another. If the accumulated draft is invalid, the service uses one of its
+bounded repair turns to return exact validation feedback. Verified against Prime
 Inference (`https://api.pinference.ai/api/v1`) and OpenAI; anything compatible (Ollama, vLLM, …)
 works by setting the base URL. Prime Inference defaults to `openai/gpt-5.6-luna`; direct OpenAI and
 Anthropic credentials retain provider-native defaults.

@@ -190,15 +190,21 @@ Messages with `tool_use`/`tool_result` blocks for Anthropic. Verified targets in
 (`https://api.openai.com/v1`), Prime
 Inference (`https://api.pinference.ai/api/v1`), and Anthropic
 (`https://api.anthropic.com/v1`). Compatible local Chat Completions endpoints such as Ollama,
-vLLM, and LM Studio can be selected with an explicit base URL.
+vLLM, and LM Studio can be selected with an explicit base URL. Native Anthropic requests carry
+`x-api-key` plus `anthropic-version: 2023-06-01`; explicit supported reasoning levels use
+`output_config.effort`. Tool continuations preserve Anthropic's complete signed assistant blocks,
+put immediate `tool_result` blocks first in the following user turn, and set `is_error` on failures.
 
 Plan construction uses shared incremental diagram tools. The selection-specific initial inventory
-uses `Required`; later research and normal full-schema construction turns use `Auto` tool choice.
+is controller-required; later research and normal full-schema construction turns use `Auto` tool
+choice.
 After exact diff evidence is retained, the initial
-intent/form bootstrap and a focused recovery from a provider-truncated response use `Required`
-with one controller-selected canonical editor branch; the following normal turn returns to
-full-schema `Auto`. Atomic edits mutate a bounded draft, inspection returns its current state, and
-a tool-less full `Auto` turn requests deterministic validation/publication. A structurally complete
+intent/form bootstrap and a focused recovery from a provider-truncated response use one
+controller-selected canonical editor branch; the following normal turn returns to full-schema
+`Auto`. OpenAI transports encode required turns in the request; Anthropic keeps provider tool
+choice on `auto` for thinking-model compatibility and applies the requirement during controller
+validation. Atomic edits mutate a bounded draft, inspection returns its current state, and a
+tool-less full `Auto` turn requests deterministic validation/publication. A structurally complete
 draft also validates after a small bounded refinement window or before an unsolicited destructive
 rebuild, preventing endless edit cycles. There is no whole-plan
 tool fallback or separate model completion tool.

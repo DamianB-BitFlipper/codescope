@@ -253,7 +253,10 @@ codescope --model openai/gpt-5.6-luna --reasoning-effort high .
 `CODESCOPE_AI_BASE_URL` configures a custom OpenAI-compatible endpoint. An arbitrary credential
 environment variable requires an explicit base URL so Codescope never sends it to a guessed
 provider. The official OpenAI base uses the Responses API so reasoning and function tools work
-together; Prime and custom compatible providers continue to use Chat Completions.
+together; Prime and custom compatible providers continue to use Chat Completions. The official
+Anthropic base uses the native Messages API with `x-api-key` and the required API-version header.
+Anthropic `low` through `max` reasoning settings map to `output_config.effort` when the selected
+model supports them; `none` and `minimal` are rejected locally.
 
 ## Privacy and telemetry
 

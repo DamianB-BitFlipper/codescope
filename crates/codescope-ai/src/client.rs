@@ -1,9 +1,11 @@
 //! Provider-neutral OpenAI Responses / compatible Chat Completions / Anthropic Messages client.
 //!
 //! OpenAI's official API uses `POST {base_url}/responses`; other OpenAI-compatible providers use
-//! `POST {base_url}/chat/completions`; Anthropic uses its native Messages shape. Callers select Auto
-//! or Required tool choice and provide incremental draft-editor tools. Streaming is off; draft
-//! mutations are ordinary tool turns and final publication is atomic.
+//! `POST {base_url}/chat/completions`; Anthropic uses its native Messages shape. Callers mark turns
+//! Auto or Required and provide incremental draft-editor tools. Anthropic keeps provider tool
+//! choice on Auto for thinking-model compatibility while Codescope enforces Required turns in its
+//! controller. Streaming is off; draft mutations are ordinary tool turns and final publication is
+//! atomic.
 //!
 //! Local protections (all before/around the network call):
 //!
@@ -102,6 +104,19 @@ impl ChatMessage {
     /// content. Keep only valid text/content blocks and omit the turn entirely otherwise.
     #[must_use]
     pub fn assistant_text_for_repair(message: &Value) -> Option<Self> {
+        let has_tool_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        if !has_tool_calls
+            && (message.get(RESPONSES_OUTPUT_FIELD).is_some()
+                || message.get(ANTHROPIC_CONTENT_FIELD).is_some())
+        {
+            // Native reasoning transports can replay their complete, provider-authenticated
+            // assistant output before the repair prompt. A rejected response containing tool calls
+            // cannot be replayed without matching results, so it follows the text-only path below.
+            return Some(ChatMessage(message.clone()));
+        }
         let content = message.get("content")?;
         let present = match content {
             Value::String(text) => !text.trim().is_empty(),
@@ -272,10 +287,13 @@ impl AiClient {
         let base = config.base_url.trim_end_matches('/');
         let provider = config.provider();
         if provider == ProviderKind::Anthropic
-            && config.reasoning_effort != ReasoningEffort::Default
+            && matches!(
+                config.reasoning_effort,
+                ReasoningEffort::None | ReasoningEffort::Minimal
+            )
         {
             return Err(AiError::Config(
-                "reasoning_effort is not supported by Anthropic's native API; use default with Anthropic"
+                "Anthropic output_config.effort supports default, low, medium, high, xhigh, or max; none and minimal are unavailable"
                     .into(),
             ));
         }
@@ -367,6 +385,15 @@ impl AiClient {
     /// Cheap: only the protocol-appropriate request-body reasoning field changes; no reconnect is
     /// needed.
     pub fn set_reasoning_effort(&self, effort: ReasoningEffort) {
+        if self.protocol == WireProtocol::AnthropicMessages
+            && matches!(effort, ReasoningEffort::None | ReasoningEffort::Minimal)
+        {
+            tracing::warn!(
+                reasoning_effort = %effort,
+                "unsupported Anthropic reasoning effort ignored"
+            );
+            return;
+        }
         tracing::info!(reasoning_effort = %effort, "ai reasoning effort changed");
         if let Ok(mut selected) = self.reasoning_effort.lock() {
             *selected = effort;
@@ -461,6 +488,7 @@ impl AiClient {
             }
             WireProtocol::AnthropicMessages => build_anthropic_body_with_tool_choice(
                 &self.model(),
+                self.reasoning_effort(),
                 messages,
                 tool_values,
                 require_tool,
@@ -472,6 +500,12 @@ impl AiClient {
     /// Attach provider-appropriate auth headers. Key material is exposed only here, and the
     /// header is marked sensitive so it is never logged (research 07 §2).
     fn apply_auth(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.provider == ProviderKind::Anthropic {
+            // This version header is required for every native Anthropic API request, including
+            // model listing. Keep it independent of the key so even a misconfigured request has
+            // the correct protocol shape and receives Anthropic's honest authentication error.
+            request = request.header("anthropic-version", "2023-06-01");
+        }
         if let Some(key) = &self.api_key {
             match self.provider {
                 ProviderKind::OpenAiCompatible => {
@@ -498,9 +532,7 @@ impl AiClient {
                         reqwest::header::HeaderValue::from_str(key.expose_secret())
                     {
                         value.set_sensitive(true);
-                        request = request
-                            .header("x-api-key", value)
-                            .header("anthropic-version", "2023-06-01");
+                        request = request.header("x-api-key", value);
                     }
                 }
             }
@@ -899,6 +931,7 @@ fn body_snippet(text: String) -> String {
 }
 
 const RESPONSES_OUTPUT_FIELD: &str = "_codescope_responses_output";
+const ANTHROPIC_CONTENT_FIELD: &str = "_codescope_anthropic_content";
 
 /// Build an OpenAI Responses API request from Codescope's provider-neutral conversation.
 ///
@@ -1135,13 +1168,15 @@ fn parse_openai_response(body: Value) -> Result<RawPlanResponse, AiError> {
 /// field, `messages` alternating user/assistant, tool calls as assistant `tool_use` content
 /// blocks, and tool results as user `tool_result` blocks.
 ///
-/// Requiring a tool is used only for focused singleton controller turns. Other turns retain
-/// normal automatic tool selection.
+/// Anthropic tool selection remains `auto`, including for focused singleton controller turns.
+/// Newer thinking models reject forced `any`/`tool` choices, while Codescope's controller already
+/// validates that focused turns return exactly the required call.
 fn build_anthropic_body_with_tool_choice(
     model: &str,
+    reasoning_effort: ReasoningEffort,
     messages: &[ChatMessage],
     tool_values: &[Value],
-    require_tool: bool,
+    _require_tool: bool,
     max_tokens_override: Option<u64>,
 ) -> Value {
     let mut system_parts: Vec<String> = Vec::new();
@@ -1165,35 +1200,72 @@ fn build_anthropic_body_with_tool_choice(
             }
             Some("tool") => {
                 // OpenAI tool result → Anthropic user message carrying tool_result blocks.
-                out_messages.push(json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": v.get("tool_call_id").cloned().unwrap_or(Value::Null),
-                        "content": v.get("content").cloned().unwrap_or(Value::String(String::new())),
-                    }],
-                }));
+                let content = v
+                    .get("content")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new()));
+                let mut result = json!({
+                    "type": "tool_result",
+                    "tool_use_id": v.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                    "content": content,
+                });
+                if anthropic_tool_result_is_error(&content) {
+                    result["is_error"] = Value::Bool(true);
+                }
+                out_messages.push(json!({"role": "user", "content": [result]}));
             }
             _ => {}
         }
     }
-    // Anthropic requires alternating roles; merge consecutive same-role messages.
+    // Anthropic combines consecutive same-role turns. Merge them explicitly so tool_result blocks
+    // remain first in the immediate user turn that follows an assistant tool_use.
     let merged = merge_same_role(out_messages);
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens_override.unwrap_or(4096),
         "messages": merged,
-        "tools": anthropic_tools(tool_values),
-        "tool_choice": { "type": if require_tool { "any" } else { "auto" } },
     });
+    if !tool_values.is_empty() {
+        body["tools"] = Value::Array(anthropic_tools(tool_values));
+        // `auto` works across classic, extended-thinking, and always-adaptive models. Codescope's
+        // controller still rejects a response that misses a locally required singleton operation.
+        body["tool_choice"] = json!({"type": "auto"});
+    }
     if !system_parts.is_empty() {
         body["system"] = Value::String(system_parts.join("\n\n"));
+    }
+    if let Some(effort) = anthropic_effort_wire_value(reasoning_effort) {
+        body["output_config"] = json!({"effort": effort});
     }
     body
 }
 
+fn anthropic_effort_wire_value(effort: ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::Default | ReasoningEffort::None | ReasoningEffort::Minimal => None,
+        ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High => Some("high"),
+        ReasoningEffort::XHigh => Some("xhigh"),
+        ReasoningEffort::Max => Some("max"),
+    }
+}
+
+fn anthropic_tool_result_is_error(content: &Value) -> bool {
+    let parsed = match content {
+        Value::String(text) => serde_json::from_str::<Value>(text).ok(),
+        value => Some(value.clone()),
+    };
+    parsed.is_some_and(|value| {
+        value.get("error").is_some() || value.get("ok").and_then(Value::as_bool) == Some(false)
+    })
+}
+
 /// Convert an OpenAI assistant message (content + tool_calls) into Anthropic content blocks.
 fn anthropic_assistant_message(v: &Value) -> Value {
+    if let Some(content) = v.get(ANTHROPIC_CONTENT_FIELD).and_then(Value::as_array) {
+        return json!({"role": "assistant", "content": content});
+    }
     let mut content: Vec<Value> = Vec::new();
     if let Some(text) = v.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
@@ -1234,7 +1306,7 @@ fn anthropic_tools(tool_values: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Merge consecutive same-role messages (Anthropic requires strict alternation).
+/// Merge consecutive same-role messages using Anthropic's documented role-combination semantics.
 fn merge_same_role(messages: Vec<Value>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for m in messages {
@@ -1268,44 +1340,67 @@ fn merge_same_role(messages: Vec<Value>) -> Vec<Value> {
 fn parse_anthropic_response(body: Value) -> Result<RawPlanResponse, AiError> {
     let model = body["model"].as_str().map(str::to_string);
     let finish_reason = body["stop_reason"].as_str().map(str::to_string);
+    let content = body
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AiError::MalformedResponse("Anthropic response has no content blocks".into())
+        })?;
     let mut tool_calls = Vec::new();
     let mut text_parts = Vec::new();
-    if let Some(blocks) = body.get("content").and_then(Value::as_array) {
-        for b in blocks {
-            match b.get("type").and_then(Value::as_str) {
-                Some("tool_use") => {
-                    let name = b["name"].as_str().unwrap_or_default();
-                    if name.is_empty() {
-                        return Err(AiError::MalformedResponse("tool_use without a name".into()));
-                    }
-                    let input = b
-                        .get("input")
-                        .cloned()
-                        .unwrap_or(Value::Object(Default::default()));
-                    tool_calls.push(RawToolCall {
-                        id: b["id"].as_str().unwrap_or_default().to_string(),
-                        name: name.to_string(),
-                        arguments: input.to_string(),
-                    });
+    for block in content {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if id.is_empty() || name.is_empty() {
+                    return Err(AiError::MalformedResponse(
+                        "Anthropic tool_use without an id or name".into(),
+                    ));
                 }
-                Some("text") => text_parts.push(b["text"].as_str().unwrap_or_default()),
-                _ => {}
+                let input = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default()));
+                tool_calls.push(RawToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: input.to_string(),
+                });
             }
+            Some("text") => text_parts.push(block["text"].as_str().unwrap_or_default()),
+            // Thinking and redacted-thinking blocks are not interpreted, but the exact signed
+            // blocks are retained below and replayed unchanged on the next tool turn.
+            _ => {}
         }
     }
-    // Rebuild an OpenAI-shaped assistant message so the tool loop's echo path stays uniform.
-    let message = if tool_calls.is_empty() {
-        json!({"role": "assistant", "content": text_parts.join("\n")})
-    } else {
-        json!({
-            "role": "assistant",
-            "tool_calls": tool_calls.iter().map(|c| json!({
-                "id": c.id,
-                "type": "function",
-                "function": {"name": c.name, "arguments": c.arguments},
-            })).collect::<Vec<_>>(),
-        })
-    };
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text_parts.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text_parts.join("\n"))
+        },
+    });
+    message[ANTHROPIC_CONTENT_FIELD] = Value::Array(content.clone());
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(
+            tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })
+                })
+                .collect(),
+        );
+    }
     Ok(RawPlanResponse {
         message,
         tool_calls,
@@ -1398,12 +1493,57 @@ mod tests {
     }
 
     #[test]
-    fn native_anthropic_rejects_chat_completions_reasoning_effort() {
+    fn native_anthropic_maps_documented_effort_and_rejects_unsupported_levels() {
         let mut cfg = enabled_config();
         cfg.base_url = crate::ANTHROPIC_BASE_URL.to_string();
-        cfg.reasoning_effort = ReasoningEffort::High;
-        let error = AiClient::new(&cfg).expect_err("native Anthropic must not silently ignore it");
-        assert!(error.to_string().contains("not supported"), "{error}");
+        for (effort, wire) in [
+            (ReasoningEffort::Default, None),
+            (ReasoningEffort::Low, Some("low")),
+            (ReasoningEffort::Medium, Some("medium")),
+            (ReasoningEffort::High, Some("high")),
+            (ReasoningEffort::XHigh, Some("xhigh")),
+            (ReasoningEffort::Max, Some("max")),
+        ] {
+            cfg.reasoning_effort = effort;
+            let client = AiClient::new(&cfg).expect("documented Anthropic effort");
+            let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
+            match wire {
+                Some(wire) => assert_eq!(body["output_config"]["effort"], wire),
+                None => assert!(body.get("output_config").is_none()),
+            }
+        }
+
+        for effort in [ReasoningEffort::None, ReasoningEffort::Minimal] {
+            cfg.reasoning_effort = effort;
+            let error = AiClient::new(&cfg).expect_err("unsupported effort must fail locally");
+            assert!(error.to_string().contains("none and minimal"), "{error}");
+        }
+    }
+
+    #[test]
+    fn native_anthropic_always_sends_version_and_uses_x_api_key() {
+        let mut cfg = enabled_config();
+        cfg.base_url = crate::ANTHROPIC_BASE_URL.to_string();
+        let client = AiClient::new(&cfg).unwrap();
+        let request = client
+            .apply_auth(client.http.post(client.endpoint()))
+            .build()
+            .unwrap();
+        assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+        assert_eq!(request.headers()["x-api-key"], "sk-test");
+        assert!(request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none());
+
+        cfg.api_key = None;
+        let keyless = AiClient::new(&cfg).unwrap();
+        let request = keyless
+            .apply_auth(keyless.http.post(keyless.endpoint()))
+            .build()
+            .unwrap();
+        assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+        assert!(request.headers().get("x-api-key").is_none());
     }
 
     #[test]
@@ -1577,7 +1717,7 @@ mod tests {
 
         assert_eq!(body["max_tokens"], 4_096);
         assert!(body.get("max_completion_tokens").is_none());
-        assert_eq!(body["tool_choice"]["type"], "any");
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]
@@ -1763,6 +1903,38 @@ mod tests {
     }
 
     #[test]
+    fn repair_replays_native_anthropic_blocks_only_without_dangling_tool_calls() {
+        let raw_content = json!([{
+            "type": "thinking",
+            "thinking": "I need a different tool.",
+            "signature": "signed-repair-thinking"
+        }, {
+            "type": "text",
+            "text": "I can revise the approach."
+        }]);
+        let mut natural = json!({
+            "role": "assistant",
+            "content": "I can revise the approach."
+        });
+        natural[ANTHROPIC_CONTENT_FIELD] = raw_content;
+        let replay = ChatMessage::assistant_text_for_repair(&natural).unwrap();
+        assert_eq!(replay.as_value(), &natural);
+
+        let mut rejected_tool_turn = natural;
+        rejected_tool_turn["tool_calls"] = json!([{
+            "id": "toolu_rejected",
+            "type": "function",
+            "function": {"name": "wrong_tool", "arguments": "{}"}
+        }]);
+        let replay = ChatMessage::assistant_text_for_repair(&rejected_tool_turn).unwrap();
+        assert_eq!(
+            replay.as_value(),
+            &json!({"role": "assistant", "content": "I can revise the approach."}),
+            "a rejected tool_use cannot be replayed without its matching tool_result"
+        );
+    }
+
+    #[test]
     fn breaker_opens_after_threshold_and_probes_after_cooldown() {
         let options = AiClientOptions {
             cooldown: Duration::from_millis(20),
@@ -1862,8 +2034,14 @@ mod tests {
             "type": "function",
             "function": {"name": "git_diff_file", "description": "d", "parameters": {"type":"object"}},
         })];
-        let body =
-            build_anthropic_body_with_tool_choice("claude-x", &messages, &tools, false, None);
+        let body = build_anthropic_body_with_tool_choice(
+            "claude-x",
+            ReasoningEffort::Default,
+            &messages,
+            &tools,
+            false,
+            None,
+        );
         assert_eq!(body["model"], "claude-x");
         assert_eq!(body["system"], "sys");
         assert_eq!(body["tool_choice"]["type"], "auto");
@@ -1878,14 +2056,21 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_body_requires_the_focused_tool() {
+    fn anthropic_focused_tool_stays_auto_for_thinking_model_compatibility() {
         let messages = vec![ChatMessage::user("focused handoff")];
         let tools = vec![json!({
             "type": "function",
             "function": {"name": "edit_diagram", "parameters": {"type": "object"}},
         })];
-        let body = build_anthropic_body_with_tool_choice("claude-x", &messages, &tools, true, None);
-        assert_eq!(body["tool_choice"]["type"], "any");
+        let body = build_anthropic_body_with_tool_choice(
+            "claude-x",
+            ReasoningEffort::Default,
+            &messages,
+            &tools,
+            true,
+            None,
+        );
+        assert_eq!(body["tool_choice"]["type"], "auto");
     }
 
     #[test]
@@ -1895,9 +2080,17 @@ mod tests {
             ChatMessage::system(format!("compact base\n\n{protocol}")),
             ChatMessage::user("compact handoff"),
         ];
-        let body = build_anthropic_body_with_tool_choice("claude-x", &messages, &[], false, None);
+        let body = build_anthropic_body_with_tool_choice(
+            "claude-x",
+            ReasoningEffort::Default,
+            &messages,
+            &[],
+            false,
+            None,
+        );
 
-        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("tools").is_none());
         assert_eq!(body["system"], format!("compact base\n\n{protocol}"));
         assert_eq!(
             body["system"]
@@ -1932,11 +2125,90 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_tool_continuation_replays_signed_blocks_and_marks_errors() {
+        let original_content = json!([
+            {
+                "type": "thinking",
+                "thinking": "I should inspect the selected hunk.",
+                "signature": "signed-thinking"
+            },
+            {"type": "text", "text": "I will inspect it."},
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "git_diff_file",
+                "input": {"file": "src/lib.rs", "hunk_index": 0}
+            }
+        ]);
+        let parsed = parse_anthropic_response(json!({
+            "model": "claude-sonnet-5",
+            "stop_reason": "tool_use",
+            "content": original_content,
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed.message[ANTHROPIC_CONTENT_FIELD], original_content,
+            "signed thinking and tool blocks must remain structurally unchanged"
+        );
+
+        let messages = vec![
+            ChatMessage::user("inspect"),
+            ChatMessage::assistant_raw(parsed.message),
+            ChatMessage::tool("toolu_1", r#"{"error":"hunk became stale"}"#),
+        ];
+        let body = build_anthropic_body_with_tool_choice(
+            "claude-sonnet-5",
+            ReasoningEffort::Medium,
+            &messages,
+            &[json!({
+                "type": "function",
+                "function": {
+                    "name": "git_diff_file",
+                    "description": "Read a diff",
+                    "parameters": {"type": "object"}
+                }
+            })],
+            false,
+            None,
+        );
+        assert_eq!(body["messages"][1]["content"], original_content);
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu_1");
+        assert_eq!(body["messages"][2]["content"][0]["is_error"], true);
+        assert_eq!(body["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn anthropic_successful_tool_results_do_not_claim_an_error() {
+        let messages = vec![ChatMessage::tool("toolu_1", r#"{"ok":true}"#)];
+        let body = build_anthropic_body_with_tool_choice(
+            "claude-x",
+            ReasoningEffort::Default,
+            &messages,
+            &[json!({
+                "type": "function",
+                "function": {
+                    "name": "inspect_visualization",
+                    "description": "inspect",
+                    "parameters": {"type": "object"}
+                }
+            })],
+            false,
+            None,
+        );
+        assert!(body["messages"][0]["content"][0].get("is_error").is_none());
+    }
+
+    #[test]
     fn anthropic_response_without_tool_use_is_a_natural_completion() {
         let body = json!({"model": "claude-x", "content": [{"type": "text", "text": "hi"}]});
         let response = parse_anthropic_response(body).unwrap();
         assert!(response.tool_calls.is_empty());
         assert_eq!(response.message["content"], "hi");
+        assert_eq!(
+            response.message[ANTHROPIC_CONTENT_FIELD],
+            json!([{"type": "text", "text": "hi"}])
+        );
     }
 
     #[test]
