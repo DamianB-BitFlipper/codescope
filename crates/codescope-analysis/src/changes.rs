@@ -685,12 +685,14 @@ mod tests {
         let change = file_change(FileStatus::Untracked, vec![]);
         let out = changed_symbols_detailed(Some(&worktree()), None, &change);
         assert_eq!(out.len(), 5); // main, Greeter, Name, Email, Hello
-        assert!(out
-            .iter()
-            .all(|c| c.record.change_kind == ChangeKind::Added));
-        assert!(out
-            .iter()
-            .all(|c| c.record.confidence == MappingConfidence::Exact));
+        assert!(
+            out.iter()
+                .all(|c| c.record.change_kind == ChangeKind::Added)
+        );
+        assert!(
+            out.iter()
+                .all(|c| c.record.confidence == MappingConfidence::Exact)
+        );
         assert!(out.iter().all(|c| c.record.hunks.is_empty()));
     }
 
@@ -718,9 +720,10 @@ mod tests {
         };
         let out = changed_symbols_detailed(None, Some(&base()), &change);
         assert_eq!(out.len(), 4); // main, Greeter, Greeter.Name, Legacy
-        assert!(out
-            .iter()
-            .all(|c| c.record.change_kind == ChangeKind::Deleted));
+        assert!(
+            out.iter()
+                .all(|c| c.record.change_kind == ChangeKind::Deleted)
+        );
         assert!(out.iter().all(|c| c.revision == Revision::Base));
         // Symbols intersected by the deletion hunk carry it.
         let main = out.iter().find(|c| c.name == "main").unwrap();

@@ -6,14 +6,14 @@
 //! never invalidates semantic or AI work.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use codescope_git::GitRepo;
 use notify::RecursiveMode;
-use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEventKind};
-use tokio::sync::{mpsc, Notify};
+use notify_debouncer_mini::{DebounceEventResult, DebouncedEventKind, new_debouncer};
+use tokio::sync::{Notify, mpsc};
 
 use crate::dispatcher::DispatchEvent;
 

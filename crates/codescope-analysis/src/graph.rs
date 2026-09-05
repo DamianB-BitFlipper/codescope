@@ -441,10 +441,12 @@ mod tests {
         let (callers, callees) =
             expand_symbol_relations(&svc, &main.file, main.selection.start()).await;
         assert_eq!(callers.completeness, Completeness::Partial);
-        assert!(callers
-            .notes
-            .iter()
-            .any(|n| n.contains("truncated by server")));
+        assert!(
+            callers
+                .notes
+                .iter()
+                .any(|n| n.contains("truncated by server"))
+        );
         assert_eq!(callees.completeness, Completeness::Partial);
         assert!(callees.notes.iter().any(|n| n.contains("timed out")));
         // The successful query still returned its caller.

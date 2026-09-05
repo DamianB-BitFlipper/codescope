@@ -20,7 +20,7 @@ use codescope_core::{
     Diagnostic, Evidence, FeatureSet, FileId, Location, Position, Revision, SymbolKind, SymbolNode,
     SymbolRef, SymbolTree, SyntaxToken,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -28,12 +28,12 @@ use crate::capabilities::{parse_text_document_sync, require, resolve_features};
 use crate::client::{LspClient, ShutdownOutcome};
 use crate::content_cache::{DocumentSnapshot, OpenDocumentState, SymbolTreeCache};
 use crate::detect::rust_project_root;
-use crate::encoding::{line_at, position_from_wire, position_to_wire, PositionEncoding};
+use crate::encoding::{PositionEncoding, line_at, position_from_wire, position_to_wire};
 use crate::error::{LspError, SemanticError};
 use crate::options::LanguageServiceOptions;
 use crate::semantic_tokens::{
-    client_capability as semantic_tokens_capability, decode as decode_semantic_tokens,
-    legend_from_capabilities, SemanticTokenLegend,
+    SemanticTokenLegend, client_capability as semantic_tokens_capability,
+    decode as decode_semantic_tokens, legend_from_capabilities,
 };
 use crate::uri::{path_from_uri, uri_from_path};
 

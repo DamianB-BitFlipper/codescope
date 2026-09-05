@@ -460,15 +460,17 @@ mod tests {
             matches!(cli.command, Some(backend::BackendCommand::Skills(_))),
             "skills must route to the bundled-skill commands"
         );
-        assert!(Cli::try_parse_from([
-            "codescope",
-            "skills",
-            "install",
-            "--global",
-            "--yes",
-            "--claude",
-        ])
-        .is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "codescope",
+                "skills",
+                "install",
+                "--global",
+                "--yes",
+                "--claude",
+            ])
+            .is_ok()
+        );
         let cli =
             Cli::try_parse_from(["codescope", "analyze", "/repo", "--scope", "staged"]).unwrap();
         match cli.command {

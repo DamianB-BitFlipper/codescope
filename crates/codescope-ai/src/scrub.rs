@@ -93,8 +93,10 @@ mod tests {
 
     #[test]
     fn scrubs_jwt_and_bearer() {
-        assert!(!scrub_secrets("Authorization: Bearer abcdef0123456789xyz")
-            .contains("abcdef0123456789xyz"));
+        assert!(
+            !scrub_secrets("Authorization: Bearer abcdef0123456789xyz")
+                .contains("abcdef0123456789xyz")
+        );
         assert!(scrub_secrets("token eyJhbGciOiJ9.eyJzdWIiOiIxIn0.abcDEF123").contains(REDACTED));
     }
 

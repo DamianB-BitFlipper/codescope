@@ -8,21 +8,21 @@
 //! zoomed. All colors come from the §2 palette below — never a bare `Color::Green`.
 
 use codescope_core::{AiStatus, ChangeScope, DiffSide, LsStatus, ValidationVerdict};
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
-use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{filter_candidates, App, Pane};
+use crate::app::{App, Pane, filter_candidates};
 use crate::diagram::DiagramRole;
 use crate::divider::DividerId;
 use crate::intraline;
 use crate::layout::{
-    choose_tier, files_width, impact_left_width, relationship_section_heights, Tier, MIN_DIFF_WIDTH,
+    MIN_DIFF_WIDTH, Tier, choose_tier, files_width, impact_left_width, relationship_section_heights,
 };
 use crate::review::{ReviewState, ReviewTarget};
 use crate::snapshot::{
@@ -2860,8 +2860,8 @@ fn render_base_picker(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsho
 mod tests {
     use super::*;
     use crate::snapshot::{DiffPane, FileRow, SymbolRow};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn buffer_text(t: &Terminal<TestBackend>) -> String {
         t.backend()
@@ -3453,14 +3453,18 @@ mod tests {
         let mut built = build_raw(&diff.rows, &spans, &syntax, 2, 0, 40, 48);
         apply_linked_diff_style(&mut built, &linked);
         for index in [1usize, 3, 5] {
-            assert!(built.lines[index]
-                .spans
-                .iter()
-                .all(|span| span.style.add_modifier.contains(Modifier::UNDERLINED)));
-            assert!(built.lines[index]
-                .spans
-                .iter()
-                .any(|span| span.style.bg == Some(CODE_LINK_BG)));
+            assert!(
+                built.lines[index]
+                    .spans
+                    .iter()
+                    .all(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            );
+            assert!(
+                built.lines[index]
+                    .spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(CODE_LINK_BG))
+            );
         }
         assert!(
             built.lines[1]
@@ -3476,10 +3480,12 @@ mod tests {
                 .any(|span| span.style.bg == Some(ADD_BG)),
             "added body retains its semantic background"
         );
-        assert!(built.lines[2]
-            .spans
-            .iter()
-            .all(|span| span.style.bg != Some(CODE_LINK_BG)));
+        assert!(
+            built.lines[2]
+                .spans
+                .iter()
+                .all(|span| span.style.bg != Some(CODE_LINK_BG))
+        );
     }
 
     #[test]
@@ -3524,14 +3530,18 @@ mod tests {
             assert_eq!(keyword.style.fg, Some(SYNTAX_KEYWORD));
             assert_eq!(keyword.style.bg, Some(background));
         }
-        assert!(built.lines[1]
-            .spans
-            .iter()
-            .any(|span| span.content.contains("old") && span.style.fg == Some(DEL_HI)));
-        assert!(built.lines[2]
-            .spans
-            .iter()
-            .any(|span| span.content.contains("new") && span.style.fg == Some(ADD_HI)));
+        assert!(
+            built.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("old") && span.style.fg == Some(DEL_HI))
+        );
+        assert!(
+            built.lines[2]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("new") && span.style.fg == Some(ADD_HI))
+        );
     }
 
     #[test]
@@ -3571,11 +3581,13 @@ mod tests {
         diff.syntax = std::sync::Arc::default();
         let syntax = syntax_row_spans(&diff);
         let fallback = build_raw(&diff.rows, &intraline, &syntax, 2, 0, 40, 48);
-        assert!(fallback.lines[0]
-            .spans
-            .iter()
-            .filter(|span| span.content.contains('/') || span.content.contains('文'))
-            .all(|span| span.style == CTX_BODY));
+        assert!(
+            fallback.lines[0]
+                .spans
+                .iter()
+                .filter(|span| span.content.contains('/') || span.content.contains('文'))
+                .all(|span| span.style == CTX_BODY)
+        );
     }
 
     #[test]

@@ -27,10 +27,10 @@
 //! "unverified" note when their endpoints resolve.
 
 use codescope_core::{
-    DiffSide, DroppedItem, EntityRef, Epoch, FileId, FormKind, LineRange, PlanCodeRef, PlanEdge,
-    PlanEdgeKind, PlanEvidence, PlanNode, ValidationReport, ValidationVerdict, VisualizationPlan,
-    VizForm, MAX_CODE_REF_LINES, MAX_FORMS_PER_PLAN, MAX_FORM_DEPTH, MAX_FORM_NODES,
-    MAX_NODE_CODE_REFS, MAX_PLAN_EVIDENCE, PLAN_VERSION,
+    DiffSide, DroppedItem, EntityRef, Epoch, FileId, FormKind, LineRange, MAX_CODE_REF_LINES,
+    MAX_FORM_DEPTH, MAX_FORM_NODES, MAX_FORMS_PER_PLAN, MAX_NODE_CODE_REFS, MAX_PLAN_EVIDENCE,
+    PLAN_VERSION, PlanCodeRef, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode, ValidationReport,
+    ValidationVerdict, VisualizationPlan, VizForm,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -96,7 +96,7 @@ pub trait FactView: Sync {
     /// Validators use this in addition to [`FactView::diff_line`]: a code reference range
     /// may include context, but each node with references must cite at least one changed row.
     fn changed_diff_line(&self, file: &FileId, index: u32, side: DiffSide, line: u32)
-        -> Lookup<()>;
+    -> Lookup<()>;
 }
 
 /// Validate and sanitize `plan` in place against `facts`, gated on `current_epoch`.
@@ -222,20 +222,20 @@ fn evidence_invalid_reason(evidence: &PlanEvidence, facts: &dyn FactView) -> Opt
             return Some(format!(
                 "file {} not queried (cannot validate)",
                 evidence.file
-            ))
+            ));
         }
     }
     if let Some(hunk) = evidence.hunk {
         match facts.hunk(&evidence.file, hunk) {
             Lookup::Present(()) => {}
             Lookup::Absent => {
-                return Some(format!("hunk {}#h{hunk} does not exist", evidence.file))
+                return Some(format!("hunk {}#h{hunk} does not exist", evidence.file));
             }
             Lookup::Unknown => {
                 return Some(format!(
                     "hunk {}#h{hunk} not queried (cannot validate)",
                     evidence.file
-                ))
+                ));
             }
         }
     }
@@ -246,13 +246,13 @@ fn evidence_invalid_reason(evidence: &PlanEvidence, facts: &dyn FactView) -> Opt
                 return Some(format!(
                     "symbol {symbol} not found in {} (analyzed)",
                     evidence.file
-                ))
+                ));
             }
             Lookup::Unknown => {
                 return Some(format!(
                     "symbol {symbol} not queried in {} (cannot validate)",
                     evidence.file
-                ))
+                ));
             }
         };
         if let Some(range) = &evidence.range {
@@ -356,13 +356,13 @@ fn code_ref_invalid_reason(code_ref: &PlanCodeRef, facts: &dyn FactView) -> Opti
             return Some(format!(
                 "code_ref hunk {}#h{} does not exist",
                 code_ref.file, code_ref.hunk
-            ))
+            ));
         }
         Lookup::Unknown => {
             return Some(format!(
                 "code_ref hunk {}#h{} not queried (cannot validate)",
                 code_ref.file, code_ref.hunk
-            ))
+            ));
         }
     }
     for line in code_ref.start_line..=code_ref.end_line {
@@ -372,13 +372,13 @@ fn code_ref_invalid_reason(code_ref: &PlanCodeRef, facts: &dyn FactView) -> Opti
                 return Some(format!(
                     "code_ref {}#h{} {:?} line {line} is not in that hunk",
                     code_ref.file, code_ref.hunk, code_ref.side
-                ))
+                ));
             }
             Lookup::Unknown => {
                 return Some(format!(
                     "code_ref {}#h{} {:?} line {line} not queried (cannot validate)",
                     code_ref.file, code_ref.hunk, code_ref.side
-                ))
+                ));
             }
         }
     }
@@ -456,13 +456,13 @@ fn node_invalid_reason(
             match facts.hunk(&entity.file, index) {
                 Lookup::Present(()) => {}
                 Lookup::Absent => {
-                    return Some(format!("hunk {}#h{index} does not exist", entity.file))
+                    return Some(format!("hunk {}#h{index} does not exist", entity.file));
                 }
                 Lookup::Unknown => {
                     return Some(format!(
                         "hunk {}#h{index} not queried (cannot validate)",
                         entity.file
-                    ))
+                    ));
                 }
             }
             None
@@ -478,7 +478,7 @@ fn node_invalid_reason(
                     return Some(format!(
                         "file {} not queried (cannot validate)",
                         entity.file
-                    ))
+                    ));
                 }
             }
             if let Some(symbol) = &entity.symbol {
@@ -488,13 +488,13 @@ fn node_invalid_reason(
                         return Some(format!(
                             "symbol {symbol} not found in {} (analyzed)",
                             entity.file
-                        ))
+                        ));
                     }
                     Lookup::Unknown => {
                         return Some(format!(
                             "symbol {symbol} not queried in {} (cannot validate)",
                             entity.file
-                        ))
+                        ));
                     }
                 };
                 if let Some(range) = &entity.range {
@@ -969,13 +969,13 @@ fn sanitize_flow(
                         return Err(format!(
                             "edge {} -> {} ({:?}) not in the impact graph",
                             edge.from, edge.to, edge.kind
-                        ))
+                        ));
                     }
                     Lookup::Unknown => {
                         return Err(format!(
                             "edge {} -> {} ({:?}) not queried (cannot validate)",
                             edge.from, edge.to, edge.kind
-                        ))
+                        ));
                     }
                 },
                 _ => notes.push(format!(
@@ -1586,10 +1586,12 @@ mod tests {
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
         assert!(plan.forms.is_empty());
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.subject.starts_with("form 0") && d.reason.contains(">20%")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.subject.starts_with("form 0") && d.reason.contains(">20%"))
+        );
     }
 
     #[test]
@@ -1611,10 +1613,12 @@ mod tests {
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("root node n1 invalid")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("root node n1 invalid"))
+        );
     }
 
     #[test]
@@ -1629,10 +1633,12 @@ mod tests {
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("endpoint n2 invalid")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("endpoint n2 invalid"))
+        );
     }
 
     #[test]
@@ -1651,9 +1657,10 @@ mod tests {
             )]);
             let report = validate(&mut plan, &StubFacts::default(), Epoch(1));
             assert_eq!(report.verdict, ValidationVerdict::Rejected, "{kind:?}");
-            assert!(report.dropped.iter().any(|item| item
-                .reason
-                .contains("flows_to edge n1 -> n2 is only valid in a sequence form")));
+            assert!(report.dropped.iter().any(|item| {
+                item.reason
+                    .contains("flows_to edge n1 -> n2 is only valid in a sequence form")
+            }));
         }
     }
 
@@ -1701,12 +1708,15 @@ mod tests {
             )]);
             let report = validate(&mut plan, &facts, Epoch(1));
             assert_eq!(report.verdict, ValidationVerdict::Rejected);
-            assert!(report.dropped.iter().any(|item| item
-                .reason
-                .contains("sequence edge n1 -> n2 uses calls; use flows_to for lifecycle order")));
-            assert!(report.dropped.iter().any(|item| item
-                .reason
-                .contains("actual call topology belongs call_tree/relationship_flow")));
+            assert!(
+                report.dropped.iter().any(|item| item.reason.contains(
+                    "sequence edge n1 -> n2 uses calls; use flows_to for lifecycle order"
+                ))
+            );
+            assert!(report.dropped.iter().any(|item| {
+                item.reason
+                    .contains("actual call topology belongs call_tree/relationship_flow")
+            }));
         }
     }
 
@@ -1719,9 +1729,10 @@ mod tests {
         )]);
         let report = validate(&mut plan, &StubFacts::default(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report.dropped.iter().any(|item| item
-            .reason
-            .contains("sequence edge n1 -> n2 uses calls; use flows_to for lifecycle order")));
+        assert!(report.dropped.iter().any(|item| {
+            item.reason
+                .contains("sequence edge n1 -> n2 uses calls; use flows_to for lifecycle order")
+        }));
     }
 
     /// Review 19: an unqueried symbol is "not queried", distinct from a proven-absent one.
@@ -1789,14 +1800,18 @@ mod tests {
             vec![],
         )]);
         let report = validate(&mut plan, &facts, Epoch(1));
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("not found in main.go (analyzed)")));
-        assert!(!report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("not queried")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("not found in main.go (analyzed)"))
+        );
+        assert!(
+            !report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("not queried"))
+        );
     }
 
     #[test]
@@ -1851,10 +1866,12 @@ mod tests {
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .notes
-            .iter()
-            .any(|note| note.contains("structural relationship visual")));
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("structural relationship visual"))
+        );
     }
 
     #[test]
@@ -1879,10 +1896,12 @@ mod tests {
         assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
         let hunks: Vec<u32> = plan.evidence.iter().filter_map(|item| item.hunk).collect();
         assert_eq!(hunks, [0, 2]);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|item| item.reason.contains("#h1")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|item| item.reason.contains("#h1"))
+        );
     }
 
     #[test]
@@ -1913,10 +1932,12 @@ mod tests {
         let mut missing = make_plan(DiffSide::New, 42, 45);
         let report = validate(&mut missing, &facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|item| item.reason.contains("New line 45 is not in that hunk")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|item| item.reason.contains("New line 45 is not in that hunk"))
+        );
 
         let mut cross_file_node = node("n1", Some(sym_entity("main.go", "A")), &[]);
         cross_file_node.code_refs.push(PlanCodeRef::new(
@@ -1933,18 +1954,22 @@ mod tests {
         )]);
         let report = validate(&mut cross_file, &facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|item| item.reason.contains("outside the focused selection scope")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|item| item.reason.contains("outside the focused selection scope"))
+        );
 
         let mut wrong_side = make_plan(DiffSide::Old, 42, 42);
         let report = validate(&mut wrong_side, &facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|item| item.reason.contains("Old line 42 is not in that hunk")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|item| item.reason.contains("Old line 42 is not in that hunk"))
+        );
     }
 
     #[test]
@@ -2023,9 +2048,10 @@ mod tests {
         let mut plan = plan_with(vec![form(FormKind::ChangedSymbolTree, vec![focus], vec![])]);
         let report = validate(&mut plan, &facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report.dropped.iter().any(|item| item
-            .reason
-            .contains("changed status not queried (cannot validate)")));
+        assert!(report.dropped.iter().any(|item| {
+            item.reason
+                .contains("changed status not queried (cannot validate)")
+        }));
     }
 
     #[test]
@@ -2056,10 +2082,12 @@ mod tests {
             .dropped
             .iter()
             .any(|d| d.subject.starts_with("form 2") && d.reason.contains("MAX_FORMS_PER_PLAN")));
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("MAX_FORM_NODES")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("MAX_FORM_NODES"))
+        );
     }
 
     #[test]
@@ -2088,10 +2116,12 @@ mod tests {
         assert!(f.node("c11").is_some());
         assert!(f.node("c12").is_none());
         assert_eq!(f.node("root").unwrap().children.len(), 11);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.subject.contains("c12") && d.reason.contains("MAX_FORM_NODES")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.subject.contains("c12") && d.reason.contains("MAX_FORM_NODES"))
+        );
     }
 
     #[test]
@@ -2133,10 +2163,12 @@ mod tests {
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("duplicate node id")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("duplicate node id"))
+        );
     }
 
     #[test]
@@ -2167,10 +2199,12 @@ mod tests {
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("outside symbol extent")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("outside symbol extent"))
+        );
         // In-extent range is fine.
         let mut ok = sym_entity("main.go", "A");
         ok.range = Some(LineRange::new(1, 0, 4, 0));
@@ -2221,14 +2255,18 @@ mod tests {
         let report = validate(&mut plan, &facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
         assert_eq!(plan.forms[0].edges.len(), 1);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("not in the impact graph")));
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("endpoint not present")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("not in the impact graph"))
+        );
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("endpoint not present"))
+        );
     }
 
     #[test]
@@ -2252,10 +2290,12 @@ mod tests {
         )]);
         let report = validate(&mut plan, &facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("does not exist")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("does not exist"))
+        );
     }
 
     #[test]
@@ -2320,10 +2360,12 @@ mod tests {
                 "first required edge/label preserved"
             );
         }
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.subject.contains("n5 -> n2") && d.reason.contains("document order")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.subject.contains("n5 -> n2") && d.reason.contains("document order"))
+        );
     }
 
     /// A duplicate consecutive edge is a drop, not a rejection: the first edge and its
@@ -2358,10 +2400,12 @@ mod tests {
         assert_eq!(f.edges.len(), 2, "nodes-1 edges: {:?}", f.edges);
         assert_eq!(f.edges[0].label.as_deref(), Some("flips the health flag"));
         assert_eq!(f.edges[1].label.as_deref(), Some("probes return 503"));
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.subject.contains("n1 -> n2") && d.reason.contains("duplicate")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.subject.contains("n1 -> n2") && d.reason.contains("duplicate"))
+        );
     }
 
     /// A missing consecutive pair still rejects the form (no synthesis): the repair loop,
@@ -2386,10 +2430,12 @@ mod tests {
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
         // The sanitizer runs before connectivity, so the missing pair is named directly
         // instead of the indirect "disconnected" reason.
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("sequence has no ordered edge n2 -> n3")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("sequence has no ordered edge n2 -> n3"))
+        );
         let nodes: Vec<PlanNode> = ["A", "B", "C", "D"]
             .iter()
             .enumerate()
@@ -2421,10 +2467,12 @@ mod tests {
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, edges)]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("sequence has no ordered edge n2 -> n3")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("sequence has no ordered edge n2 -> n3"))
+        );
     }
 
     /// Sanitization runs before fact validation: an extra back-edge whose typed kind is
@@ -2543,10 +2591,12 @@ mod tests {
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
         assert_eq!(plan.forms[0].edges.len(), 2);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.subject.contains("n1 -> ghost")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.subject.contains("n1 -> ghost"))
+        );
     }
 
     /// A duplicate required pair where the first duplicate is blank and a later labeled
@@ -2599,10 +2649,12 @@ mod tests {
         let mut plan = plan_with(vec![form(FormKind::Sequence, nodes, vec![blank])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("has no explanatory label")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("has no explanatory label"))
+        );
     }
 
     /// A sole evidence item that is invalid (nonexistent hunk) rejects the plan; the
@@ -2628,14 +2680,18 @@ mod tests {
         let report = validate(&mut plan, &facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
         // The concrete dropped reason is preserved (not flattened into the terminal note).
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.subject.contains("evidence") && d.reason.contains("#h9")));
-        assert!(report
-            .notes
-            .iter()
-            .any(|n| n.contains("no valid evidence remains")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.subject.contains("evidence") && d.reason.contains("#h9"))
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("no valid evidence remains"))
+        );
         assert!(plan.evidence.is_empty());
     }
 
@@ -2703,10 +2759,12 @@ mod tests {
         assert_eq!(plan.evidence[0].hunk, Some(0));
         assert_eq!(plan.evidence[0].symbol, None);
         assert_eq!(plan.evidence[0].range, None);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|item| { item.reason.contains("retained exact hunk evidence") }));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|item| { item.reason.contains("retained exact hunk evidence") })
+        );
     }
 
     /// BeforeAfter contract: three nodes reject with the exact-two-nodes reason.
@@ -2726,10 +2784,12 @@ mod tests {
         let mut plan = plan_with(vec![form(FormKind::BeforeAfter, nodes, vec![])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("before_after needs exactly two nodes")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("before_after needs exactly two nodes"))
+        );
     }
 
     /// BeforeAfter contract: children on a node reject with the flat-nodes reason.
@@ -2746,10 +2806,12 @@ mod tests {
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         // Three nodes also present; the two-node reason fires first by construction.
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("before_after needs exactly two nodes")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("before_after needs exactly two nodes"))
+        );
         // The flat case in isolation: exactly two nodes, one carries a child.
         let mut flat_violation = plan_with(vec![form(
             FormKind::BeforeAfter,
@@ -2761,10 +2823,12 @@ mod tests {
         )]);
         let report = validate(&mut flat_violation, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("before_after nodes must be flat")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("before_after nodes must be flat"))
+        );
     }
 
     #[test]
@@ -2792,10 +2856,12 @@ mod tests {
 
         assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
         assert_eq!(plan.forms.len(), 1, "the before/after visual survives");
-        assert!(plan.forms[0]
-            .nodes
-            .iter()
-            .all(|node| node.entity.is_none() && !node.code_refs.is_empty()));
+        assert!(
+            plan.forms[0]
+                .nodes
+                .iter()
+                .all(|node| node.entity.is_none() && !node.code_refs.is_empty())
+        );
         assert_eq!(
             report
                 .dropped
@@ -2822,10 +2888,12 @@ mod tests {
         )]);
         let report = validate(&mut disproven, &complete_facts, Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|item| item.reason.contains("not found in main.go (analyzed)")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|item| item.reason.contains("not found in main.go (analyzed)"))
+        );
     }
 
     /// BeforeAfter contract: two edges reject; a single reversed edge rejects; the valid
@@ -2866,10 +2934,12 @@ mod tests {
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("before_after edge must run n1 -> n2")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("before_after edge must run n1 -> n2"))
+        );
         // Two edges: rejected.
         let mut e1 = edge("n1", "n2", PlanEdgeKind::Writes);
         e1.label = Some("first".into());
@@ -2878,10 +2948,12 @@ mod tests {
         let mut plan = plan_with(vec![form(FormKind::BeforeAfter, two_nodes(), vec![e1, e2])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("at most one transition edge")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("at most one transition edge"))
+        );
         // A missing label on the transition edge: rejected with the before_after reason
         // (the tree path never reaches the flow label check).
         let mut unlabeled = edge("n1", "n2", PlanEdgeKind::Writes);
@@ -2893,18 +2965,21 @@ mod tests {
         )]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report.dropped.iter().any(|d| d
-            .reason
-            .contains("before_after transition edge needs an explanatory label")));
+        assert!(report.dropped.iter().any(|d| {
+            d.reason
+                .contains("before_after transition edge needs an explanatory label")
+        }));
         // A blank (whitespace-only) label is equally missing.
         let mut blank = edge("n1", "n2", PlanEdgeKind::Writes);
         blank.label = Some("   ".into());
         let mut plan = plan_with(vec![form(FormKind::BeforeAfter, two_nodes(), vec![blank])]);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::Rejected);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.reason.contains("explanatory label")));
+        assert!(
+            report
+                .dropped
+                .iter()
+                .any(|d| d.reason.contains("explanatory label"))
+        );
     }
 }

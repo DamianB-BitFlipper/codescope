@@ -1476,9 +1476,10 @@ mod canvas_tests {
                 .is_none(),
             "a fully visible relationship has nothing to expand"
         );
-        assert!(e
-            .relationship_overlay_in_viewport(&plan, &edge, 0, 0, 0)
-            .is_none());
+        assert!(
+            e.relationship_overlay_in_viewport(&plan, &edge, 0, 0, 0)
+                .is_none()
+        );
     }
     #[test]
     fn relationship_kind_names_are_truthful_and_exhaustive() {
@@ -1651,15 +1652,19 @@ mod canvas_tests {
         assert!(relationship.label_rect.y > source.rect.bottom());
         assert!(relationship.label_rect.y < destination.rect.y);
         assert!(!relationship.has_hidden_label);
-        assert!(canvas
-            .relationship_at(DiagramPosition {
-                x: relationship.label_rect.x,
-                y: relationship.label_rect.y,
-            })
-            .is_none());
-        assert!(canvas
-            .relationship_overlay(&plan, &relationship.target)
-            .is_none());
+        assert!(
+            canvas
+                .relationship_at(DiagramPosition {
+                    x: relationship.label_rect.x,
+                    y: relationship.label_rect.y,
+                })
+                .is_none()
+        );
+        assert!(
+            canvas
+                .relationship_overlay(&plan, &relationship.target)
+                .is_none()
+        );
 
         // A narrow horizontal lane genuinely clips this description. Its expanded text owns
         // the same canvas anchor rather than jumping to the viewport origin.
@@ -1724,9 +1729,11 @@ mod canvas_tests {
         };
         let ordered = [rect("first"), rect("second"), rect("third"), rect("fourth")];
         assert!(ordered.windows(2).all(|pair| pair[0].y < pair[1].y));
-        assert!(ordered
-            .windows(2)
-            .all(|pair| pair[0].x + pair[0].width / 2 == pair[1].x + pair[1].width / 2));
+        assert!(
+            ordered
+                .windows(2)
+                .all(|pair| pair[0].x + pair[0].width / 2 == pair[1].x + pair[1].width / 2)
+        );
         assert!(canvas.relationships.iter().all(|relationship| {
             relationship.path.len() == 2
                 && relationship.path[0].x == relationship.path[1].x
@@ -1845,11 +1852,13 @@ mod canvas_tests {
         state.move_node(b.clone(), DiagramPosition { x: 4, y: 12 });
         let overlap = built(&plan, &state, 40);
         assert_eq!(overlap.node_at(DiagramPosition { x: 4, y: 12 }), Some(b));
-        assert!(built(&plan, &state, 1)
-            .nodes
-            .iter()
-            .flat_map(|n| &n.lines)
-            .all(|line| line.width() <= 1));
+        assert!(
+            built(&plan, &state, 1)
+                .nodes
+                .iter()
+                .flat_map(|n| &n.lines)
+                .all(|line| line.width() <= 1)
+        );
         assert_eq!(
             built(&plan, &state, 40)
                 .nodes

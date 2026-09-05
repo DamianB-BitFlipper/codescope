@@ -6,8 +6,8 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -24,7 +24,7 @@ use codescope_tui::snapshot::{
 };
 use codescope_tui::{Action, ExternalControl};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -315,7 +315,7 @@ async fn bind_server(
         }
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("cannot bind agent socket {}", path.display()))
+                .with_context(|| format!("cannot bind agent socket {}", path.display()));
         }
     };
     set_owner_only(&path)?;
@@ -1698,9 +1698,11 @@ mod tests {
             truncated: false,
         });
         let view = context_view(camino::Utf8Path::new(TEST_REPO), &snapshot, 20);
-        assert!(view["view_id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("view-v1-")));
+        assert!(
+            view["view_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("view-v1-"))
+        );
         assert_eq!(view["live"]["selection"]["kind"], "symbol");
         assert_eq!(view["focused_diff"]["rows"][0]["kind"], "hunk");
         assert_eq!(view["focused_diff"]["rows"][1]["hunk"], 0);
@@ -1762,18 +1764,20 @@ mod tests {
 
         let mut refreshing = snapshot;
         refreshing.epoch = refreshing.epoch.next();
-        assert!(diff_view(
-            &refreshing,
-            &id,
-            &selection,
-            Some("src/api.rs"),
-            None,
-            0,
-            20,
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("refreshing"));
+        assert!(
+            diff_view(
+                &refreshing,
+                &id,
+                &selection,
+                Some("src/api.rs"),
+                None,
+                0,
+                20,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("refreshing")
+        );
     }
 
     #[test]
@@ -1810,10 +1814,12 @@ mod tests {
             snapshot.agent_changeset.as_deref().unwrap(),
         );
         assert_ne!(id, changed_id, "changed diff content must change the id");
-        assert!(resolve_view_id(Utf8Path::new(TEST_REPO), &snapshot, &id)
-            .unwrap_err()
-            .to_string()
-            .contains("does not identify a view"));
+        assert!(
+            resolve_view_id(Utf8Path::new(TEST_REPO), &snapshot, &id)
+                .unwrap_err()
+                .to_string()
+                .contains("does not identify a view")
+        );
 
         snapshot.epoch = snapshot.epoch.next();
         snapshot.agent_changeset_epoch = snapshot.epoch;
@@ -1996,9 +2002,11 @@ mod tests {
         .unwrap();
         assert_eq!(rejected["accepted"], false);
         assert_eq!(rejected["revision"], 8);
-        assert!(rejected["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("unknown field `form_id`")));
+        assert!(
+            rejected["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown field `form_id`"))
+        );
         responder.await.unwrap();
     }
 
@@ -2032,9 +2040,11 @@ mod tests {
         let reply: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["result"]["live"]["selection"]["kind"], "symbol");
-        assert!(reply["result"]["view_id"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("view-v1-")));
+        assert!(
+            reply["result"]["view_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("view-v1-"))
+        );
 
         drop(server);
         assert!(!path.exists());

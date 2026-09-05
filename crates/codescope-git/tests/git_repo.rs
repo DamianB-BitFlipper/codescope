@@ -166,7 +166,11 @@ async fn staged_vs_unstaged_modification() {
     let repo = open_repo(&top).await;
 
     // Staged edit to a.go, unstaged edit to b.txt.
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 42 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 42 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
     git(top.as_std_path(), &["add", "a.go"]);
     write(
         top.as_std_path(),
@@ -188,9 +192,11 @@ async fn staged_vs_unstaged_modification() {
         .expect("captured staged patch");
     assert_eq!(staged_sections.len(), 1);
     assert_eq!(staged_sections[0].path, "a.go");
-    assert!(staged_sections[0]
-        .text
-        .starts_with("diff --git a/a.go b/a.go\n"));
+    assert!(
+        staged_sections[0]
+            .text
+            .starts_with("diff --git a/a.go b/a.go\n")
+    );
     assert!(staged_sections[0].text.ends_with('\n'));
 
     let unstaged = repo
@@ -220,7 +226,11 @@ async fn working_scope_combines_staged_unstaged_and_untracked() {
     let repo = open_repo(&top).await;
 
     // Staged edit to a.go, unstaged edit to b.txt, untracked c.txt.
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 42 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 42 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
     git(top.as_std_path(), &["add", "a.go"]);
     write(
         top.as_std_path(),
@@ -295,10 +305,12 @@ async fn branch_working_scope_combines_commits_index_worktree_and_untracked() {
         vec!["a.go"],
         "plain branch scope stops at HEAD"
     );
-    assert!(branch.files[0].hunks[0]
-        .lines
-        .iter()
-        .any(|line| line.text.contains("return 2")));
+    assert!(
+        branch.files[0].hunks[0]
+            .lines
+            .iter()
+            .any(|line| line.text.contains("return 2"))
+    );
 
     let combined = repo
         .changeset(ChangeScope::BranchWorking)
@@ -314,10 +326,12 @@ async fn branch_working_scope_combines_commits_index_worktree_and_untracked() {
         vec!["a.go", "b.txt", "c.txt"]
     );
     let a = combined.find_file(Utf8Path::new("a.go")).unwrap();
-    assert!(a.hunks[0]
-        .lines
-        .iter()
-        .any(|line| line.text.contains("return 3")));
+    assert!(
+        a.hunks[0]
+            .lines
+            .iter()
+            .any(|line| line.text.contains("return 3"))
+    );
     let c = combined.find_file(Utf8Path::new("c.txt")).unwrap();
     assert_eq!(c.status, FileStatus::Untracked);
     assert!(c.hunks.is_empty());
@@ -487,7 +501,11 @@ async fn branch_scope_via_nearest_ancestor() {
     let (_tmp, top) = scratch_repo();
     let repo = open_repo(&top).await;
     git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 7 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 7 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
     git(top.as_std_path(), &["commit", "-q", "-am", "feature edit"]);
     write(top.as_std_path(), "c.go", "package main\n\nfunc C() {}\n");
     git(top.as_std_path(), &["add", "c.go"]);
@@ -862,9 +880,11 @@ async fn branch_diff_and_base_content_are_base_to_head() {
     let changes = repo.branch_changeset_from_base(&base).await.unwrap();
     let file = changes.find_file(Utf8Path::new("b.txt")).unwrap();
     let lines = &file.hunks[0].lines;
-    assert!(lines
-        .iter()
-        .any(|line| { line.kind == codescope_core::DiffLineKind::Del && line.text == "four" }));
+    assert!(
+        lines
+            .iter()
+            .any(|line| { line.kind == codescope_core::DiffLineKind::Del && line.text == "four" })
+    );
     assert!(lines.iter().any(|line| {
         line.kind == codescope_core::DiffLineKind::Add && line.text == "HEAD-VALUE"
     }));
@@ -895,7 +915,11 @@ async fn base_inference_ancestor_default_upstream_wins() {
     //    fallbacks. `origin/main` is a remote-tracking twin of `main` at the same commit, but
     //    remote-tracking refs are excluded from the ancestor tier — the LOCAL `main` wins.
     git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 9 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 9 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
     git(top.as_std_path(), &["commit", "-q", "-am", "edit"]);
     let main_sha = git(top.as_std_path(), &["rev-parse", "main"]);
     let ctx = repo.repo_context().await.expect("context");
@@ -918,7 +942,11 @@ async fn base_inference_ancestor_default_upstream_wins() {
         top.as_std_path(),
         &["push", "-q", "-u", "origin", "feature"],
     );
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 10 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 10 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
     git(top.as_std_path(), &["commit", "-q", "-am", "ahead"]);
     let ctx = repo.repo_context().await.expect("context");
     let up = ctx.upstream.expect("upstream");
@@ -968,7 +996,11 @@ async fn unmerged_conflict_marked_no_hunks() {
 async fn base_file_content_present_and_absent() {
     let (_tmp, top) = scratch_repo();
     let repo = open_repo(&top).await;
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 99 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 99 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
 
     let content = repo
         .base_file_content("HEAD", Utf8Path::new("a.go"))
@@ -1004,14 +1036,22 @@ async fn fingerprint_stable_and_sensitive() {
     assert_eq!(f1, f2, "fingerprint must be stable with no changes");
     assert_eq!(f1.len(), 32);
 
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 5 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 5 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
     let f3 = repo.fingerprint().await.expect("fp3");
     assert_ne!(f1, f3, "worktree change must change the fingerprint");
 
     // Review 03 finding 5: a second edit to the already-modified file must also change the
     // fingerprint (porcelain v2 carries no worktree content hash).
     std::thread::sleep(std::time::Duration::from_millis(5));
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\nfunc A() int { return 6 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\nfunc A() int { return 6 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
     let f3b = repo.fingerprint().await.expect("fp3b");
     assert_ne!(
         f3, f3b,
@@ -1036,7 +1076,11 @@ async fn fingerprint_stable_and_sensitive() {
 async fn read_only_guarantee_smoke() {
     // Snapshot .git mtimes, run every query, verify nothing under .git changed shape.
     let (_tmp, top) = scratch_repo();
-    write(top.as_std_path(), "a.go", "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 3 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n");
+    write(
+        top.as_std_path(),
+        "a.go",
+        "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 3 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n",
+    );
     let repo = open_repo(&top).await;
 
     let index_before = std::fs::read(top.join(".git/index")).expect("read index");

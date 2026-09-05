@@ -406,8 +406,7 @@ fn plan_schema_v6_and_flows_to_serde_contract() {
         PlanEdgeKind::FlowsTo
     );
     assert_eq!(
-        serde_json::to_value(VisualizationPlan::new(Epoch(0))).expect("serialize new plan")
-            ["plan_version"],
+        serde_json::to_value(VisualizationPlan::new(Epoch(0))).expect("serialize new plan")["plan_version"],
         serde_json::json!(6)
     );
 }

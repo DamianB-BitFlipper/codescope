@@ -6,7 +6,7 @@
 
 use crate::error::AiError;
 use codescope_core::{
-    VisualizationPlan, MAX_CODE_REF_LINES, MAX_FORMS_PER_PLAN, MAX_NODE_CODE_REFS, PLAN_VERSION,
+    MAX_CODE_REF_LINES, MAX_FORMS_PER_PLAN, MAX_NODE_CODE_REFS, PLAN_VERSION, VisualizationPlan,
 };
 #[cfg(test)]
 use serde_json::Value;

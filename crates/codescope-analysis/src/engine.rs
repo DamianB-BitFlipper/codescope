@@ -20,8 +20,8 @@ use codescope_core::{
 };
 use codescope_git::GitRepo;
 
-use crate::changes::{changed_symbols_detailed, file_mappings, ChangedSymbolInfo};
-use crate::digest::{change_digest, ChangeDigest};
+use crate::changes::{ChangedSymbolInfo, changed_symbols_detailed, file_mappings};
+use crate::digest::{ChangeDigest, change_digest};
 use crate::error::AnalysisError;
 use crate::graph::{annotate_diagnostics, build_impact_graph};
 use crate::mapper::MappedHunk;
@@ -694,9 +694,11 @@ mod tests {
         .await
         .expect("changeset timed out")
         .unwrap();
-        assert!(changeset
-            .find_file(camino::Utf8Path::new(MEMSTORE))
-            .is_some());
+        assert!(
+            changeset
+                .find_file(camino::Utf8Path::new(MEMSTORE))
+                .is_some()
+        );
         assert!(changeset.find_file(camino::Utf8Path::new(HEALTH)).is_some());
 
         let snap = tokio::time::timeout(

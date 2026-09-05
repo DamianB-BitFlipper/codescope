@@ -27,7 +27,7 @@
 //! [`reqwest::Error::without_url`].
 
 use crate::config::{
-    is_official_base_url, AiConfig, ProviderKind, ReasoningEffort, OPENAI_BASE_URL,
+    AiConfig, OPENAI_BASE_URL, ProviderKind, ReasoningEffort, is_official_base_url,
 };
 use crate::error::AiError;
 use crate::tools::ToolDef;
@@ -35,7 +35,7 @@ use governor::clock::{Clock, QuantaClock};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1531,10 +1531,12 @@ mod tests {
             .unwrap();
         assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
         assert_eq!(request.headers()["x-api-key"], "sk-test");
-        assert!(request
-            .headers()
-            .get(reqwest::header::AUTHORIZATION)
-            .is_none());
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
 
         cfg.api_key = None;
         let keyless = AiClient::new(&cfg).unwrap();
@@ -1883,12 +1885,14 @@ mod tests {
 
     #[test]
     fn repair_assistant_omits_null_content_and_strips_output_only_fields() {
-        assert!(ChatMessage::assistant_text_for_repair(&json!({
-            "role": "assistant",
-            "content": null,
-            "reasoning": "internal"
-        }))
-        .is_none());
+        assert!(
+            ChatMessage::assistant_text_for_repair(&json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning": "internal"
+            }))
+            .is_none()
+        );
 
         let replay = ChatMessage::assistant_text_for_repair(&json!({
             "role": "assistant",

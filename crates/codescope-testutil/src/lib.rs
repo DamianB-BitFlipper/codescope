@@ -31,5 +31,5 @@ pub mod helpers;
 pub mod scenarios;
 
 pub use error::{Result, TestutilError};
-pub use go_fixture::{build_fixture, reset_fixture, FixtureInfo};
+pub use go_fixture::{FixtureInfo, build_fixture, reset_fixture};
 pub use helpers::{copy_fixture_into, live_ai_enabled, require_go, require_gopls};

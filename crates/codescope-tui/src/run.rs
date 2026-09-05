@@ -4,12 +4,12 @@
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
 use codescope_core::ChangeScope;
 
-use crate::action::{map_key, Action, ExternalControl};
+use crate::action::{Action, ExternalControl, map_key};
 use crate::app::{App, Pane};
 use crate::render::render;
 use crate::snapshot::UiSnapshot;

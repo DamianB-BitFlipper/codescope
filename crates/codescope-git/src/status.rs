@@ -154,7 +154,7 @@ pub(crate) fn parse_status_z(bytes: &[u8]) -> Result<StatusSnapshot> {
             _ => {
                 return Err(GitError::ParseStatus {
                     detail: format!("unknown record: {record:?}"),
-                })
+                });
             }
         }
     }
@@ -237,7 +237,7 @@ fn parse_rename(record: &str, orig_path: &str) -> Result<StatusEntry> {
         _ => {
             return Err(GitError::ParseStatus {
                 detail: format!("bad rename/copy score field {xscore:?} in {record:?}"),
-            })
+            });
         }
     };
     let score: u8 = xscore[1..].parse().map_err(|_| GitError::ParseStatus {

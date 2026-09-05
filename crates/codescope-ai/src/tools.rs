@@ -10,7 +10,7 @@
 
 use codescope_core::MAX_CODE_REF_LINES;
 use futures::future::BoxFuture;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Hard budget of research and diagram-edit tool calls per plan. Incremental construction
 /// needs room to inspect, create, revise, and validate without turning one missed detail
@@ -856,9 +856,10 @@ mod tests {
         assert!(tool.parameters["properties"]["query"].get("enum").is_none());
         assert_eq!(tool.parameters["properties"]["line"]["minimum"], 1);
         assert_eq!(tool.parameters["properties"]["column"]["minimum"], 0);
-        assert!(tool
-            .description
-            .contains("future adapters may advertise more"));
+        assert!(
+            tool.description
+                .contains("future adapters may advertise more")
+        );
     }
 
     #[test]
@@ -899,9 +900,11 @@ mod tests {
         for variant in variants {
             assert_eq!(variant["type"], "object");
             assert_eq!(variant["additionalProperties"], false);
-            assert!(variant["description"]
-                .as_str()
-                .is_some_and(|v| !v.is_empty()));
+            assert!(
+                variant["description"]
+                    .as_str()
+                    .is_some_and(|v| !v.is_empty())
+            );
             assert_eq!(variant["examples"].as_array().unwrap().len(), 1);
             let example = variant["examples"][0].clone();
             serde_json::from_value::<codescope_core::DiagramCommand>(example)
@@ -915,14 +918,18 @@ mod tests {
                 .unwrap()
         };
         let create_node = by_op("create_node");
-        assert!(create_node["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("form_id")));
-        assert!(create_node["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("node")));
+        assert!(
+            create_node["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("form_id"))
+        );
+        assert!(
+            create_node["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("node"))
+        );
         let node = &create_node["properties"]["node"];
         assert_eq!(
             node["properties"]["hint"]["properties"]["highlight"]["type"],
@@ -943,17 +950,21 @@ mod tests {
         assert!(patch["properties"].get("clear_label").is_none());
         let create_edge = by_op("create_edge");
         let edge_kind = &create_edge["properties"]["edge"]["properties"]["kind"];
-        assert!(edge_kind["enum"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("flows_to")));
-        assert!(edge_kind["description"]
-            .as_str()
-            .is_some_and(|description| {
-                description.contains("conceptual chronological adjacency in a Sequence form")
-                    && description.contains("supplied relationship evidence proves")
-                    && !description.contains("required normal")
-            }));
+        assert!(
+            edge_kind["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("flows_to"))
+        );
+        assert!(
+            edge_kind["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("conceptual chronological adjacency in a Sequence form")
+                        && description.contains("supplied relationship evidence proves")
+                        && !description.contains("required normal")
+                })
+        );
         assert_eq!(
             create_edge["examples"][0]["edge"]["kind"], "flows_to",
             "the canonical edge example must teach the Sequence transition kind"
@@ -970,9 +981,11 @@ mod tests {
             update_edge["properties"]["patch"]["properties"]["clear_label"]["type"],
             "boolean"
         );
-        assert!(update_edge["properties"]["patch"]["properties"]
-            .get("clear_entity")
-            .is_none());
+        assert!(
+            update_edge["properties"]["patch"]["properties"]
+                .get("clear_entity")
+                .is_none()
+        );
     }
 
     #[test]

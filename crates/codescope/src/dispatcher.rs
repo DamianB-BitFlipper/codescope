@@ -8,9 +8,9 @@
 use std::collections::HashSet;
 
 use codescope_ai::{
-    parse_plan, validate, AiActivityObserver, AiActivityUpdate, AiOutcome, AiService,
-    AiToolActivityState, DiagramObserver, FactView, ProviderKind, ReasoningEffort,
-    DIAGRAM_EDIT_TOOL_NAME,
+    AiActivityObserver, AiActivityUpdate, AiOutcome, AiService, AiToolActivityState,
+    DIAGRAM_EDIT_TOOL_NAME, DiagramObserver, FactView, ProviderKind, ReasoningEffort, parse_plan,
+    validate,
 };
 use codescope_analysis::{AnalysisEngine, AnalysisSnapshot};
 use codescope_core::{
@@ -19,6 +19,8 @@ use codescope_core::{
 };
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
+use codescope_tui::Action;
+use codescope_tui::UiPreferences;
 use codescope_tui::action::{next_scope, previous_scope};
 use codescope_tui::snapshot::{
     AgentDiagramResult, AiActivity, AiSummaryKey, AiSummaryState, AiTokenUsage, AiToolCallActivity,
@@ -26,12 +28,10 @@ use codescope_tui::snapshot::{
     ImpactRow, InterpretationSource, RepoBar, ScopeCounts, SelectedChange, SemanticPane,
     StatusLevel, StatusMessage, SymbolRow, UiSnapshot,
 };
-use codescope_tui::Action;
-use codescope_tui::UiPreferences;
 use tokio::sync::{mpsc, watch};
 
 use crate::request_coordinator::RequestCoordinator;
-use crate::research_tools::{research_brief, QueriedLspFacts, ScopedResearchTools};
+use crate::research_tools::{QueriedLspFacts, ScopedResearchTools, research_brief};
 
 /// Publication boundary between the backend dispatcher and a state consumer.
 ///
@@ -253,8 +253,7 @@ pub struct RelationRows {
 const AUTO_BASE: &str = "(auto / inferred)";
 
 /// Appended to AI failures while automatic generation is enabled.
-const AUTO_AI_FAILURE_SUFFIX: &str =
-    "m change model · retries automatically when the selection or file changes · deterministic impact remains available";
+const AUTO_AI_FAILURE_SUFFIX: &str = "m change model · retries automatically when the selection or file changes · deterministic impact remains available";
 /// Appended to AI failures while generation requires an explicit user trigger.
 const MANUAL_AI_FAILURE_SUFFIX: &str =
     "a retry current selection · m change model · deterministic impact remains available";
@@ -4925,10 +4924,12 @@ mod tests {
             snapshot.ai_activity.calls[2].state,
             AiToolCallActivityState::Failed
         );
-        assert!(snapshot.ai_activity.calls[2]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("must not be empty")));
+        assert!(
+            snapshot.ai_activity.calls[2]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("must not be empty"))
+        );
 
         disp.reject_agent_diagram(
             43,
@@ -5013,10 +5014,12 @@ mod tests {
         );
         let result = snapshot_rx.borrow().agent_diagram_result.clone().unwrap();
         assert!(!result.accepted);
-        assert!(result
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("view_id is stale")));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("view_id is stale"))
+        );
         assert!(result.draft.is_none());
 
         std::fs::remove_dir_all(&root).ok();
@@ -5089,11 +5092,13 @@ mod tests {
         })
         .await;
         disp.handle(failed).await;
-        assert!(snapshot_rx
-            .borrow()
-            .status
-            .text
-            .contains("disk unavailable"));
+        assert!(
+            snapshot_rx
+                .borrow()
+                .status
+                .text
+                .contains("disk unavailable")
+        );
         assert_eq!(snapshot_rx.borrow().status.level, StatusLevel::Warning);
 
         disp.config_write_tx.take();
@@ -5155,10 +5160,11 @@ mod tests {
         assert!(!snap.model_list_loading);
         assert!(snap.model_list_error.is_some());
         assert_eq!(snap.available_models, ["current/model"]);
-        assert!(snap
-            .status
-            .text
-            .contains("current/manual model remains available"));
+        assert!(
+            snap.status
+                .text
+                .contains("current/manual model remains available")
+        );
         assert!(!snap.status.text.contains("AI not configured"));
 
         std::fs::remove_dir_all(&root).ok();
@@ -5607,12 +5613,14 @@ mod tests {
         plan.intent = format!("plan for {label}");
         plan.forms.push(codescope_core::VizForm {
             kind: codescope_core::FormKind::CallTree,
-            nodes: vec![codescope_core::PlanNode::new(
-                "n1",
-                label,
-                codescope_core::PlanNodeChange::Modified,
-            )
-            .with_detail("explains the selected change")],
+            nodes: vec![
+                codescope_core::PlanNode::new(
+                    "n1",
+                    label,
+                    codescope_core::PlanNodeChange::Modified,
+                )
+                .with_detail("explains the selected change"),
+            ],
             edges: Vec::new(),
         });
         CachedAiPlan {

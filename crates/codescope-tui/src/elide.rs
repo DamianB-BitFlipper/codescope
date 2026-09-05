@@ -166,11 +166,7 @@ pub fn shared_root(paths: &[&str]) -> Option<String> {
     }
     let root = first[..common].join("/") + "/";
     // Only strip when it actually saves meaningful width.
-    if root.width() >= 8 {
-        Some(root)
-    } else {
-        None
-    }
+    if root.width() >= 8 { Some(root) } else { None }
 }
 
 /// Elide one (root-stripped) row into `budget` cells, preserving its distinguishing

@@ -735,9 +735,10 @@ mod tests {
     fn empty_tree_maps_everything_unmapped() {
         let empty = SymbolTree::new(FileId::new("empty.go").unwrap(), Revision::Worktree, vec![]);
         let maps = map_changes(&empty, &[hunk(1, 1, 1, 1), del_hunk(5, 3, 4)]);
-        assert!(maps
-            .iter()
-            .all(|m| m.confidence == MappingConfidence::Unmapped));
+        assert!(
+            maps.iter()
+                .all(|m| m.confidence == MappingConfidence::Unmapped)
+        );
     }
 
     /// Review 20: context lines are never evidence. An Add run surrounded by context maps
@@ -798,9 +799,10 @@ mod tests {
         assert_eq!(maps[0].run_index, 0);
         assert_eq!(maps[1].targets, vec![SymbolId::new("2")]);
         assert_eq!(maps[1].run_index, 1);
-        assert!(maps
-            .iter()
-            .all(|m| m.confidence == MappingConfidence::Exact));
+        assert!(
+            maps.iter()
+                .all(|m| m.confidence == MappingConfidence::Exact)
+        );
     }
 
     /// Review 20: a replacement (Del run + Add run) maps both sides; the deleted base

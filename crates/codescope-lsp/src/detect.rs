@@ -229,12 +229,16 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let folders = go_module_folders(&root);
         assert_eq!(folders.len(), 3);
-        assert!(folders
-            .iter()
-            .any(|p| p.as_str().ends_with("packages/alpha")));
-        assert!(folders
-            .iter()
-            .any(|p| p.as_str().ends_with("packages/beta")));
+        assert!(
+            folders
+                .iter()
+                .any(|p| p.as_str().ends_with("packages/alpha"))
+        );
+        assert!(
+            folders
+                .iter()
+                .any(|p| p.as_str().ends_with("packages/beta"))
+        );
         assert!(
             folders.iter().any(|p| p.as_path() == root.as_path()),
             "root folder missing: {folders:?}"

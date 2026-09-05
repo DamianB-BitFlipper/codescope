@@ -746,14 +746,16 @@ mod tests {
         );
         assert_eq!(d.changed_symbols.len(), MAX_DIGEST_SYMBOLS);
         assert_eq!(d.relations.len(), MAX_DIGEST_RELATIONS);
-        assert!(d
-            .notes
-            .iter()
-            .any(|n| n.contains("changed symbols truncated: 50 of 60")));
-        assert!(d
-            .notes
-            .iter()
-            .any(|n| n.contains("relations truncated: 100 of 120")));
+        assert!(
+            d.notes
+                .iter()
+                .any(|n| n.contains("changed symbols truncated: 50 of 60"))
+        );
+        assert!(
+            d.notes
+                .iter()
+                .any(|n| n.contains("relations truncated: 100 of 120"))
+        );
     }
 
     #[test]

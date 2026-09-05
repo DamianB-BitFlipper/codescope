@@ -52,12 +52,14 @@ async fn rust_analyzer_end_to_end() {
         .expect("start failed");
 
     assert_eq!(svc.language_name(), "Rust");
-    assert!(svc
-        .features()
-        .is_supported(codescope_core::Feature::DocumentSymbols));
-    assert!(!svc
-        .features()
-        .is_supported(codescope_core::Feature::TypeHierarchySub));
+    assert!(
+        svc.features()
+            .is_supported(codescope_core::Feature::DocumentSymbols)
+    );
+    assert!(
+        !svc.features()
+            .is_supported(codescope_core::Feature::TypeHierarchySub)
+    );
 
     let file = FileId::new("src/main.rs").unwrap();
 

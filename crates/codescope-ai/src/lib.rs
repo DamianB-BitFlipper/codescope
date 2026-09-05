@@ -34,24 +34,24 @@ pub mod tools;
 mod validator;
 
 pub use client::{
-    AiClient, AiClientOptions, ChatMessage, RawPlanResponse, RawToolCall, TokenUsage,
-    RETRY_AFTER_CAP,
+    AiClient, AiClientOptions, ChatMessage, RETRY_AFTER_CAP, RawPlanResponse, RawToolCall,
+    TokenUsage,
 };
 pub use config::{
-    AiConfig, AiFileConfig, ProviderKind, ReasoningEffort, ANTHROPIC_BASE_URL,
-    DEFAULT_ANTHROPIC_MODEL, DEFAULT_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_TIMEOUT, OPENAI_BASE_URL,
-    PRIME_BASE_URL,
+    ANTHROPIC_BASE_URL, AiConfig, AiFileConfig, DEFAULT_ANTHROPIC_MODEL, DEFAULT_MODEL,
+    DEFAULT_OPENAI_MODEL, DEFAULT_TIMEOUT, OPENAI_BASE_URL, PRIME_BASE_URL, ProviderKind,
+    ReasoningEffort,
 };
 pub use error::AiError;
 pub use plan::parse_plan;
-pub use scrub::{scrub_secrets, REDACTED};
+pub use scrub::{REDACTED, scrub_secrets};
 pub use service::{
-    redact_repo_root, AiActivityObserver, AiActivityUpdate, AiOutcome, AiService,
-    AiToolActivityState, DiagramObserver, RetryPolicy,
+    AiActivityObserver, AiActivityUpdate, AiOutcome, AiService, AiToolActivityState,
+    DiagramObserver, RetryPolicy, redact_repo_root,
 };
 pub use tools::{
-    diagram_tools, is_diagram_tool, is_read_only_tool, read_only_tools, research_tools,
-    semantic_tools, NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, DIAGRAM_EDIT_TOOL_NAME,
-    DIAGRAM_INSPECT_TOOL_NAME, LSP_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
+    DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, LSP_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
+    NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, diagram_tools, is_diagram_tool,
+    is_read_only_tool, read_only_tools, research_tools, semantic_tools,
 };
-pub use validator::{validate, FactView, Lookup, IMPACT_SUMMARY_MAX_BULLETS};
+pub use validator::{FactView, IMPACT_SUMMARY_MAX_BULLETS, Lookup, validate};

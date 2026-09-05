@@ -30,10 +30,10 @@ pub mod graph;
 pub mod mapper;
 pub mod source;
 
-pub use changes::{changed_symbols, changed_symbols_detailed, file_mappings, ChangedSymbolInfo};
-pub use digest::{change_digest, estimate_tokens, ChangeDigest};
+pub use changes::{ChangedSymbolInfo, changed_symbols, changed_symbols_detailed, file_mappings};
+pub use digest::{ChangeDigest, change_digest, estimate_tokens};
 pub use engine::{AnalysisEngine, AnalysisSnapshot, FileAnalysis, FileSemanticResult};
 pub use error::AnalysisError;
 pub use graph::{annotate_diagnostics, build_impact_graph};
-pub use mapper::{map_changes, map_changes_detailed, map_changes_with_base, MappedHunk};
+pub use mapper::{MappedHunk, map_changes, map_changes_detailed, map_changes_with_base};
 pub use source::SemanticSource;

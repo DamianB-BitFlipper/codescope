@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use codescope_core::ChangeScope;
 
 use crate::action::{
-    next_scope, previous_scope, Action, DiffTextSelection, PlanNodeTarget, PlanRelationshipTarget,
+    Action, DiffTextSelection, PlanNodeTarget, PlanRelationshipTarget, next_scope, previous_scope,
 };
 use crate::divider::DividerSizes;
 use crate::file_rows::ProjectedRow;

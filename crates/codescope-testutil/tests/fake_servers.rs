@@ -2,11 +2,11 @@
 //! through their public APIs with hand-rolled test clients (no client frameworks).
 
 use codescope_core::Epoch;
-use codescope_testutil::fake_ai::{AiScriptStep, ScriptedProvider, FAKE_MODEL};
+use codescope_testutil::fake_ai::{AiScriptStep, FAKE_MODEL, ScriptedProvider};
 use codescope_testutil::fake_lsp::{
-    read_frame, spawn_in_process, write_frame, FakeLspConfig, ScriptedResponse, METHOD_NOT_FOUND,
+    FakeLspConfig, METHOD_NOT_FOUND, ScriptedResponse, read_frame, spawn_in_process, write_frame,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -320,9 +320,11 @@ async fn ai_valid_plan_round_trips_through_core_types() {
     let calls = choice["message"]["tool_calls"].as_array().unwrap();
     assert_eq!(calls[0]["type"], "function");
     assert_eq!(calls[0]["function"]["name"], "edit_visualization");
-    assert!(calls
-        .iter()
-        .all(|call| call["function"]["name"] == "edit_visualization"));
+    assert!(
+        calls
+            .iter()
+            .all(|call| call["function"]["name"] == "edit_visualization")
+    );
     assert!(calls.iter().any(|call| {
         call["function"]["arguments"]
             .as_str()
@@ -375,9 +377,11 @@ async fn ai_scripted_failure_modes_in_order() {
     let calls = completion["choices"][0]["message"]["tool_calls"]
         .as_array()
         .unwrap();
-    assert!(calls.iter().any(|call| call["function"]["arguments"]
-        .as_str()
-        .is_some_and(|arguments| arguments.contains("internal/api/quantum_flux.go"))));
+    assert!(calls.iter().any(|call| {
+        call["function"]["arguments"]
+            .as_str()
+            .is_some_and(|arguments| arguments.contains("internal/api/quantum_flux.go"))
+    }));
 
     // 3. Typed diagram fixtures naturally end their tool sequence on the next turn.
     let response = post_chat(&provider, &chat_request()).await;
@@ -450,8 +454,10 @@ async fn ai_steps_can_be_pushed_while_serving() {
     let response = post_chat(&provider, &chat_request()).await;
     assert_eq!(response.status, 200);
     assert_eq!(provider.remaining_steps(), 1);
-    assert!(provider
-        .chat_completions_url()
-        .ends_with("/v1/chat/completions"));
+    assert!(
+        provider
+            .chat_completions_url()
+            .ends_with("/v1/chat/completions")
+    );
     assert!(provider.base_url().starts_with("http://127.0.0.1:"));
 }

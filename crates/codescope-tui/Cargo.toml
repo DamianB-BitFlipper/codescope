@@ -2,12 +2,17 @@
 name = "codescope-tui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "codescope Ratatui interface: renders UiSnapshot, emits Actions"
 
 [dependencies]
-codescope-core = { path = "../codescope-core" }
-codescope-telemetry = { path = "../codescope-telemetry" }
+codescope-core.workspace = true
+codescope-telemetry.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 tui-tree-widget.workspace = true

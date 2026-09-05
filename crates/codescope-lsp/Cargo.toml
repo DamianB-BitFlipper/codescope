@@ -2,7 +2,12 @@
 name = "codescope-lsp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "codescope LSP layer: generic stdio JSON-RPC client + gopls adapter"
 
 [features]
@@ -11,7 +16,7 @@ description = "codescope LSP layer: generic stdio JSON-RPC client + gopls adapte
 testing = []
 
 [dependencies]
-codescope-core = { path = "../codescope-core" }
+codescope-core.workspace = true
 camino.workspace = true
 ignore.workspace = true
 lsp-types.workspace = true
@@ -25,6 +30,6 @@ url.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
-codescope-core = { path = "../codescope-core" }
+codescope-core.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true

@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use codescope_ai::{
-    diagram_tools, research_tools, semantic_tools, Lookup, ToolDef, ToolExecError, ToolExecutor,
-    LSP_INSPECT_TOOL_NAME,
+    LSP_INSPECT_TOOL_NAME, Lookup, ToolDef, ToolExecError, ToolExecutor, diagram_tools,
+    research_tools, semantic_tools,
 };
 use codescope_core::{
     Availability, ChangeSet, Completeness, Diagnostic, DiffLineKind, EntityRef, Epoch, Evidence,
@@ -19,7 +19,7 @@ use codescope_core::{
 };
 use codescope_lsp::{LanguageService, SemanticError};
 use futures::future::BoxFuture;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::dispatcher::AiSelectionKey;
 
@@ -1571,7 +1571,10 @@ pub(crate) fn research_brief(selection: &AiSelectionKey, changeset: &ChangeSet) 
             file, name, line, ..
         } => (
             "symbol",
-            format!("{name} in {file} at one-based line {}", line.saturating_add(1)),
+            format!(
+                "{name} in {file} at one-based line {}",
+                line.saturating_add(1)
+            ),
             "Explain this selected symbol's change. Keep every source reference in its file and omit unrelated file behavior.",
         ),
     };
@@ -1812,7 +1815,7 @@ fn semantic_error_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codescope_ai::{validate, FactView};
+    use codescope_ai::{FactView, validate};
     use codescope_core::{
         Availability, ChangeScope, DiagnosticSeverity, DiffLine, DiffSide, FormKind, Hunk,
         PlanEdge, PlanNode, PlanNodeChange, Revision, SymbolId, SymbolKind, ValidationVerdict,
@@ -2079,11 +2082,13 @@ mod tests {
             tools.resolve("handler.rs").unwrap().as_str(),
             "src/api/handler.rs"
         );
-        assert!(tools
-            .resolve("../secret")
-            .unwrap_err()
-            .0
-            .contains("forbidden"));
+        assert!(
+            tools
+                .resolve("../secret")
+                .unwrap_err()
+                .0
+                .contains("forbidden")
+        );
         assert!(tools.resolve_file("model.rs").is_err());
         assert_eq!(
             tools
@@ -2109,11 +2114,13 @@ mod tests {
                 vec![change("src/one/handler.rs"), change("src/two/handler.rs")],
             ),
         );
-        assert!(tools
-            .resolve_file("handler.rs")
-            .unwrap_err()
-            .0
-            .contains("matches multiple"));
+        assert!(
+            tools
+                .resolve_file("handler.rs")
+                .unwrap_err()
+                .0
+                .contains("matches multiple")
+        );
         assert_eq!(
             tools.resolve_file("one/handler.rs").unwrap().path.as_str(),
             "src/one/handler.rs"
@@ -2178,10 +2185,12 @@ mod tests {
     async fn semantic_inspection_is_scoped_capability_gated_and_revision_tagged() {
         let source = Arc::new(FakeSemantic::new());
         let tools = semantic_executor(source.clone(), QueriedLspFacts::default());
-        assert!(tools
-            .available_tools()
-            .iter()
-            .any(|tool| tool.name == LSP_INSPECT_TOOL_NAME));
+        assert!(
+            tools
+                .available_tools()
+                .iter()
+                .any(|tool| tool.name == LSP_INSPECT_TOOL_NAME)
+        );
 
         let capabilities: Value = serde_json::from_str(
             &tools
@@ -2250,24 +2259,28 @@ mod tests {
         assert_eq!(unavailable["status"], "unavailable");
         assert_eq!(unknown_source.outgoing_calls.load(Ordering::SeqCst), 0);
 
-        assert!(tools
-            .execute(
-                LSP_INSPECT_TOOL_NAME,
-                &json!({"query": "symbols", "path": "/etc/passwd"}),
-            )
-            .await
-            .unwrap_err()
-            .0
-            .contains("absolute paths are forbidden"));
-        assert!(tools
-            .execute(
-                LSP_INSPECT_TOOL_NAME,
-                &json!({"query": "symbols", "path": "model.rs"}),
-            )
-            .await
-            .unwrap_err()
-            .0
-            .contains("not a changed file in the current selection"));
+        assert!(
+            tools
+                .execute(
+                    LSP_INSPECT_TOOL_NAME,
+                    &json!({"query": "symbols", "path": "/etc/passwd"}),
+                )
+                .await
+                .unwrap_err()
+                .0
+                .contains("absolute paths are forbidden")
+        );
+        assert!(
+            tools
+                .execute(
+                    LSP_INSPECT_TOOL_NAME,
+                    &json!({"query": "symbols", "path": "model.rs"}),
+                )
+                .await
+                .unwrap_err()
+                .0
+                .contains("not a changed file in the current selection")
+        );
     }
 
     #[tokio::test]
@@ -2363,10 +2376,12 @@ mod tests {
         assert_eq!(result["returned_results"], 2);
         assert_eq!(result["truncated"], true);
         assert_eq!(result["completeness"], "partial");
-        assert!(result["notes"][0]
-            .as_str()
-            .unwrap()
-            .contains("kept 2 of 60"));
+        assert!(
+            result["notes"][0]
+                .as_str()
+                .unwrap()
+                .contains("kept 2 of 60")
+        );
         assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_RESULT_BYTES);
     }
 

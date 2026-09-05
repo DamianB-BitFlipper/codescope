@@ -28,12 +28,12 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::LspError;
-use crate::framing::{encode_frame, FrameDecoder, FrameEvent};
+use crate::framing::{FrameDecoder, FrameEvent, encode_frame};
 use crate::jsonrpc::{self, Incoming, RequestId, ResponseError};
 
 /// How long the process may take to exit after `shutdown` + `exit` before it

@@ -28,7 +28,13 @@ Codescope currently has production language-server adapters for Go (`gopls`) and
 
 ## Installation
 
-Codescope is currently installed from source. It requires Rust 1.85 or newer:
+Codescope requires Rust 1.85 or newer. Install the prerelease from crates.io:
+
+```bash
+cargo install codescope --version 0.1.0-alpha.1 --locked
+```
+
+Or install the latest source checkout:
 
 ```bash
 git clone https://github.com/DamianB-BitFlipper/codescope.git
@@ -309,6 +315,14 @@ cargo build --release
 ./target/release/codescope .
 ```
 
+Enable the tracked pre-commit hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook runs Clippy across every workspace target and rejects warnings.
+
 Before submitting changes:
 
 ```bash
@@ -323,10 +337,11 @@ git diff --check
 - [Architecture](docs/architecture.md) — crate boundaries and system design
 - [AI data flow](docs/ai-dataflow.md) — research, diagram construction, and validation
 - [Telemetry](docs/telemetry.md) — local event schema, snapshots, and privacy
+- [Publishing](docs/publishing.md) — crates.io packaging and workspace release order
 - [Adding a language server](docs/adding-a-language-server.md) — extending semantic support
 - [Known limitations](docs/limitations.md) — accuracy boundaries and next improvements
 - [Research notes](docs/research/) — evidence behind the design decisions
 
 ## License
 
-Codescope is licensed under the MIT License.
+Codescope is licensed under the [Apache License 2.0](LICENSE).

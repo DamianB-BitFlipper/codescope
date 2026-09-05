@@ -23,7 +23,7 @@ pub mod run;
 pub mod scroll;
 pub mod snapshot;
 
-pub use action::{map_key, Action, ExternalControl, PlanNodeTarget, PlanRelationshipTarget};
+pub use action::{Action, ExternalControl, PlanNodeTarget, PlanRelationshipTarget, map_key};
 pub use app::{App, Pane, UiPreferences};
 pub use divider::{DividerId, DividerSizes};
 pub use render::render;

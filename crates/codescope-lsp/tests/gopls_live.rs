@@ -91,9 +91,10 @@ async fn gopls_end_to_end() {
         .expect("start timed out")
         .expect("start failed");
 
-    assert!(svc
-        .features()
-        .is_supported(codescope_core::Feature::DocumentSymbols));
+    assert!(
+        svc.features()
+            .is_supported(codescope_core::Feature::DocumentSymbols)
+    );
     let file = FileId::new("main.go").unwrap();
 
     // Symbol tree (hierarchical: struct fields nested, methods top-level).
@@ -122,9 +123,11 @@ async fn gopls_end_to_end() {
             .expect("semantic_tokens failed")
             .value;
         assert!(!syntax.is_empty(), "expected gopls syntax tokens");
-        assert!(syntax
-            .iter()
-            .all(|token| token.range.start_line == token.range.end_line));
+        assert!(
+            syntax
+                .iter()
+                .all(|token| token.range.start_line == token.range.end_line)
+        );
     }
 
     // Implementations of Greeter.Greet (interface method at line 6, col 1).
@@ -251,9 +254,10 @@ func main() {
         .expect("start failed");
 
     assert_eq!(svc.language_name(), "Go");
-    assert!(svc
-        .features()
-        .is_supported(codescope_core::Feature::DocumentSymbols));
+    assert!(
+        svc.features()
+            .is_supported(codescope_core::Feature::DocumentSymbols)
+    );
 
     // Symbols in the remote module are served.
     let file = FileId::new("packages/greet/greet.go").unwrap();

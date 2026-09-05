@@ -9,7 +9,7 @@
 
 use codescope_ai::{AiConfig, AiOutcome, AiService, FactView, Lookup, NoToolExecutor};
 use codescope_core::{
-    DiffSide, EntityRef, Epoch, FileId, LineRange, PlanEdgeKind, MAX_NODE_CODE_REFS,
+    DiffSide, EntityRef, Epoch, FileId, LineRange, MAX_NODE_CODE_REFS, PlanEdgeKind,
 };
 
 /// Accept-everything facts: the live smoke exercises the wire + plan contract, not the

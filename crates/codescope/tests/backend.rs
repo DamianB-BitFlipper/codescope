@@ -219,14 +219,15 @@ fn incremental_plan_script(plan: &VisualizationPlan) -> Vec<AiScriptStep> {
                     .expect("fixture sequence plan must connect each scaffold pair with flows_to")
             })
             .collect(),
-        FormKind::RelationshipFlow => vec![form
-            .edges
-            .iter()
-            .enumerate()
-            .find_map(|(index, edge)| {
-                edge_joins_scaffold(form, edge, scaffold_nodes).then_some(index)
-            })
-            .expect("fixture relationship flow must connect its scaffold")],
+        FormKind::RelationshipFlow => vec![
+            form.edges
+                .iter()
+                .enumerate()
+                .find_map(|(index, edge)| {
+                    edge_joins_scaffold(form, edge, scaffold_nodes).then_some(index)
+                })
+                .expect("fixture relationship flow must connect its scaffold"),
+        ],
         _ => Vec::new(),
     };
     script.extend(scaffold_edges.iter().map(|&index| {
@@ -613,9 +614,11 @@ fn analyze_git_only_when_server_binary_missing() {
     );
     // Files carry per-file notes and no semantic trees, but hunks survive in the digest.
     let files = json["files"].as_array().unwrap();
-    assert!(files
-        .iter()
-        .all(|f| !f["notes"].as_array().unwrap().is_empty()));
+    assert!(
+        files
+            .iter()
+            .all(|f| !f["notes"].as_array().unwrap().is_empty())
+    );
     assert!(files.iter().all(|f| f["worktree"].is_null()));
     assert!(json["changed"].as_array().unwrap().is_empty());
     assert!(
@@ -853,11 +856,13 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
     assert!(!requests[0].body.contains("focused source evidence"));
     let diff_body = requests[1].body_json().expect("diff-turn request JSON");
     assert_eq!(diff_body["tool_choice"], "auto");
-    assert!(diff_body["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|message| message["role"] == "tool"));
+    assert!(
+        diff_body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool")
+    );
     let plan_body = requests[2].body_json().expect("plan-turn request JSON");
     assert!(
         plan_body["messages"]
@@ -919,9 +924,11 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
         diff_snapshot["data"]["payload"]["comparison"]["scope"],
         "branch"
     );
-    assert!(diff_snapshot["data"]["payload"]["files"]
-        .as_array()
-        .is_some_and(|files| !files.is_empty()));
+    assert!(
+        diff_snapshot["data"]["payload"]["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty())
+    );
     let llm_requests = telemetry_records
         .iter()
         .filter(|record| record["event"] == "llm.request")
@@ -952,9 +959,11 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
             .all(|record| record["origin"] == "internal_agent"),
         "built-in model records have explicit provenance"
     );
-    assert!(llm_requests[0]["data"]["body"]["messages"]
-        .as_array()
-        .is_some_and(|messages| !messages.is_empty()));
+    assert!(
+        llm_requests[0]["data"]["body"]["messages"]
+            .as_array()
+            .is_some_and(|messages| !messages.is_empty())
+    );
     assert_eq!(
         llm_requests[0]["data"]["request_id"],
         llm_responses[0]["data"]["request_id"]
@@ -1171,12 +1180,16 @@ fn agent_diagram_schema_exposes_the_shared_tools_without_a_live_tui() {
     let out = codescope_in(temp.path(), &["agent", ".", "diagram", "schema"]);
     let value = json_stdout(&out);
     let tools = value["tools"].as_array().expect("diagram tools array");
-    assert!(tools
-        .iter()
-        .any(|tool| tool["name"] == "edit_visualization"));
-    assert!(tools
-        .iter()
-        .any(|tool| tool["name"] == "inspect_visualization"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "edit_visualization")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "inspect_visualization")
+    );
     assert_eq!(
         value["finish"]["command"],
         "codescope agent . diagram finish --view-id VIEW_ID"
@@ -1199,12 +1212,16 @@ fn every_command_appends_local_session_telemetry() {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("valid telemetry JSONL"))
         .collect::<Vec<_>>();
-    assert!(records
-        .iter()
-        .any(|record| record["event"] == "session.start"));
-    assert!(records
-        .iter()
-        .any(|record| record["event"] == "session.end"));
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"] == "session.start")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"] == "session.end")
+    );
     assert!(records.iter().all(|record| record["schema_version"] == 1));
     assert!(records.iter().all(|record| matches!(
         record["origin"].as_str(),
@@ -1215,12 +1232,16 @@ fn every_command_appends_local_session_telemetry() {
         .filter(|record| record["event"] == "agent.command")
         .collect::<Vec<_>>();
     assert_eq!(agent_commands.len(), 2, "client start and completion");
-    assert!(agent_commands
-        .iter()
-        .all(|record| record["origin"] == "external_agent"));
-    assert!(agent_commands
-        .iter()
-        .all(|record| record["data"]["operation"] == "diagram.schema"));
+    assert!(
+        agent_commands
+            .iter()
+            .all(|record| record["origin"] == "external_agent")
+    );
+    assert!(
+        agent_commands
+            .iter()
+            .all(|record| record["data"]["operation"] == "diagram.schema")
+    );
     assert_eq!(agent_commands[0]["data"]["side"], "client");
     assert_eq!(agent_commands[0]["data"]["phase"], "started");
     assert_eq!(agent_commands[0]["data"]["status"], "running");
@@ -2691,11 +2712,13 @@ fn omitted_path_uses_the_current_directory() {
 
     let out = codescope_in(&root, &["bases"]);
     let json = json_stdout(&out);
-    assert!(json["bases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|b| b["ref_name"] == "main"));
+    assert!(
+        json["bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["ref_name"] == "main")
+    );
 }
 
 // ---------------------------------------------------------------------------

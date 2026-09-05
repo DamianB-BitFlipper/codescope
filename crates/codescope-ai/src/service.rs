@@ -23,18 +23,18 @@ use crate::client::{
 };
 use crate::config::{AiConfig, ReasoningEffort};
 use crate::error::AiError;
-use crate::plan::{parse_plan, MAX_AI_EVIDENCE, MAX_AI_FORM_EDGES, MAX_AI_FORM_NODES};
+use crate::plan::{MAX_AI_EVIDENCE, MAX_AI_FORM_EDGES, MAX_AI_FORM_NODES, parse_plan};
 use crate::tools::{
-    diagram_command_example, diagram_tool_for_op, is_read_only_tool, ToolDef, ToolExecutor,
-    DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, LSP_INSPECT_TOOL_NAME,
+    DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, LSP_INSPECT_TOOL_NAME, ToolDef,
+    ToolExecutor, diagram_command_example, diagram_tool_for_op, is_read_only_tool,
 };
-use crate::validator::{validate, FactView};
+use crate::validator::{FactView, validate};
 use backon::{ExponentialBuilder, Retryable};
 use camino::{Utf8Path, Utf8PathBuf};
 use codescope_core::{
-    DiagramCommand, DiagramDraft, DiagramEdgePatch, DiagramNodePatch, Epoch, FormKind, PlanEdge,
-    PlanEvidence, PlanNode, ValidationReport, ValidationVerdict, VisualizationPlan,
-    MAX_CODE_REF_LINES, MAX_FORMS_PER_PLAN, MAX_FORM_DEPTH, MAX_NODE_CODE_REFS, PLAN_VERSION,
+    DiagramCommand, DiagramDraft, DiagramEdgePatch, DiagramNodePatch, Epoch, FormKind,
+    MAX_CODE_REF_LINES, MAX_FORM_DEPTH, MAX_FORMS_PER_PLAN, MAX_NODE_CODE_REFS, PLAN_VERSION,
+    PlanEdge, PlanEvidence, PlanNode, ValidationReport, ValidationVerdict, VisualizationPlan,
 };
 use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
@@ -888,8 +888,7 @@ impl AiService {
                     DIAGRAM_EDIT_TOOL_NAME => {
                         let command = match parse_provider_diagram_command(&call.arguments) {
                             Ok(DiagramCommand::Finish) => {
-                                let reason =
-                                    "finish is not an edit; end the tool sequence when the \
+                                let reason = "finish is not an edit; end the tool sequence when the \
                                               draft is complete";
                                 tool_messages.push(ChatMessage::tool(
                                     call.id.clone(),
@@ -1934,9 +1933,15 @@ fn construction_protocol(op: &str, required_misses: Option<usize>) -> String {
 /// repository-derived text, so the controller can safely repeat it after a capped response.
 fn controller_operation_guidance(op: &str) -> &'static str {
     match op {
-        "create_node" => "Add the next distinct, unrepresented decisive selected-code behavior. In a sequence, follow actual selected-code execution/lifecycle order. If controller_feedback reports a rejected code_ref, preserve the intended node and repair the specifically identified reference: copy a one-based inclusive range of at most 12 lines from the retained git_diff_file evidence, and do not reuse, invent, or calculate the rejected range.",
-        "create_edge" => "Add one missing sequence or connectivity relation between existing nodes. For a Sequence lifecycle adjacency, set `kind` to `flows_to`. Use `calls` only for actual proven calls, never as a synonym for “then”. Do not duplicate an existing relation.",
-        "add_evidence" => "Add hunk-local evidence only. Its reason may describe only its cited hunk.",
+        "create_node" => {
+            "Add the next distinct, unrepresented decisive selected-code behavior. In a sequence, follow actual selected-code execution/lifecycle order. If controller_feedback reports a rejected code_ref, preserve the intended node and repair the specifically identified reference: copy a one-based inclusive range of at most 12 lines from the retained git_diff_file evidence, and do not reuse, invent, or calculate the rejected range."
+        }
+        "create_edge" => {
+            "Add one missing sequence or connectivity relation between existing nodes. For a Sequence lifecycle adjacency, set `kind` to `flows_to`. Use `calls` only for actual proven calls, never as a synonym for “then”. Do not duplicate an existing relation."
+        }
+        "add_evidence" => {
+            "Add hunk-local evidence only. Its reason may describe only its cited hunk."
+        }
         _ => "Apply the controller-selected operation now.",
     }
 }
@@ -2214,10 +2219,7 @@ fn validate_command_code_ref_spans(command: &DiagramCommand) -> Result<(), Strin
             };
             return Err(format!(
                 "diagram command field `{field}[{index}]` is invalid: {invalid_reason}; submitted {}#h{} {side} {}..{}. Retry the same `{op}` with this reference corrected from retained git_diff_file evidence: copy exact one-based annotated line numbers on one side of one hunk, keep the inclusive span at most {MAX_CODE_REF_LINES} lines, and do not invent or calculate line numbers",
-                reference.file,
-                reference.hunk,
-                reference.start_line,
-                reference.end_line,
+                reference.file, reference.hunk, reference.start_line, reference.end_line,
             ));
         }
     }
@@ -3364,15 +3366,21 @@ mod tests {
 
         // Two- and three-hunk sequences keep the generic shape guidance rather than the
         // four-slot lifecycle scaffold.
-        assert!(node_quality_guidance(&form(FormKind::Sequence, 0), 2)
-            .unwrap()
-            .contains("This is the first box"));
-        assert!(node_quality_guidance(&form(FormKind::Sequence, 1), 3)
-            .unwrap()
-            .contains("This is an intermediate required box"));
-        assert!(node_quality_guidance(&form(FormKind::Sequence, 1), 2)
-            .unwrap()
-            .contains("final required flow box"));
+        assert!(
+            node_quality_guidance(&form(FormKind::Sequence, 0), 2)
+                .unwrap()
+                .contains("This is the first box")
+        );
+        assert!(
+            node_quality_guidance(&form(FormKind::Sequence, 1), 3)
+                .unwrap()
+                .contains("This is an intermediate required box")
+        );
+        assert!(
+            node_quality_guidance(&form(FormKind::Sequence, 1), 2)
+                .unwrap()
+                .contains("final required flow box")
+        );
 
         let relationship = node_quality_guidance(&form(FormKind::RelationshipFlow, 2), 4)
             .expect("relationship node remains required");
@@ -3733,10 +3741,12 @@ mod tests {
         }
         // needs-at-least-two-nodes is not about edge wiring; it keeps the generic branch
         // (the model already knows the form minimums from the schema).
-        assert!(!plan_repair_instruction(
-            "form 0 (RelationshipFlow): relationship visual needs at least two nodes"
-        )
-        .contains("Preserve the useful sequence"));
+        assert!(
+            !plan_repair_instruction(
+                "form 0 (RelationshipFlow): relationship visual needs at least two nodes"
+            )
+            .contains("Preserve the useful sequence")
+        );
     }
 
     /// The live GLM failure class: a symbol entity the lazy fact store never queried must
@@ -3756,10 +3766,12 @@ mod tests {
         assert!(instruction.contains("omit entity entirely"));
         assert!(instruction.contains("zero-based hunk"));
         // Analyzed-and-missing symbols and out-of-extent ranges share the branch.
-        assert!(plan_repair_instruction(
-            "form 0 (CallTree): root node n1 invalid: symbol Gone not found in a.go (analyzed)"
-        )
-        .contains("exact current fact or tool result"));
+        assert!(
+            plan_repair_instruction(
+                "form 0 (CallTree): root node n1 invalid: symbol Gone not found in a.go (analyzed)"
+            )
+            .contains("exact current fact or tool result")
+        );
         assert!(plan_repair_instruction(
             "form 0 (ChangedSymbolTree): node n2 in form 0: range 5..9 outside symbol extent 10..30"
         )

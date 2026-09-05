@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "codescope"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "camino",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-ai"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "backon",
  "camino",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-analysis"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "codescope-core",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "lsp-types",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-git"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "codescope-core",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-lsp"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "codescope-core",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-telemetry"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde_json",
  "sha2",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-testutil"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "codescope-core",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "codescope-tui"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "codescope-core",
  "codescope-telemetry",

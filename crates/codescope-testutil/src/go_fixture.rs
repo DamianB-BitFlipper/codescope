@@ -244,11 +244,7 @@ pub fn gofmt_unformatted(root: impl AsRef<Path>) -> Result<Vec<String>> {
 
 /// Platform null device, used to neutralize the user's global git config.
 fn null_device() -> &'static str {
-    if cfg!(windows) {
-        "NUL"
-    } else {
-        "/dev/null"
-    }
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
 /// Run `git` inside `root` with fully pinned identity/config env. `date`, when given, sets

@@ -17,7 +17,9 @@ pub enum AiError {
     /// A literal `api_key` value appeared in a config file. Config files may only name an
     /// env var (`api_key_env`); rejecting literals prevents keys committed into config
     /// (research 07 §2).
-    #[error("literal api_key in a config file is not allowed; set api_key_env to an env var name instead")]
+    #[error(
+        "literal api_key in a config file is not allowed; set api_key_env to an env var name instead"
+    )]
     LiteralApiKeyInConfig,
 
     /// The local circuit breaker is open after repeated transport failures; the provider
@@ -123,25 +125,33 @@ mod tests {
         assert!(AiError::RateLimited { retry_after: None }.is_retryable());
         assert!(AiError::Timeout(Duration::from_secs(20)).is_retryable());
         assert!(AiError::Transport("connect refused".into()).is_retryable());
-        assert!(AiError::Http {
-            status: 503,
-            message: "overloaded".into()
-        }
-        .is_retryable());
-        assert!(!AiError::Http {
-            status: 401,
-            message: "unauthorized".into()
-        }
-        .is_retryable());
+        assert!(
+            AiError::Http {
+                status: 503,
+                message: "overloaded".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !AiError::Http {
+                status: 401,
+                message: "unauthorized".into()
+            }
+            .is_retryable()
+        );
         assert!(!AiError::NoToolCall.is_retryable());
-        assert!(!AiError::CircuitOpen {
-            retry_in: Duration::from_secs(60)
-        }
-        .is_retryable());
-        assert!(!AiError::Throttled {
-            retry_after: Duration::from_secs(6)
-        }
-        .is_retryable());
+        assert!(
+            !AiError::CircuitOpen {
+                retry_in: Duration::from_secs(60)
+            }
+            .is_retryable()
+        );
+        assert!(
+            !AiError::Throttled {
+                retry_after: Duration::from_secs(6)
+            }
+            .is_retryable()
+        );
     }
 
     #[test]

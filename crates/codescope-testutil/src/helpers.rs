@@ -1,7 +1,7 @@
 //! Environment probes and fixture-copy helpers shared by codescope test suites.
 
 use crate::error::{Result, TestutilError};
-use crate::go_fixture::{build_fixture, FixtureInfo};
+use crate::go_fixture::{FixtureInfo, build_fixture};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;

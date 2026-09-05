@@ -31,7 +31,7 @@ use codescope_core::{
     Upstream, ValidationReport, VisualizationPlan,
 };
 use codescope_git::GitRepo;
-use codescope_lsp::{detect_languages, Language, LanguageService, LspError, SemanticError};
+use codescope_lsp::{Language, LanguageService, LspError, SemanticError, detect_languages};
 use codescope_tui::snapshot::FileSemanticLoad;
 use codescope_tui::{Action, UiSnapshot};
 use serde::Serialize;

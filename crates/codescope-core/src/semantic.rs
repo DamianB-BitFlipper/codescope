@@ -558,13 +558,15 @@ mod tests {
     fn find_smallest_containing_gap_returns_none() {
         let tree = sample_tree();
         // Line 11 is between main (ends 10) and Greeter (starts 12).
-        assert!(tree
-            .find_smallest_containing(&LineRange::from_line_span(11, 11))
-            .is_none());
+        assert!(
+            tree.find_smallest_containing(&LineRange::from_line_span(11, 11))
+                .is_none()
+        );
         // Spanning two top-level symbols → no single container.
-        assert!(tree
-            .find_smallest_containing(&LineRange::from_line_span(5, 35))
-            .is_none());
+        assert!(
+            tree.find_smallest_containing(&LineRange::from_line_span(5, 35))
+                .is_none()
+        );
     }
 
     #[test]

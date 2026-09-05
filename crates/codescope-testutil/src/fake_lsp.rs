@@ -19,7 +19,7 @@
 //! The server records every inbound message; fetch them with [`FakeLspServer::received`].
 
 use crate::error::{Result, TestutilError};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;

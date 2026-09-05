@@ -2,7 +2,7 @@
 //! digest, over a hand-built two-file change-set (no git, no LSP).
 
 use camino::Utf8PathBuf;
-use codescope_analysis::digest::{change_digest, DIGEST_DEFAULT_TOKEN_BUDGET};
+use codescope_analysis::digest::{DIGEST_DEFAULT_TOKEN_BUDGET, change_digest};
 use codescope_analysis::{changed_symbols_detailed, map_changes_with_base};
 use codescope_core::{
     ApproxReason, BaseInfo, BaseSource, ChangeKind, ChangeScope, ChangeSet, DiffLine, EntityRef,

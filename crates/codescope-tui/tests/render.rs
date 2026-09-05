@@ -4,8 +4,8 @@ use codescope_core::{
     AiStatus, ChangeScope, FileId, FormKind, LsStatus, PlanEdge, PlanEdgeKind, PlanEvidence,
     PlanNode, PlanNodeChange, VisualizationPlan, VizForm,
 };
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 use codescope_tui::app::App;
 use codescope_tui::render::render;
@@ -388,7 +388,7 @@ fn sanitized_sequence_plan_warns_in_the_generated_pane() {
     );
 }
 
-use codescope_tui::action::{map_key, Action};
+use codescope_tui::action::{Action, map_key};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn key(code: KeyCode) -> KeyEvent {

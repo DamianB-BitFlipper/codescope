@@ -1505,28 +1505,32 @@ mod tests {
         app.diagram.set_overlay_scroll(0);
         let first_page = geo(&app, &s);
         let first_overlay = first_page.plan_relationship_overlay.clone().unwrap();
-        assert!(map_mouse(
-            wheel_up(first_overlay.rect.x, first_overlay.rect.y),
-            &app,
-            &s,
-            &first_page,
-            DragState::Idle
-        )
-        .action
-        .is_none());
+        assert!(
+            map_mouse(
+                wheel_up(first_overlay.rect.x, first_overlay.rect.y),
+                &app,
+                &s,
+                &first_page,
+                DragState::Idle
+            )
+            .action
+            .is_none()
+        );
         assert_eq!(app.ai_plan_scroll, base_scroll);
         app.diagram.set_overlay_scroll(first_overlay.max_offset);
         let last_page = geo(&app, &s);
         let last_overlay = last_page.plan_relationship_overlay.clone().unwrap();
-        assert!(map_mouse(
-            wheel_down(last_overlay.rect.x, last_overlay.rect.y),
-            &app,
-            &s,
-            &last_page,
-            DragState::Idle
-        )
-        .action
-        .is_none());
+        assert!(
+            map_mouse(
+                wheel_down(last_overlay.rect.x, last_overlay.rect.y),
+                &app,
+                &s,
+                &last_page,
+                DragState::Idle
+            )
+            .action
+            .is_none()
+        );
         assert_eq!(app.ai_plan_scroll, base_scroll);
         let second = map_mouse(
             down(last_overlay.rect.x, last_overlay.rect.y),
@@ -1829,9 +1833,10 @@ mod tests {
             .diff_text_point_at(frame.rect.x, frame.rect.y)
             .expect("gutter clamps to source body");
         assert_eq!(start.column, frame.code_starts[0].unwrap());
-        assert!(g
-            .diff_text_point_at(frame.rect.x, frame.rect.y + 1)
-            .is_none());
+        assert!(
+            g.diff_text_point_at(frame.rect.x, frame.rect.y + 1)
+                .is_none()
+        );
         let end = g
             .diff_text_point_at(
                 frame.rect.x + frame.code_starts[2].unwrap() as u16 + 3,

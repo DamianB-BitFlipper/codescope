@@ -5,9 +5,9 @@
 //! fact validator remains the authority on whether the result may be rendered or published.
 
 use crate::{
-    DiagnosticSeverity, EntityRef, Epoch, FormKind, NodeHint, PlanCodeRef, PlanEdge, PlanEdgeKind,
-    PlanEvidence, PlanNode, PlanNodeChange, VisualizationPlan, VizForm, MAX_FORMS_PER_PLAN,
-    MAX_FORM_NODES, MAX_NODE_CODE_REFS, MAX_PLAN_EVIDENCE, PLAN_VERSION,
+    DiagnosticSeverity, EntityRef, Epoch, FormKind, MAX_FORM_NODES, MAX_FORMS_PER_PLAN,
+    MAX_NODE_CODE_REFS, MAX_PLAN_EVIDENCE, NodeHint, PLAN_VERSION, PlanCodeRef, PlanEdge,
+    PlanEdgeKind, PlanEvidence, PlanNode, PlanNodeChange, VisualizationPlan, VizForm,
 };
 
 /// Defensive draft cap. AI-facing validation may impose a smaller presentation limit.

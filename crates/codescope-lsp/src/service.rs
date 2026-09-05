@@ -15,7 +15,7 @@ use codescope_core::{
     SyntaxToken,
 };
 
-use crate::detect::{detect_languages, Language};
+use crate::detect::{Language, detect_languages};
 use crate::error::SemanticError;
 use crate::gopls::GoplsService;
 use crate::options::LanguageServiceOptions;

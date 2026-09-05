@@ -41,7 +41,7 @@ pub mod service;
 pub mod uri;
 
 pub use client::{LspClient, ShutdownOutcome};
-pub use detect::{detect_languages, Language};
+pub use detect::{Language, detect_languages};
 pub use encoding::PositionEncoding;
 pub use error::{LspError, SemanticError};
 pub use gopls::GoplsService;

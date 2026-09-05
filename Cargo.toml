@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/codescope-core",
     "crates/codescope-git",
@@ -13,11 +13,27 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Damian Barabonkov <dbctl@pm.me>"]
+license = "Apache-2.0"
+repository = "https://github.com/DamianB-BitFlipper/codescope"
+homepage = "https://github.com/DamianB-BitFlipper/codescope"
+readme = "README.md"
 
 [workspace.dependencies]
+# Workspace crates keep their local paths for development and explicit versions for packaged
+# manifests, where Cargo removes `path` before publishing to crates.io.
+codescope-ai = { version = "=0.1.0-alpha.1", path = "crates/codescope-ai" }
+codescope-analysis = { version = "=0.1.0-alpha.1", path = "crates/codescope-analysis" }
+codescope-core = { version = "=0.1.0-alpha.1", path = "crates/codescope-core" }
+codescope-git = { version = "=0.1.0-alpha.1", path = "crates/codescope-git" }
+codescope-lsp = { version = "=0.1.0-alpha.1", path = "crates/codescope-lsp" }
+codescope-telemetry = { version = "=0.1.0-alpha.1", path = "crates/codescope-telemetry" }
+codescope-testutil = { version = "=0.1.0-alpha.1", path = "crates/codescope-testutil" }
+codescope-tui = { version = "=0.1.0-alpha.1", path = "crates/codescope-tui" }
+
 # verified versions (docs/research)
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "io-std", "net"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }

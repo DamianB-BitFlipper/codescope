@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use camino::Utf8Path;
 use codescope_core::{ChangeScope, ChangeSet, FileChange, HeadState, RepoContext};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Store and activate the current parsed comparison, returning its content identity. `Ok(None)`
 /// means telemetry was not initialized; malformed/missing captured comparison data is an error so
@@ -491,9 +491,11 @@ mod tests {
                 "leaked {hidden}"
             );
         }
-        assert!(!serde_json::to_string(&payload)
-            .unwrap()
-            .contains(root.as_str()));
+        assert!(
+            !serde_json::to_string(&payload)
+                .unwrap()
+                .contains(root.as_str())
+        );
 
         let files = payload["files"].as_array().unwrap();
         assert_eq!(files.len(), 2);

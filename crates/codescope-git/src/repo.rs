@@ -1,9 +1,9 @@
 //! [`GitRepo`]: discovery plus the high-level read-only queries.
 
-use crate::diff::{parse_unified_diff_with_sections, unmerged_change, ParsedUnifiedDiff};
+use crate::diff::{ParsedUnifiedDiff, parse_unified_diff_with_sections, unmerged_change};
 use crate::error::{GitError, Result};
 use crate::runner::GitCommand;
-use crate::status::{parse_status_z, StatusSnapshot};
+use crate::status::{StatusSnapshot, parse_status_z};
 use camino::{Utf8Path, Utf8PathBuf};
 use codescope_core::{
     BaseInfo, BaseSource, ChangeScope, ChangeSet, FileChange, FileStatus, Oid, RepoContext,

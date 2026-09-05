@@ -4,23 +4,23 @@
 //! local throttle) without any real network dependency.
 
 use codescope_ai::{
-    diagram_tools, research_tools, AiActivityObserver, AiActivityUpdate, AiClient, AiClientOptions,
-    AiConfig, AiError, AiOutcome, AiService, AiToolActivityState, ChatMessage, DiagramObserver,
-    FactView, Lookup, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolDef, ToolExecError,
-    ToolExecutor, DIAGRAM_EDIT_TOOL_NAME, MAX_TOOL_CALLS,
+    AiActivityObserver, AiActivityUpdate, AiClient, AiClientOptions, AiConfig, AiError, AiOutcome,
+    AiService, AiToolActivityState, ChatMessage, DIAGRAM_EDIT_TOOL_NAME, DiagramObserver, FactView,
+    Lookup, MAX_TOOL_CALLS, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolDef, ToolExecError,
+    ToolExecutor, diagram_tools, research_tools,
 };
 use codescope_core::{
     DiagramCommand, DiagramDraft, DiagramNodePatch, DiffSide, EntityRef, Epoch, FileId, FormKind,
-    LineRange, PlanCodeRef, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode, PlanNodeChange,
-    ValidationVerdict, VisualizationPlan, VizForm, MAX_NODE_CODE_REFS,
+    LineRange, MAX_NODE_CODE_REFS, PlanCodeRef, PlanEdge, PlanEdgeKind, PlanEvidence, PlanNode,
+    PlanNodeChange, ValidationVerdict, VisualizationPlan, VizForm,
 };
 use codescope_testutil::fake_ai::{
-    hallucinated_sample_plan, sample_plan, AiScriptStep, ScriptedProvider,
+    AiScriptStep, ScriptedProvider, hallucinated_sample_plan, sample_plan,
 };
 use codescope_testutil::go_fixture::{MIDDLEWARE_FILE, POSTGRES_FILE};
 use futures::future::BoxFuture;
 use secrecy::SecretString;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1502,19 +1502,23 @@ async fn incremental_tools_build_and_publish_the_observed_live_draft() {
             op
         );
         assert!(tools[0]["function"]["parameters"].get("oneOf").is_none());
-        assert!(body["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("CONSTRUCTION PROTOCOL (mandatory, current step)"));
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("CONSTRUCTION PROTOCOL (mandatory, current step)")
+        );
     }
     for body in requests.iter().skip(3) {
         let body = body.body_json().unwrap();
         assert_eq!(body["tool_choice"], "auto");
         assert!(body["tools"].as_array().unwrap().len() > 1);
-        assert!(!body["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("CONSTRUCTION PROTOCOL"));
+        assert!(
+            !body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("CONSTRUCTION PROTOCOL")
+        );
     }
 }
 
@@ -1670,19 +1674,23 @@ async fn bootstrap_then_auto_applies_canonical_commands_on_fresh_turns() {
             op
         );
         assert!(tools[0]["function"]["parameters"].get("oneOf").is_none());
-        assert!(body["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("CONSTRUCTION PROTOCOL (mandatory, current step)"));
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("CONSTRUCTION PROTOCOL (mandatory, current step)")
+        );
     }
     for body in requests.iter().skip(3) {
         let body = body.body_json().unwrap();
         assert_eq!(body["tool_choice"], "auto");
         assert!(body["tools"].as_array().unwrap().len() > 1);
-        assert!(!body["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("CONSTRUCTION PROTOCOL"));
+        assert!(
+            !body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("CONSTRUCTION PROTOCOL")
+        );
     }
 }
 
@@ -1809,10 +1817,12 @@ async fn compact_length_uses_fresh_focused_singleton_without_replay_or_repair() 
     assert_eq!(capped_auto["max_tokens"], 8_192);
     assert_eq!(capped_auto["tool_choice"], "auto");
     assert!(capped_auto["tools"].as_array().unwrap().len() > 1);
-    assert!(capped_auto["messages"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("CONTROLLER IMMEDIATE ACTION"));
+    assert!(
+        capped_auto["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("CONTROLLER IMMEDIATE ACTION")
+    );
 
     // The recovery is a fresh controller state, exact canonical create_node branch, Required,
     // and the explicit 4k override. Nothing from the capped response is replayed or charged.
@@ -1824,10 +1834,12 @@ async fn compact_length_uses_fresh_focused_singleton_without_replay_or_repair() 
         "create_node"
     );
     assert_eq!(capped_auto["messages"][1], focused["messages"][1]);
-    assert!(focused["messages"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("FOCUSED LENGTH RECOVERY"));
+    assert!(
+        focused["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("FOCUSED LENGTH RECOVERY")
+    );
     assert_eq!(
         compact_handoff(&focused)["controller_feedback"],
         Value::Null
@@ -1848,21 +1860,27 @@ async fn compact_length_uses_fresh_focused_singleton_without_replay_or_repair() 
     for body in [&focused, &after_focused] {
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
-        assert!(messages
-            .iter()
-            .all(|message| matches!(message["role"].as_str(), Some("system" | "user"))));
-        assert!(!body
-            .to_string()
-            .contains("LENGTH_RESPONSE_MUST_NOT_BE_REPLAYED"));
+        assert!(
+            messages
+                .iter()
+                .all(|message| matches!(message["role"].as_str(), Some("system" | "user")))
+        );
+        assert!(
+            !body
+                .to_string()
+                .contains("LENGTH_RESPONSE_MUST_NOT_BE_REPLAYED")
+        );
     }
     // A successful focused edit immediately returns to normal full-schema Auto at 8k.
     assert_eq!(after_focused["max_tokens"], 8_192);
     assert_eq!(after_focused["tool_choice"], "auto");
     assert!(after_focused["tools"].as_array().unwrap().len() > 1);
-    assert!(!after_focused["messages"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("FOCUSED LENGTH RECOVERY"));
+    assert!(
+        !after_focused["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("FOCUSED LENGTH RECOVERY")
+    );
     assert!(!requests.iter().any(|request| {
         request
             .body_json()
@@ -2256,13 +2274,17 @@ async fn completion_repair_uses_a_fresh_compact_handoff_and_clears_feedback_afte
     assert_eq!(repair_messages[0]["role"], "system");
     assert_eq!(repair_messages[1]["role"], "user");
     assert!(repair_request["tools"].as_array().unwrap().len() > 1);
-    assert!(!repair_messages[0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("CONSTRUCTION PROTOCOL"));
-    assert!(repair_messages
-        .iter()
-        .all(|message| !matches!(message["role"].as_str(), Some("assistant" | "tool"))));
+    assert!(
+        !repair_messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("CONSTRUCTION PROTOCOL")
+    );
+    assert!(
+        repair_messages
+            .iter()
+            .all(|message| !matches!(message["role"].as_str(), Some("assistant" | "tool")))
+    );
     let repair_handoff = compact_handoff(&repair_request);
     let rejection = repair_handoff["controller_feedback"]
         .as_str()
@@ -2272,9 +2294,11 @@ async fn completion_repair_uses_a_fresh_compact_handoff_and_clears_feedback_afte
         repair_handoff["current_draft"]["forms"][0]["nodes"][0]["code_refs"][0]["end_line"],
         1_000
     );
-    assert!(repair_messages
-        .iter()
-        .all(|message| !matches!(message["role"].as_str(), Some("assistant" | "tool"))));
+    assert!(
+        repair_messages
+            .iter()
+            .all(|message| !matches!(message["role"].as_str(), Some("assistant" | "tool")))
+    );
 }
 
 #[tokio::test]
@@ -2329,9 +2353,11 @@ async fn malformed_bootstrap_edit_feedback_is_fresh_then_clears_after_acceptance
     assert_eq!(retry_messages.len(), 2);
     assert_eq!(retry_messages[0]["role"], "system");
     assert_eq!(retry_messages[1]["role"], "user");
-    assert!(retry_messages
-        .iter()
-        .all(|message| !matches!(message["role"].as_str(), Some("assistant" | "tool"))));
+    assert!(
+        retry_messages
+            .iter()
+            .all(|message| !matches!(message["role"].as_str(), Some("assistant" | "tool")))
+    );
     let retry_handoff = compact_handoff(&retry_set_intent);
     let feedback = retry_handoff["controller_feedback"]
         .as_str()
@@ -2530,9 +2556,11 @@ async fn compact_handoff_retains_tagged_same_turn_read_only_results() {
 
     let requests = provider.requests();
     let bootstrap_handoff = compact_handoff(&requests[1].body_json().unwrap());
-    assert!(bootstrap_handoff["successful_diff_results"]
-        .as_array()
-        .is_some_and(|results| !results.is_empty()));
+    assert!(
+        bootstrap_handoff["successful_diff_results"]
+            .as_array()
+            .is_some_and(|results| !results.is_empty())
+    );
     let tagged = bootstrap_handoff["successful_read_only_results"]
         .as_array()
         .expect("tagged compact read-only results");
@@ -2768,11 +2796,13 @@ async fn precompact_diff_and_four_node_edits_are_staged_without_draft_mutation()
         handoff["controller_state"]["remaining_operations"],
         json!(MAX_TOOL_CALLS - 1)
     );
-    assert!(observed
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|draft| draft.forms.is_empty()));
+    assert!(
+        observed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|draft| draft.forms.is_empty())
+    );
 }
 
 #[tokio::test]
@@ -2861,18 +2891,22 @@ async fn compact_diff_retention_precedes_large_supplementary_reads() {
     let handoff = compact_handoff(&requests[1].body_json().unwrap());
     let diffs = handoff["successful_diff_results"].as_array().unwrap();
     assert_eq!(diffs.len(), 1);
-    assert!(diffs[0]
-        .as_str()
-        .unwrap()
-        .contains("repo_path: src/priority.rs"));
+    assert!(
+        diffs[0]
+            .as_str()
+            .unwrap()
+            .contains("repo_path: src/priority.rs")
+    );
     assert_eq!(
         handoff["controller_state"]["saved_read_only_results_truncated"],
         true
     );
-    assert!(!handoff["successful_read_only_results"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(
+        !handoff["successful_read_only_results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -3049,11 +3083,13 @@ async fn controller_requires_status_inventory_before_a_file_diff() {
     assert_eq!(inventory["tools"][0]["function"]["name"], "git_status_file");
     let diff = requests[1].body_json().unwrap();
     assert_eq!(diff["tool_choice"], "auto");
-    assert!(diff["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|message| message["role"] == "tool"));
+    assert!(
+        diff["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool")
+    );
     let calls = executor.0.calls.lock().unwrap();
     assert_eq!(calls[0].0, "git_status_file");
     assert_eq!(calls[1].0, "git_diff_file");
@@ -3949,10 +3985,12 @@ async fn hallucinated_plan_is_rejected_by_validation() {
         "initial plan plus exactly three bounded repairs"
     );
     // Sanity: the scripted plan really was hallucinated.
-    assert!(hallucinated_sample_plan(Epoch(1)).forms[0].nodes[0]
-        .entity
-        .as_ref()
-        .is_some_and(|e| e.file.as_path().as_str().contains("quantum")));
+    assert!(
+        hallucinated_sample_plan(Epoch(1)).forms[0].nodes[0]
+            .entity
+            .as_ref()
+            .is_some_and(|e| e.file.as_path().as_str().contains("quantum"))
+    );
 }
 
 #[tokio::test]
@@ -4069,10 +4107,12 @@ async fn four_hunk_sequence_defers_completion_until_final_slot_and_three_edges()
     assert_eq!(report.verdict, ValidationVerdict::Valid);
     assert_eq!(plan.forms[0].nodes.len(), 4);
     assert_eq!(plan.forms[0].edges.len(), 3);
-    assert!(plan.forms[0]
-        .edges
-        .iter()
-        .all(|edge| edge.kind == PlanEdgeKind::FlowsTo));
+    assert!(
+        plan.forms[0]
+            .edges
+            .iter()
+            .all(|edge| edge.kind == PlanEdgeKind::FlowsTo)
+    );
     assert!(
         !report.notes.iter().any(|note| note.contains("edge")),
         "flows_to lifecycle adjacency must not produce graph edge notes: {:?}",
@@ -4163,10 +4203,12 @@ async fn three_hunk_sequence_cannot_complete_at_two_nodes_and_requires_every_edg
     // The post-two-node no-tool attempt is followed by a normal Auto request that requires n3.
     let node_three_request = requests[6].body_json().unwrap();
     assert_eq!(node_three_request["tool_choice"], "auto");
-    assert!(node_three_request["messages"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("`op` is `create_node`"));
+    assert!(
+        node_three_request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("`op` is `create_node`")
+    );
     assert_eq!(
         compact_handoff(&node_three_request)["current_draft"]["forms"][0]["nodes"]
             .as_array()
@@ -4178,10 +4220,12 @@ async fn three_hunk_sequence_cannot_complete_at_two_nodes_and_requires_every_edg
     // The capped normal request sees a missing relation; recovery requires create_edge and
     // starts from three nodes with no accepted edge from the discarded response.
     let capped = requests[7].body_json().unwrap();
-    assert!(capped["messages"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("`op` is `create_edge`"));
+    assert!(
+        capped["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("`op` is `create_edge`")
+    );
     let focused = requests[8].body_json().unwrap();
     assert_eq!(focused["tool_choice"], "required");
     assert_eq!(
@@ -4197,10 +4241,12 @@ async fn three_hunk_sequence_cannot_complete_at_two_nodes_and_requires_every_edg
 
     // One accepted edge still leaves n2 -> n3 missing, so the next normal request remains edge.
     let second_edge_request = requests[9].body_json().unwrap();
-    assert!(second_edge_request["messages"][0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("`op` is `create_edge`"));
+    assert!(
+        second_edge_request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("`op` is `create_edge`")
+    );
 }
 
 #[tokio::test]

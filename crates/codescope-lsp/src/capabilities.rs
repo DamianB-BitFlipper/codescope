@@ -81,7 +81,7 @@ pub fn resolve_features(caps: &Value) -> Result<FeatureSet, SemanticError> {
         _ => {
             return Err(SemanticError::BrokenSession(
                 "initialize result has no capabilities object".to_string(),
-            ))
+            ));
         }
     };
 

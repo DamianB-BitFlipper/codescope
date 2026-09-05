@@ -4,7 +4,7 @@ use codescope_core::{LineRange, SyntaxToken};
 use lsp_types::{Position, SemanticToken, SemanticTokensResult};
 use serde_json::Value;
 
-use crate::encoding::{line_at, position_from_wire, PositionEncoding};
+use crate::encoding::{PositionEncoding, line_at, position_from_wire};
 use crate::error::{LspError, SemanticError};
 
 /// The token types and modifiers advertised by a server, in their wire index order.
@@ -174,12 +174,16 @@ mod tests {
 
     #[test]
     fn null_and_unknown_legend_entries_degrade_safely() {
-        assert!(decode(Value::Null, "", PositionEncoding::Utf8, &legend())
-            .expect("null is empty")
-            .is_empty());
+        assert!(
+            decode(Value::Null, "", PositionEncoding::Utf8, &legend())
+                .expect("null is empty")
+                .is_empty()
+        );
         let result = json!({ "data": [0, 0, 1, 99, 0] });
-        assert!(decode(result, "x", PositionEncoding::Utf8, &legend())
-            .expect("unknown token type is skipped")
-            .is_empty());
+        assert!(
+            decode(result, "x", PositionEncoding::Utf8, &legend())
+                .expect("unknown token type is skipped")
+                .is_empty()
+        );
     }
 }

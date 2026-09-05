@@ -2,21 +2,28 @@
 name = "codescope"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
-description = "codescope: understand what your code changes do to the system"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "A terminal-native code review workspace for understanding Git changes and their system impact"
+keywords = ["git", "code-review", "tui", "lsp", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "codescope"
 path = "src/main.rs"
 
 [dependencies]
-codescope-core = { path = "../codescope-core" }
-codescope-git = { path = "../codescope-git" }
-codescope-lsp = { path = "../codescope-lsp" }
-codescope-analysis = { path = "../codescope-analysis" }
-codescope-ai = { path = "../codescope-ai" }
-codescope-telemetry = { path = "../codescope-telemetry" }
-codescope-tui = { path = "../codescope-tui" }
+codescope-core.workspace = true
+codescope-git.workspace = true
+codescope-lsp.workspace = true
+codescope-analysis.workspace = true
+codescope-ai.workspace = true
+codescope-telemetry.workspace = true
+codescope-tui.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
@@ -37,6 +44,6 @@ ignore.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-codescope-testutil = { path = "../codescope-testutil" }
+codescope-testutil.workspace = true
 portable-pty.workspace = true
 serde_json.workspace = true

@@ -2,11 +2,16 @@
 name = "codescope-testutil"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "codescope dev-facing test support: deterministic Go fixture repo, fake LSP server, scripted fake AI provider"
 
 [dependencies]
-codescope-core = { path = "../codescope-core" }
+codescope-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

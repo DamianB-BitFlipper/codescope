@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 use codescope_ai::{AiConfig, AiError, AiFileConfig, ReasoningEffort};
 use codescope_tui::{DividerId, UiPreferences};
 use serde::Deserialize;
-use toml_edit::{value, DocumentMut};
+use toml_edit::{DocumentMut, value};
 
 use crate::dispatcher::ConfigPersistence;
 

@@ -555,18 +555,22 @@ mod tests {
 
     #[test]
     fn upstream_divergence() {
-        assert!(Upstream {
-            name: "origin/main".into(),
-            ahead: 1,
-            behind: 2
-        }
-        .is_diverged());
-        assert!(!Upstream {
-            name: "origin/main".into(),
-            ahead: 1,
-            behind: 0
-        }
-        .is_diverged());
+        assert!(
+            Upstream {
+                name: "origin/main".into(),
+                ahead: 1,
+                behind: 2
+            }
+            .is_diverged()
+        );
+        assert!(
+            !Upstream {
+                name: "origin/main".into(),
+                ahead: 1,
+                behind: 0
+            }
+            .is_diverged()
+        );
     }
 
     #[test]

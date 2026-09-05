@@ -607,16 +607,20 @@ mod tests {
     #[test]
     fn ai_status_plan_availability() {
         assert!(!AiStatus::Idle.has_plan());
-        assert!(!AiStatus::Loading {
-            since_epoch: Epoch(1)
-        }
-        .has_plan());
+        assert!(
+            !AiStatus::Loading {
+                since_epoch: Epoch(1)
+            }
+            .has_plan()
+        );
         assert!(AiStatus::Ready { epoch: Epoch(1) }.has_plan());
         assert!(!AiStatus::Stale { epoch: Epoch(1) }.has_plan());
-        assert!(!AiStatus::Failed {
-            reason: "boom".into()
-        }
-        .has_plan());
+        assert!(
+            !AiStatus::Failed {
+                reason: "boom".into()
+            }
+            .has_plan()
+        );
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! machines without a Go toolchain.
 
 use codescope_testutil::go_fixture::{
-    self, build_fixture, FIXTURE_BASE, FIXTURE_BRANCH, HEAD_PREFIX_LEN, RENAMED_FROM, RENAMED_TO,
-    STAGED_MODIFIED_FILE, UNTRACKED_FILE,
+    self, FIXTURE_BASE, FIXTURE_BRANCH, HEAD_PREFIX_LEN, RENAMED_FROM, RENAMED_TO,
+    STAGED_MODIFIED_FILE, UNTRACKED_FILE, build_fixture,
 };
 use codescope_testutil::helpers::{canonical_fixture, copy_fixture_into, require_go};
 use std::path::Path;
@@ -80,11 +80,12 @@ fn fixture_head_is_stable_across_rebuilds() {
 
     assert_eq!(a.head_prefix, b.head_prefix, "OIDs must be deterministic");
     assert_eq!(a.head_prefix.as_str().len(), HEAD_PREFIX_LEN);
-    assert!(a
-        .head_prefix
-        .as_str()
-        .chars()
-        .all(|c| c.is_ascii_hexdigit()));
+    assert!(
+        a.head_prefix
+            .as_str()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    );
     assert_eq!(a.branch, FIXTURE_BRANCH);
     assert_eq!(a.base, FIXTURE_BASE);
     assert_eq!(a.root, tmp.path().join("a"));

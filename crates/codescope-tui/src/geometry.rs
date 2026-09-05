@@ -12,7 +12,7 @@ use crate::action::{PlanNodeTarget, PlanRelationshipTarget};
 use crate::app::{App, Pane};
 use crate::divider::{DividerAxis, DividerHandle, DividerId};
 use crate::layout::{
-    choose_tier, files_width, impact_left_width, relationship_section_heights, Tier, MIN_DIFF_WIDTH,
+    MIN_DIFF_WIDTH, Tier, choose_tier, files_width, impact_left_width, relationship_section_heights,
 };
 use crate::review::ReviewTarget;
 use crate::scroll::{ScrollRegion, ScrollRegionId};

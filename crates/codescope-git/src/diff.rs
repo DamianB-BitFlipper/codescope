@@ -239,7 +239,7 @@ impl<'a> DiffParser<'a> {
                 _ => {
                     return Err(GitError::ParseDiff {
                         detail: format!("unexpected line inside hunk {header:?}: {line:?}"),
-                    })
+                    });
                 }
             }
         }
@@ -494,7 +494,7 @@ fn unquote_path(raw: &str) -> Result<Utf8PathBuf> {
             other => {
                 return Err(GitError::ParseDiff {
                     detail: format!("unknown escape \\{} in quoted path: {raw:?}", other as char),
-                })
+                });
             }
         }
     }
@@ -703,9 +703,11 @@ index 1234567..89abcde 100644
             text
         );
         assert!(parsed.sections[0].text.contains("café\n+雪\n"));
-        assert!(parsed.sections[1]
-            .text
-            .ends_with("\\ No newline at end of file\n"));
+        assert!(
+            parsed.sections[1]
+                .text
+                .ends_with("\\ No newline at end of file\n")
+        );
     }
 
     #[test]

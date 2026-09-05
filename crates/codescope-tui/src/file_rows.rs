@@ -352,9 +352,10 @@ mod tests {
                 ..
             }
         )));
-        assert!(rows
-            .iter()
-            .any(|row| matches!(row, ProjectedRow::File { file_index: 2, .. })));
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, ProjectedRow::File { file_index: 2, .. }))
+        );
     }
 
     #[test]

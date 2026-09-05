@@ -22,10 +22,10 @@
 
 use crate::error::{Result, TestutilError};
 use codescope_core::{
-    DiffSide, EntityRef, Epoch, FileId, FormKind, PlanCodeRef, PlanNode, PlanNodeChange,
-    VisualizationPlan, VizForm, MAX_FORMS_PER_PLAN, MAX_PLAN_EVIDENCE,
+    DiffSide, EntityRef, Epoch, FileId, FormKind, MAX_FORMS_PER_PLAN, MAX_PLAN_EVIDENCE,
+    PlanCodeRef, PlanNode, PlanNodeChange, VisualizationPlan, VizForm,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -715,7 +715,7 @@ fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use codescope_core::{
-        DiffSide, PlanCodeRef, MAX_FORMS_PER_PLAN, MAX_FORM_NODES, MAX_NODE_CODE_REFS, PLAN_VERSION,
+        DiffSide, MAX_FORM_NODES, MAX_FORMS_PER_PLAN, MAX_NODE_CODE_REFS, PLAN_VERSION, PlanCodeRef,
     };
 
     #[test]
@@ -739,14 +739,18 @@ mod tests {
         }
         assert!(plan.forms[0].nodes[0].expanded_detail.is_some());
         assert_eq!(plan.forms[0].nodes[1].code_refs.len(), 2);
-        assert!(plan.forms[0].nodes[1]
-            .code_refs
-            .iter()
-            .any(|r| r.side == DiffSide::Old));
-        assert!(plan.forms[0].nodes[1]
-            .code_refs
-            .iter()
-            .any(|r| r.side == DiffSide::New));
+        assert!(
+            plan.forms[0].nodes[1]
+                .code_refs
+                .iter()
+                .any(|r| r.side == DiffSide::Old)
+        );
+        assert!(
+            plan.forms[0].nodes[1]
+                .code_refs
+                .iter()
+                .any(|r| r.side == DiffSide::New)
+        );
         // Round-trips through the exact wire shape the AI layer parses.
         let value = serde_json::to_value(&plan).unwrap();
         assert!(
@@ -762,10 +766,12 @@ mod tests {
         // The ghost plan must still pass the parse-time 1-2-refs-per-node contract so the
         // hallucination is caught by validation, not by the parser.
         let plan = hallucinated_sample_plan(Epoch(1));
-        assert!(plan.forms[0]
-            .nodes
-            .iter()
-            .all(|node| (1..=MAX_NODE_CODE_REFS).contains(&node.code_refs.len())));
+        assert!(
+            plan.forms[0]
+                .nodes
+                .iter()
+                .all(|node| (1..=MAX_NODE_CODE_REFS).contains(&node.code_refs.len()))
+        );
         assert_eq!(
             plan.forms[0].nodes[0].code_refs,
             vec![PlanCodeRef::new(
@@ -851,9 +857,11 @@ mod tests {
         let calls = completion["choices"][0]["message"]["tool_calls"]
             .as_array()
             .unwrap();
-        assert!(calls
-            .iter()
-            .all(|call| call["function"]["name"] == DIAGRAM_EDIT_TOOL_NAME));
+        assert!(
+            calls
+                .iter()
+                .all(|call| call["function"]["name"] == DIAGRAM_EDIT_TOOL_NAME)
+        );
     }
 
     #[test]
