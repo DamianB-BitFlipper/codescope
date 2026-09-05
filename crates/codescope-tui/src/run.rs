@@ -40,6 +40,7 @@ pub async fn run(
     // recomputed). Rebuilt on every draw.
     let mut last_geometry = crate::geometry::UiGeometry::default();
     let mut drag = crate::mouse::DragState::Idle;
+    let mut wheel_axis = crate::mouse::WheelAxisFilter::default();
     // Drag setters are previews: coalesce any number of motion samples into one write on
     // mouse-up (or flush when the interaction is cancelled/exits).
     let mut preferences_dirty = false;
@@ -136,13 +137,26 @@ pub async fn run(
                         // through the same path as a keypress.
                         let previous_drag = drag.clone();
                         let before = telemetry_state(&app);
-                        let outcome = crate::mouse::map_mouse(
-                            mouse,
-                            &app,
-                            &app.snapshot,
-                            &last_geometry,
-                            drag,
+                        let wheel_allowed = wheel_axis.allows(
+                            mouse.kind,
+                            std::time::Instant::now(),
                         );
+                        let wheel_axis_filtered = !wheel_allowed;
+                        let outcome = if wheel_allowed {
+                            crate::mouse::map_mouse(
+                                mouse,
+                                &app,
+                                &app.snapshot,
+                                &last_geometry,
+                                drag,
+                            )
+                        } else {
+                            crate::mouse::MouseOutcome {
+                                action: None,
+                                drag,
+                                dirty: false,
+                            }
+                        };
                         let action_name = outcome.action.as_ref().map(|action| format!("{action:?}"));
                         let next_drag = format!("{:?}", outcome.drag);
                         let record_mouse = !matches!(
@@ -171,6 +185,7 @@ pub async fn run(
                                     "column": mouse.column,
                                     "row": mouse.row,
                                     "mapped_action": action_name,
+                                    "wheel_axis_filtered": wheel_axis_filtered,
                                     "drag_after": next_drag,
                                     "state_before": before,
                                     "state_after": telemetry_state(&app),
@@ -189,6 +204,7 @@ pub async fn run(
                         // A resize invalidates the retained geometry, hover target, and any
                         // drag anchored to it. The next draw rebuilds the whole frame plan.
                         drag = crate::mouse::DragState::Idle;
+                        wheel_axis.reset();
                         app.apply(Action::HoverPlanNode(None));
                         if preferences_dirty {
                             persist_preferences(&app, &tx).await;
@@ -589,8 +605,10 @@ async fn dispatch(
         scope @ (Action::ScopeStaged
         | Action::ScopeUnstaged
         | Action::ScopeBranch
+        | Action::ScopeBranchWorking
         | Action::ScopeWorking
-        | Action::ScopeCycle) => {
+        | Action::ScopeCycle
+        | Action::ScopeCycleReverse) => {
             app.apply(scope.clone());
             pending_scope.record(app.snapshot.scope);
             let _ = tx.send(scope).await;
@@ -1304,13 +1322,25 @@ mod tests {
             &mut SelectionTracker::default(),
         )
         .await;
-        assert_eq!(app.snapshot.scope, ChangeScope::Staged); // Branch -> Staged
+        assert_eq!(app.snapshot.scope, ChangeScope::BranchWorking);
         assert_eq!(rx.recv().await, Some(Action::ScopeCycle));
-        assert_eq!(pending.0, Some(ChangeScope::Staged));
+        assert_eq!(pending.0, Some(ChangeScope::BranchWorking));
 
         let mut stale = UiSnapshot::default(); // scope: Branch
         pending.reconcile(&mut stale);
         app.update(stale);
-        assert_eq!(app.snapshot.scope, ChangeScope::Staged);
+        assert_eq!(app.snapshot.scope, ChangeScope::BranchWorking);
+
+        dispatch(
+            &mut app,
+            Action::ScopeCycleReverse,
+            &tx,
+            &mut pending,
+            &mut SelectionTracker::default(),
+        )
+        .await;
+        assert_eq!(app.snapshot.scope, ChangeScope::Branch);
+        assert_eq!(rx.recv().await, Some(Action::ScopeCycleReverse));
+        assert_eq!(pending.0, Some(ChangeScope::Branch));
     }
 }

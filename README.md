@@ -8,8 +8,9 @@ right.
 
 ## Highlights
 
-- **Review the comparison you mean.** Switch between branch, staged, unstaged, and all working-tree
-  changes, with explicit base selection for branch reviews.
+- **Review the comparison you mean.** Switch among committed branch changes, branch plus working
+  changes, staged, unstaged, and all uncommitted changes, with explicit base selection for
+  branch-based reviews.
 - **Navigate by code, not just files.** Changed hunks are mapped to functions, methods, and types.
 - **Follow real relationships.** Callers, callees, implementations, references, diagnostics, and
   syntax information come from the repository's language server.
@@ -68,21 +69,21 @@ Press `?` at any time for the complete in-app key reference.
 
 | Key | Comparison |
 |---|---|
-| `B` | branch versus base |
-| `s` | staged changes |
-| `u` | unstaged changes |
-| `w` | all uncommitted changes |
-| `S` | cycle comparisons |
+| `s` | next: branch → branch+working → staged → unstaged → working |
+| `S` | previous comparison |
 | `b` | choose the branch base |
 | `g` | refresh repository state and clear session AI impacts |
 
-For branch comparisons, Codescope prefers a meaningful upstream and otherwise finds the nearest
-strict ancestor branch by Git topology. The base picker can override that choice. Pass `--watch`
-to refresh automatically when the worktree or Git state changes; otherwise refreshes are explicit.
+`branch` compares the resolved merge base to `HEAD`; `branch+working` compares that same base to
+the current worktree, combining committed branch changes with staged, unstaged, and untracked work.
+For both branch-based comparisons, Codescope prefers a meaningful upstream and otherwise finds the
+nearest strict ancestor branch by Git topology. The base picker can override that choice. Pass
+`--watch` to refresh automatically when the worktree or Git state changes; otherwise refreshes are
+explicit.
 
-Completed AI impacts are retained while switching between branch, staged, unstaged, and working
-scopes during the session. Codescope restores them only when the returning parsed comparison is
-identical; press `g` to clear the session's generated impacts and rebuild from repository state.
+Completed AI impacts are retained while switching among comparison scopes during the session.
+Codescope restores them only when the returning parsed comparison is identical; press `g` to clear
+the session's generated impacts and rebuild from repository state.
 
 ## The review workspace
 
@@ -106,7 +107,9 @@ The center pane renders exact old/new Git rows, with syntax colors when the lang
 supports them. Codescope requests colors on first view and also fills a bounded syntax cache in the
 background; whichever path reaches a file first supplies the same cached result. Each file
 remembers its scroll position while you navigate elsewhere. Hovering a diagram box temporarily
-centers and highlights its cited lines; clicking the box keeps the jumped position.
+centers and highlights its cited lines; clicking the box keeps the jumped position. Trackpad
+gestures lock to their dominant axis, with a small horizontal dead-zone so vertical reading does
+not drift an unwrapped diff sideways.
 
 ### Impact and diagrams
 
@@ -170,6 +173,7 @@ scripts and debugging:
 
 ```bash
 codescope scan .
+codescope changeset --scope branch-working .
 codescope changeset --scope working .
 codescope analyze --scope branch .
 codescope digest --scope staged --text .
@@ -216,9 +220,10 @@ Codescope's internal AI. The protocol cannot execute a shell command or write to
 | `Space`, `←` / `→` | toggle or explicitly collapse / expand the targeted item |
 | `a` / `A` | generate AI / toggle automatic generation |
 | `m` | choose model and reasoning effort |
+| `s` / `S` | next / previous comparison scope |
 | `v` | toggle the selected change's reviewed state from any pane |
 | `?` | show help |
-| `q`, `Ctrl-C` | quit |
+| `Q`, `Ctrl-C` | quit |
 
 The mouse can select tree rows, scroll individual panes, resize every visible divider, drag diagram
 boxes, open relationships, toggle review markers, and select diff text for copying.

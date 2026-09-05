@@ -72,7 +72,13 @@ pub struct BaseInfo { pub source: BaseSource /*Upstream|OriginHead|Guess|ForkPoi
     pub ref_name: String, pub merge_base: Oid }
 
 pub struct ChangeSet { pub scope: ChangeScope, pub files: Vec<FileChange> }
-pub enum ChangeScope { Branch /*mb...HEAD*/, Staged, Unstaged } // untracked live in Unstaged set
+pub enum ChangeScope {
+    Branch,        // merge-base...HEAD
+    BranchWorking, // merge-base vs worktree, including staged/unstaged/untracked
+    Staged,
+    Unstaged,
+    Working,
+}
 pub struct FileChange { pub path: PathBuf, pub old_path: Option<PathBuf> /*rename*/,
     pub status: FileStatus, pub hunks: Vec<Hunk>, pub binary: bool }
 pub enum FileStatus { Added, Modified, Deleted, Renamed{score:u8}, Copied{score:u8},
@@ -81,8 +87,9 @@ pub struct Hunk { pub old_start: u32, pub old_len: u32, pub new_start: u32, pub 
     pub section: Option<String> /*header context*/, pub lines: Vec<DiffLine> }
 ```
 
-Scopes stay distinct: three ChangeSets (Branch, Staged, Unstaged[+untracked]) computed
-independently; the UI switches scope, never merges them implicitly.
+Scopes stay distinct and are computed independently. `BranchWorking` is the explicit combined
+comparison from the branch merge base to the current worktree; it is not synthesized by merging
+the separately rendered `Branch`, `Staged`, or `Unstaged` change sets.
 
 ## Pitfalls (verified)
 

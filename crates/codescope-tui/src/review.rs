@@ -417,7 +417,10 @@ impl ReviewLedger {
 }
 
 fn comparison_key(snapshot: &UiSnapshot) -> ComparisonKey {
-    let base = if snapshot.scope == ChangeScope::Branch {
+    let base = if matches!(
+        snapshot.scope,
+        ChangeScope::Branch | ChangeScope::BranchWorking
+    ) {
         if snapshot.base_ref.is_empty() {
             snapshot.repo.base.clone().unwrap_or_default()
         } else {

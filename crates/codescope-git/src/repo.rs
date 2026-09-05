@@ -213,8 +213,23 @@ impl GitRepo {
 
     /// Repo context with an explicit base override (`Some(ref)`) instead of inference.
     /// The override must yield a meaningful merge base (one strictly before HEAD).
+    /// Use [`Self::repo_context_for_scope`] for the more permissive combined scope.
     pub async fn repo_context_with_base(&self, base_override: Option<&str>) -> Result<RepoContext> {
+        self.repo_context_for_scope(ChangeScope::Branch, base_override)
+            .await
+    }
+
+    /// Repo context using the base semantics of a specific comparison scope.
+    ///
+    /// `BranchWorking` permits a ref whose merge base equals `HEAD`: although that ref produces no
+    /// committed branch diff, it is still a meaningful base for dirty worktree changes.
+    pub async fn repo_context_for_scope(
+        &self,
+        scope: ChangeScope,
+        base_override: Option<&str>,
+    ) -> Result<RepoContext> {
         let status = self.status_snapshot().await?;
+        let allow_head_equivalent = scope == ChangeScope::BranchWorking;
         let head = status.head_state();
         let upstream = status.upstream.clone().map(|name| {
             let (ahead, behind) = status.ahead_behind.unwrap_or((0, 0));
@@ -226,14 +241,24 @@ impl GitRepo {
         });
         let base = match base_override {
             Some(reference) => match self.merge_base(reference).await? {
-                Some(mb) if status.oid.as_ref().is_some_and(|head| *head != mb) => Some(BaseInfo {
-                    source: BaseSource::Override,
-                    ref_name: reference.to_string(),
-                    merge_base: mb,
-                }),
+                Some(mb)
+                    if status
+                        .oid
+                        .as_ref()
+                        .is_some_and(|head| allow_head_equivalent || *head != mb) =>
+                {
+                    Some(BaseInfo {
+                        source: BaseSource::Override,
+                        ref_name: reference.to_string(),
+                        merge_base: mb,
+                    })
+                }
                 Some(_) | None => return Err(GitError::NoBase),
             },
-            None => self.infer_base(&status).await?,
+            None => {
+                self.infer_base_with_head_equivalent(&status, allow_head_equivalent)
+                    .await?
+            }
         };
         Ok(RepoContext {
             toplevel: self.toplevel.clone(),
@@ -244,17 +269,20 @@ impl GitRepo {
         })
     }
 
-    /// Infer a meaningful comparison base. A configured upstream wins only when its
-    /// merge-base is not HEAD; otherwise the exact nearest strict ancestor (local or
-    /// remote-tracking) wins before the conventional fallbacks.
-    async fn infer_base(&self, status: &StatusSnapshot) -> Result<Option<BaseInfo>> {
+    async fn infer_base_with_head_equivalent(
+        &self,
+        status: &StatusSnapshot,
+        allow_head_equivalent: bool,
+    ) -> Result<Option<BaseInfo>> {
         let Some(head) = status.oid.as_ref() else {
             return Ok(None);
         };
-        let candidates = self.branch_ref_candidates(status).await?;
+        let candidates = self
+            .branch_ref_candidates(status, allow_head_equivalent)
+            .await?;
         if let Some(upstream) = &status.upstream {
             if let Some(merge_base) = self.merge_base(upstream).await? {
-                if merge_base != *head {
+                if allow_head_equivalent || merge_base != *head {
                     let (ref_name, _) = self.canonical_ref(upstream, &candidates);
                     return Ok(Some(BaseInfo {
                         source: BaseSource::Upstream,
@@ -267,7 +295,7 @@ impl GitRepo {
         let (ranked, _) = self
             .rank_by_topology(head, candidates.clone(), RankMode::Inference)
             .await?;
-        self.infer_base_from_candidates(status, &candidates, &ranked)
+        self.infer_base_from_candidates(status, &candidates, &ranked, allow_head_equivalent)
             .await
     }
 
@@ -287,9 +315,21 @@ impl GitRepo {
     /// the picker exposes each short ref spelling. Refs equivalent to HEAD remain excluded
     /// because they cannot produce a comparison.
     pub async fn base_picker_refs(&self) -> Result<Vec<String>> {
-        let meaningful = self.base_candidates_with_metadata().await?.entries;
+        self.base_picker_refs_for_scope(ChangeScope::Branch).await
+    }
+
+    /// Every branch ref selectable for `scope`. `BranchWorking` includes HEAD-equivalent refs,
+    /// since they still provide a meaningful base for uncommitted work.
+    pub async fn base_picker_refs_for_scope(&self, scope: ChangeScope) -> Result<Vec<String>> {
+        let allow_head_equivalent = scope == ChangeScope::BranchWorking;
+        let meaningful = self
+            .base_candidates_with_metadata_inner(allow_head_equivalent)
+            .await?
+            .entries;
         let status = self.status_snapshot().await?;
-        let candidates = self.branch_ref_candidates(&status).await?;
+        let candidates = self
+            .branch_ref_candidates(&status, allow_head_equivalent)
+            .await?;
 
         let mut refs = Vec::with_capacity(candidates.len().max(meaningful.len()));
         let mut seen = HashSet::new();
@@ -316,6 +356,13 @@ impl GitRepo {
     /// Base picker entries with an explicit marker when the bounded ancestor scan stopped
     /// before exhausting the graph.
     pub async fn base_candidates_with_metadata(&self) -> Result<BaseCandidates> {
+        self.base_candidates_with_metadata_inner(false).await
+    }
+
+    async fn base_candidates_with_metadata_inner(
+        &self,
+        allow_head_equivalent: bool,
+    ) -> Result<BaseCandidates> {
         let status = self.status_snapshot().await?;
         let Some(head) = status.oid.as_ref() else {
             return Ok(BaseCandidates {
@@ -323,12 +370,14 @@ impl GitRepo {
                 truncated: false,
             });
         };
-        let candidates = self.branch_ref_candidates(&status).await?;
+        let candidates = self
+            .branch_ref_candidates(&status, allow_head_equivalent)
+            .await?;
         let (ranked, truncated) = self
             .rank_by_topology(head, candidates.clone(), RankMode::Picker)
             .await?;
         let inferred = self
-            .infer_base_from_candidates(&status, &candidates, &ranked)
+            .infer_base_from_candidates(&status, &candidates, &ranked, allow_head_equivalent)
             .await?;
 
         let mut out = Vec::new();
@@ -364,7 +413,7 @@ impl GitRepo {
             }
             if self.ref_exists(guess).await? {
                 if let Some(mb) = self.merge_base(guess).await? {
-                    if mb == *head {
+                    if !allow_head_equivalent && mb == *head {
                         continue;
                     }
                     let (ref_name, key) = self.canonical_ref(guess, &candidates);
@@ -386,7 +435,11 @@ impl GitRepo {
 
     /// Enumerate local and remote-tracking refs once, exclude symbolic/HEAD-equivalent
     /// rows, and canonicalize presentation identities before any graph work.
-    async fn branch_ref_candidates(&self, status: &StatusSnapshot) -> Result<Vec<BranchCandidate>> {
+    async fn branch_ref_candidates(
+        &self,
+        status: &StatusSnapshot,
+        allow_head_equivalent: bool,
+    ) -> Result<Vec<BranchCandidate>> {
         let Some(head) = status.oid.as_ref() else {
             return Ok(Vec::new());
         };
@@ -428,7 +481,11 @@ impl GitRepo {
             {
                 continue;
             }
-            if tip == head.as_str() {
+            let current_local_branch = status
+                .branch
+                .as_deref()
+                .is_some_and(|branch| full.strip_prefix("refs/heads/") == Some(branch));
+            if current_local_branch || (!allow_head_equivalent && tip == head.as_str()) {
                 continue;
             }
             if !valid_object_id(tip) {
@@ -590,13 +647,14 @@ impl GitRepo {
         status: &StatusSnapshot,
         candidates: &[BranchCandidate],
         ranked: &[BranchCandidate],
+        allow_head_equivalent: bool,
     ) -> Result<Option<BaseInfo>> {
         let Some(head) = status.oid.as_ref() else {
             return Ok(None);
         };
         if let Some(upstream) = &status.upstream {
             if let Some(mb) = self.merge_base(upstream).await? {
-                if mb != *head {
+                if allow_head_equivalent || mb != *head {
                     let (ref_name, _) = self.canonical_ref(upstream, candidates);
                     return Ok(Some(BaseInfo {
                         source: BaseSource::Upstream,
@@ -622,7 +680,7 @@ impl GitRepo {
         if origin_head.success() {
             let name = origin_head.stdout_trimmed("symbolic-ref origin/HEAD")?;
             if let Some(mb) = self.merge_base(&name).await? {
-                if mb != *head {
+                if allow_head_equivalent || mb != *head {
                     let (ref_name, _) = self.canonical_ref(&name, candidates);
                     return Ok(Some(BaseInfo {
                         source: BaseSource::OriginHead,
@@ -636,7 +694,7 @@ impl GitRepo {
         for guess in ["origin/main", "origin/master"] {
             if self.ref_exists(guess).await? {
                 if let Some(mb) = self.merge_base(guess).await? {
-                    if mb != *head {
+                    if allow_head_equivalent || mb != *head {
                         let (ref_name, _) = self.canonical_ref(guess, candidates);
                         return Ok(Some(BaseInfo {
                             source: BaseSource::Guess,
@@ -658,7 +716,7 @@ impl GitRepo {
                 .await?;
             if out.success() {
                 let sha = out.stdout_trimmed("merge-base --fork-point")?;
-                if !sha.is_empty() && sha != head.as_str() {
+                if !sha.is_empty() && (allow_head_equivalent || sha != head.as_str()) {
                     return Ok(Some(BaseInfo {
                         source: BaseSource::ForkPoint,
                         ref_name: local.to_string(),
@@ -745,6 +803,9 @@ impl GitRepo {
     ///
     /// - [`ChangeScope::Branch`]: `git diff -M -U3 <merge-base>...HEAD`; errors with
     ///   [`GitError::NoBase`] when no meaningful base can be inferred.
+    /// - [`ChangeScope::BranchWorking`]: `git diff -M -U3 <merge-base>` against the current
+    ///   worktree, plus untracked files. Unlike `Branch`, a base at `HEAD` remains meaningful
+    ///   because the worktree can differ from it.
     /// - [`ChangeScope::Staged`]: `git diff --cached -M -U3` (works on unborn HEAD too:
     ///   git diffs the index against the empty tree).
     /// - [`ChangeScope::Unstaged`]: `git diff -M -U3` plus untracked files from porcelain
@@ -754,13 +815,20 @@ impl GitRepo {
     /// pairing (verified pitfall). Unmerged paths are marked, never hunk-parsed.
     #[tracing::instrument(skip(self), err)]
     pub async fn changeset(&self, scope: ChangeScope) -> Result<ChangeSet> {
-        if scope == ChangeScope::Branch {
+        if matches!(scope, ChangeScope::Branch | ChangeScope::BranchWorking) {
             let status = self.status_snapshot().await?;
-            let base = self.infer_base(&status).await?.ok_or(GitError::NoBase)?;
-            return self.branch_changeset_from_base(&base).await;
+            let base = self
+                .infer_base_with_head_equivalent(&status, scope == ChangeScope::BranchWorking)
+                .await?
+                .ok_or(GitError::NoBase)?;
+            return match scope {
+                ChangeScope::Branch => self.branch_changeset_from_base(&base).await,
+                ChangeScope::BranchWorking => self.branch_working_changeset_from_base(&base).await,
+                _ => unreachable!("branch-dependent scopes handled above"),
+            };
         }
         let (mut files, mut diff_sections) = match scope {
-            ChangeScope::Branch => unreachable!("returned above"),
+            ChangeScope::Branch | ChangeScope::BranchWorking => unreachable!("returned above"),
             ChangeScope::Staged => {
                 let mut args = vec!["diff", "--cached"];
                 args.extend_from_slice(DIFF_FLAGS);
@@ -822,7 +890,13 @@ impl GitRepo {
             // The well-known empty tree object id.
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
         };
-        let mut args = vec!["diff", &target];
+        self.worktree_diff_from(&target).await
+    }
+
+    /// Compare a committed tree directly with the current index/worktree and merge untracked and
+    /// unmerged status metadata into the parsed diff.
+    async fn worktree_diff_from(&self, target: &str) -> Result<ParsedUnifiedDiff> {
+        let mut args = vec!["diff", target];
         args.extend_from_slice(DIFF_FLAGS);
         let out = self.cmd(&args).run().await?;
         let text = String::from_utf8_lossy(out.stdout_bytes());
@@ -873,6 +947,16 @@ impl GitRepo {
         files.sort_by(|a, b| a.path.cmp(&b.path));
         parsed.sections.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(ChangeSet::new(ChangeScope::Branch, files).with_diff_sections(parsed.sections))
+    }
+
+    /// Compute the combined committed-branch + dirty-worktree comparison from an already-resolved
+    /// merge base. Unlike branch scope, the new side is the worktree rather than `HEAD`.
+    pub async fn branch_working_changeset_from_base(&self, base: &BaseInfo) -> Result<ChangeSet> {
+        let mut parsed = self.worktree_diff_from(base.merge_base.as_str()).await?;
+        parsed.files.sort_by(|a, b| a.path.cmp(&b.path));
+        parsed.sections.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(ChangeSet::new(ChangeScope::BranchWorking, parsed.files)
+            .with_diff_sections(parsed.sections))
     }
 
     /// Content of `path` at revision `base` (`git show <base>:<path>`).
@@ -1036,8 +1120,8 @@ mod tests {
         dir
     }
 
-    /// A same-tip upstream is not a meaningful comparison. Branch scope reports no base;
-    /// users can still review the dirty tree through Working/Unstaged/Staged.
+    /// A same-tip upstream is not meaningful for committed-only Branch scope, but it is the exact
+    /// base needed by BranchWorking when the branch has dirty changes before its first commit.
     #[tokio::test]
     async fn branch_scope_rejects_head_equivalent_upstream() {
         let root = fully_pushed_repo();
@@ -1060,6 +1144,27 @@ mod tests {
             err.is_no_base(),
             "branch scope is honestly unavailable: {err}"
         );
+        let combined_context = repo
+            .repo_context_for_scope(ChangeScope::BranchWorking, None)
+            .await
+            .expect("combined context");
+        assert!(
+            combined_context.base.is_some(),
+            "same-tip upstream is valid for branch + working"
+        );
+        assert!(
+            repo.base_picker_refs_for_scope(ChangeScope::BranchWorking)
+                .await
+                .expect("combined base picker")
+                .contains(&"upstream".to_string()),
+            "the combined scope picker includes its same-tip base"
+        );
+        let combined = repo
+            .changeset(ChangeScope::BranchWorking)
+            .await
+            .expect("branch + working changeset");
+        let paths: Vec<_> = combined.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["new.txt", "staged.txt", "tracked.txt"]);
         let working = repo
             .changeset(ChangeScope::Working)
             .await

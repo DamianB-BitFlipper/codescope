@@ -142,6 +142,8 @@ pub struct DebugAiArgs {
 pub enum Scope {
     /// Committed on this branch (`merge-base...HEAD`).
     Branch,
+    /// Committed branch changes plus the current index/worktree (`merge-base` vs worktree).
+    BranchWorking,
     /// Index vs HEAD.
     Staged,
     /// Worktree vs index, plus untracked files.
@@ -154,6 +156,7 @@ impl From<Scope> for ChangeScope {
     fn from(scope: Scope) -> ChangeScope {
         match scope {
             Scope::Branch => ChangeScope::Branch,
+            Scope::BranchWorking => ChangeScope::BranchWorking,
             Scope::Staged => ChangeScope::Staged,
             Scope::Unstaged => ChangeScope::Unstaged,
             Scope::Working => ChangeScope::Working,
@@ -166,6 +169,7 @@ impl Scope {
     fn as_str(self) -> &'static str {
         match self {
             Scope::Branch => "branch",
+            Scope::BranchWorking => "branch-working",
             Scope::Staged => "staged",
             Scope::Unstaged => "unstaged",
             Scope::Working => "working",
@@ -215,6 +219,7 @@ async fn scan(args: &BackendArgs) -> Result<()> {
     let mut notes = Vec::new();
     for scope in [
         ChangeScope::Branch,
+        ChangeScope::BranchWorking,
         ChangeScope::Staged,
         ChangeScope::Unstaged,
         ChangeScope::Working,
@@ -578,6 +583,7 @@ async fn next_snapshot(snapshots: &mut mpsc::UnboundedReceiver<UiSnapshot>) -> R
 fn scope_action(scope: Scope) -> Action {
     match scope {
         Scope::Branch => Action::ScopeBranch,
+        Scope::BranchWorking => Action::ScopeBranchWorking,
         Scope::Staged => Action::ScopeStaged,
         Scope::Unstaged => Action::ScopeUnstaged,
         Scope::Working => Action::ScopeWorking,
@@ -689,6 +695,7 @@ impl<'a> From<&'a RepoContext> for RepoView<'a> {
 #[derive(Serialize, Default)]
 struct ScopeCounts {
     branch: Option<usize>,
+    branch_working: Option<usize>,
     staged: Option<usize>,
     unstaged: Option<usize>,
     working: Option<usize>,
@@ -698,6 +705,7 @@ impl ScopeCounts {
     fn set(&mut self, scope: ChangeScope, count: usize) {
         match scope {
             ChangeScope::Branch => self.branch = Some(count),
+            ChangeScope::BranchWorking => self.branch_working = Some(count),
             ChangeScope::Staged => self.staged = Some(count),
             ChangeScope::Unstaged => self.unstaged = Some(count),
             ChangeScope::Working => self.working = Some(count),

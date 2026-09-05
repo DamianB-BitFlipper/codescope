@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use codescope_core::ChangeScope;
 
 use crate::action::{
-    next_scope, Action, DiffTextSelection, PlanNodeTarget, PlanRelationshipTarget,
+    next_scope, previous_scope, Action, DiffTextSelection, PlanNodeTarget, PlanRelationshipTarget,
 };
 use crate::divider::DividerSizes;
 use crate::file_rows::ProjectedRow;
@@ -551,10 +551,14 @@ impl App {
             Action::SetAgentDiffSelection(_) => {}
             // Mouse: select a file/symbol row by logical index and focus Files. The
             // selection tracker emits the same SelectionChanged a keyboard move would.
-            Action::SelectFileRow { logical_index } => {
+            Action::SelectFileRow {
+                logical_index,
+                viewport_offset,
+            } => {
                 self.focused = Pane::Files;
                 self.file_sel = logical_index.min(self.flat_file_rows().saturating_sub(1));
-                self.files_scroll_detached = false;
+                self.files_scroll = viewport_offset;
+                self.files_scroll_detached = true;
             }
             Action::AgentFocus(target) => {
                 self.focused = Pane::Files;
@@ -607,8 +611,10 @@ impl App {
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
             Action::ScopeUnstaged => self.set_scope(ChangeScope::Unstaged),
             Action::ScopeBranch => self.set_scope(ChangeScope::Branch),
+            Action::ScopeBranchWorking => self.set_scope(ChangeScope::BranchWorking),
             Action::ScopeWorking => self.set_scope(ChangeScope::Working),
             Action::ScopeCycle => self.set_scope(next_scope(self.snapshot.scope)),
+            Action::ScopeCycleReverse => self.set_scope(previous_scope(self.snapshot.scope)),
             Action::NextHunk => self.jump_hunk(1),
             Action::PrevHunk => self.jump_hunk(-1),
             Action::ModelPicker => {
@@ -1526,7 +1532,7 @@ mod tests {
         let mut app = App::new();
         assert_eq!(app.snapshot.scope, ChangeScope::Branch);
         let mut seen = vec![app.snapshot.scope];
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.apply(Action::ScopeCycle);
             seen.push(app.snapshot.scope);
         }
@@ -1534,12 +1540,16 @@ mod tests {
             seen,
             vec![
                 ChangeScope::Branch,
+                ChangeScope::BranchWorking,
                 ChangeScope::Staged,
                 ChangeScope::Unstaged,
                 ChangeScope::Working,
                 ChangeScope::Branch,
             ]
         );
+
+        app.apply(Action::ScopeCycleReverse);
+        assert_eq!(app.snapshot.scope, ChangeScope::Working);
     }
 
     #[test]

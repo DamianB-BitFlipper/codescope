@@ -261,6 +261,69 @@ async fn working_scope_combines_staged_unstaged_and_untracked() {
 }
 
 #[tokio::test]
+async fn branch_working_scope_combines_commits_index_worktree_and_untracked() {
+    let (_tmp, top) = scratch_repo();
+    git(top.as_std_path(), &["checkout", "-q", "-b", "feature"]);
+
+    // Commit one branch change, then layer staged, unstaged, and untracked work over HEAD.
+    let committed = "package main\n\nimport \"fmt\"\n\n// A returns a constant used by tests.\nfunc A() int { return 2 }\n\nfunc helperOne() string { return \"one\" }\n\nfunc helperTwo() string { return \"two\" }\n\nfunc main() { fmt.Println(A()) }\n";
+    write(top.as_std_path(), "a.go", committed);
+    git(top.as_std_path(), &["add", "a.go"]);
+    git(top.as_std_path(), &["commit", "-q", "-m", "branch edit"]);
+
+    write(
+        top.as_std_path(),
+        "a.go",
+        &committed.replace("return 2", "return 3"),
+    );
+    git(top.as_std_path(), &["add", "a.go"]);
+    write(
+        top.as_std_path(),
+        "b.txt",
+        "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\n",
+    );
+    write(top.as_std_path(), "c.txt", "brand new\n");
+
+    let repo = open_repo(&top).await;
+    let branch = repo.changeset(ChangeScope::Branch).await.expect("branch");
+    assert_eq!(
+        branch
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.go"],
+        "plain branch scope stops at HEAD"
+    );
+    assert!(branch.files[0].hunks[0]
+        .lines
+        .iter()
+        .any(|line| line.text.contains("return 2")));
+
+    let combined = repo
+        .changeset(ChangeScope::BranchWorking)
+        .await
+        .expect("branch + working");
+    assert_eq!(combined.scope, ChangeScope::BranchWorking);
+    assert_eq!(
+        combined
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.go", "b.txt", "c.txt"]
+    );
+    let a = combined.find_file(Utf8Path::new("a.go")).unwrap();
+    assert!(a.hunks[0]
+        .lines
+        .iter()
+        .any(|line| line.text.contains("return 3")));
+    let c = combined.find_file(Utf8Path::new("c.txt")).unwrap();
+    assert_eq!(c.status, FileStatus::Untracked);
+    assert!(c.hunks.is_empty());
+}
+
+#[tokio::test]
 async fn untracked_files_reported_per_file() {
     let (_tmp, top) = scratch_repo();
     let repo = open_repo(&top).await;

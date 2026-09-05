@@ -275,7 +275,7 @@ fn render_top_bar(frame: &mut Frame, area: Rect, snap: &UiSnapshot) {
     let reserved = right_w.min(area.width as usize) as u16;
     let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(reserved)]).split(area);
     let budget = chunks[0].width as usize;
-    let git_context = if snap.scope == ChangeScope::Branch {
+    let git_context = if matches!(snap.scope, ChangeScope::Branch | ChangeScope::BranchWorking) {
         format!(" {base} ← {} ", r.branch)
     } else {
         format!(" {} ", r.branch)
@@ -334,6 +334,7 @@ fn ai_status_glyph(ai: &AiStatus) -> (&'static str, Style) {
 fn scope_label(scope: ChangeScope) -> &'static str {
     match scope {
         ChangeScope::Branch => "branch",
+        ChangeScope::BranchWorking => "branch+working",
         ChangeScope::Staged => "staged",
         ChangeScope::Unstaged => "unstaged",
         ChangeScope::Working => "working",
@@ -860,7 +861,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     // where wrapped-line geometry and the actual viewport height are both known.
     let scroll_y = diff_first_visual(app, &built, usize::from(area.height.saturating_sub(2)));
 
-    // -- title: basename left, state right; preserve hunk/wrap, elide symbol, then path.
+    // -- title: repo-relative path left, state right; preserve hunk/wrap, elide symbol, then path.
     let mut right_parts: Vec<String> = Vec::new();
     // The snapshot publishes `focused_symbol`; fall back to the local derivation for
     // snapshots that predate it (it stays correct on file rows: `None`).
@@ -891,7 +892,7 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let zoom = zoom_tag(app, Pane::Diff);
     let right_text = format!(" {}{} ", right_parts.join(" · "), zoom);
     let right_w = right_text.width();
-    // Elide the symbol (second) before the basename (last): rebuild without the symbol.
+    // Elide the symbol before the path: rebuild without the symbol.
     let right_text = if right_w + 6 > inner_w && focused_symbol.is_some() {
         let mut parts: Vec<String> = Vec::new();
         if d.total_hunks > 0 {
@@ -911,12 +912,15 @@ fn render_diff(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     };
     let right_w = right_text.width();
     let base_budget = inner_w.saturating_sub(right_w + 1).max(1);
-    let base = if d.title.is_empty() {
+    let path = if d.title.is_empty() {
         String::new()
     } else {
-        truncate_cells(basename(&d.title), base_budget)
+        crate::elide::elide_paths(&[d.title.as_str()], base_budget)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
     };
-    let left_text = format!(" {base} ");
+    let left_text = format!(" {path} ");
 
     let block = pane_block(
         Line::from(Span::styled(
@@ -2597,7 +2601,7 @@ fn help_lines() -> Vec<Line<'static>> {
             Style::new().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("  q / Ctrl-C      quit"),
+        Line::from("  Q / Ctrl-C      quit"),
         Line::from("  ? / Esc         this help / close"),
         Line::from("  g               refresh repository state; clear AI impacts"),
         Line::from("  a               generate AI for the current selection"),
@@ -2609,8 +2613,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  1 / 2 / 3       focus files / diff / impact"),
         Line::from("  j/k · ↑/↓       move selection · scroll"),
         Line::from("  Ctrl-d/u · Pg   half / full page in diff"),
-        Line::from("  s / u / B / w   staged / unstaged / branch / working scope"),
-        Line::from("  S               cycle scope"),
+        Line::from("  s / S           next / previous comparison scope"),
         Line::from("  b               pick comparison base (default: nearest ancestor)"),
         Line::from("  Enter           jump to symbol / re-center view"),
         Line::from("  Space           expand / collapse selection"),
@@ -3136,6 +3139,18 @@ mod tests {
         snap.base_ref.clear();
         t.draw(|f| render(f, &app, &snap)).unwrap();
         assert!(row_text(&t, 0).contains("origin/main ← feature/x"));
+
+        snap.scope = ChangeScope::BranchWorking;
+        t.draw(|f| render(f, &app, &snap)).unwrap();
+        let top = row_text(&t, 0);
+        assert!(
+            top.contains("branch+working"),
+            "combined scope label: {top}"
+        );
+        assert!(
+            top.contains("origin/main ← feature/x"),
+            "combined scope retains its base: {top}"
+        );
     }
 
     #[test]
@@ -3760,17 +3775,13 @@ mod tests {
     }
 
     #[test]
-    fn diff_title_basename_and_state() {
+    fn diff_title_repo_relative_path_and_state() {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let app = app_with(&sample());
         t.draw(|f| render(f, &app, &sample())).unwrap();
         let title = row_text(&t, 1);
-        // Basename only (not the full path) on the left; hunk + wrap on the right.
-        assert!(title.contains("service.go"), "{title}");
-        assert!(
-            !title.contains("internal/service"),
-            "no full path in title: {title}"
-        );
+        // The complete repository-relative path is on the left; hunk + wrap stay on the right.
+        assert!(title.contains("internal/service/service.go"), "{title}");
         assert!(title.contains("hunk 1/1"), "{title}");
         assert!(title.contains("wrap off"), "{title}");
     }

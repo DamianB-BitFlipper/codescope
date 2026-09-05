@@ -390,6 +390,7 @@ fn scan_fixture_reports_context_scopes_and_languages() {
     assert_eq!(json["scopes"]["unstaged"], 2);
     assert_eq!(json["scopes"]["working"], 3);
     assert!(json["scopes"]["branch"].as_u64().unwrap() >= 1);
+    assert!(json["scopes"]["branch_working"].as_u64().unwrap() >= 3);
 
     // Language detection + server availability probe.
     assert_eq!(json["languages"], serde_json::json!(["Go"]));
@@ -407,6 +408,7 @@ fn scan_scratch_repo_has_no_language_server() {
     assert_eq!(json["repo"]["head"]["branch"], "feature");
     assert_eq!(json["repo"]["base"]["ref_name"], "main");
     assert_eq!(json["scopes"]["branch"], 1);
+    assert!(json["scopes"]["branch_working"].as_u64().is_some());
     assert_eq!(json["scopes"]["working"], 1);
     assert_eq!(json["languages"], serde_json::json!(["Python"]));
     // Python is detected but has no adapter.
@@ -420,6 +422,7 @@ fn scan_tolerates_branch_scope_without_base() {
     let out = codescope(&["scan", &root.to_string_lossy()]);
     let json = json_stdout(&out);
     assert!(json["scopes"]["branch"].is_null());
+    assert!(json["scopes"]["branch_working"].is_null());
     assert_eq!(json["scopes"]["working"], 0);
     let notes = json["notes"]
         .as_array()
@@ -441,10 +444,16 @@ fn changeset_fixture_all_scopes() {
     let (_tmp, root) = go_fixture();
     let root = root.to_string_lossy().to_string();
 
-    for scope in ["branch", "staged", "unstaged", "working"] {
+    for (scope, serialized) in [
+        ("branch", "branch"),
+        ("branch-working", "branch_working"),
+        ("staged", "staged"),
+        ("unstaged", "unstaged"),
+        ("working", "working"),
+    ] {
         let out = codescope(&["changeset", &root, "--scope", scope]);
         let json = json_stdout(&out);
-        assert_eq!(json["scope"], scope);
+        assert_eq!(json["scope"], serialized);
         assert!(json["files"].is_array(), "files array: {json}");
         assert_repo_relative(&stdout(&out), Path::new(&root));
     }
@@ -1625,6 +1634,23 @@ fn fully_pushed_branch_reports_no_base_and_keeps_working_scope() {
     let out = codescope(&["changeset", &root, "--scope", "working"]);
     let json = json_stdout(&out);
     assert_eq!(json["files"][0]["path"], "util.go");
+
+    // The combined scope deliberately accepts the same-tip upstream as its base: there are no
+    // branch commits, but the dirty worktree still makes a useful base-to-worktree comparison.
+    let out = codescope(&["changeset", &root, "--scope", "branch-working"]);
+    let json = json_stdout(&out);
+    assert_eq!(json["scope"], "branch_working");
+    assert_eq!(json["files"][0]["path"], "util.go");
+
+    // Exercise the analysis path too. It must resolve repository context with the combined
+    // scope's base rules instead of reusing committed-only Branch inference and losing the base.
+    let out = codescope_env(
+        &["analyze", &root, "--scope", "branch-working"],
+        GIT_ONLY_ENV,
+    );
+    let json = json_stdout(&out);
+    assert_eq!(json["changeset"]["scope"], "branch_working");
+    assert_eq!(json["repo"]["base"]["ref_name"], "main");
 }
 
 #[test]
@@ -1935,12 +1961,12 @@ fn merge_conflict_reports_unmerged_files_without_failing() {
     let out = codescope(&["scan", &root]);
     let json = json_stdout(&out);
     assert_eq!(json["repo"]["head"]["branch"], "other");
-    for scope in ["branch", "staged", "unstaged", "working"] {
+    for scope in ["branch", "branch_working", "staged", "unstaged", "working"] {
         assert_eq!(json["scopes"][scope].as_u64(), Some(1), "{scope}: {json}");
     }
 
     // The tree scopes mark the conflicted file unmerged; combined diffs carry no hunks.
-    for scope in ["staged", "unstaged", "working"] {
+    for scope in ["branch-working", "staged", "unstaged", "working"] {
         let out = codescope(&["changeset", &root, "--scope", scope]);
         let json = json_stdout(&out);
         let files = json["files"].as_array().unwrap();
@@ -2087,6 +2113,10 @@ fn clean_repo_empty_uncommitted_scopes_and_committed_branch_scope() {
     assert_eq!(json["repo"]["head"]["branch"], "feature");
     assert_eq!(json["repo"]["base"]["ref_name"], "main");
     assert_eq!(json["scopes"]["branch"], 1, "the committed feature file");
+    assert_eq!(
+        json["scopes"]["branch_working"], 1,
+        "clean combined scope equals branch scope"
+    );
     assert_eq!(json["scopes"]["staged"], 0);
     assert_eq!(json["scopes"]["unstaged"], 0);
     assert_eq!(json["scopes"]["working"], 0);
@@ -2108,6 +2138,11 @@ fn clean_repo_empty_uncommitted_scopes_and_committed_branch_scope() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["path"], "extra.go");
     assert_eq!(files[0]["status"], "added");
+
+    let out = codescope(&["changeset", &root, "--scope", "branch-working"]);
+    let json = json_stdout(&out);
+    assert_eq!(json["scope"], "branch_working");
+    assert_eq!(json["files"].as_array().unwrap().len(), 1);
     assert_eq!(
         json["fallback"].as_bool(),
         Some(false),

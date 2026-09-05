@@ -187,7 +187,7 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 ## Data model anchors (codescope-core)
 
 - `RepoContext { toplevel, head: HeadState, upstream, base }`
-- `ChangeSet { scope: ChangeScope{Branch|Staged|Unstaged}, files: Vec<FileChange> }`,
+- `ChangeSet { scope: ChangeScope{Branch|BranchWorking|Staged|Unstaged|Working}, files: Vec<FileChange> }`,
   `FileChange{path, old_path, status, hunks, binary}`, `Hunk{old/new start/len, section}`
 - `SymbolNode{id,name,detail,kind,range,selection,children}` / `SymbolTree{file,revision,roots}`
 - `ChangedSymbol{symbol, change_kind, hunks, confidence}` / `MappingConfidence`

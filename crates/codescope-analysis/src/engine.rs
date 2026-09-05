@@ -185,7 +185,10 @@ impl<S: SemanticSource> AnalysisEngine<S> {
         changeset: &ChangeSet,
         epoch: Epoch,
     ) -> Result<AnalysisSnapshot, AnalysisError> {
-        let repo_ctx = self.repo.repo_context().await?;
+        let repo_ctx = self
+            .repo
+            .repo_context_for_scope(changeset.scope, None)
+            .await?;
         self.refresh_with_ctx(changeset, epoch, repo_ctx).await
     }
 
@@ -311,7 +314,7 @@ impl<S: SemanticSource> AnalysisEngine<S> {
             // the file on disk. Query an exact overlay so token line numbers match the diff.
             (_, ChangeScope::Branch) => self.syntax_at_revision(&file, "HEAD", "new").await,
             (_, ChangeScope::Staged) => self.syntax_at_revision(&file, ":0", "new").await,
-            (_, ChangeScope::Unstaged | ChangeScope::Working) => {
+            (_, ChangeScope::BranchWorking | ChangeScope::Unstaged | ChangeScope::Working) => {
                 match self.svc.semantic_tokens(&file).await {
                     Ok(tokens) => tokens.value,
                     Err(error) => {
@@ -509,11 +512,11 @@ impl<S: SemanticSource> AnalysisEngine<S> {
 }
 
 /// The revision whose content is the "old side" of hunks for `scope` (research 02):
-/// merge-base for `Branch`, `HEAD` for `Staged`, the index (`:0`) for `Unstaged`,
-/// and `HEAD` for `Working` (all uncommitted changes diff against HEAD).
+/// merge-base for `Branch` and `BranchWorking`, `HEAD` for `Staged`, the index (`:0`) for
+/// `Unstaged`, and `HEAD` for `Working` (all uncommitted changes diff against HEAD).
 fn base_revspec(scope: ChangeScope, repo_ctx: &RepoContext) -> Option<String> {
     match scope {
-        ChangeScope::Branch => repo_ctx
+        ChangeScope::Branch | ChangeScope::BranchWorking => repo_ctx
             .base
             .as_ref()
             .map(|b| b.merge_base.as_str().to_string()),
@@ -916,6 +919,13 @@ mod tests {
         assert_eq!(
             base_revspec(
                 ChangeScope::Branch,
+                &ctx(Some(base_info.clone()), HeadState::Branch("x".into()))
+            ),
+            Some("cafe12".to_string())
+        );
+        assert_eq!(
+            base_revspec(
+                ChangeScope::BranchWorking,
                 &ctx(Some(base_info.clone()), HeadState::Branch("x".into()))
             ),
             Some("cafe12".to_string())

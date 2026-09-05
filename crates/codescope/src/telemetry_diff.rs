@@ -112,7 +112,7 @@ fn comparison_metadata(context: &RepoContext, changeset: &ChangeSet) -> Value {
         |oid| json!({ "kind": "head_commit", "oid": oid }),
     );
     let resolved_base = match changeset.scope {
-        ChangeScope::Branch => context.base.as_ref().map(|base| {
+        ChangeScope::Branch | ChangeScope::BranchWorking => context.base.as_ref().map(|base| {
             json!({
                 "kind": "merge_base",
                 "ref": base.ref_name,
@@ -129,7 +129,9 @@ fn comparison_metadata(context: &RepoContext, changeset: &ChangeSet) -> Value {
             |oid| json!({ "kind": "head_commit", "oid": oid }),
         ),
         ChangeScope::Staged => json!({ "kind": "index" }),
-        ChangeScope::Unstaged | ChangeScope::Working => json!({ "kind": "worktree" }),
+        ChangeScope::BranchWorking | ChangeScope::Unstaged | ChangeScope::Working => {
+            json!({ "kind": "worktree" })
+        }
     };
     let head = match &context.head {
         HeadState::Branch(name) => json!({ "state": "branch", "name": name }),
@@ -553,5 +555,25 @@ mod tests {
         let payload = build_payload(&context, &changeset, Some("sha256:repo".into())).unwrap();
         assert_eq!(payload["canonical_diff"], "");
         assert_eq!(payload["files"], json!([]));
+    }
+
+    #[test]
+    fn branch_working_metadata_joins_merge_base_to_worktree() {
+        let context = RepoContext {
+            toplevel: Utf8PathBuf::from("/repo"),
+            head: HeadState::Branch("feature".into()),
+            head_oid: Some(Oid::new("2222222222222222222222222222222222222222")),
+            upstream: None,
+            base: Some(BaseInfo {
+                source: BaseSource::Override,
+                ref_name: "main".into(),
+                merge_base: Oid::new("1111111111111111111111111111111111111111"),
+            }),
+        };
+        let changeset = ChangeSet::new(ChangeScope::BranchWorking, Vec::new());
+        let metadata = comparison_metadata(&context, &changeset);
+        assert_eq!(metadata["scope"], "branch_working");
+        assert_eq!(metadata["resolved_base"]["kind"], "merge_base");
+        assert_eq!(metadata["resolved_head"]["kind"], "worktree");
     }
 }

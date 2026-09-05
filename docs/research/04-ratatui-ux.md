@@ -75,7 +75,7 @@ loop {
 │ symbols     │                                          │  callees ▸  │
 │ (List)      │                                          │  impact tree│
 ├─────────────┴──────────────────────────────────────────┴─────────────┤
-│ q quit · ? help · Tab pane · s scope · a AI │ msg: ...               │  <- Length(1)
+│ Q quit · ? help · Tab pane · s scope · a AI │ msg: ...               │  <- Length(1)
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -109,10 +109,10 @@ whole keymap is unit-testable without a terminal.
 
 | key(s) | action |
 |---|---|
-| `q`, `Ctrl-C` | quit |
+| `Q`, `Ctrl-C` | quit |
 | `?` | toggle help modal (lists this table) |
 | `Tab` / `Shift-Tab`, `1` `2` `3` | cycle / directly focus files, diff, semantic pane |
-| `s` / `u` / `B` | scope: staged / unstaged / branch-vs-base (`S` cycles) |
+| `s` / `S` | cycle comparison scope forward / backward |
 | `R` | re-scan git data |
 | `j`/`k`, `↓`/`↑` | move selection / scroll focused pane |
 | `Enter` | files: jump diff+semantic to symbol; semantic: re-center impact graph on symbol |

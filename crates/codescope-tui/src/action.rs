@@ -208,10 +208,14 @@ pub enum Action {
     ScopeUnstaged,
     /// Show the branch-vs-base scope.
     ScopeBranch,
+    /// Show committed branch changes plus the current index/worktree.
+    ScopeBranchWorking,
     /// Show the working scope (all uncommitted changes: staged + unstaged).
     ScopeWorking,
-    /// Cycle scope (branch → staged → unstaged → working).
+    /// Cycle scope forward.
     ScopeCycle,
+    /// Cycle scope backward.
+    ScopeCycleReverse,
     /// Refresh repository state from Git and the working tree.
     RefreshGit,
     /// Generate or regenerate AI output for the currently selected directory, file, or symbol.
@@ -291,11 +295,14 @@ pub enum Action {
     /// Publish or clear the retained diff excerpt for local agent clients. Produced by the
     /// run loop after applying the corresponding local gesture.
     SetAgentDiffSelection(Option<crate::snapshot::SelectedDiffContext>),
-    /// Mouse: select the file/symbol row at this logical index (and focus Files).
-    /// The selection tracker emits the same SelectionChanged a keyboard move would.
+    /// Mouse: select the file/symbol row at this logical index (and focus Files) without moving
+    /// the changed-files viewport. The selection tracker emits the same SelectionChanged a
+    /// keyboard move would.
     SelectFileRow {
         /// The logical (selectable) row index.
         logical_index: usize,
+        /// Physical first row of the viewport in which the click occurred.
+        viewport_offset: usize,
     },
     /// Mouse wheel: set the independently scrollable region under the pointer. This is
     /// absolute because the retained frame geometry owns the displayed/clamped origin.
@@ -322,11 +329,18 @@ pub enum Action {
 /// Map a key event to an [`Action`] in the current app context.
 ///
 /// Returns [`Action::None`] for release/repeat events (Windows emits them) and unmapped
-/// keys. When the help modal is open, any key other than `?`/`Esc` is swallowed.
+/// keys. `Q` and `Ctrl-C` quit globally; otherwise the help modal swallows every key except
+/// `?`/`Esc`.
 #[must_use]
 pub fn map_key(key: KeyEvent, app: &App) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::None;
+    }
+    if key.kind == KeyEventKind::Press
+        && (key.code == KeyCode::Char('Q')
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
+    {
+        return Action::Quit;
     }
     if key.kind == KeyEventKind::Repeat {
         if app.status_detail.is_some() || app.show_help {
@@ -373,14 +387,12 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
-            KeyCode::Char('c') => Action::Quit,
             KeyCode::Char('d') => Action::HalfPageDown,
             KeyCode::Char('u') => Action::HalfPageUp,
             _ => Action::None,
         };
     }
     match key.code {
-        KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('?') => Action::ToggleHelp,
         // Esc exits a pinned zoom; otherwise it is deliberately inert (modals handle
         // their own Esc above).
@@ -395,11 +407,8 @@ pub fn map_key(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('1') => Action::Focus(Pane::Files),
         KeyCode::Char('2') => Action::Focus(Pane::Diff),
         KeyCode::Char('3') => Action::Focus(Pane::Impact),
-        KeyCode::Char('s') => Action::ScopeStaged,
-        KeyCode::Char('u') => Action::ScopeUnstaged,
-        KeyCode::Char('B') => Action::ScopeBranch,
-        KeyCode::Char('w') => Action::ScopeWorking,
-        KeyCode::Char('S') => Action::ScopeCycle,
+        KeyCode::Char('s') => Action::ScopeCycle,
+        KeyCode::Char('S') => Action::ScopeCycleReverse,
         KeyCode::Char('g') => Action::RefreshGit,
         KeyCode::Char('a') => Action::GenerateAi,
         KeyCode::Char('A') => Action::ToggleAiGenerationMode,
@@ -462,10 +471,23 @@ fn picker_key(key: KeyEvent, close: Action, select: Action) -> Action {
 #[must_use]
 pub fn next_scope(scope: ChangeScope) -> ChangeScope {
     match scope {
-        ChangeScope::Branch => ChangeScope::Staged,
+        ChangeScope::Branch => ChangeScope::BranchWorking,
+        ChangeScope::BranchWorking => ChangeScope::Staged,
         ChangeScope::Staged => ChangeScope::Unstaged,
         ChangeScope::Unstaged => ChangeScope::Working,
         ChangeScope::Working => ChangeScope::Branch,
+    }
+}
+
+/// Reverse cycle order for [`Action::ScopeCycleReverse`].
+#[must_use]
+pub fn previous_scope(scope: ChangeScope) -> ChangeScope {
+    match scope {
+        ChangeScope::Branch => ChangeScope::Working,
+        ChangeScope::BranchWorking => ChangeScope::Branch,
+        ChangeScope::Staged => ChangeScope::BranchWorking,
+        ChangeScope::Unstaged => ChangeScope::Staged,
+        ChangeScope::Working => ChangeScope::Unstaged,
     }
 }
 
@@ -510,7 +532,8 @@ mod tests {
 
     #[test]
     fn quit_keys() {
-        assert_eq!(map_key(key(KeyCode::Char('q')), &app()), Action::Quit);
+        assert_eq!(map_key(key(KeyCode::Char('Q')), &app()), Action::Quit);
+        assert_eq!(map_key(key(KeyCode::Char('q')), &app()), Action::None);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(map_key(ctrl_c, &app()), Action::Quit);
     }
@@ -527,23 +550,14 @@ mod tests {
 
     #[test]
     fn scope_keys() {
+        assert_eq!(map_key(key(KeyCode::Char('s')), &app()), Action::ScopeCycle);
         assert_eq!(
-            map_key(key(KeyCode::Char('s')), &app()),
-            Action::ScopeStaged
+            map_key(key(KeyCode::Char('S')), &app()),
+            Action::ScopeCycleReverse
         );
-        assert_eq!(
-            map_key(key(KeyCode::Char('u')), &app()),
-            Action::ScopeUnstaged
-        );
-        assert_eq!(
-            map_key(key(KeyCode::Char('B')), &app()),
-            Action::ScopeBranch
-        );
-        assert_eq!(
-            map_key(key(KeyCode::Char('w')), &app()),
-            Action::ScopeWorking
-        );
-        assert_eq!(map_key(key(KeyCode::Char('S')), &app()), Action::ScopeCycle);
+        for removed in ['u', 'B', 'w'] {
+            assert_eq!(map_key(key(KeyCode::Char(removed)), &app()), Action::None);
+        }
     }
 
     #[test]
@@ -641,6 +655,11 @@ mod tests {
         a.show_help = true;
         assert_eq!(map_key(key(KeyCode::Char('j')), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('Q')), &a), Action::Quit);
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &a),
+            Action::Quit
+        );
         assert_eq!(map_key(key(KeyCode::Char('?')), &a), Action::ToggleHelp);
         assert_eq!(map_key(key(KeyCode::Esc), &a), Action::ToggleHelp);
     }
@@ -655,6 +674,7 @@ mod tests {
         };
         a.apply(Action::ToggleStatusDetail);
         assert_eq!(map_key(key(KeyCode::Char('q')), &a), Action::None);
+        assert_eq!(map_key(key(KeyCode::Char('Q')), &a), Action::Quit);
         assert_eq!(map_key(key(KeyCode::Char('?')), &a), Action::None);
         assert_eq!(map_key(key(KeyCode::Esc), &a), Action::ToggleStatusDetail);
     }
@@ -785,9 +805,20 @@ mod tests {
 
     #[test]
     fn scope_cycle_order() {
-        assert_eq!(next_scope(ChangeScope::Branch), ChangeScope::Staged);
+        assert_eq!(next_scope(ChangeScope::Branch), ChangeScope::BranchWorking);
+        assert_eq!(next_scope(ChangeScope::BranchWorking), ChangeScope::Staged);
         assert_eq!(next_scope(ChangeScope::Staged), ChangeScope::Unstaged);
         assert_eq!(next_scope(ChangeScope::Unstaged), ChangeScope::Working);
         assert_eq!(next_scope(ChangeScope::Working), ChangeScope::Branch);
+        for scope in [
+            ChangeScope::Branch,
+            ChangeScope::BranchWorking,
+            ChangeScope::Staged,
+            ChangeScope::Unstaged,
+            ChangeScope::Working,
+        ] {
+            assert_eq!(previous_scope(next_scope(scope)), scope);
+            assert_eq!(next_scope(previous_scope(scope)), scope);
+        }
     }
 }

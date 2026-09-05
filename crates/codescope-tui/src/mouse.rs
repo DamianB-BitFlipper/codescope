@@ -7,7 +7,9 @@
 //! (horizontal wins at their intersection); a selectable file/symbol row; a pane for
 //! focus; anything else is inert. Right/middle buttons and double-click are no-ops.
 
-use crossterm::event::{MouseButton, MouseEvent};
+use std::time::{Duration, Instant};
+
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use crate::action::Action;
 use crate::action::PlanNodeTarget;
@@ -16,6 +18,90 @@ use crate::app::{App, Pane};
 use crate::divider::DividerId;
 use crate::geometry::UiGeometry;
 use crate::snapshot::UiSnapshot;
+
+/// Keep one trackpad gesture on its dominant axis. Terminals report diagonal trackpad motion as
+/// separate vertical and horizontal wheel events, so a vertical read can otherwise nudge a long
+/// unwrapped diff sideways on every gesture.
+#[derive(Debug, Default)]
+pub(crate) struct WheelAxisFilter {
+    locked: Option<WheelAxis>,
+    last_dominant: Option<Instant>,
+    pending_horizontal: Option<(HorizontalDirection, Instant)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelAxis {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HorizontalDirection {
+    Left,
+    Right,
+}
+
+const WHEEL_AXIS_LOCK_WINDOW: Duration = Duration::from_millis(180);
+
+impl WheelAxisFilter {
+    /// Whether this event should reach ordinary mouse routing.
+    ///
+    /// Vertical input claims a fresh gesture immediately. Horizontal input must provide two
+    /// consecutive samples before claiming it, which removes incidental sideways trackpad noise;
+    /// once claimed, either axis remains locked while its dominant samples keep arriving.
+    pub(crate) fn allows(&mut self, kind: MouseEventKind, now: Instant) -> bool {
+        let axis = match kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => WheelAxis::Vertical,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => WheelAxis::Horizontal,
+            _ => return true,
+        };
+
+        if self
+            .last_dominant
+            .is_some_and(|last| now.saturating_duration_since(last) > WHEEL_AXIS_LOCK_WINDOW)
+        {
+            self.locked = None;
+            self.last_dominant = None;
+        }
+
+        if let Some(locked) = self.locked {
+            if locked != axis {
+                return false;
+            }
+            self.last_dominant = Some(now);
+            return true;
+        }
+
+        if axis == WheelAxis::Vertical {
+            self.locked = Some(WheelAxis::Vertical);
+            self.last_dominant = Some(now);
+            self.pending_horizontal = None;
+            return true;
+        }
+
+        let direction = match kind {
+            MouseEventKind::ScrollLeft => HorizontalDirection::Left,
+            MouseEventKind::ScrollRight => HorizontalDirection::Right,
+            _ => unreachable!("horizontal axis was established above"),
+        };
+        let confirmed = self.pending_horizontal.is_some_and(|(pending, at)| {
+            pending == direction && now.saturating_duration_since(at) <= WHEEL_AXIS_LOCK_WINDOW
+        });
+        if confirmed {
+            self.locked = Some(WheelAxis::Horizontal);
+            self.last_dominant = Some(now);
+            self.pending_horizontal = None;
+            true
+        } else {
+            self.pending_horizontal = Some((direction, now));
+            false
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
 
 /// The drag state machine.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -141,8 +227,8 @@ pub fn map_mouse(
         K::Moved => route_hover(x, y, app, geometry),
         K::ScrollUp => route_wheel(x, y, -3, geometry),
         K::ScrollDown => route_wheel(x, y, 3, geometry),
-        K::ScrollLeft => route_horizontal_wheel(x, y, -8, app, geometry),
-        K::ScrollRight => route_horizontal_wheel(x, y, 8, app, geometry),
+        K::ScrollLeft => route_horizontal_wheel(x, y, -4, app, geometry),
+        K::ScrollRight => route_horizontal_wheel(x, y, 4, app, geometry),
         K::Down(MouseButton::Left) => route_down(x, y, app, snap, geometry),
         // Non-left or non-primary kinds are inert.
         _ if !is_left => MouseOutcome::inert(drag),
@@ -301,6 +387,7 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
                     return MouseOutcome::action(
                         Action::SelectFileRow {
                             logical_index: logical,
+                            viewport_offset: geo.files_first_visible,
                         },
                         DragState::Idle,
                     );
@@ -500,6 +587,53 @@ mod tests {
     fn wheel_right(x: u16, y: u16) -> MouseEvent {
         mouse(MouseEventKind::ScrollRight, x, y)
     }
+
+    #[test]
+    fn wheel_axis_filter_keeps_vertical_gestures_from_drifting_sideways() {
+        let started = Instant::now();
+        let mut filter = WheelAxisFilter::default();
+
+        assert!(filter.allows(MouseEventKind::ScrollDown, started));
+        assert!(!filter.allows(
+            MouseEventKind::ScrollRight,
+            started + Duration::from_millis(20)
+        ));
+        assert!(filter.allows(
+            MouseEventKind::ScrollDown,
+            started + Duration::from_millis(40)
+        ));
+
+        // Once the vertical gesture has ended, two deliberate horizontal samples claim a fresh
+        // gesture. The first sample is the horizontal dead-zone.
+        assert!(!filter.allows(
+            MouseEventKind::ScrollRight,
+            started + Duration::from_millis(240)
+        ));
+        assert!(filter.allows(
+            MouseEventKind::ScrollRight,
+            started + Duration::from_millis(250)
+        ));
+    }
+
+    #[test]
+    fn wheel_axis_filter_holds_a_deliberate_horizontal_gesture() {
+        let started = Instant::now();
+        let mut filter = WheelAxisFilter::default();
+
+        assert!(!filter.allows(MouseEventKind::ScrollLeft, started));
+        assert!(filter.allows(
+            MouseEventKind::ScrollLeft,
+            started + Duration::from_millis(10)
+        ));
+        assert!(!filter.allows(
+            MouseEventKind::ScrollUp,
+            started + Duration::from_millis(20)
+        ));
+        assert!(filter.allows(
+            MouseEventKind::ScrollUp,
+            started + Duration::from_millis(200)
+        ));
+    }
     /// A snapshot with two files: a collapsed one and an expanded one with two symbols.
     fn snap() -> UiSnapshot {
         UiSnapshot {
@@ -610,7 +744,13 @@ mod tests {
         // The first file row is at the top of the files inner rect.
         let (rect, phys) = g.file_row_rects[0];
         let out = map_mouse(down(rect.x + 1, rect.y), &app, &s, &g, DragState::Idle);
-        assert_eq!(out.action, Some(Action::SelectFileRow { logical_index: 0 }));
+        assert_eq!(
+            out.action,
+            Some(Action::SelectFileRow {
+                logical_index: 0,
+                viewport_offset: 0,
+            })
+        );
         let _ = phys;
     }
 
@@ -670,7 +810,13 @@ mod tests {
             &g,
             DragState::Idle,
         );
-        assert_eq!(out.action, Some(Action::SelectFileRow { logical_index: 2 }));
+        assert_eq!(
+            out.action,
+            Some(Action::SelectFileRow {
+                logical_index: 2,
+                viewport_offset: 0,
+            })
+        );
     }
 
     #[test]
@@ -1001,6 +1147,56 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_scrolled_file_keeps_the_files_viewport_in_place() {
+        let mut s = snap();
+        s.files = (0..30)
+            .map(|index| FileRow {
+                path: format!("file-{index}.go"),
+                status: "M",
+                changed_symbol_count: 0,
+                added_lines: 0,
+                removed_lines: 0,
+                symbols: Vec::new(),
+                expanded: false,
+                semantic: FileSemanticLoad::Ready,
+            })
+            .collect();
+        let mut app = app_with(&s);
+        app.apply(Action::ScrollRegion {
+            region: crate::scroll::ScrollRegionId::Files,
+            offset: 8,
+        });
+
+        let before = geo(&app, &s);
+        assert_eq!(before.files_first_visible, 8);
+        let row = before
+            .file_row_rects
+            .iter()
+            .find(|(_, physical)| *physical == 10)
+            .map(|(rect, _)| *rect)
+            .expect("third visible file row");
+        let out = map_mouse(down(row.x + 2, row.y), &app, &s, &before, DragState::Idle);
+        assert_eq!(
+            out.action,
+            Some(Action::SelectFileRow {
+                logical_index: 10,
+                viewport_offset: 8,
+            })
+        );
+
+        app.apply(out.action.expect("file selection"));
+        let after = geo(&app, &s);
+        assert_eq!(app.selected_file_path(), Some("file-10.go"));
+        assert_eq!(after.files_first_visible, 8, "click must not jump the list");
+
+        // The dispatcher publishes a retargeted diff after the click. That data update must not
+        // turn the retained files viewport back into selection-following mode either.
+        s.diff.title = "file-10.go".to_string();
+        app.update(s.clone());
+        assert_eq!(geo(&app, &s).files_first_visible, 8);
+    }
+
+    #[test]
     fn horizontal_trackpad_scroll_targets_only_the_unwrapped_diff() {
         let s = snap();
         let mut app = app_with(&s);
@@ -1017,10 +1213,10 @@ mod tests {
         );
         assert_eq!(
             right.action,
-            Some(Action::ScrollDiffHorizontal { delta: 8 })
+            Some(Action::ScrollDiffHorizontal { delta: 4 })
         );
         app.apply(right.action.expect("horizontal scroll"));
-        assert_eq!(app.diff_hscroll, 8);
+        assert_eq!(app.diff_hscroll, 4);
         assert_eq!(
             app.focused,
             Pane::Files,
@@ -1036,7 +1232,7 @@ mod tests {
         );
         assert_eq!(
             left.action,
-            Some(Action::ScrollDiffHorizontal { delta: -8 })
+            Some(Action::ScrollDiffHorizontal { delta: -4 })
         );
         app.apply(left.action.expect("horizontal scroll"));
         assert_eq!(app.diff_hscroll, 0);

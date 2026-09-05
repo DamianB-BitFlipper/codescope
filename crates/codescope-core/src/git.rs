@@ -130,8 +130,8 @@ pub struct RepoContext {
     /// Upstream tracking info, if configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<Upstream>,
-    /// Inferred base for the `Branch` change scope; `None` when no base could be inferred
-    /// (e.g. unborn HEAD or no remotes).
+    /// Inferred base for a branch-based change scope; `None` when no base could be inferred
+    /// (e.g. unborn HEAD or no other branch ref).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<BaseInfo>,
 }
@@ -142,6 +142,8 @@ pub struct RepoContext {
 pub enum ChangeScope {
     /// Committed on this branch: `merge-base...HEAD`.
     Branch,
+    /// Committed branch changes plus the current index/worktree: `merge-base` vs worktree.
+    BranchWorking,
     /// Index vs HEAD (`git diff --cached`).
     Staged,
     /// Worktree vs index (`git diff`); untracked files live in this set.

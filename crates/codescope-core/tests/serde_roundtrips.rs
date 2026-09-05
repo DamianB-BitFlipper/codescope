@@ -62,8 +62,10 @@ fn git_domain_roundtrips() {
     });
     for scope in [
         ChangeScope::Branch,
+        ChangeScope::BranchWorking,
         ChangeScope::Staged,
         ChangeScope::Unstaged,
+        ChangeScope::Working,
     ] {
         roundtrip(&scope);
     }

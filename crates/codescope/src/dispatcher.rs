@@ -19,6 +19,7 @@ use codescope_core::{
 };
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
+use codescope_tui::action::{next_scope, previous_scope};
 use codescope_tui::snapshot::{
     AgentDiagramResult, AiActivity, AiSummaryKey, AiSummaryState, AiTokenUsage, AiToolCallActivity,
     AiToolCallActivityState, DiffPane, DiffRow, FileRow, ImpactList, ImpactLoadState, ImpactPane,
@@ -1048,16 +1049,10 @@ impl Dispatcher {
             Action::ScopeStaged => self.set_scope(ChangeScope::Staged),
             Action::ScopeUnstaged => self.set_scope(ChangeScope::Unstaged),
             Action::ScopeBranch => self.set_scope(ChangeScope::Branch),
+            Action::ScopeBranchWorking => self.set_scope(ChangeScope::BranchWorking),
             Action::ScopeWorking => self.set_scope(ChangeScope::Working),
-            Action::ScopeCycle => {
-                let next = match self.scope {
-                    ChangeScope::Branch => ChangeScope::Staged,
-                    ChangeScope::Staged => ChangeScope::Unstaged,
-                    ChangeScope::Unstaged => ChangeScope::Working,
-                    ChangeScope::Working => ChangeScope::Branch,
-                };
-                self.set_scope(next);
-            }
+            Action::ScopeCycle => self.set_scope(next_scope(self.scope)),
+            Action::ScopeCycleReverse => self.set_scope(previous_scope(self.scope)),
             Action::ModelPicker => self.spawn_list_models(),
             Action::AiSettingsSelected {
                 model,
@@ -1284,8 +1279,12 @@ impl Dispatcher {
     fn spawn_list_bases(&mut self) {
         let repo = self.repo.clone();
         let tx = self.job_tx.clone();
+        let scope = self.scope;
         tokio::spawn(async move {
-            let bases = repo.base_picker_refs().await.unwrap_or_default();
+            let bases = repo
+                .base_picker_refs_for_scope(scope)
+                .await
+                .unwrap_or_default();
             let _ = tx.send(DispatchEvent::BaseLoaded { bases }).await;
         });
     }
@@ -3028,8 +3027,13 @@ impl Dispatcher {
         self.selected_directory = None;
         self.selected_symbol = None;
         self.selected_relations = None;
+        let label = if self.scope == ChangeScope::BranchWorking {
+            "branch + working comparison"
+        } else {
+            "branch comparison"
+        };
         self.set_status(
-            "branch comparison unavailable: no meaningful base could be inferred",
+            format!("{label} unavailable: no meaningful base could be inferred"),
             StatusLevel::Warning,
         );
         self.publish();
@@ -4011,7 +4015,7 @@ fn one_line(value: &str) -> String {
 }
 
 /// The git+analysis pipeline, run as one spawned job. A base override (from the base
-/// picker) flows into the repo context and, for the `Branch` scope, into the diff itself.
+/// picker) flows into the repo context and, for both branch-based scopes, into the diff itself.
 async fn run_pipeline(
     repo: GitRepo,
     scope: ChangeScope,
@@ -4021,10 +4025,10 @@ async fn run_pipeline(
     tx: &mpsc::Sender<DispatchEvent>,
 ) -> anyhow::Result<AnalysisSnapshot> {
     let ctx = repo
-        .repo_context_with_base(base_override.as_deref())
+        .repo_context_for_scope(scope, base_override.as_deref())
         .await?;
     let changeset = match scope {
-        ChangeScope::Branch => {
+        ChangeScope::Branch | ChangeScope::BranchWorking => {
             let Some(base) = ctx.base.as_ref() else {
                 // Publish the honest current context and explicitly invalidate a retained
                 // branch diff. This is not an empty comparison: no comparison can run.
@@ -4038,7 +4042,11 @@ async fn run_pipeline(
             };
             // Use the merge-base captured in the same context rendered by the top bar.
             // Re-resolving a mutable ref here could label one base while diffing another.
-            repo.branch_changeset_from_base(base).await?
+            if scope == ChangeScope::Branch {
+                repo.branch_changeset_from_base(base).await?
+            } else {
+                repo.branch_working_changeset_from_base(base).await?
+            }
         }
         _ => repo.changeset(scope).await?,
     };
