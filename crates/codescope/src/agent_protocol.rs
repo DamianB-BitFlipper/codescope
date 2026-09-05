@@ -22,16 +22,17 @@ use codescope_tui::snapshot::{
     AiSummaryKey, AiSummaryState, AiToolCallActivityState, DiffRow, FileSemanticLoad,
     ImpactLoadState, UiSnapshot,
 };
-use codescope_tui::Action;
+use codescope_tui::{Action, ExternalControl};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 
-const PROTOCOL_VERSION: u8 = 3;
+const PROTOCOL_VERSION: u8 = 5;
 #[cfg(unix)]
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const DEFAULT_DIFF_LINES: usize = 160;
@@ -39,6 +40,7 @@ const MAX_DIFF_LINES: usize = 500;
 const MAX_TREE_FILES: usize = 500;
 const DIAGRAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 static AGENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static AGENT_COMMAND_ORDINAL: AtomicU64 = AtomicU64::new(1);
 
 fn parse_diff_limit(value: &str) -> std::result::Result<usize, String> {
     let limit = value
@@ -94,6 +96,9 @@ pub(crate) enum AgentOperation {
 /// Authoritative focused-diff lookup for validator-compatible code references.
 #[derive(Args, Debug)]
 pub(crate) struct DiffArgs {
+    /// View identifier returned by `codescope agent . context`.
+    #[arg(long, value_name = "ID")]
+    view_id: String,
     /// Repo-relative changed file; defaults to the focused file.
     #[arg(long)]
     file: Option<String>,
@@ -111,6 +116,9 @@ pub(crate) struct DiffArgs {
 /// Incremental diagram editor commands.
 #[derive(Args, Debug)]
 pub(crate) struct DiagramArgs {
+    /// View identifier returned by `codescope agent . context`; required except for `schema`.
+    #[arg(long, global = true, value_name = "ID")]
+    view_id: Option<String>,
     /// Diagram operation.
     #[command(subcommand)]
     operation: DiagramOperation,
@@ -119,7 +127,7 @@ pub(crate) struct DiagramArgs {
 /// The controller and internal AI use the same serialized [`DiagramCommand`] operations.
 #[derive(Subcommand, Debug)]
 enum DiagramOperation {
-    /// Return the complete current draft for the visible selection.
+    /// Return the complete draft for the captured view.
     #[command(alias = "show")]
     Inspect,
     /// Apply one shared editor command encoded as JSON.
@@ -130,7 +138,7 @@ enum DiagramOperation {
     },
     /// Print the shared edit and inspection tool schemas without connecting to a TUI.
     Schema,
-    /// Validate and publish the current draft as the visible AI summary.
+    /// Validate and publish the captured view's current draft.
     Finish,
 }
 
@@ -155,32 +163,86 @@ pub(crate) struct FocusArgs {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum AgentRequest {
     Context {
+        command_id: String,
         max_diff_lines: usize,
     },
     Diff {
+        command_id: String,
+        view_id: String,
         file: Option<String>,
         hunk: Option<usize>,
         offset: usize,
         max_lines: usize,
     },
     Focus {
+        command_id: String,
         directory: Option<String>,
         file: Option<String>,
         symbol: Option<String>,
         line: Option<u32>,
     },
-    DiagramGet,
-    DiagramApply {
+    DiagramGet {
+        command_id: String,
         request_id: u64,
-        command: DiagramCommand,
+        view_id: String,
+    },
+    DiagramApply {
+        command_id: String,
+        request_id: u64,
+        view_id: String,
+        command: Box<DiagramCommand>,
     },
     /// Raw CLI edit. The live server performs schema decoding so malformed calls can be
     /// acknowledged and displayed alongside accepted controller activity.
     DiagramApplyRaw {
+        command_id: String,
         request_id: u64,
+        view_id: String,
         command: String,
     },
-    Refresh,
+    Refresh {
+        command_id: String,
+    },
+}
+
+impl AgentRequest {
+    fn command_id(&self) -> &str {
+        match self {
+            Self::Context { command_id, .. }
+            | Self::Diff { command_id, .. }
+            | Self::Focus { command_id, .. }
+            | Self::DiagramGet { command_id, .. }
+            | Self::DiagramApply { command_id, .. }
+            | Self::DiagramApplyRaw { command_id, .. }
+            | Self::Refresh { command_id } => command_id,
+        }
+    }
+
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Context { .. } => "context",
+            Self::Diff { .. } => "diff",
+            Self::Focus { .. } => "focus",
+            Self::DiagramGet { .. } => "diagram.inspect",
+            Self::DiagramApply { command, .. }
+                if matches!(command.as_ref(), DiagramCommand::Finish) =>
+            {
+                "diagram.finish"
+            }
+            Self::DiagramApply { .. } | Self::DiagramApplyRaw { .. } => "diagram.edit",
+            Self::Refresh { .. } => "refresh",
+        }
+    }
+
+    fn view_id(&self) -> Option<&str> {
+        match self {
+            Self::Diff { view_id, .. }
+            | Self::DiagramGet { view_id, .. }
+            | Self::DiagramApply { view_id, .. }
+            | Self::DiagramApplyRaw { view_id, .. } => Some(view_id),
+            Self::Context { .. } | Self::Focus { .. } | Self::Refresh { .. } => None,
+        }
+    }
 }
 
 /// Keeps the listener task and its filesystem entry alive for exactly one TUI session.
@@ -193,7 +255,7 @@ impl AgentServer {
     pub(crate) async fn start(
         repo_root: Utf8PathBuf,
         snapshots: watch::Receiver<UiSnapshot>,
-        controls: mpsc::Sender<Action>,
+        controls: mpsc::Sender<ExternalControl>,
     ) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -230,7 +292,7 @@ async fn bind_server(
     path: PathBuf,
     repo_root: Utf8PathBuf,
     snapshots: watch::Receiver<UiSnapshot>,
-    controls: mpsc::Sender<Action>,
+    controls: mpsc::Sender<ExternalControl>,
 ) -> Result<AgentServer> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -301,7 +363,7 @@ async fn serve_connection(
     mut stream: UnixStream,
     repo_root: &Utf8PathBuf,
     mut snapshots: watch::Receiver<UiSnapshot>,
-    controls: &mpsc::Sender<Action>,
+    controls: &mpsc::Sender<ExternalControl>,
     diagram_lock: &tokio::sync::Mutex<()>,
 ) -> Result<()> {
     let response = match read_request(&mut stream).await {
@@ -350,11 +412,56 @@ async fn handle_request(
     request: AgentRequest,
     repo_root: &Utf8PathBuf,
     snapshots: &mut watch::Receiver<UiSnapshot>,
-    controls: &mpsc::Sender<Action>,
+    controls: &mpsc::Sender<ExternalControl>,
+    diagram_lock: &tokio::sync::Mutex<()>,
+) -> Result<Value> {
+    let command_id = request.command_id().to_string();
+    let operation = request.operation();
+    let requested_view_id = request.view_id().map(str::to_string);
+    record_agent_command(
+        &command_id,
+        operation,
+        "server",
+        "received",
+        "running",
+        requested_view_id.as_deref(),
+        None,
+    );
+    let result = handle_request_inner(request, repo_root, snapshots, controls, diagram_lock).await;
+    let result_view_id = result
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("view_id"))
+        .and_then(Value::as_str);
+    let status = match &result {
+        Err(_) => "failed",
+        Ok(value) if value.get("accepted").and_then(Value::as_bool) == Some(false) => "rejected",
+        Ok(_) => "succeeded",
+    };
+    record_agent_command(
+        &command_id,
+        operation,
+        "server",
+        "completed",
+        status,
+        requested_view_id.as_deref(),
+        result_view_id,
+    );
+    result
+}
+
+async fn handle_request_inner(
+    request: AgentRequest,
+    repo_root: &Utf8PathBuf,
+    snapshots: &mut watch::Receiver<UiSnapshot>,
+    controls: &mpsc::Sender<ExternalControl>,
     diagram_lock: &tokio::sync::Mutex<()>,
 ) -> Result<Value> {
     match request {
-        AgentRequest::Context { max_diff_lines } => {
+        AgentRequest::Context {
+            command_id: _,
+            max_diff_lines,
+        } => {
             let snapshot = snapshots.borrow().clone();
             Ok(context_view(
                 repo_root,
@@ -363,14 +470,19 @@ async fn handle_request(
             ))
         }
         AgentRequest::Diff {
+            command_id: _,
+            view_id,
             file,
             hunk,
             offset,
             max_lines,
         } => {
             let snapshot = snapshots.borrow().clone();
+            let (_, selection) = resolve_view_id(repo_root, &snapshot, &view_id)?;
             diff_view(
                 &snapshot,
+                &view_id,
+                &selection,
                 file.as_deref(),
                 hunk,
                 offset,
@@ -378,6 +490,7 @@ async fn handle_request(
             )
         }
         AgentRequest::Focus {
+            command_id,
             directory,
             file,
             symbol,
@@ -386,7 +499,12 @@ async fn handle_request(
             let snapshot = snapshots.borrow().clone();
             let target = resolve_focus(&snapshot, directory, file, symbol, line)?;
             controls
-                .send(Action::AgentFocus(target.clone()))
+                .send(ExternalControl {
+                    command_id,
+                    operation: "focus".to_string(),
+                    view_id: None,
+                    action: Action::AgentFocus(target.clone()),
+                })
                 .await
                 .context("the TUI control loop has stopped")?;
             Ok(json!({
@@ -395,19 +513,56 @@ async fn handle_request(
                 "note": "focus is applied asynchronously; call context to observe the resulting snapshot"
             }))
         }
-        AgentRequest::DiagramGet => {
-            let snapshot = snapshots.borrow().clone();
-            Ok(diagram_view(&snapshot))
-        }
-        AgentRequest::DiagramApply {
+        AgentRequest::DiagramGet {
+            command_id,
             request_id,
-            command,
+            view_id,
         } => {
+            let snapshot = snapshots.borrow().clone();
+            let (epoch, selection) = resolve_view_id(repo_root, &snapshot, &view_id)?;
             apply_diagram_action(
                 request_id,
-                Action::AgentDiagram {
-                    request_id,
-                    command,
+                ExternalControl {
+                    command_id,
+                    operation: "diagram.inspect".to_string(),
+                    view_id: Some(view_id),
+                    action: Action::AgentDiagramInspect {
+                        request_id,
+                        epoch,
+                        selection,
+                    },
+                },
+                snapshots,
+                controls,
+                diagram_lock,
+            )
+            .await
+        }
+        AgentRequest::DiagramApply {
+            command_id,
+            request_id,
+            view_id,
+            command,
+        } => {
+            let snapshot = snapshots.borrow().clone();
+            let (epoch, selection) = resolve_view_id(repo_root, &snapshot, &view_id)?;
+            apply_diagram_action(
+                request_id,
+                ExternalControl {
+                    command_id,
+                    operation: if matches!(command.as_ref(), DiagramCommand::Finish) {
+                        "diagram.finish"
+                    } else {
+                        "diagram.edit"
+                    }
+                    .to_string(),
+                    view_id: Some(view_id),
+                    action: Action::AgentDiagram {
+                        request_id,
+                        epoch,
+                        selection,
+                        command,
+                    },
                 },
                 snapshots,
                 controls,
@@ -416,27 +571,52 @@ async fn handle_request(
             .await
         }
         AgentRequest::DiagramApplyRaw {
+            command_id,
             request_id,
+            view_id,
             command,
         } => {
+            let snapshot = snapshots.borrow().clone();
+            let (epoch, selection) = resolve_view_id(repo_root, &snapshot, &view_id)?;
             let action = match serde_json::from_str::<DiagramCommand>(&command) {
                 Ok(command) => Action::AgentDiagram {
                     request_id,
-                    command,
+                    epoch,
+                    selection,
+                    command: Box::new(command),
                 },
                 Err(error) => Action::AgentDiagramRejected {
                     request_id,
+                    epoch,
+                    selection,
                     detail: codescope_ai::scrub_secrets(&raw_diagram_activity_detail(&command)),
                     error: codescope_ai::scrub_secrets(&format!(
                         "diagram command is not valid shared editor JSON: {error}"
                     )),
                 },
             };
-            apply_diagram_action(request_id, action, snapshots, controls, diagram_lock).await
+            apply_diagram_action(
+                request_id,
+                ExternalControl {
+                    command_id,
+                    operation: "diagram.edit".to_string(),
+                    view_id: Some(view_id),
+                    action,
+                },
+                snapshots,
+                controls,
+                diagram_lock,
+            )
+            .await
         }
-        AgentRequest::Refresh => {
+        AgentRequest::Refresh { command_id } => {
             controls
-                .send(Action::RefreshGit)
+                .send(ExternalControl {
+                    command_id,
+                    operation: "refresh".to_string(),
+                    view_id: None,
+                    action: Action::RefreshGit,
+                })
                 .await
                 .context("the TUI control loop has stopped")?;
             Ok(json!({
@@ -447,11 +627,35 @@ async fn handle_request(
     }
 }
 
+fn record_agent_command(
+    command_id: &str,
+    operation: &str,
+    side: &str,
+    phase: &str,
+    status: &str,
+    view_id: Option<&str>,
+    result_view_id: Option<&str>,
+) {
+    codescope_telemetry::record_with_origin(
+        codescope_telemetry::TelemetryOrigin::ExternalAgent,
+        "agent.command",
+        json!({
+            "command_id": command_id,
+            "operation": operation,
+            "side": side,
+            "phase": phase,
+            "status": status,
+            "view_id": view_id,
+            "result_view_id": result_view_id,
+        }),
+    );
+}
+
 async fn apply_diagram_action(
     request_id: u64,
-    action: Action,
+    control: ExternalControl,
     snapshots: &mut watch::Receiver<UiSnapshot>,
-    controls: &mpsc::Sender<Action>,
+    controls: &mpsc::Sender<ExternalControl>,
     diagram_lock: &tokio::sync::Mutex<()>,
 ) -> Result<Value> {
     // Serialize external writers so the latest-value snapshot cannot skip over an
@@ -462,8 +666,12 @@ async fn apply_diagram_action(
         .agent_diagram_result
         .as_ref()
         .map_or(0, |result| result.revision);
+    let view_id = control
+        .view_id
+        .clone()
+        .context("diagram control omitted its captured view id")?;
     controls
-        .send(action)
+        .send(control)
         .await
         .context("the TUI control loop has stopped")?;
     let snapshot = wait_for_diagram_result(snapshots, request_id, previous_revision).await?;
@@ -472,15 +680,16 @@ async fn apply_diagram_action(
         .as_ref()
         .context("dispatcher omitted the diagram command result")?;
     Ok(json!({
+        "view_id": view_id,
         "accepted": result.accepted,
         "published": result.published,
         "revision": result.revision,
         "summary": result.summary,
         "error": result.error,
-        "selection": selected_view(&snapshot),
-        "draft": snapshot.diagram_draft,
-        "published_plan": snapshot.semantic.plan,
-        "validation": snapshot.semantic.report,
+        "selection": summary_key_view(&result.selection),
+        "draft": result.draft,
+        "published_plan": result.published_plan,
+        "validation": result.validation,
     }))
 }
 
@@ -501,16 +710,6 @@ fn raw_diagram_activity_detail(command: &str) -> String {
         Some(subject) => format!("{operation} · {subject}"),
         None => operation.to_string(),
     }
-}
-
-fn diagram_view(snapshot: &UiSnapshot) -> Value {
-    json!({
-        "selection": selected_view(snapshot),
-        "revision": snapshot.agent_diagram_result.as_ref().map(|result| result.revision).unwrap_or(0),
-        "draft": snapshot.diagram_draft,
-        "published_plan": snapshot.semantic.plan,
-        "validation": snapshot.semantic.report,
-    })
 }
 
 async fn wait_for_diagram_result(
@@ -601,8 +800,124 @@ fn resolve_focus(
     })
 }
 
+/// Content-address one selectable view inside one repository comparison. The repository root and
+/// complete captured diff enter only the hash and are never exposed through the identifier.
+fn view_id(
+    repo_root: &Utf8Path,
+    epoch: codescope_core::Epoch,
+    selection: &AiSummaryKey,
+    changeset: &codescope_core::ChangeSet,
+) -> String {
+    fn part(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    part(&mut hasher, b"codescope-agent-view-v1");
+    part(&mut hasher, repo_root.as_str().as_bytes());
+    hasher.update(epoch.get().to_be_bytes());
+    // `ChangeSet` serialization covers scope, status, paths, hunks, and every parsed diff row.
+    // Retained unified sections additionally cover extended headers and no-newline markers.
+    part(
+        &mut hasher,
+        &serde_json::to_vec(changeset).expect("ChangeSet serialization is infallible"),
+    );
+    if let Some(sections) = &changeset.diff_sections {
+        for section in sections {
+            part(&mut hasher, section.path.as_str().as_bytes());
+            part(&mut hasher, section.text.as_bytes());
+        }
+    }
+    match selection {
+        AiSummaryKey::Directory(path) => {
+            part(&mut hasher, b"directory");
+            part(&mut hasher, path.as_bytes());
+        }
+        AiSummaryKey::File(path) => {
+            part(&mut hasher, b"file");
+            part(&mut hasher, path.as_bytes());
+        }
+        AiSummaryKey::Symbol {
+            file,
+            name,
+            position,
+        } => {
+            part(&mut hasher, b"symbol");
+            part(&mut hasher, file.as_bytes());
+            part(&mut hasher, name.as_bytes());
+            match position {
+                Some((line, column)) => {
+                    hasher.update([1]);
+                    hasher.update(line.to_be_bytes());
+                    hasher.update(column.to_be_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        }
+    }
+    let digest = hasher.finalize();
+    let mut hash = String::with_capacity(digest.len() * 2);
+    use std::fmt::Write as _;
+    for byte in digest {
+        let _ = write!(hash, "{byte:02x}");
+    }
+    format!("view-v1-{:016x}-{hash}", epoch.get())
+}
+
+fn view_id_epoch(id: &str) -> Result<codescope_core::Epoch> {
+    let encoded = id.strip_prefix("view-v1-").context(
+        "invalid view_id; run `codescope agent . context` and pass its exact result.view_id",
+    )?;
+    let (epoch, hash) = encoded.split_once('-').context(
+        "invalid view_id; run `codescope agent . context` and pass its exact result.view_id",
+    )?;
+    anyhow::ensure!(
+        epoch.len() == 16 && hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid view_id; run `codescope agent . context` and pass its exact result.view_id"
+    );
+    let epoch = u64::from_str_radix(epoch, 16).context(
+        "invalid view_id; run `codescope agent . context` and pass its exact result.view_id",
+    )?;
+    Ok(codescope_core::Epoch(epoch))
+}
+
+/// Resolve an ID against every selection in the current captured comparison. This lets an agent
+/// continue working after the human navigates elsewhere without keeping an unbounded server-side
+/// handle registry.
+fn resolve_view_id(
+    repo_root: &Utf8Path,
+    snapshot: &UiSnapshot,
+    id: &str,
+) -> Result<(codescope_core::Epoch, AiSummaryKey)> {
+    let captured_epoch = view_id_epoch(id)?;
+    anyhow::ensure!(
+        captured_epoch == snapshot.epoch,
+        "view_id is stale: it belongs to epoch {captured_epoch}, but Codescope is at epoch {}; run `codescope agent . context` and use its new view_id",
+        snapshot.epoch
+    );
+    let changeset = snapshot
+        .agent_changeset
+        .as_deref()
+        .filter(|_| snapshot.agent_changeset_epoch == snapshot.epoch)
+        .context(
+            "the repository comparison has no current captured diff; wait for `codescope agent . context` to return a view_id",
+        )?;
+    let selection = snapshot
+        .ai_summaries
+        .keys()
+        .find(|selection| view_id(repo_root, snapshot.epoch, selection, changeset) == id)
+        .cloned()
+        .with_context(|| {
+            "view_id does not identify a view in the current comparison; run `codescope agent . context` and use its new view_id"
+        })?;
+    Ok((captured_epoch, selection))
+}
+
 fn diff_view(
     snapshot: &UiSnapshot,
+    view_id: &str,
+    selection: &AiSummaryKey,
     requested_file: Option<&str>,
     requested_hunk: Option<usize>,
     offset: usize,
@@ -616,8 +931,10 @@ fn diff_view(
         .agent_changeset
         .as_deref()
         .context("the current Git snapshot is not ready")?;
-    let default_file =
-        (!snapshot.diff.title.ends_with('/')).then_some(snapshot.diff.title.as_str());
+    let default_file = match selection {
+        AiSummaryKey::Directory(_) => None,
+        AiSummaryKey::File(path) | AiSummaryKey::Symbol { file: path, .. } => Some(path.as_str()),
+    };
     let file = requested_file.or(default_file).context(
         "the current selection is a directory; pass --file with a changed path from context",
     )?;
@@ -636,9 +953,10 @@ fn diff_view(
     let Some(hunk_index) = requested_hunk else {
         anyhow::ensure!(offset == 0, "--offset requires --hunk");
         return Ok(json!({
+            "view_id": view_id,
             "epoch": snapshot.epoch,
             "scope": snapshot.scope,
-            "selection": selected_view(snapshot),
+            "selection": summary_key_view(selection),
             "file": file,
             "status": change.status,
             "old_path": change.old_path,
@@ -684,9 +1002,10 @@ fn diff_view(
         .collect::<Vec<_>>();
     let next_offset = (offset + page.len() < hunk.lines.len()).then_some(offset + page.len());
     Ok(json!({
+        "view_id": view_id,
         "epoch": snapshot.epoch,
         "scope": snapshot.scope,
-        "selection": selected_view(snapshot),
+        "selection": summary_key_view(selection),
         "file": file,
         "hunk": hunk_index,
         "header": {
@@ -710,6 +1029,17 @@ fn diff_view(
 }
 
 fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usize) -> Value {
+    let active_view_id = if snapshot.agent_changeset_epoch == snapshot.epoch {
+        snapshot.agent_changeset.as_deref().and_then(|changeset| {
+            snapshot
+                .active_selection
+                .as_ref()
+                .filter(|selection| snapshot.ai_summaries.contains_key(*selection))
+                .map(|selection| view_id(repo_root, snapshot.epoch, selection, changeset))
+        })
+    } else {
+        None
+    };
     let mut current_hunk = None;
     let diff_rows = snapshot
         .diff
@@ -754,6 +1084,7 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
     let impact = &snapshot.impact;
     json!({
         "protocol_version": PROTOCOL_VERSION,
+        "view_id": active_view_id,
         "repository": {
             "root": repo_root,
             "name": snapshot.repo.repo_name,
@@ -829,17 +1160,20 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
                 "codescope agent . context",
                 "codescope agent . focus --file path/to/file.rs --symbol symbol_name",
                 "codescope agent . context",
-                "codescope agent . diff --file path/to/file.rs",
-                "codescope agent . diff --file path/to/file.rs --hunk 0",
-                "codescope agent . diagram inspect",
-                "codescope agent . diagram edit '{\"op\":\"update_edge\",\"form_id\":\"main\",\"from\":\"n1\",\"to\":\"n2\",\"patch\":{\"label\":\"passes parsed request\"}}'",
-                "codescope agent . diagram finish"
+                "save result.view_id; do not substitute a later viewport's id",
+                "codescope agent . diff --view-id VIEW_ID --file path/to/file.rs",
+                "codescope agent . diff --view-id VIEW_ID --file path/to/file.rs --hunk 0",
+                "codescope agent . diagram inspect --view-id VIEW_ID",
+                "codescope agent . diagram edit --view-id VIEW_ID '{\"op\":\"update_edge\",\"form_id\":\"main\",\"from\":\"n1\",\"to\":\"n2\",\"patch\":{\"label\":\"passes parsed request\"}}'",
+                "codescope agent . diagram finish --view-id VIEW_ID"
             ],
             "constraints": [
                 "local owner-only Unix socket",
                 "read-only repository access",
                 "no shell execution",
                 "the external agent researches with its own code, Git, and language tools",
+                "diff and diagram commands require the captured view_id and never follow later human navigation",
+                "a repository refresh invalidates prior view ids",
                 "draft edits use the shared typed diagram API",
                 "finish validates AI/controller output before publication"
             ]
@@ -848,6 +1182,9 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
 }
 
 fn selected_view(snapshot: &UiSnapshot) -> Value {
+    if let Some(selection) = &snapshot.active_selection {
+        return summary_key_view(selection);
+    }
     if snapshot.diff.title.ends_with('/') {
         return json!({ "kind": "directory", "path": snapshot.diff.title.trim_end_matches('/') });
     }
@@ -954,22 +1291,103 @@ pub(crate) fn socket_path(repo_root: &camino::Utf8Path) -> PathBuf {
 }
 
 pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
+    let command_id = new_agent_command_id();
+    let operation = agent_operation_name(&args.operation);
+    let requested_view_id = agent_operation_view_id(&args.operation);
+    record_agent_command(
+        &command_id,
+        operation,
+        "client",
+        "started",
+        "running",
+        requested_view_id,
+        None,
+    );
+    let result = run_client_command(args, &command_id).await;
+    let (status, result_view_id) = match &result {
+        Ok(completion) => (completion.status, completion.result_view_id.as_deref()),
+        Err(_) => ("failed", None),
+    };
+    record_agent_command(
+        &command_id,
+        operation,
+        "client",
+        "completed",
+        status,
+        requested_view_id,
+        result_view_id,
+    );
+    result.map(|_| ())
+}
+
+struct AgentCommandCompletion {
+    status: &'static str,
+    result_view_id: Option<String>,
+}
+
+impl AgentCommandCompletion {
+    fn succeeded() -> Self {
+        Self {
+            status: "succeeded",
+            result_view_id: None,
+        }
+    }
+}
+
+fn new_agent_command_id() -> String {
+    let session = codescope_telemetry::session_id()
+        .unwrap_or_else(|| format!("process-{}", std::process::id()));
+    let ordinal = AGENT_COMMAND_ORDINAL.fetch_add(1, Ordering::Relaxed);
+    format!("agent-command:{session}:{ordinal}")
+}
+
+fn agent_operation_name(operation: &AgentOperation) -> &'static str {
+    match operation {
+        AgentOperation::Context { .. } => "context",
+        AgentOperation::Diff(_) => "diff",
+        AgentOperation::Focus(_) => "focus",
+        AgentOperation::Diagram(DiagramArgs { operation, .. }) => match operation {
+            DiagramOperation::Inspect => "diagram.inspect",
+            DiagramOperation::Edit { .. } => "diagram.edit",
+            DiagramOperation::Schema => "diagram.schema",
+            DiagramOperation::Finish => "diagram.finish",
+        },
+        AgentOperation::Refresh => "refresh",
+        AgentOperation::Socket => "socket",
+    }
+}
+
+fn agent_operation_view_id(operation: &AgentOperation) -> Option<&str> {
+    match operation {
+        AgentOperation::Diff(diff) => Some(diff.view_id.as_str()),
+        AgentOperation::Diagram(diagram) => diagram.view_id.as_deref(),
+        AgentOperation::Context { .. }
+        | AgentOperation::Focus(_)
+        | AgentOperation::Refresh
+        | AgentOperation::Socket => None,
+    }
+}
+
+async fn run_client_command(args: &AgentArgs, command_id: &str) -> Result<AgentCommandCompletion> {
     if matches!(
         &args.operation,
         AgentOperation::Diagram(DiagramArgs {
-            operation: DiagramOperation::Schema
+            operation: DiagramOperation::Schema,
+            ..
         })
     ) {
-        return emit(
+        emit(
             &json!({
                 "tools": codescope_ai::diagram_tools(),
                 "finish": {
-                    "command": "codescope agent . diagram finish",
+                    "command": "codescope agent . diagram finish --view-id VIEW_ID",
                     "description": "Validate and publish the current draft after all edits succeed."
-                }
+                },
+                "note": "Run `codescope agent . context`, retain result.view_id, and pass it to every inspect/edit/finish command."
             }),
             args.compact,
-        );
+        )?;
+        return Ok(AgentCommandCompletion::succeeded());
     }
     let repo = GitRepo::discover(&args.path)
         .await
@@ -980,7 +1398,8 @@ pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| socket_path(repo.toplevel()));
     if matches!(args.operation, AgentOperation::Socket) {
-        return emit(&json!({ "socket": path }), args.compact);
+        emit(&json!({ "socket": path }), args.compact)?;
+        return Ok(AgentCommandCompletion::succeeded());
     }
     #[cfg(not(unix))]
     anyhow::bail!("live agent control requires Unix-socket support");
@@ -988,33 +1407,53 @@ pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
     {
         let request = match &args.operation {
             AgentOperation::Context { max_diff_lines } => AgentRequest::Context {
+                command_id: command_id.to_string(),
                 max_diff_lines: *max_diff_lines,
             },
             AgentOperation::Diff(diff) => AgentRequest::Diff {
+                command_id: command_id.to_string(),
+                view_id: diff.view_id.clone(),
                 file: diff.file.clone(),
                 hunk: diff.hunk,
                 offset: diff.offset,
                 max_lines: diff.max_lines,
             },
             AgentOperation::Focus(focus) => AgentRequest::Focus {
+                command_id: command_id.to_string(),
                 directory: focus.directory.clone(),
                 file: focus.file.clone(),
                 symbol: focus.symbol.clone(),
                 line: focus.line,
             },
             AgentOperation::Diagram(diagram) => match &diagram.operation {
-                DiagramOperation::Inspect => AgentRequest::DiagramGet,
-                DiagramOperation::Edit { command } => AgentRequest::DiagramApplyRaw {
+                DiagramOperation::Inspect => AgentRequest::DiagramGet {
+                    command_id: command_id.to_string(),
                     request_id: AGENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+                    view_id: diagram.view_id.clone().context(
+                        "diagram inspect requires --view-id from `codescope agent . context`",
+                    )?,
+                },
+                DiagramOperation::Edit { command } => AgentRequest::DiagramApplyRaw {
+                    command_id: command_id.to_string(),
+                    request_id: AGENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+                    view_id: diagram.view_id.clone().context(
+                        "diagram edit requires --view-id from `codescope agent . context`",
+                    )?,
                     command: command.clone(),
                 },
                 DiagramOperation::Finish => AgentRequest::DiagramApply {
+                    command_id: command_id.to_string(),
                     request_id: AGENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
-                    command: DiagramCommand::Finish,
+                    view_id: diagram.view_id.clone().context(
+                        "diagram finish requires --view-id from `codescope agent . context`",
+                    )?,
+                    command: Box::new(DiagramCommand::Finish),
                 },
                 DiagramOperation::Schema => unreachable!("handled before repository discovery"),
             },
-            AgentOperation::Refresh => AgentRequest::Refresh,
+            AgentOperation::Refresh => AgentRequest::Refresh {
+                command_id: command_id.to_string(),
+            },
             AgentOperation::Socket => unreachable!(),
         };
         let mut stream = UnixStream::connect(&path)
@@ -1036,7 +1475,24 @@ pub(crate) async fn run_client(args: &AgentArgs) -> Result<()> {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown protocol error")
         );
-        emit(&response, args.compact)
+        let status = if response
+            .pointer("/result/accepted")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            "rejected"
+        } else {
+            "succeeded"
+        };
+        let result_view_id = response
+            .pointer("/result/view_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        emit(&response, args.compact)?;
+        Ok(AgentCommandCompletion {
+            status,
+            result_view_id,
+        })
     }
 }
 
@@ -1078,7 +1534,20 @@ mod tests {
         AgentDiagramResult, DiffPane, FileRow, SelectedDiffContext, SymbolRow,
     };
 
+    const TEST_REPO: &str = "/tmp/example/repo";
+
+    fn live_selection() -> AiSummaryKey {
+        AiSummaryKey::Symbol {
+            file: "src/api.rs".to_string(),
+            name: "serve".to_string(),
+            position: Some((12, 4)),
+        }
+    }
+
     fn live_snapshot() -> UiSnapshot {
+        let selection = live_selection();
+        let mut ai_summaries = std::collections::HashMap::new();
+        ai_summaries.insert(selection.clone(), AiSummaryState::NotGenerated);
         UiSnapshot {
             agent_changeset: Some(std::sync::Arc::new(codescope_core::ChangeSet::new(
                 codescope_core::ChangeScope::Branch,
@@ -1116,9 +1585,12 @@ mod tests {
                 }],
                 expanded: true,
             }],
+            ai_summaries,
+            active_selection: Some(selection),
             diff: DiffPane {
                 title: "src/api.rs".to_string(),
                 focused_symbol: Some("serve".to_string()),
+                selection_focus_row: Some(2),
                 rows: vec![
                     DiffRow::HunkHeader("@@ -12,1 +12,2 @@ serve".to_string()),
                     DiffRow::Context {
@@ -1225,7 +1697,10 @@ mod tests {
             text: "listen();".to_string(),
             truncated: false,
         });
-        let view = context_view(camino::Utf8Path::new("/tmp/example/repo"), &snapshot, 20);
+        let view = context_view(camino::Utf8Path::new(TEST_REPO), &snapshot, 20);
+        assert!(view["view_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("view-v1-")));
         assert_eq!(view["live"]["selection"]["kind"], "symbol");
         assert_eq!(view["focused_diff"]["rows"][0]["kind"], "hunk");
         assert_eq!(view["focused_diff"]["rows"][1]["hunk"], 0);
@@ -1258,33 +1733,154 @@ mod tests {
     #[test]
     fn diff_lists_hunks_then_returns_exact_code_reference_coordinates() {
         let snapshot = live_snapshot();
-        let overview = diff_view(&snapshot, Some("src/api.rs"), None, 0, 20).unwrap();
+        let selection = live_selection();
+        let id = view_id(
+            Utf8Path::new(TEST_REPO),
+            snapshot.epoch,
+            &selection,
+            snapshot.agent_changeset.as_deref().unwrap(),
+        );
+        let overview =
+            diff_view(&snapshot, &id, &selection, Some("src/api.rs"), None, 0, 20).unwrap();
         assert_eq!(overview["hunks"][0]["hunk"], 0);
         assert_eq!(overview["hunks"][0]["added"], 1);
+        assert_eq!(overview["view_id"], id);
 
-        let hunk = diff_view(&snapshot, Some("src/api.rs"), Some(0), 0, 20).unwrap();
+        let hunk = diff_view(
+            &snapshot,
+            &id,
+            &selection,
+            Some("src/api.rs"),
+            Some(0),
+            0,
+            20,
+        )
+        .unwrap();
         assert_eq!(hunk["rows"][1]["kind"], "add");
         assert_eq!(hunk["rows"][1]["new_line"], 13);
         assert_eq!(hunk["code_ref"]["hunk"], 0);
 
         let mut refreshing = snapshot;
         refreshing.epoch = refreshing.epoch.next();
-        assert!(diff_view(&refreshing, Some("src/api.rs"), None, 0, 20)
+        assert!(diff_view(
+            &refreshing,
+            &id,
+            &selection,
+            Some("src/api.rs"),
+            None,
+            0,
+            20,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("refreshing"));
+    }
+
+    #[test]
+    fn view_id_pins_selection_across_navigation_and_expires_with_epoch() {
+        let mut snapshot = live_snapshot();
+        let captured = live_selection();
+        let id = view_id(
+            Utf8Path::new(TEST_REPO),
+            snapshot.epoch,
+            &captured,
+            snapshot.agent_changeset.as_deref().unwrap(),
+        );
+
+        let other = AiSummaryKey::File("src/api.rs".to_string());
+        snapshot
+            .ai_summaries
+            .insert(other.clone(), AiSummaryState::NotGenerated);
+        snapshot.active_selection = Some(other);
+        snapshot.diff.focused_symbol = None;
+
+        let (_, resolved) = resolve_view_id(Utf8Path::new(TEST_REPO), &snapshot, &id).unwrap();
+        assert_eq!(
+            resolved, captured,
+            "human navigation must not retarget the id"
+        );
+
+        let mut changed = snapshot.agent_changeset.as_deref().unwrap().clone();
+        changed.files[0].hunks[0].lines[1] = codescope_core::DiffLine::add(13, "changed();");
+        snapshot.agent_changeset = Some(std::sync::Arc::new(changed));
+        let changed_id = view_id(
+            Utf8Path::new(TEST_REPO),
+            snapshot.epoch,
+            &captured,
+            snapshot.agent_changeset.as_deref().unwrap(),
+        );
+        assert_ne!(id, changed_id, "changed diff content must change the id");
+        assert!(resolve_view_id(Utf8Path::new(TEST_REPO), &snapshot, &id)
             .unwrap_err()
             .to_string()
-            .contains("refreshing"));
+            .contains("does not identify a view"));
+
+        snapshot.epoch = snapshot.epoch.next();
+        snapshot.agent_changeset_epoch = snapshot.epoch;
+        let error = resolve_view_id(Utf8Path::new(TEST_REPO), &snapshot, &id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("view_id is stale"));
+        assert_ne!(
+            id,
+            view_id(
+                Utf8Path::new(TEST_REPO),
+                snapshot.epoch,
+                &captured,
+                snapshot.agent_changeset.as_deref().unwrap(),
+            )
+        );
+    }
+
+    #[test]
+    fn context_advertises_only_ids_backed_by_the_current_captured_diff() {
+        let mut snapshot = live_snapshot();
+        let old_id = view_id(
+            Utf8Path::new(TEST_REPO),
+            snapshot.epoch,
+            &live_selection(),
+            snapshot.agent_changeset.as_deref().unwrap(),
+        );
+        snapshot.refreshing = true;
+        assert_eq!(
+            context_view(Utf8Path::new(TEST_REPO), &snapshot, 20)["view_id"],
+            old_id,
+            "semantic warm-up does not invalidate an already captured Git comparison"
+        );
+
+        snapshot.epoch = snapshot.epoch.next();
+
+        let context = context_view(Utf8Path::new(TEST_REPO), &snapshot, 20);
+        assert!(context["view_id"].is_null());
+        let error = resolve_view_id(Utf8Path::new(TEST_REPO), &snapshot, &old_id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("view_id is stale"));
     }
 
     #[tokio::test]
     async fn diagram_command_is_forwarded_without_translation() {
         let mut snapshot = live_snapshot();
+        let selection = live_selection();
+        let epoch = snapshot.epoch;
+        let captured_view_id = view_id(
+            Utf8Path::new(TEST_REPO),
+            epoch,
+            &selection,
+            snapshot.agent_changeset.as_deref().unwrap(),
+        );
         snapshot.agent_diagram_result = Some(AgentDiagramResult {
             request_id: 42,
             revision: 6,
+            epoch,
+            selection: selection.clone(),
             accepted: false,
             published: false,
             summary: None,
             error: Some("older process reused its local request id".to_string()),
+            draft: None,
+            published_plan: None,
+            validation: None,
         });
         let (tx, mut rx) = mpsc::channel(1);
         let (snapshot_tx, mut snapshots) = watch::channel(snapshot);
@@ -1293,52 +1889,86 @@ mod tests {
         };
         let expected = command.clone();
         let responder = tokio::spawn(async move {
-            let Some(Action::AgentDiagram {
-                request_id,
-                command,
+            let Some(ExternalControl {
+                command_id,
+                operation,
+                view_id,
+                action:
+                    Action::AgentDiagram {
+                        request_id,
+                        epoch,
+                        selection,
+                        command,
+                    },
             }) = rx.recv().await
             else {
                 panic!("expected an agent diagram command");
             };
-            assert_eq!(command, expected);
+            assert_eq!(command_id, "command-42");
+            assert_eq!(operation, "diagram.edit");
+            assert!(view_id.is_some());
+            assert_eq!(*command, expected);
             snapshot_tx.send_modify(|snapshot| {
                 snapshot.agent_diagram_result = Some(AgentDiagramResult {
                     request_id,
                     revision: 7,
+                    epoch,
+                    selection,
                     accepted: true,
                     published: false,
                     summary: Some("updated the diagram intent".to_string()),
                     error: None,
+                    draft: None,
+                    published_plan: None,
+                    validation: None,
                 });
             });
 
-            let Some(Action::AgentDiagramRejected {
-                request_id,
-                detail,
-                error,
+            let Some(ExternalControl {
+                command_id,
+                operation,
+                view_id,
+                action:
+                    Action::AgentDiagramRejected {
+                        request_id,
+                        epoch,
+                        selection,
+                        detail,
+                        error,
+                    },
             }) = rx.recv().await
             else {
                 panic!("expected a rejected raw agent diagram command");
             };
+            assert_eq!(command_id, "command-43");
+            assert_eq!(operation, "diagram.edit");
+            assert!(view_id.is_some());
             assert_eq!(detail, "set_intent · form-1");
             assert!(error.contains("unknown field `form_id`"));
             snapshot_tx.send_modify(|snapshot| {
                 snapshot.agent_diagram_result = Some(AgentDiagramResult {
                     request_id,
                     revision: 8,
+                    epoch,
+                    selection,
                     accepted: false,
                     published: false,
                     summary: None,
                     error: Some(error),
+                    draft: None,
+                    published_plan: None,
+                    validation: None,
                 });
             });
         });
         let result = handle_request(
             AgentRequest::DiagramApply {
+                command_id: "command-42".to_string(),
                 request_id: 42,
-                command: command.clone(),
+                view_id: captured_view_id.clone(),
+                command: Box::new(command.clone()),
             },
-            &Utf8PathBuf::from("/tmp/example/repo"),
+            &Utf8PathBuf::from(TEST_REPO),
             &mut snapshots,
             &tx,
             &tokio::sync::Mutex::new(()),
@@ -1351,11 +1981,13 @@ mod tests {
 
         let rejected = handle_request(
             AgentRequest::DiagramApplyRaw {
+                command_id: "command-43".to_string(),
                 request_id: 43,
+                view_id: captured_view_id,
                 command: r#"{"op":"set_intent","form_id":"form-1","intent":"Explain it"}"#
                     .to_string(),
             },
-            &Utf8PathBuf::from("/tmp/example/repo"),
+            &Utf8PathBuf::from(TEST_REPO),
             &mut snapshots,
             &tx,
             &tokio::sync::Mutex::new(()),
@@ -1387,7 +2019,11 @@ mod tests {
         .unwrap();
 
         let mut stream = UnixStream::connect(&path).await.unwrap();
-        let request = serde_json::to_vec(&AgentRequest::Context { max_diff_lines: 20 }).unwrap();
+        let request = serde_json::to_vec(&AgentRequest::Context {
+            command_id: "command-context".to_string(),
+            max_diff_lines: 20,
+        })
+        .unwrap();
         stream.write_all(&request).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         stream.shutdown().await.unwrap();
@@ -1396,6 +2032,9 @@ mod tests {
         let reply: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["result"]["live"]["selection"]["kind"], "symbol");
+        assert!(reply["result"]["view_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("view-v1-")));
 
         drop(server);
         assert!(!path.exists());

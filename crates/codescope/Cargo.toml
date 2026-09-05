@@ -34,6 +34,7 @@ camino.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 ignore.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 codescope-testutil = { path = "../codescope-testutil" }

@@ -42,6 +42,33 @@ struct TelemetrySink {
     emitted_diff_snapshot_ids: HashSet<String>,
 }
 
+/// Explicit producer identity for one telemetry record.
+///
+/// This is deliberately independent of the event name so consumers never have to infer whether
+/// an operation came from the human, Codescope's built-in model, or an external coding agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryOrigin {
+    /// Codescope lifecycle, comparison, and derived UI state.
+    Application,
+    /// Direct keyboard, mouse, or terminal interaction.
+    User,
+    /// Codescope's built-in LLM and its tool loop.
+    InternalAgent,
+    /// A client using the local `codescope agent` protocol.
+    ExternalAgent,
+}
+
+impl TelemetryOrigin {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Application => "application",
+            Self::User => "user",
+            Self::InternalAgent => "internal_agent",
+            Self::ExternalAgent => "external_agent",
+        }
+    }
+}
+
 impl TelemetrySink {
     #[cfg(test)]
     fn open(path: &Path) -> io::Result<Self> {
@@ -111,6 +138,7 @@ impl TelemetrySink {
         &mut self,
         event: &str,
         data: Value,
+        origin: TelemetryOrigin,
         diff_snapshot_override: Option<Option<String>>,
     ) -> io::Result<()> {
         self.sequence = self.sequence.saturating_add(1);
@@ -121,6 +149,7 @@ impl TelemetrySink {
             "session_id": self.session_id,
             "sequence": self.sequence,
             "repository": self.repository,
+            "origin": origin.as_str(),
             "event": event,
             "data": data,
         });
@@ -148,6 +177,7 @@ impl TelemetrySink {
                     "epoch": epoch,
                     "payload": payload,
                 }),
+                TelemetryOrigin::Application,
                 Some(Some(id.clone())),
             )?;
             self.emitted_diff_snapshot_ids.insert(id.clone());
@@ -210,6 +240,16 @@ pub fn path() -> Option<PathBuf> {
         .and_then(|sink| sink.lock().ok().map(|sink| sink.path.clone()))
 }
 
+/// Return the opaque identity of the active process/session stream.
+///
+/// Local protocol clients use this as one component of cross-process command correlation; it is
+/// already present on every record and contains no repository or credential material.
+#[must_use]
+pub fn session_id() -> Option<String> {
+    SINK.get()
+        .and_then(|sink| sink.lock().ok().map(|sink| sink.session_id.clone()))
+}
+
 /// Attach a stable opaque repository identity to subsequent events and emit a context event.
 /// The canonical root is hashed immediately and is never retained or written.
 pub fn set_repository(root: impl Into<String>) {
@@ -229,6 +269,7 @@ pub fn set_repository(root: impl Into<String>) {
     let _ = sink.write(
         "session.repository",
         json!({ "repository_id": repository_id }),
+        TelemetryOrigin::Application,
         None,
     );
 }
@@ -260,6 +301,7 @@ pub fn mark_diff_snapshot_unavailable(epoch: u64, reason: &str) {
         let _ = sink.write(
             "diff.snapshot_unavailable",
             json!({ "epoch": epoch, "reason": reason }),
+            TelemetryOrigin::Application,
             Some(None),
         );
     }
@@ -280,12 +322,20 @@ where
 /// Calls made before successful initialization are no-ops. Post-initialization write errors
 /// are intentionally isolated from the user operation being observed.
 pub fn record(event: &str, data: Value) {
+    record_with_origin(TelemetryOrigin::Application, event, data);
+}
+
+/// Append one structured event with an explicit producer identity.
+///
+/// Prefer this for human input, internal-model activity, and local agent-protocol activity. Calls
+/// made before successful initialization and post-initialization write failures remain no-ops.
+pub fn record_with_origin(origin: TelemetryOrigin, event: &str, data: Value) {
     let Some(sink) = SINK.get() else {
         return;
     };
     if let Ok(mut sink) = sink.lock() {
         let scoped = DIFF_SNAPSHOT_CONTEXT.try_with(Clone::clone).ok();
-        let _ = sink.write(event, data, scoped);
+        let _ = sink.write(event, data, origin, scoped);
     }
 }
 
@@ -299,9 +349,20 @@ mod tests {
         let path = dir.path().join("telemetry.jsonl");
         let mut sink = TelemetrySink::open(&path).unwrap();
         sink.repository = Some("sha256:repo-id".into());
-        sink.write("input.key", json!({"key": "j"}), None).unwrap();
-        sink.write("llm.response", json!({"body": {"ok": true}}), None)
-            .unwrap();
+        sink.write(
+            "input.key",
+            json!({"key": "j"}),
+            TelemetryOrigin::User,
+            None,
+        )
+        .unwrap();
+        sink.write(
+            "llm.response",
+            json!({"body": {"ok": true}}),
+            TelemetryOrigin::InternalAgent,
+            None,
+        )
+        .unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let records = text
@@ -312,8 +373,10 @@ mod tests {
         assert_eq!(records[0]["schema_version"], 1);
         assert_eq!(records[0]["sequence"], 1);
         assert_eq!(records[0]["repository"], "sha256:repo-id");
+        assert_eq!(records[0]["origin"], "user");
         assert_eq!(records[0]["event"], "input.key");
         assert_eq!(records[1]["sequence"], 2);
+        assert_eq!(records[1]["origin"], "internal_agent");
         assert_eq!(records[1]["data"]["body"]["ok"], true);
     }
 
@@ -334,15 +397,26 @@ mod tests {
             sha256_hex(&serde_json::to_vec(&first_payload).unwrap())
         );
         assert_eq!(first_id, expected_id, "the ID hashes the stored payload");
-        sink.write("input.key", json!({"key": "j"}), None).unwrap();
+        sink.write(
+            "input.key",
+            json!({"key": "j"}),
+            TelemetryOrigin::User,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             sink.activate_diff_snapshot(2, first_payload.clone())
                 .unwrap(),
             first_id,
             "an unchanged refresh reuses the content identity"
         );
-        sink.write("llm.request", json!({"body": "prompt"}), None)
-            .unwrap();
+        sink.write(
+            "llm.request",
+            json!({"body": "prompt"}),
+            TelemetryOrigin::InternalAgent,
+            None,
+        )
+        .unwrap();
 
         let second_payload = json!({
             "comparison": { "scope": "working" },
@@ -352,19 +426,41 @@ mod tests {
             .activate_diff_snapshot(3, second_payload.clone())
             .unwrap();
         assert_ne!(first_id, second_id);
-        sink.write("input.mouse", json!({"row": 4}), None).unwrap();
+        sink.write(
+            "input.mouse",
+            json!({"row": 4}),
+            TelemetryOrigin::User,
+            None,
+        )
+        .unwrap();
         let third_payload = json!({
             "comparison": { "scope": "staged" },
             "canonical_diff": second_payload["canonical_diff"],
         });
         let third_id = sink.activate_diff_snapshot(4, third_payload).unwrap();
         assert_ne!(second_id, third_id);
-        sink.write("ui.snapshot", json!({"epoch": 4}), None)
-            .unwrap();
+        sink.write(
+            "ui.snapshot",
+            json!({"epoch": 4}),
+            TelemetryOrigin::Application,
+            None,
+        )
+        .unwrap();
         sink.active_diff_snapshot_id = None;
-        sink.write("diff.snapshot_unavailable", json!({"epoch": 5}), Some(None))
-            .unwrap();
-        sink.write("input.key", json!({"key": "k"}), None).unwrap();
+        sink.write(
+            "diff.snapshot_unavailable",
+            json!({"epoch": 5}),
+            TelemetryOrigin::Application,
+            Some(None),
+        )
+        .unwrap();
+        sink.write(
+            "input.key",
+            json!({"key": "k"}),
+            TelemetryOrigin::User,
+            None,
+        )
+        .unwrap();
 
         let records = std::fs::read_to_string(path)
             .unwrap()
@@ -428,11 +524,17 @@ mod tests {
         sink.write(
             "llm.response",
             json!({"done": true}),
+            TelemetryOrigin::InternalAgent,
             Some(Some("old".into())),
         )
         .unwrap();
-        sink.write("llm.response", json!({"unavailable": true}), Some(None))
-            .unwrap();
+        sink.write(
+            "llm.response",
+            json!({"unavailable": true}),
+            TelemetryOrigin::InternalAgent,
+            Some(None),
+        )
+        .unwrap();
 
         let records = std::fs::read_to_string(path)
             .unwrap()

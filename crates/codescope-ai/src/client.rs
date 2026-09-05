@@ -1,8 +1,9 @@
-//! Provider-neutral Chat Completions / Anthropic Messages client.
+//! Provider-neutral OpenAI Responses / compatible Chat Completions / Anthropic Messages client.
 //!
-//! OpenAI-compatible providers use `POST {base_url}/chat/completions`; Anthropic uses its native
-//! Messages shape. Callers select Auto or Required tool choice and provide incremental draft-editor
-//! tools. Streaming is off; draft mutations are ordinary tool turns and final publication is atomic.
+//! OpenAI's official API uses `POST {base_url}/responses`; other OpenAI-compatible providers use
+//! `POST {base_url}/chat/completions`; Anthropic uses its native Messages shape. Callers select Auto
+//! or Required tool choice and provide incremental draft-editor tools. Streaming is off; draft
+//! mutations are ordinary tool turns and final publication is atomic.
 //!
 //! Local protections (all before/around the network call):
 //!
@@ -23,7 +24,9 @@
 //! mode also emits scrubbed `trace` events. Reqwest errors are sanitized with
 //! [`reqwest::Error::without_url`].
 
-use crate::config::{AiConfig, ProviderKind, ReasoningEffort};
+use crate::config::{
+    is_official_base_url, AiConfig, ProviderKind, ReasoningEffort, OPENAI_BASE_URL,
+};
 use crate::error::AiError;
 use crate::tools::ToolDef;
 use governor::clock::{Clock, QuantaClock};
@@ -53,11 +56,11 @@ pub struct TokenUsage {
 /// finish reasoning and emit the structured tool call instead of stopping at the old 4k ceiling.
 const GLM_PLAN_MAX_TOKENS: u64 = 8_192;
 
-/// One chat message, stored as its OpenAI wire object.
+/// One provider-neutral conversation turn, stored as a JSON object.
 ///
-/// A thin newtype over [`Value`] keeps the client wire-exact (assistant messages with tool
-/// calls are echoed back verbatim in the tool loop) without modeling the whole OpenAI
-/// surface.
+/// A thin newtype over [`Value`] keeps Chat Completions assistant messages wire-exact and lets a
+/// Responses turn retain the provider's complete output-item array without modeling either full
+/// API surface.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(transparent)]
 pub struct ChatMessage(Value);
@@ -85,8 +88,7 @@ impl ChatMessage {
         }))
     }
 
-    /// An assistant message echoed verbatim (used to feed tool calls back into the
-    /// conversation).
+    /// An assistant turn retained for the next tool-loop request.
     #[must_use]
     pub fn assistant_raw(message: Value) -> Self {
         ChatMessage(message)
@@ -128,13 +130,13 @@ pub struct RawToolCall {
     pub arguments: String,
 }
 
-/// A parsed chat completion: the raw assistant message plus its tool calls.
+/// A parsed provider response: its replayable assistant turn plus extracted tool calls.
 ///
 /// The service interprets these as research or incremental diagram operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawPlanResponse {
-    /// The assistant message exactly as received (echo it into the conversation when
-    /// answering tool calls).
+    /// A replayable assistant turn. Chat Completions retains the assistant message exactly;
+    /// Responses retains its complete output-item list in a private transport field.
     pub message: Value,
     /// All tool calls in the message, in order.
     pub tool_calls: Vec<RawToolCall>,
@@ -189,16 +191,36 @@ struct BreakerState {
 
 type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, QuantaClock>;
 
-/// Provider request client for Chat Completions or native Anthropic Messages.
+/// Concrete HTTP envelope selected independently of the provider's authentication family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireProtocol {
+    OpenAiResponses,
+    ChatCompletions,
+    AnthropicMessages,
+}
+
+impl WireProtocol {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiResponses => "openai_responses",
+            Self::ChatCompletions => "chat_completions",
+            Self::AnthropicMessages => "anthropic_messages",
+        }
+    }
+}
+
+/// Provider request client for OpenAI Responses, compatible Chat Completions, or Anthropic.
 pub struct AiClient {
     http: reqwest::Client,
     endpoint: String,
+    models_endpoint: String,
     model: Mutex<String>,
     reasoning_effort: Mutex<ReasoningEffort>,
     api_key: Option<SecretString>,
     prime_team_id: Option<String>,
     timeout: Duration,
     provider: ProviderKind,
+    protocol: WireProtocol,
     limiter: DirectLimiter,
     in_flight: tokio::sync::Semaphore,
     clock: QuantaClock,
@@ -213,6 +235,7 @@ impl std::fmt::Debug for AiClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AiClient")
             .field("endpoint", &self.endpoint)
+            .field("protocol", &self.protocol)
             .field("model", &self.model)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("api_key", &self.api_key.as_ref().map(|_| "«redacted»"))
@@ -252,23 +275,34 @@ impl AiClient {
             && config.reasoning_effort != ReasoningEffort::Default
         {
             return Err(AiError::Config(
-                "reasoning_effort is only supported by OpenAI-compatible Chat Completions providers; use default with Anthropic's native API"
+                "reasoning_effort is not supported by Anthropic's native API; use default with Anthropic"
                     .into(),
             ));
         }
-        let endpoint = match provider {
-            ProviderKind::OpenAiCompatible => format!("{base}/chat/completions"),
-            ProviderKind::Anthropic => format!("{base}/messages"),
+        let official_openai = reqwest::Url::parse(base)
+            .ok()
+            .is_some_and(|url| is_official_base_url(&url, OPENAI_BASE_URL));
+        let protocol = match (provider, official_openai) {
+            (ProviderKind::OpenAiCompatible, true) => WireProtocol::OpenAiResponses,
+            (ProviderKind::OpenAiCompatible, false) => WireProtocol::ChatCompletions,
+            (ProviderKind::Anthropic, _) => WireProtocol::AnthropicMessages,
+        };
+        let endpoint = match protocol {
+            WireProtocol::OpenAiResponses => format!("{base}/responses"),
+            WireProtocol::ChatCompletions => format!("{base}/chat/completions"),
+            WireProtocol::AnthropicMessages => format!("{base}/messages"),
         };
         Ok(AiClient {
             http,
             endpoint,
+            models_endpoint: format!("{base}/models"),
             model: Mutex::new(config.model.clone()),
             reasoning_effort: Mutex::new(config.reasoning_effort),
             api_key: config.api_key.clone(),
             prime_team_id: config.prime_team_id.clone(),
             timeout: config.timeout,
             provider,
+            protocol,
             limiter,
             in_flight: tokio::sync::Semaphore::new(options.max_in_flight_requests),
             clock,
@@ -286,7 +320,7 @@ impl AiClient {
         &self.endpoint
     }
 
-    /// The provider protocol this client speaks.
+    /// The configured provider family.
     #[must_use]
     pub fn provider(&self) -> ProviderKind {
         self.provider
@@ -330,7 +364,8 @@ impl AiClient {
 
     /// Switch the reasoning budget used for subsequent requests.
     ///
-    /// Cheap: only the request-body `reasoning_effort` field changes; no reconnect is needed.
+    /// Cheap: only the protocol-appropriate request-body reasoning field changes; no reconnect is
+    /// needed.
     pub fn set_reasoning_effort(&self, effort: ReasoningEffort) {
         tracing::info!(reasoning_effort = %effort, "ai reasoning effort changed");
         if let Ok(mut selected) = self.reasoning_effort.lock() {
@@ -338,18 +373,9 @@ impl AiClient {
         }
     }
 
-    /// The `GET {base}/models` URL, derived per provider (one path segment stripped for
-    /// Anthropic, two for OpenAI-compatible). Split out for testing.
+    /// The `GET {base}/models` URL retained alongside the inference endpoint.
     fn models_url(&self) -> String {
-        let strip = match self.provider {
-            ProviderKind::OpenAiCompatible => 2,
-            ProviderKind::Anthropic => 1,
-        };
-        let mut base = self.endpoint.as_str();
-        for _ in 0..strip {
-            base = base.rsplit_once('/').map(|(b, _)| b).unwrap_or(base);
-        }
-        format!("{base}/models")
+        self.models_endpoint.clone()
     }
 
     /// List the models the provider exposes (`GET {base}/models`).
@@ -384,26 +410,6 @@ impl AiClient {
         Ok(parse_model_list(&body))
     }
 
-    /// The output-limit field accepted by this Chat Completions endpoint.
-    ///
-    /// `api.openai.com` uses `max_completion_tokens`; OpenAI-compatible providers retain
-    /// `max_tokens`. Native Anthropic bodies are built separately.
-    fn output_token_field(&self) -> &'static str {
-        if self.provider == ProviderKind::OpenAiCompatible
-            && reqwest::Url::parse(&self.endpoint)
-                .ok()
-                .and_then(|url| {
-                    url.host_str()
-                        .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
-                })
-                .unwrap_or(false)
-        {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        }
-    }
-
     /// Build the provider-shaped request body.
     fn build_body(
         &self,
@@ -412,8 +418,16 @@ impl AiClient {
         require_tool: bool,
         max_tokens_override: Option<u64>,
     ) -> Value {
-        match self.provider {
-            ProviderKind::OpenAiCompatible => {
+        match self.protocol {
+            WireProtocol::OpenAiResponses => build_openai_responses_body(
+                &self.model(),
+                self.reasoning_effort(),
+                messages,
+                tool_values,
+                require_tool,
+                max_tokens_override,
+            ),
+            WireProtocol::ChatCompletions => {
                 let model = self.model();
                 let mut body = json!({
                     "model": model,
@@ -441,14 +455,11 @@ impl AiClient {
                         body["thinking"] = json!({"type": "disabled"});
                     }
                 } else if let Some(max_tokens) = max_tokens_override {
-                    // Official Chat Completions rejects the legacy `max_tokens` field.
-                    // Compatible endpoints keep that field, so select by endpoint capability,
-                    // never by a model-name heuristic.
-                    body[self.output_token_field()] = json!(max_tokens);
+                    body["max_tokens"] = json!(max_tokens);
                 }
                 body
             }
-            ProviderKind::Anthropic => build_anthropic_body_with_tool_choice(
+            WireProtocol::AnthropicMessages => build_anthropic_body_with_tool_choice(
                 &self.model(),
                 messages,
                 tool_values,
@@ -570,11 +581,13 @@ impl AiClient {
         let telemetry_started = Instant::now();
         let tool_values: Vec<Value> = tools.iter().map(ToolDef::to_openai).collect();
         let body = self.build_body(messages, &tool_values, require_tool, max_tokens_override);
-        codescope_telemetry::record(
+        codescope_telemetry::record_with_origin(
+            codescope_telemetry::TelemetryOrigin::InternalAgent,
             "llm.request",
             json!({
                 "request_id": telemetry_request_id,
                 "provider": format!("{:?}", self.provider),
+                "protocol": self.protocol.as_str(),
                 "endpoint": sanitized_endpoint(&self.endpoint),
                 "model": self.model(),
                 "reasoning_effort": self.reasoning_effort().to_string(),
@@ -597,7 +610,8 @@ impl AiClient {
             Err(e) => {
                 self.record_failure();
                 if e.is_timeout() {
-                    codescope_telemetry::record(
+                    codescope_telemetry::record_with_origin(
+                        codescope_telemetry::TelemetryOrigin::InternalAgent,
                         "llm.error",
                         json!({
                             "request_id": telemetry_request_id,
@@ -610,7 +624,8 @@ impl AiClient {
                     return Err(AiError::Timeout(self.timeout));
                 }
                 let sanitized = e.without_url();
-                codescope_telemetry::record(
+                codescope_telemetry::record_with_origin(
+                    codescope_telemetry::TelemetryOrigin::InternalAgent,
                     "llm.error",
                     json!({
                         "request_id": telemetry_request_id,
@@ -627,7 +642,8 @@ impl AiClient {
         let status = response.status();
         if status.as_u16() == 429 {
             let retry_after = parse_retry_after(response.headers());
-            codescope_telemetry::record(
+            codescope_telemetry::record_with_origin(
+                codescope_telemetry::TelemetryOrigin::InternalAgent,
                 "llm.error",
                 json!({
                     "request_id": telemetry_request_id,
@@ -643,7 +659,8 @@ impl AiClient {
         if !status.is_success() {
             let response_body = response.text().await.unwrap_or_default();
             Self::trace_wire_text("error_response", &response_body);
-            codescope_telemetry::record(
+            codescope_telemetry::record_with_origin(
+                codescope_telemetry::TelemetryOrigin::InternalAgent,
                 "llm.error",
                 json!({
                     "request_id": telemetry_request_id,
@@ -671,7 +688,8 @@ impl AiClient {
                 // body is a protocol problem, not availability.
                 if e.is_timeout() {
                     self.record_failure();
-                    codescope_telemetry::record(
+                    codescope_telemetry::record_with_origin(
+                        codescope_telemetry::TelemetryOrigin::InternalAgent,
                         "llm.error",
                         json!({
                             "request_id": telemetry_request_id,
@@ -682,7 +700,8 @@ impl AiClient {
                     return Err(AiError::Timeout(self.timeout));
                 }
                 let sanitized = e.without_url();
-                codescope_telemetry::record(
+                codescope_telemetry::record_with_origin(
+                    codescope_telemetry::TelemetryOrigin::InternalAgent,
                     "llm.error",
                     json!({
                         "request_id": telemetry_request_id,
@@ -697,7 +716,8 @@ impl AiClient {
         Self::trace_wire_json("response", &completion);
         self.record_success();
         let usage = parse_token_usage(&completion);
-        codescope_telemetry::record(
+        codescope_telemetry::record_with_origin(
+            codescope_telemetry::TelemetryOrigin::InternalAgent,
             "llm.response",
             json!({
                 "request_id": telemetry_request_id,
@@ -715,12 +735,14 @@ impl AiClient {
             output_tokens = usage.output,
             "provider completion token usage"
         );
-        let parsed = match self.provider {
-            ProviderKind::OpenAiCompatible => parse_completion(completion),
-            ProviderKind::Anthropic => parse_anthropic_response(completion),
+        let parsed = match self.protocol {
+            WireProtocol::OpenAiResponses => parse_openai_response(completion),
+            WireProtocol::ChatCompletions => parse_completion(completion),
+            WireProtocol::AnthropicMessages => parse_anthropic_response(completion),
         };
         if let Err(error) = &parsed {
-            codescope_telemetry::record(
+            codescope_telemetry::record_with_origin(
+                codescope_telemetry::TelemetryOrigin::InternalAgent,
                 "llm.error",
                 json!({
                     "request_id": telemetry_request_id,
@@ -818,9 +840,9 @@ fn sanitized_endpoint(endpoint: &str) -> String {
     url.to_string()
 }
 
-/// Read the two common provider usage shapes. OpenAI-compatible responses report
-/// `prompt_tokens` / `completion_tokens`; Anthropic reports `input_tokens` /
-/// `output_tokens` and may split cached input into two additional counters.
+/// Read the common provider usage shapes. Chat Completions reports `prompt_tokens` /
+/// `completion_tokens`; Responses and Anthropic report `input_tokens` / `output_tokens`, while
+/// Anthropic may split cached input into two additional counters.
 fn parse_token_usage(body: &Value) -> TokenUsage {
     let Some(usage) = body.get("usage") else {
         return TokenUsage::default();
@@ -876,7 +898,236 @@ fn body_snippet(text: String) -> String {
     snippet
 }
 
-/// Extract the assistant message and its tool calls from a completion object.
+const RESPONSES_OUTPUT_FIELD: &str = "_codescope_responses_output";
+
+/// Build an OpenAI Responses API request from Codescope's provider-neutral conversation.
+///
+/// Responses function tools are flat objects, reasoning effort is nested, and tool results are
+/// input items keyed by `call_id`. We disable provider-side storage and request encrypted reasoning
+/// content so every output item needed for a stateless tool continuation can be replayed.
+fn build_openai_responses_body(
+    model: &str,
+    reasoning_effort: ReasoningEffort,
+    messages: &[ChatMessage],
+    tool_values: &[Value],
+    require_tool: bool,
+    max_tokens_override: Option<u64>,
+) -> Value {
+    let (instructions, input) = openai_responses_input(messages);
+    let mut body = json!({
+        "model": model,
+        "input": input,
+        "tools": openai_responses_tools(tool_values),
+        "tool_choice": if require_tool { "required" } else { "auto" },
+        "parallel_tool_calls": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+    });
+    if !instructions.is_empty() {
+        body["instructions"] = Value::String(instructions.join("\n\n"));
+    }
+    if let Some(effort) = reasoning_effort.wire_value() {
+        body["reasoning"] = json!({"effort": effort});
+    }
+    if let Some(max_tokens) = max_tokens_override {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
+    body
+}
+
+/// Convert the shared Chat-style transcript into Responses input items.
+fn openai_responses_input(messages: &[ChatMessage]) -> (Vec<String>, Vec<Value>) {
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for message in messages {
+        let value = message.as_value();
+        match value.get("role").and_then(Value::as_str) {
+            Some("system") => {
+                if let Some(content) = value.get("content").and_then(Value::as_str) {
+                    instructions.push(content.to_string());
+                }
+            }
+            Some("user") => input.push(json!({
+                "role": "user",
+                "content": value
+                    .get("content")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
+            })),
+            Some("assistant") => {
+                // A prior Responses turn carries its exact provider output. Replaying every item
+                // preserves encrypted reasoning, function-call identity, and any phase metadata.
+                if let Some(items) = value.get(RESPONSES_OUTPUT_FIELD).and_then(Value::as_array) {
+                    input.extend(items.iter().cloned());
+                    continue;
+                }
+                if value
+                    .get("content")
+                    .is_some_and(|content| !content.is_null())
+                {
+                    input.push(json!({
+                        "role": "assistant",
+                        "content": value["content"].clone(),
+                    }));
+                }
+                if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
+                    input.extend(calls.iter().map(|call| {
+                        json!({
+                            "type": "function_call",
+                            "call_id": call["id"].clone(),
+                            "name": call["function"]["name"].clone(),
+                            "arguments": call["function"]["arguments"].clone(),
+                        })
+                    }));
+                }
+            }
+            Some("tool") => input.push(json!({
+                "type": "function_call_output",
+                "call_id": value
+                    .get("tool_call_id")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "output": value
+                    .get("content")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new())),
+            })),
+            _ => {}
+        }
+    }
+    (instructions, input)
+}
+
+/// Flatten Chat Completions function definitions into Responses function tools.
+fn openai_responses_tools(tool_values: &[Value]) -> Vec<Value> {
+    tool_values
+        .iter()
+        .map(|tool| {
+            let function = &tool["function"];
+            json!({
+                "type": "function",
+                "name": function["name"].clone(),
+                "description": function["description"].clone(),
+                "parameters": function["parameters"].clone(),
+            })
+        })
+        .collect()
+}
+
+/// Parse a Responses result into the shared assistant/tool-call representation.
+fn parse_openai_response(body: Value) -> Result<RawPlanResponse, AiError> {
+    if body.get("status").and_then(Value::as_str) == Some("failed") {
+        let message = body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(crate::scrub::scrub_secrets)
+            .unwrap_or_else(|| "OpenAI response failed".to_string());
+        return Err(AiError::MalformedResponse(message));
+    }
+
+    let output = body
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AiError::MalformedResponse("response has no output items".into()))?;
+    let mut tool_calls = Vec::new();
+    let mut text_parts = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                if call_id.is_empty() || name.is_empty() {
+                    return Err(AiError::MalformedResponse(
+                        "function call without a call_id or name".into(),
+                    ));
+                }
+                let arguments = match item.get("arguments") {
+                    Some(Value::String(arguments)) => arguments.clone(),
+                    Some(arguments) if !arguments.is_null() => arguments.to_string(),
+                    _ => String::new(),
+                };
+                tool_calls.push(RawToolCall {
+                    id: call_id.to_string(),
+                    name: name.to_string(),
+                    arguments,
+                });
+            }
+            Some("message") => {
+                if let Some(content) = item.get("content").and_then(Value::as_array) {
+                    for part in content {
+                        if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                text_parts.push(text);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let status = body.get("status").and_then(Value::as_str);
+    let finish_reason = if status == Some("incomplete") {
+        body.pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .map(|reason| {
+                if reason.eq_ignore_ascii_case("max_output_tokens") {
+                    "length".to_string()
+                } else {
+                    reason.to_string()
+                }
+            })
+            .or_else(|| Some("incomplete".to_string()))
+    } else if tool_calls.is_empty() {
+        Some("stop".to_string())
+    } else {
+        Some("tool_calls".to_string())
+    };
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text_parts.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text_parts.join("\n"))
+        },
+    });
+    message[RESPONSES_OUTPUT_FIELD] = Value::Array(output.clone());
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(
+            tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    tracing::debug!(
+        calls = tool_calls.len(),
+        finish_reason = finish_reason.as_deref().unwrap_or(""),
+        "OpenAI response parsed"
+    );
+    Ok(RawPlanResponse {
+        message,
+        tool_calls,
+        model: body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        finish_reason,
+    })
+}
+
 /// Build an Anthropic Messages-API body from the OpenAI-shaped conversation.
 ///
 /// The tool loop inside `AiService` builds OpenAI envelopes (`system` / `user` / `assistant`
@@ -1152,13 +1403,30 @@ mod tests {
         cfg.base_url = crate::ANTHROPIC_BASE_URL.to_string();
         cfg.reasoning_effort = ReasoningEffort::High;
         let error = AiClient::new(&cfg).expect_err("native Anthropic must not silently ignore it");
-        assert!(error.to_string().contains("OpenAI-compatible"), "{error}");
+        assert!(error.to_string().contains("not supported"), "{error}");
     }
 
     #[test]
     fn endpoint_join_trims_trailing_slash() {
         let client = AiClient::new(&enabled_config()).unwrap();
         assert_eq!(client.endpoint(), "http://127.0.0.1:1/v1/chat/completions");
+    }
+
+    #[test]
+    fn official_openai_uses_responses_without_changing_compatible_endpoints() {
+        let mut cfg = enabled_config();
+        cfg.base_url = format!("{}/", crate::OPENAI_BASE_URL);
+        let client = AiClient::new(&cfg).unwrap();
+        assert_eq!(client.endpoint(), "https://api.openai.com/v1/responses");
+        assert_eq!(client.protocol, WireProtocol::OpenAiResponses);
+
+        cfg.base_url = "https://openai-proxy.example.test/v1".into();
+        let client = AiClient::new(&cfg).unwrap();
+        assert_eq!(
+            client.endpoint(),
+            "https://openai-proxy.example.test/v1/chat/completions"
+        );
+        assert_eq!(client.protocol, WireProtocol::ChatCompletions);
     }
 
     #[test]
@@ -1237,16 +1505,45 @@ mod tests {
     }
 
     #[test]
-    fn official_openai_output_override_uses_max_completion_tokens() {
+    fn official_openai_body_uses_responses_tool_and_reasoning_shapes() {
         let mut cfg = enabled_config();
         cfg.base_url = crate::OPENAI_BASE_URL.into();
         cfg.model = crate::DEFAULT_OPENAI_MODEL.into();
+        cfg.reasoning_effort = ReasoningEffort::High;
         let client = AiClient::new(&cfg).unwrap();
 
-        let body = client.build_body(&[ChatMessage::user("digest")], &[], true, Some(4_096));
-        assert_eq!(body["max_completion_tokens"], 4_096);
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "git_diff_file",
+                "description": "Read one diff",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        })];
+        let body = client.build_body(
+            &[
+                ChatMessage::system("controller"),
+                ChatMessage::user("digest"),
+            ],
+            &tools,
+            true,
+            Some(4_096),
+        );
+        assert_eq!(body["max_output_tokens"], 4_096);
         assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("messages").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["instructions"], "controller");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"], "digest");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "git_diff_file");
+        assert!(body["tools"][0].get("function").is_none());
         assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
     }
 
     #[test]
@@ -1350,6 +1647,98 @@ mod tests {
         .unwrap();
         assert!(plain.tool_calls.is_empty());
         assert_eq!(plain.message["content"], "hello");
+    }
+
+    #[test]
+    fn responses_parser_extracts_calls_text_and_preserves_replay_items() {
+        let response = json!({
+            "id": "resp_1",
+            "model": "gpt-5.6-luna",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-reasoning",
+                    "summary": [],
+                    "phase": "analysis"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "I will inspect it."}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "git_diff_file",
+                    "arguments": "{\"file\":\"src/lib.rs\",\"hunk_index\":0}",
+                    "status": "completed"
+                }
+            ]
+        });
+
+        let parsed = parse_openai_response(response.clone()).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(parsed.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+        assert_eq!(parsed.tool_calls[0].name, "git_diff_file");
+        assert_eq!(parsed.message["content"], "I will inspect it.");
+        assert_eq!(parsed.message[RESPONSES_OUTPUT_FIELD], response["output"]);
+    }
+
+    #[test]
+    fn responses_replay_preserves_reasoning_and_correlates_tool_output() {
+        let prior_output = json!([
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "opaque-reasoning",
+                "summary": [],
+                "phase": "analysis"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "git_diff_file",
+                "arguments": "{\"file\":\"src/lib.rs\"}",
+                "status": "completed"
+            }
+        ]);
+        let mut prior_message = json!({"role": "assistant", "content": null});
+        prior_message[RESPONSES_OUTPUT_FIELD] = prior_output.clone();
+        let messages = vec![
+            ChatMessage::system("controller"),
+            ChatMessage::user("inspect"),
+            ChatMessage::assistant_raw(prior_message),
+            ChatMessage::tool("call_1", "diff text 🦀\nsecond line"),
+        ];
+
+        let (instructions, input) = openai_responses_input(&messages);
+        assert_eq!(instructions, vec!["controller"]);
+        assert_eq!(input[0], json!({"role": "user", "content": "inspect"}));
+        assert_eq!(input[1], prior_output[0]);
+        assert_eq!(input[2], prior_output[1]);
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[3]["output"], "diff text 🦀\nsecond line");
+    }
+
+    #[test]
+    fn responses_incomplete_output_limit_maps_to_length() {
+        let parsed = parse_openai_response(json!({
+            "model": "gpt-5.6-luna",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": []
+        }))
+        .unwrap();
+        assert_eq!(parsed.finish_reason.as_deref(), Some("length"));
     }
 
     #[test]
@@ -1573,7 +1962,7 @@ mod tests {
 
     #[test]
     fn list_models_url_respects_provider() {
-        // OpenAI-compatible: {base}/chat/completions -> {base}/models
+        // OpenAI Responses: the models endpoint remains directly under the configured base.
         let mut cfg = enabled_config();
         cfg.base_url = "https://api.openai.com/v1".into();
         let client = AiClient::new(&cfg).unwrap();

@@ -51,7 +51,11 @@ struct SelectionViewKey {
 enum SelectionViewTarget {
     Directory(String),
     File(String),
-    Symbol { file: String, name: String },
+    Symbol {
+        file: String,
+        name: String,
+        position: Option<(u32, u32)>,
+    },
 }
 
 /// How the logical diff row stored in [`App::diff_scroll`] is placed in the visible viewport.
@@ -98,6 +102,7 @@ impl SelectionViewMemory {
         &mut self,
         next: Option<SelectionViewKey>,
         current: SelectionViewState,
+        initial: SelectionViewState,
     ) -> Option<SelectionViewState> {
         if self.active == next {
             return None;
@@ -109,7 +114,7 @@ impl SelectionViewMemory {
             .as_ref()
             .and_then(|key| self.saved.get(key))
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(initial);
         self.active = next;
         Some(restored)
     }
@@ -130,21 +135,48 @@ fn selection_view_key(snapshot: &UiSnapshot) -> Option<SelectionViewKey> {
     if snapshot.diff.title.is_empty() {
         return None;
     }
-    let target = if let Some(directory) = snapshot.diff.title.strip_suffix('/') {
-        SelectionViewTarget::Directory(directory.to_string())
-    } else if let Some(name) = &snapshot.diff.focused_symbol {
-        SelectionViewTarget::Symbol {
-            file: snapshot.diff.title.clone(),
+    let target = match &snapshot.active_selection {
+        Some(AiSummaryKey::Directory(path)) => SelectionViewTarget::Directory(path.clone()),
+        Some(AiSummaryKey::File(path)) => SelectionViewTarget::File(path.clone()),
+        Some(AiSummaryKey::Symbol {
+            file,
+            name,
+            position,
+        }) => SelectionViewTarget::Symbol {
+            file: file.clone(),
             name: name.clone(),
+            position: *position,
+        },
+        None => {
+            if let Some(directory) = snapshot.diff.title.strip_suffix('/') {
+                SelectionViewTarget::Directory(directory.to_string())
+            } else if let Some(name) = &snapshot.diff.focused_symbol {
+                SelectionViewTarget::Symbol {
+                    file: snapshot.diff.title.clone(),
+                    name: name.clone(),
+                    position: None,
+                }
+            } else {
+                SelectionViewTarget::File(snapshot.diff.title.clone())
+            }
         }
-    } else {
-        SelectionViewTarget::File(snapshot.diff.title.clone())
     };
     Some(SelectionViewKey {
         epoch: snapshot.epoch,
         scope: snapshot.scope,
         target,
     })
+}
+
+fn initial_selection_view(snapshot: &UiSnapshot) -> SelectionViewState {
+    let mut state = SelectionViewState::default();
+    if let Some(row) = snapshot.diff.selection_focus_row {
+        state.diff_anchor = DiffViewportAnchor {
+            row: u16::try_from(row).unwrap_or(u16::MAX),
+            alignment: DiffScrollAlignment::Center,
+        };
+    }
+    state
 }
 
 /// View-state for the running app.
@@ -328,6 +360,7 @@ impl App {
         let impact_retargeted =
             self.snapshot.impact.selected_change != snapshot.impact.selected_change;
         let next_view_key = selection_view_key(&snapshot);
+        let initial_view = initial_selection_view(&snapshot);
         let selection_retargeted = self.selection_view_memory.active != next_view_key;
         let activity_started = !self.snapshot.ai_activity.active && snapshot.ai_activity.active;
         let plan_changed = self.snapshot.semantic.plan != snapshot.semantic.plan;
@@ -344,7 +377,10 @@ impl App {
         }
         if selection_retargeted {
             let current = self.current_selection_view();
-            if let Some(restored) = self.selection_view_memory.switch_to(next_view_key, current) {
+            if let Some(restored) =
+                self.selection_view_memory
+                    .switch_to(next_view_key, current, initial_view)
+            {
                 self.apply_selection_view(restored);
             }
             self.hovered_plan_node = None;
@@ -460,6 +496,19 @@ impl App {
                 self.diff_wrap = !self.diff_wrap;
                 self.diff_selection = None;
             }
+            Action::ScrollDiffHorizontal { delta } => {
+                if !self.diff_wrap {
+                    let next = if delta.is_negative() {
+                        self.diff_hscroll.saturating_sub(delta.unsigned_abs())
+                    } else {
+                        self.diff_hscroll.saturating_add(delta as u16)
+                    };
+                    if next != self.diff_hscroll {
+                        self.diff_hscroll = next;
+                        self.diff_selection = None;
+                    }
+                }
+            }
             Action::ResetHScroll => {
                 self.diff_hscroll = 0;
                 self.diff_selection = None;
@@ -531,12 +580,7 @@ impl App {
             // constraints and can yield without overwriting the stable request.
             Action::ResizeDivider { divider, extent } => self.dividers.set(divider, extent),
             Action::Collapse => match self.focused {
-                // Wrapped mode has no hidden horizontal state: h must not move it.
-                Pane::Diff if self.diff_wrap => {}
-                Pane::Diff => {
-                    self.diff_hscroll = self.diff_hscroll.saturating_sub(8);
-                    self.diff_selection = None;
-                }
+                Pane::Diff => {}
                 Pane::Impact => {
                     if let Some(target) = self.hovered_plan_node.clone() {
                         if self.plan_node(&target).is_some() {
@@ -544,17 +588,13 @@ impl App {
                         }
                     }
                 }
-                // Files-pane expansion is dispatcher-owned: run.rs routes Space/h/l to
+                // Files-pane expansion is dispatcher-owned: run.rs routes Space/Left/Right to
                 // the targeted SetFileExpanded command; App applies no local tree
                 // mutation for them (review 18 m4).
                 Pane::Files => {}
             },
             Action::Expand => match self.focused {
-                Pane::Diff if self.diff_wrap => {}
-                Pane::Diff => {
-                    self.diff_hscroll = self.diff_hscroll.saturating_add(8);
-                    self.diff_selection = None;
-                }
+                Pane::Diff => {}
                 Pane::Impact => {
                     if let Some(target) = self.hovered_plan_node.clone() {
                         if self.plan_node(&target).is_some() {
@@ -632,6 +672,7 @@ impl App {
             | Action::SelectSymbol { .. }
             | Action::SelectionChanged { .. }
             | Action::DirectorySelectionChanged { .. }
+            | Action::AgentDiagramInspect { .. }
             | Action::AgentDiagram { .. }
             | Action::AgentDiagramRejected { .. }
             | Action::RefreshGit
@@ -1026,7 +1067,7 @@ impl App {
         }
     }
 
-    /// The selected file's repo-relative path (symbol rows map to their owning file).
+    /// The selected file's repo-relative path (symbol rows still expose their owning file).
     pub fn selected_file_path(&self) -> Option<&str> {
         match self.selected_projected_row()? {
             ProjectedRow::File { file_index, .. } | ProjectedRow::Symbol { file_index, .. } => self
@@ -1845,19 +1886,19 @@ mod tests {
     fn hscroll_moves_only_in_raw_mode() {
         let mut app = App::new();
         app.focused = Pane::Diff;
-        // Raw mode (default): l steps by 8, h steps back, 0 resets.
-        app.apply(Action::Expand);
-        app.apply(Action::Expand);
+        // Raw mode (default): Right steps by 8, Left steps back, 0 resets.
+        app.apply(Action::ScrollDiffHorizontal { delta: 8 });
+        app.apply(Action::ScrollDiffHorizontal { delta: 8 });
         assert_eq!(app.diff_hscroll, 16);
-        app.apply(Action::Collapse);
+        app.apply(Action::ScrollDiffHorizontal { delta: -8 });
         assert_eq!(app.diff_hscroll, 8);
         app.apply(Action::ResetHScroll);
         assert_eq!(app.diff_hscroll, 0);
-        // Wrap mode: h/l must not move hidden horizontal state.
-        app.apply(Action::Expand);
+        // Wrap mode: arrows/trackpad must not move hidden horizontal state.
+        app.apply(Action::ScrollDiffHorizontal { delta: 8 });
         app.apply(Action::ToggleWrap);
         let before = app.diff_hscroll;
-        app.apply(Action::Expand);
+        app.apply(Action::ScrollDiffHorizontal { delta: 8 });
         assert_eq!(app.diff_hscroll, before);
     }
 
@@ -1865,7 +1906,7 @@ mod tests {
     fn scope_switch_resets_hscroll() {
         let mut app = App::new();
         app.focused = Pane::Diff;
-        app.apply(Action::Expand);
+        app.apply(Action::ScrollDiffHorizontal { delta: 8 });
         assert_eq!(app.diff_hscroll, 8);
         app.apply(Action::ScopeStaged);
         assert_eq!(app.diff_hscroll, 0);
@@ -1979,6 +2020,7 @@ mod tests {
         snap.diff = crate::snapshot::DiffPane {
             title: "src/main.rs".into(),
             focused_symbol: None,
+            selection_focus_row: None,
             rows: vec![
                 DiffRow::HunkHeader("@@ -10,2 +10,2 @@ first".into()),
                 DiffRow::Context {
@@ -2271,5 +2313,47 @@ mod tests {
         assert_eq!(app.diff_scroll, 1);
         assert_eq!(app.diff_hscroll, 2);
         assert_eq!(app.current_hunk, 1);
+    }
+
+    #[test]
+    fn lsp_object_view_centers_its_diff_then_restores_its_own_location() {
+        fn symbol_view(name: &str, line: u32, focus_row: usize) -> UiSnapshot {
+            UiSnapshot {
+                active_selection: Some(AiSummaryKey::Symbol {
+                    file: "src/main.rs".to_string(),
+                    name: name.to_string(),
+                    position: Some((line, 0)),
+                }),
+                diff: crate::snapshot::DiffPane {
+                    title: "src/main.rs".to_string(),
+                    focused_symbol: Some(name.to_string()),
+                    selection_focus_row: Some(focus_row),
+                    rows: (0..50)
+                        .map(|index| DiffRow::Context {
+                            old_ln: index + 1,
+                            new_ln: index + 1,
+                            text: format!("line {index}"),
+                        })
+                        .collect(),
+                    ..crate::snapshot::DiffPane::default()
+                },
+                epoch: Epoch(1),
+                ..UiSnapshot::default()
+            }
+        }
+
+        let mut app = App::new();
+        app.update(symbol_view("first", 4, 12));
+        assert_eq!(app.diff_scroll, 12);
+        assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Center);
+
+        app.set_diff_scroll(16, DiffScrollAlignment::Top);
+        app.update(symbol_view("second", 30, 36));
+        assert_eq!(app.diff_scroll, 36);
+        assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Center);
+
+        app.update(symbol_view("first", 4, 12));
+        assert_eq!(app.diff_scroll, 16, "each object retains its own viewport");
+        assert_eq!(app.diff_scroll_alignment, DiffScrollAlignment::Top);
     }
 }

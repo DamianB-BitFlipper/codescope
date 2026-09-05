@@ -23,7 +23,7 @@ use codescope_ai::{AiService, ReasoningEffort};
 use codescope_analysis::AnalysisEngine;
 use codescope_git::GitRepo;
 use codescope_lsp::LanguageService;
-use codescope_tui::{Action, App, UiSnapshot};
+use codescope_tui::{Action, App, ExternalControl, UiSnapshot};
 use dispatcher::{DispatchEvent, Dispatcher};
 use tokio::sync::{mpsc, watch};
 use watcher::RepoWatchers;
@@ -154,7 +154,7 @@ async fn main() -> Result<()> {
     // work actions; optional watchers send change events; spawned jobs report back on the same queue.
     let (snapshot_tx, snapshot_rx) = watch::channel(UiSnapshot::placeholder());
     let (action_tx, action_rx) = mpsc::channel::<Action>(64);
-    let (control_tx, control_rx) = mpsc::channel::<Action>(32);
+    let (control_tx, control_rx) = mpsc::channel::<ExternalControl>(32);
     let (event_tx, event_rx) = mpsc::channel::<DispatchEvent>(64);
     let job_tx = event_tx.clone();
 
@@ -418,9 +418,27 @@ mod tests {
             matches!(cli.command, Some(backend::BackendCommand::Agent(_))),
             "agent must route to the live protocol client"
         );
+        let view_id = "view-v1-0000000000000000-0000000000000000000000000000000000000000000000000000000000000000";
         for args in [
-            vec!["codescope", "agent", ".", "diff", "--hunk", "0"],
-            vec!["codescope", "agent", ".", "diagram", "inspect"],
+            vec![
+                "codescope",
+                "agent",
+                ".",
+                "diff",
+                "--view-id",
+                view_id,
+                "--hunk",
+                "0",
+            ],
+            vec![
+                "codescope",
+                "agent",
+                ".",
+                "diagram",
+                "inspect",
+                "--view-id",
+                view_id,
+            ],
             vec!["codescope", "agent", ".", "diagram", "schema"],
             vec![
                 "codescope",
@@ -428,6 +446,8 @@ mod tests {
                 ".",
                 "diagram",
                 "edit",
+                "--view-id",
+                view_id,
                 r#"{"op":"set_intent","intent":"Explain the change."}"#,
             ],
         ] {

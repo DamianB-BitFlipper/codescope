@@ -25,7 +25,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-/// Default chat-completions base for OpenAI.
+/// Default API base for OpenAI. The client uses the Responses API at this endpoint.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Default chat-completions base for Prime Inference (used when the key came from
@@ -36,10 +36,9 @@ pub const PRIME_BASE_URL: &str = "https://api.pinference.ai/api/v1";
 /// `ANTHROPIC_API_KEY`).
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 
-/// Default model for Prime Inference: plans are schema-constrained, so a small model suffices
-/// (research 05 §5). The provider-specific default follows the resolved key — a Prime model id
-/// is not valid on OpenAI/Anthropic (review 09 finding F2).
-pub const DEFAULT_MODEL: &str = "openai/gpt-5-mini";
+/// Default model for Prime Inference. The provider-specific default follows the resolved key — a
+/// Prime model id is not valid on OpenAI/Anthropic (review 09 finding F2).
+pub const DEFAULT_MODEL: &str = "openai/gpt-5.6-luna";
 
 /// Default model when the key came from `OPENAI_API_KEY`.
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-mini";
@@ -50,13 +49,13 @@ pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-latest";
 /// Default per-request timeout (research 07 §4: 20 s budget).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(20_000);
 
-/// Reasoning budget requested from an OpenAI-compatible Chat Completions model.
+/// Reasoning budget requested from a reasoning-capable provider model.
 ///
 /// [`ReasoningEffort::Default`] selects Codescope's automatic provider/model behavior,
-/// which normally omits `reasoning_effort` (Prime-hosted GLM is the compatibility exception:
-/// it uses `minimal`). The remaining variants are sent verbatim as the top-level
-/// `reasoning_effort` field. Providers and models support different subsets, so an explicit
-/// choice can still be rejected honestly by the upstream API.
+/// which normally omits the provider field (Prime-hosted GLM is the compatibility exception: it
+/// uses `minimal`). The remaining variants are sent as `reasoning.effort` to OpenAI's Responses
+/// API or `reasoning_effort` to compatible Chat Completions APIs. Providers and models support
+/// different subsets, so an explicit choice can still be rejected honestly by the upstream API.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     /// Use Codescope's automatic provider/model behavior.
@@ -158,8 +157,8 @@ impl<'de> serde::Deserialize<'de> for ReasoningEffort {
 /// describes a usable provider configuration; there is no disabled AI state.
 #[derive(Clone)]
 pub struct AiConfig {
-    /// Provider base URL. The client derives an OpenAI-compatible Chat Completions endpoint or
-    /// uses the native Anthropic Messages endpoint according to the resolved provider.
+    /// Provider base URL. The client derives OpenAI Responses, compatible Chat Completions, or
+    /// native Anthropic Messages endpoints according to the resolved provider and URL.
     pub base_url: String,
     /// Model identifier sent in the request body.
     pub model: String,
@@ -360,7 +359,8 @@ impl AiConfig {
 /// The wire protocol a provider speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
-    /// OpenAI-compatible `POST {base}/chat/completions` (OpenAI, Prime Inference, Ollama, …).
+    /// OpenAI-compatible protocol family: Responses on OpenAI itself, Chat Completions on Prime
+    /// Inference, Ollama, and custom endpoints.
     OpenAiCompatible,
     /// Anthropic's native `POST {base}/messages` with `x-api-key` auth.
     Anthropic,
@@ -491,7 +491,7 @@ fn parse_base_url(value: &str) -> Result<Url, AiError> {
 /// URL parsing makes scheme/host/default-port comparisons case-insensitive where the URL
 /// standard requires it. A trailing slash remains equivalent to preserve existing configuration
 /// behavior, while a query or a different path remains custom.
-fn is_official_base_url(base_url: &Url, default_base_url: &str) -> bool {
+pub(crate) fn is_official_base_url(base_url: &Url, default_base_url: &str) -> bool {
     let Ok(default_url) = Url::parse(default_base_url) else {
         return false;
     };
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn prime_key_defaults_to_prime_model_id() {
         let cfg = AiConfig::resolve(None, env_of(&[("PRIME_API_KEY", "sk-p")])).unwrap();
-        assert_eq!(cfg.model, DEFAULT_MODEL);
+        assert_eq!(cfg.model, "openai/gpt-5.6-luna");
     }
 
     #[test]

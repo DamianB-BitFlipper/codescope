@@ -119,31 +119,21 @@ pub fn impact_left_width(request: u16, content_width: u16) -> u16 {
     )
 }
 
-/// Heights of selected-change, callers, and downstream sections. At useful heights the
-/// first two honor their independent requests while reserving a minimum for everything
-/// after them. Very short layouts degrade with the old deterministic 3/even split.
+/// Heights of the callers and downstream sections in the relationship sidebar. At useful
+/// heights the callers section honors its requested extent while reserving a useful downstream
+/// section. Very short layouts split the available rows as evenly as possible.
 #[must_use]
-pub fn impact_section_heights(
-    selected_request: u16,
-    callers_request: u16,
-    total_height: u16,
-) -> [u16; 3] {
-    let required = MIN_SELECTED_CHANGE_HEIGHT + 2 * MIN_RELATION_SECTION_HEIGHT;
+pub fn relationship_section_heights(callers_request: u16, total_height: u16) -> [u16; 2] {
+    let required = 2 * MIN_RELATION_SECTION_HEIGHT;
     if total_height < required {
-        let selected = total_height.min(MIN_SELECTED_CHANGE_HEIGHT);
-        let remaining = total_height.saturating_sub(selected);
-        let callers = remaining / 2;
-        return [selected, callers, remaining.saturating_sub(callers)];
+        let callers = total_height / 2;
+        return [callers, total_height.saturating_sub(callers)];
     }
 
-    let selected = selected_request
-        .max(MIN_SELECTED_CHANGE_HEIGHT)
-        .min(total_height.saturating_sub(2 * MIN_RELATION_SECTION_HEIGHT));
-    let remaining = total_height.saturating_sub(selected);
     let callers = callers_request
         .max(MIN_RELATION_SECTION_HEIGHT)
-        .min(remaining.saturating_sub(MIN_RELATION_SECTION_HEIGHT));
-    [selected, callers, remaining.saturating_sub(callers)]
+        .min(total_height.saturating_sub(MIN_RELATION_SECTION_HEIGHT));
+    [callers, total_height.saturating_sub(callers)]
 }
 
 #[cfg(test)]
@@ -217,10 +207,9 @@ mod tests {
     }
 
     #[test]
-    fn impact_sections_honor_both_requests_and_reserve_downstream() {
-        assert_eq!(impact_section_heights(4, 5, 14), [4, 5, 5]);
-        assert_eq!(impact_section_heights(8, 9, 14), [8, 4, 2]);
-        assert_eq!(impact_section_heights(99, 99, 7), [3, 2, 2]);
-        assert_eq!(impact_section_heights(4, 5, 3), [3, 0, 0]);
+    fn relationship_sections_honor_callers_request_and_reserve_downstream() {
+        assert_eq!(relationship_section_heights(5, 14), [5, 9]);
+        assert_eq!(relationship_section_heights(99, 14), [12, 2]);
+        assert_eq!(relationship_section_heights(5, 3), [1, 2]);
     }
 }

@@ -6,9 +6,9 @@
 //! - [`AiConfig`]: required env-first provider configuration; keyless local endpoints may be
 //!   configured explicitly, and literal keys in config files are rejected
 //!   ([`AiError::LiteralApiKeyInConfig`]).
-//! - [`AiClient`]: OpenAI-compatible `POST {base}/chat/completions` with controller-selected
-//!   Auto or Required tool choice, an in-flight concurrency guard, a high rate ceiling, and a
-//!   3-strikes/60 s circuit breaker.
+//! - [`AiClient`]: OpenAI Responses, compatible Chat Completions, and native Anthropic Messages
+//!   with controller-selected Auto or Required tool choice, an in-flight concurrency guard, a high
+//!   rate ceiling, and a 3-strikes/60 s circuit breaker.
 //! - [`parse_plan`]: tool-call arguments → [`codescope_core::VisualizationPlan`].
 //! - [`validate`]: the deterministic fact-validation boundary (epoch, entities, semantic-edge
 //!   evidence or Sequence transition adjacency, exact changed diff lines, and caps) over a [`FactView`].

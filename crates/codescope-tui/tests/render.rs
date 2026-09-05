@@ -47,6 +47,7 @@ fn sample() -> UiSnapshot {
         diff: DiffPane {
             title: "internal/service/service.go".to_string(),
             focused_symbol: None,
+            selection_focus_row: None,
             rows: vec![
                 DiffRow::HunkHeader("@@ -10,3 +10,4 @@ func GetDisplayName".to_string()),
                 DiffRow::Context {

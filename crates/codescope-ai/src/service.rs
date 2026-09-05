@@ -58,7 +58,7 @@ const MAX_BOOTSTRAP_OPERATIONS: usize = 2;
 /// the controller validates it automatically. Destructive edits are intercepted sooner.
 const MAX_FINALIZATION_EDITS: usize = 3;
 /// A focused recovery is deliberately short. It is an explicit provider-neutral override:
-/// official OpenAI uses `max_completion_tokens`, compatible endpoints use `max_tokens`, and
+/// official OpenAI Responses uses `max_output_tokens`, compatible endpoints use `max_tokens`, and
 /// Anthropic uses its required `max_tokens` field.
 const FOCUSED_RECOVERY_OUTPUT_TOKENS: u64 = 4_096;
 /// Prefix for the one controller-owned, transient instruction that follows tool results.
@@ -1481,8 +1481,9 @@ fn completion_feedback(completion: &DraftCompletion, repo_root: &Utf8Path) -> St
 
 /// True when a provider explicitly says it exhausted its output budget.
 ///
-/// OpenAI-compatible Chat Completions uses `length`; Anthropic Messages uses
-/// `max_tokens`. The controller policy deliberately does not inspect model names.
+/// Chat Completions uses `length`; Responses' `max_output_tokens` reason is normalized to
+/// `length`; Anthropic Messages uses `max_tokens`. The controller policy deliberately does not
+/// inspect model names.
 fn finish_reason_is_length(reason: Option<&str>) -> bool {
     matches!(reason, Some(value) if value.eq_ignore_ascii_case("length") || value.eq_ignore_ascii_case("max_tokens"))
 }
@@ -2002,7 +2003,8 @@ fn observe_tool_activity(
     let arguments = crate::scrub::scrub_secrets(&redact_repo_root(&call.arguments, repo_root));
     let arguments = serde_json::from_str::<serde_json::Value>(&arguments)
         .unwrap_or(serde_json::Value::String(arguments));
-    codescope_telemetry::record(
+    codescope_telemetry::record_with_origin(
+        codescope_telemetry::TelemetryOrigin::InternalAgent,
         "llm.tool",
         serde_json::json!({
             "tool_call_id": call.id,
@@ -2039,7 +2041,8 @@ fn observe_tool_failure(
     let arguments = crate::scrub::scrub_secrets(&redact_repo_root(&call.arguments, repo_root));
     let arguments = serde_json::from_str::<serde_json::Value>(&arguments)
         .unwrap_or(serde_json::Value::String(arguments));
-    codescope_telemetry::record(
+    codescope_telemetry::record_with_origin(
+        codescope_telemetry::TelemetryOrigin::InternalAgent,
         "llm.tool",
         serde_json::json!({
             "tool_call_id": call.id,

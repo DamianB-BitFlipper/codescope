@@ -933,6 +933,16 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
             .all(|record| record["diff_snapshot_id"].as_str() == Some(diff_snapshot_id)),
         "all provider/controller records correlate to the accepted comparison"
     );
+    assert!(
+        telemetry_records
+            .iter()
+            .filter(|record| matches!(
+                record["event"].as_str(),
+                Some("llm.request" | "llm.response" | "llm.error" | "llm.tool")
+            ))
+            .all(|record| record["origin"] == "internal_agent"),
+        "built-in model records have explicit provenance"
+    );
     assert!(llm_requests[0]["data"]["body"]["messages"]
         .as_array()
         .is_some_and(|messages| !messages.is_empty()));
@@ -1160,7 +1170,7 @@ fn agent_diagram_schema_exposes_the_shared_tools_without_a_live_tui() {
         .any(|tool| tool["name"] == "inspect_visualization"));
     assert_eq!(
         value["finish"]["command"],
-        "codescope agent . diagram finish"
+        "codescope agent . diagram finish --view-id VIEW_ID"
     );
 }
 
@@ -1187,6 +1197,31 @@ fn every_command_appends_local_session_telemetry() {
         .iter()
         .any(|record| record["event"] == "session.end"));
     assert!(records.iter().all(|record| record["schema_version"] == 1));
+    assert!(records.iter().all(|record| matches!(
+        record["origin"].as_str(),
+        Some("application" | "user" | "internal_agent" | "external_agent")
+    )));
+    let agent_commands = records
+        .iter()
+        .filter(|record| record["event"] == "agent.command")
+        .collect::<Vec<_>>();
+    assert_eq!(agent_commands.len(), 2, "client start and completion");
+    assert!(agent_commands
+        .iter()
+        .all(|record| record["origin"] == "external_agent"));
+    assert!(agent_commands
+        .iter()
+        .all(|record| record["data"]["operation"] == "diagram.schema"));
+    assert_eq!(agent_commands[0]["data"]["side"], "client");
+    assert_eq!(agent_commands[0]["data"]["phase"], "started");
+    assert_eq!(agent_commands[0]["data"]["status"], "running");
+    assert_eq!(agent_commands[1]["data"]["phase"], "completed");
+    assert_eq!(agent_commands[1]["data"]["status"], "succeeded");
+    let command_id = agent_commands[0]["data"]["command_id"]
+        .as_str()
+        .expect("structured command id");
+    assert!(command_id.starts_with("agent-command:"));
+    assert_eq!(agent_commands[1]["data"]["command_id"], command_id);
 }
 
 #[test]

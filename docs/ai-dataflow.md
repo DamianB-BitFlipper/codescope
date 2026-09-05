@@ -133,8 +133,13 @@ as `edit_visualization`; an external coding agent sends the identical tagged JSO
 `codescope agent . diagram edit '<json>'`. Both edit the dispatcher-owned `DiagramDraft`, and
 both finish through the same parser, epoch gate, fact validator, and renderer. The controller can
 also use `diagram inspect`, `diagram schema`, and `diagram finish`; each edit waits for its
-dispatcher acknowledgement and returns the resulting draft. A controller edit cancels only an
-older internal writer for that same selection so two agents cannot race one draft; ordinary tree
+dispatcher acknowledgement and returns the resulting draft. `context` returns an opaque
+content-addressed `view_id` for the exact selection, captured comparison, and repository epoch. The
+controller passes that ID to every diff and stateful diagram command, so later human navigation
+cannot retarget its work. A refresh/comparison epoch invalidates the ID; both the socket and
+dispatcher reject stale commands. A controller edit cancels only an older internal writer for that
+same selection so two agents cannot race one draft. If that view is not currently visible, its
+selection-scoped draft, cache, and activity update without moving the human's panes; ordinary tree
 navigation still leaves started requests running under the 16-entry queue policy.
 
 ## Headless debugging
@@ -164,8 +169,10 @@ the printed JSON compact. Per-node `code_refs` and optional `expanded_detail` re
 
 ## Provider neutrality
 
-The client speaks OpenAI-compatible Chat Completions for OpenAI, Prime, and custom endpoints,
-and native Anthropic Messages for Anthropic. A selection-specific initial inventory, the initial
+The client speaks OpenAI Responses for the official OpenAI endpoint, OpenAI-compatible Chat
+Completions for Prime and custom endpoints, and native Anthropic Messages for Anthropic. Responses
+turns use nested `reasoning.effort`, flat function tools, and stateless replay of every returned
+output item; provider-side storage is disabled. A selection-specific initial inventory, the initial
 intent/form bootstrap after retained diff evidence,
 and a focused recovery from a provider-truncated response, use `Required` with one
 controller-selected canonical branch. Other research/construction turns use `Auto`. A tool-less
@@ -173,8 +180,8 @@ full `Auto` turn is one completion signal; bounded finalization is another. If t
 draft is invalid, the service uses one of its bounded repair turns to return exact validation
 feedback. Verified against Prime
 Inference (`https://api.pinference.ai/api/v1`) and OpenAI; anything compatible (Ollama, vLLM, …)
-works by setting the base URL. The default model is a small, schema-constrained one — plans are
-structured, so they don't need a frontier model.
+works by setting the base URL. Prime Inference defaults to `openai/gpt-5.6-luna`; direct OpenAI and
+Anthropic credentials retain provider-native defaults.
 
 ## Privacy
 
@@ -186,7 +193,9 @@ structured, so they don't need a frontier model.
 - Every provider request, response, usage record, latency, and error is appended to that process's
   JSONL file under the local `telemetry/` directory beside global config. Prompt, tool, completion,
   and provider-returned reasoning content is retained after recognizable secret values are
-  scrubbed. Headers and key material are excluded, and Codescope does not upload the file.
+  scrubbed. These records carry `origin: "internal_agent"`; external `codescope agent` commands
+  carry `origin: "external_agent"` plus a cross-process command ID and structured operation.
+  Headers and key material are excluded, and Codescope does not upload the file.
 - After the dispatcher accepts a parsed comparison, a deduplicated `diff.snapshot` stores its
   complete privacy-filtered unified patch, resolved scope/base/head, and file/hunk byte mappings.
   Its SHA-256 `diff_snapshot_id` hashes the exact stored payload and correlates later UI,

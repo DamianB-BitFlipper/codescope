@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch};
 
 use codescope_core::ChangeScope;
 
-use crate::action::{map_key, Action};
+use crate::action::{map_key, Action, ExternalControl};
 use crate::app::{App, Pane};
 use crate::render::render;
 use crate::snapshot::UiSnapshot;
@@ -20,13 +20,14 @@ use crate::snapshot::UiSnapshot;
 /// - `tx` receives Actions that require work the TUI cannot do itself
 ///   (RefreshGit, model/base selection, scope changes); view-only actions are applied
 ///   locally.
-/// - `control_rx` receives the same typed actions from a local control-protocol server.
+/// - `control_rx` receives typed actions and correlation metadata from a local control-protocol
+///   server.
 pub async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
     mut rx: watch::Receiver<UiSnapshot>,
     tx: mpsc::Sender<Action>,
-    mut control_rx: mpsc::Receiver<Action>,
+    mut control_rx: mpsc::Receiver<ExternalControl>,
 ) -> std::io::Result<()> {
     // Defensive: ensure the terminal is in raw mode so key events are delivered. Idempotent;
     // ratatui::init already does this, but a missed enable leaves the app unresponsive.
@@ -62,8 +63,14 @@ pub async fn run(
         tokio::select! {
             command = control_rx.recv(), if control_open => {
                 match command {
-                    Some(action) => {
+                    Some(control) => {
                         let before = telemetry_state(&app);
+                        let ExternalControl {
+                            command_id,
+                            operation,
+                            view_id,
+                            action,
+                        } = control;
                         let action_name = format!("{action:?}");
                         preferences_dirty |= dispatch(
                             &mut app,
@@ -73,9 +80,13 @@ pub async fn run(
                             &mut selection,
                         )
                         .await;
-                        codescope_telemetry::record(
+                        codescope_telemetry::record_with_origin(
+                            codescope_telemetry::TelemetryOrigin::ExternalAgent,
                             "input.control",
                             json!({
+                                "command_id": command_id,
+                                "operation": operation,
+                                "view_id": view_id,
                                 "action": action_name,
                                 "state_before": before,
                                 "state_after": telemetry_state(&app),
@@ -101,7 +112,8 @@ pub async fn run(
                             &mut selection,
                         )
                         .await;
-                        codescope_telemetry::record(
+                        codescope_telemetry::record_with_origin(
+                            codescope_telemetry::TelemetryOrigin::User,
                             "input.key",
                             json!({
                                 "code": format!("{:?}", key.code),
@@ -150,7 +162,8 @@ pub async fn run(
                             .await;
                         }
                         if record_mouse {
-                            codescope_telemetry::record(
+                            codescope_telemetry::record_with_origin(
+                                codescope_telemetry::TelemetryOrigin::User,
                                 "input.mouse",
                                 json!({
                                     "kind": format!("{:?}", mouse.kind),
@@ -330,10 +343,18 @@ fn telemetry_state(app: &App) -> Value {
         Some(crate::snapshot::AiSummaryKey::Directory(path)) => {
             Some(app.review_state(&crate::review::ReviewTarget::Directory(path)))
         }
-        Some(crate::snapshot::AiSummaryKey::File(path))
-        | Some(crate::snapshot::AiSummaryKey::Symbol { file: path, .. }) => {
+        Some(crate::snapshot::AiSummaryKey::File(path)) => {
             Some(app.review_state(&crate::review::ReviewTarget::File(path)))
         }
+        Some(crate::snapshot::AiSummaryKey::Symbol {
+            file,
+            name,
+            position,
+        }) => Some(app.review_state(&crate::review::ReviewTarget::Symbol {
+            file,
+            name,
+            position,
+        })),
         None => None,
     };
     json!({
@@ -476,7 +497,9 @@ async fn dispatch(
             }
             app.apply(Action::AgentFocus(target));
         }
-        Action::AgentDiagram { .. } | Action::AgentDiagramRejected { .. } => {
+        Action::AgentDiagramInspect { .. }
+        | Action::AgentDiagram { .. }
+        | Action::AgentDiagramRejected { .. } => {
             let _ = tx.send(action).await;
         }
         Action::ClearDiffSelection => {
@@ -503,6 +526,13 @@ async fn dispatch(
             app.apply(action);
             let _ = tx.send(Action::SetAgentDiffSelection(None)).await;
         }
+        Action::ScrollDiffHorizontal { .. } => {
+            let previous = app.diff_hscroll;
+            app.apply(action);
+            if app.diff_hscroll != previous {
+                let _ = tx.send(Action::SetAgentDiffSelection(None)).await;
+            }
+        }
         Action::SetFileExpanded { .. } => {
             // Optimistic local apply (responsive expand/collapse), then the dispatcher
             // reconciles: it owns expansion state. The path is part of
@@ -514,7 +544,7 @@ async fn dispatch(
             // Directory disclosure is pure local view state and must not start work.
             app.apply(action);
         }
-        // Space/h/l are expansion aliases and resolve the same targeted command.
+        // Space/Left/Right are expansion aliases and resolve the same targeted command.
         Action::ToggleExpand | Action::Collapse | Action::Expand if app.focused == Pane::Files => {
             if let Some(cmd) = app.tree_toggle_action() {
                 let forward = matches!(cmd, Action::SetFileExpanded { .. });

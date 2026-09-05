@@ -89,16 +89,27 @@ impl ProjectedRow {
         }
     }
 
-    /// Review target represented by this row. Symbols intentionally map to their owning file so
-    /// the keyboard shortcut remains useful while inspecting a symbol; analysis notes are inert.
+    /// Review target represented by this row. LSP objects keep independent state beneath their
+    /// owning file; analysis notes are inert.
     #[must_use]
     pub fn review_target(&self, files: &[FileRow]) -> Option<ReviewTarget> {
         match self {
             ProjectedRow::Directory { path, .. } => Some(ReviewTarget::Directory(path.clone())),
-            ProjectedRow::File { file_index, .. } | ProjectedRow::Symbol { file_index, .. } => {
-                files
-                    .get(*file_index)
-                    .map(|file| ReviewTarget::File(file.path.clone()))
+            ProjectedRow::File { file_index, .. } => files
+                .get(*file_index)
+                .map(|file| ReviewTarget::File(file.path.clone())),
+            ProjectedRow::Symbol {
+                file_index,
+                symbol_index,
+                ..
+            } => {
+                let file = files.get(*file_index)?;
+                let symbol = file.symbols.get(*symbol_index)?;
+                Some(ReviewTarget::Symbol {
+                    file: file.path.clone(),
+                    name: symbol.name.clone(),
+                    position: symbol.position,
+                })
             }
             ProjectedRow::Note { .. } => None,
         }
@@ -344,6 +355,26 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| matches!(row, ProjectedRow::File { file_index: 2, .. })));
+    }
+
+    #[test]
+    fn symbol_rows_are_independent_review_targets() {
+        let mut source = file("src/lib.rs");
+        source.expanded = true;
+        let files = vec![source];
+        let rows = project(&files, &HashSet::new());
+        let symbol = rows
+            .iter()
+            .find(|row| matches!(row, ProjectedRow::Symbol { .. }))
+            .expect("expanded LSP object row");
+        assert_eq!(
+            symbol.review_target(&files),
+            Some(ReviewTarget::Symbol {
+                file: "src/lib.rs".into(),
+                name: "run".into(),
+                position: Some((1, 0)),
+            })
+        );
     }
 
     #[test]

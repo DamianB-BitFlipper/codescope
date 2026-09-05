@@ -4,8 +4,9 @@ Codescope writes always-on telemetry to a `telemetry/` directory beside its glob
 Every process/session creates a distinct `<timestamp>-<pid>-<nonce>.jsonl` file, preventing one
 unbounded global log. The directory is owner-only and each append-only stream is
 owner-readable/owner-writable on Unix. Telemetry is local only and has no upload path. Each line is
-one independently valid JSON object with session, sequence, elapsed-time, repository, event, and
-data fields.
+one independently valid JSON object with session, sequence, elapsed-time, repository, `origin`,
+event, and data fields. `origin` is always one of `application`, `user`, `internal_agent`, or
+`external_agent`; consumers never need to infer provenance from an event name or payload string.
 
 ## Diff snapshots
 
@@ -33,6 +34,27 @@ used. Codescope clears the active ID as soon as an epoch refresh starts and emit
 `diff.snapshot_unavailable`; records remain uncorrelated until a valid current comparison is
 accepted. Provider work uses a request-scoped copy of the ID so a late response cannot be
 misattributed to a newer comparison.
+
+## Agent provenance and command correlation
+
+Provider requests, responses, errors, and tool activity emitted by Codescope's built-in model use
+`origin: "internal_agent"`. Direct keyboard and mouse events use `origin: "user"`.
+
+Every `codescope agent` invocation creates structured `agent.command` records with
+`origin: "external_agent"`. The short-lived CLI stream records client start and completion; the
+running TUI stream records server receipt and completion for commands that connect to it, including
+read-only `context` and `diff` calls. Their data contains:
+
+- `command_id`, generated from the unique client telemetry session and shared across the socket;
+- stable `operation` names such as `context`, `diff`, `focus`, `diagram.inspect`, `diagram.edit`,
+  `diagram.finish`, and `refresh`;
+- `side` (`client` or `server`), `phase`, and `status`; and
+- the requested `view_id`, plus `result_view_id` when `context` captures a view.
+
+Mutating commands additionally produce `input.control` in the TUI stream with the same
+`command_id`, `operation`, and `view_id`, before/after UI state, and active `diff_snapshot_id`.
+Thus an external command can be joined from its CLI invocation through socket handling to the
+visible change it caused, while remaining unambiguously distinct from internal `llm.*` activity.
 
 ## Privacy boundary
 

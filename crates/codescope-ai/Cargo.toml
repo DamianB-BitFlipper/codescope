@@ -3,7 +3,7 @@ name = "codescope-ai"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "codescope AI layer: provider-neutral chat-completions client, incremental diagram protocol, fact-validation boundary"
+description = "codescope AI layer: provider-neutral inference client, incremental diagram protocol, fact-validation boundary"
 
 [dependencies]
 codescope-core = { path = "../codescope-core" }

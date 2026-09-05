@@ -78,13 +78,21 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    owner-only Unix socket. `codescope agent` projects the latest `UiSnapshot` into a bounded JSON
    context and translates `focus`/`diagram`/`refresh` requests into typed TUI `Action`s. It also
    projects authoritative hunks from the dispatcher-captured change-set for external evidence.
+   Context content-addresses the exact directory/file/symbol, complete captured comparison, and
+   repository epoch as an opaque `view_id`. Diff lookup and diagram inspection/mutation require
+   that ID, resolve it against the captured comparison, and address the selection directly rather
+   than following later cursor movement. Refreshing or changing the comparison invalidates the old
+   epoch and produces an explicit stale-view error; the dispatcher repeats the epoch check when
+   applying a command to close the socket-to-action race.
    Focus first updates the visible tree cursor and then passes through the normal selection
    tracker, preventing the retained cursor from undoing remote control. The protocol exposes no
    shell, internal-AI prompt, or raw plan injection. The external agent researches with its host
    tools, anchors diagram claims to captured diff coordinates, and applies typed `DiagramCommand`s
    shared with the internal model tools. Controller edits acknowledge through the published
    snapshot, so each CLI call returns the resulting draft or validation error synchronously.
-6. **AI**: OpenAI-compatible Chat Completions and native Anthropic Messages via reqwest 0.13. A
+6. **AI**: OpenAI Responses, compatible Chat Completions, and native Anthropic Messages via reqwest
+   0.13. Direct OpenAI tool turns replay returned output items (including encrypted reasoning)
+   without provider-side storage. A
    bounded loop researches and
    incrementally builds the renderer-native `DiagramDraft` through create/update/delete tools.
    Production research starts with one selection-specific `Required` inventory call
@@ -121,7 +129,9 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    bounded tool-tagged supplementary reads, the current draft, and controller feedback—never an
    old tool transcript. Up to eight current research/editor tools share the 128-operation loop.
    The headless backend uses the same policy.
-   External-agent diagram edits cancel only an older internal writer for that same selection.
+   External-agent diagram edits cancel only an older internal writer for the addressed selection.
+   If that selection is no longer visible, its draft/cache/activity update in place without
+   changing the human's current diff, diagram, or status; navigating back restores the result.
    Navigation itself retains the 16-entry active-request behavior above.
    Interactive startup requires a resolved AI provider; missing or disabled configuration is a
    startup error rather than a reduced-function mode. (research 05)
@@ -136,7 +146,11 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    It contains the complete post-exclusion/post-scrub unified patch, resolved comparison
    identifiers, and byte-addressable file/hunk metadata. Its SHA-256 `diff_snapshot_id` is attached
    to later UI, controller, snapshot, and LLM records; identical payloads are stored once per
-   session stream. An epoch bump clears correlation before stale UI is republished, and each LLM future
+   session stream. Every record also carries an explicit application/user/internal-agent/external-
+   agent origin. External commands propagate a client-session-derived command ID, stable operation,
+   and captured view ID across the CLI stream, socket server events, and resulting TUI control
+   event, including read-only context/diff calls. An epoch bump clears correlation before stale UI
+   is republished, and each LLM future
    retains the ID present when it launched. The sink is append-only, owner-only on Unix, never
    includes auth headers, credential material, excluded files, or absolute repository paths, and
    has no upload path. The full event contract is in [`telemetry.md`](telemetry.md). (research 07's
@@ -158,8 +172,10 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    erasing add/delete meaning. Click/`Space` grows that box in place with lossless detail and source
    refs. Dragging stores a session-local X/Y position and reroutes incident arrows. Clicking an
    arrow toggles a top-layer, wheel-pageable full-text overlay. Overlay state never changes base
-   box/edge geometry, canvas extent, or scroll. External assumptions remain above the full Review
-   block. (research 04)
+   box/edge geometry, canvas extent, or scroll. Selecting an LSP object seeds its unified
+   per-selection viewport from the first changed row in its mapped hunk and centers that row; later
+   visits restore the object's own diff and diagram location. External assumptions remain above
+   the full Review block. (research 04)
 10. **Fixture + tests**: shell-regenerable Go fixture with deterministic OIDs; hand-rolled fake
    LSP server for negative tests; ScriptedProvider fake AI; live AI behind #[ignore] + env.
    (research 08)

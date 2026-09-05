@@ -184,9 +184,10 @@ claim.
 
 ## 5. Provider-neutral client
 
-**Wire protocols:** OpenAI-compatible Chat Completions with tool calling for OpenAI, Prime
-Inference, and custom endpoints; native Anthropic Messages with `tool_use`/`tool_result` blocks for
-Anthropic. Verified compatible targets include OpenAI (`https://api.openai.com/v1`), Prime
+**Wire protocols:** OpenAI Responses with function calling for the official OpenAI endpoint;
+OpenAI-compatible Chat Completions for Prime Inference and custom endpoints; native Anthropic
+Messages with `tool_use`/`tool_result` blocks for Anthropic. Verified targets include OpenAI
+(`https://api.openai.com/v1`), Prime
 Inference (`https://api.pinference.ai/api/v1`), and Anthropic
 (`https://api.anthropic.com/v1`). Compatible local Chat Completions endpoints such as Ollama,
 vLLM, and LM Studio can be selected with an explicit base URL.
@@ -203,10 +204,10 @@ rebuild, preventing endless edit cycles. There is no whole-plan
 tool fallback or separate model completion tool.
 
 **Crate choice:** `reqwest` 0.13.4 with the workspace's `json`, `stream`, and `rustls`
-features, plus `serde`/`serde_json`. The direct client keeps exact control over both
-OpenAI-compatible Chat Completions and native Anthropic Messages payloads, authentication, tool
-choice, usage accounting, and sanitized errors. HTTP streaming remains disabled; draft progress
-uses ordinary bounded tool turns rather than SSE.
+features, plus `serde`/`serde_json`. The direct client keeps exact control over OpenAI Responses,
+compatible Chat Completions, and native Anthropic Messages payloads, authentication, tool choice,
+usage accounting, and sanitized errors. HTTP streaming remains disabled; draft progress uses
+ordinary bounded tool turns rather than SSE.
 
 HTTP streaming remains off. Accepted draft edits remain available through the shared draft API;
 between ordinary tool turns the TUI shows each research/edit call progressing through
@@ -242,6 +243,6 @@ language-server inspection. Absolute paths, credentials, and environment values 
    handoff at most 128 KiB. The current research/editor tools share at most 128
    operations; retained exact Git diff results remain authoritative and take priority over tagged
    supplementary reads.
-5. Client: reqwest + serde, OpenAI-compatible chat completions and the shared incremental
-   diagram tools; `CODESCOPE_AI_*` env config with `PRIME_API_KEY` auto-detection; interactive
-   startup fails clearly when no provider credential or explicit local endpoint exists.
+5. Client: reqwest + serde, OpenAI Responses / compatible Chat Completions and the shared
+   incremental diagram tools; `CODESCOPE_AI_*` env config with `PRIME_API_KEY` auto-detection;
+   interactive startup fails clearly when no provider credential or explicit local endpoint exists.

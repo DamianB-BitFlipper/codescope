@@ -12,7 +12,7 @@ use crate::action::{PlanNodeTarget, PlanRelationshipTarget};
 use crate::app::{App, Pane};
 use crate::divider::{DividerAxis, DividerHandle, DividerId};
 use crate::layout::{
-    choose_tier, files_width, impact_left_width, impact_section_heights, Tier, MIN_DIFF_WIDTH,
+    choose_tier, files_width, impact_left_width, relationship_section_heights, Tier, MIN_DIFF_WIDTH,
 };
 use crate::review::ReviewTarget;
 use crate::scroll::{ScrollRegion, ScrollRegionId};
@@ -46,7 +46,7 @@ pub struct UiGeometry {
     pub file_row_rects: Vec<(Rect, usize)>,
     /// Dedicated right-edge review controls for visible directory/file rows. These sit above the
     /// general row targets so clicking a marker never changes selection.
-    pub file_review_rects: Vec<(Rect, ReviewTarget)>,
+    pub review_rects: Vec<(Rect, ReviewTarget)>,
     /// Physical index of the first visible file row (the scroll offset).
     pub files_first_visible: usize,
     /// Independently scrollable rectangles in the frame the user actually saw.
@@ -124,16 +124,17 @@ impl UiGeometry {
                                 rows_proj[phys],
                                 crate::file_rows::ProjectedRow::Directory { .. }
                                     | crate::file_rows::ProjectedRow::File { .. }
+                                    | crate::file_rows::ProjectedRow::Symbol { .. }
                             )
                         {
                             let target = rows_proj[phys]
                                 .review_target(&snap.files)
-                                .expect("directory/file rows are reviewable");
+                                .expect("selectable changed-tree rows are reviewable");
                             review_rects.push((Rect::new(fi.x + fi.width - 1, y, 1, 1), target));
                         }
                     }
                     geo.file_row_rects = rects;
-                    geo.file_review_rects = review_rects;
+                    geo.review_rects = review_rects;
                     geo.register_scroll_region(
                         ScrollRegionId::Files,
                         body,
@@ -230,16 +231,17 @@ impl UiGeometry {
                         rows_proj[phys],
                         crate::file_rows::ProjectedRow::Directory { .. }
                             | crate::file_rows::ProjectedRow::File { .. }
+                            | crate::file_rows::ProjectedRow::Symbol { .. }
                     )
                 {
                     let target = rows_proj[phys]
                         .review_target(&snap.files)
-                        .expect("directory/file rows are reviewable");
+                        .expect("selectable changed-tree rows are reviewable");
                     review_rects.push((Rect::new(fi.x + fi.width - 1, y, 1, 1), target));
                 }
             }
             geo.file_row_rects = rects;
-            geo.file_review_rects = review_rects;
+            geo.review_rects = review_rects;
             geo.register_scroll_region(
                 ScrollRegionId::Files,
                 work_split[0],
@@ -503,43 +505,35 @@ impl UiGeometry {
                 left_width,
             ));
 
-            let [selected, callers, downstream] = impact_section_heights(
-                app.dividers.get(DividerId::SelectedCallers),
+            let [callers, downstream] = relationship_section_heights(
                 app.dividers.get(DividerId::CallersDownstream),
                 content.height,
             );
             let left = Rect::new(content.x, content.y, left_width, content.height);
             let rows = ratatui::layout::Layout::vertical([
-                ratatui::layout::Constraint::Length(selected),
                 ratatui::layout::Constraint::Length(callers),
                 ratatui::layout::Constraint::Length(downstream),
             ])
             .split(left);
-            let callers_capacity = impact_list_capacity(rows[1].height, true);
-            let downstream_capacity = impact_list_capacity(rows[2].height, false);
+            let callers_capacity = impact_list_capacity(rows[0].height, true);
+            let downstream_capacity = impact_list_capacity(rows[1].height, false);
             self.register_scroll_region(
                 ScrollRegionId::Callers,
-                rows[1],
+                rows[0],
                 app.callers_scroll,
                 scroll_max(snap.impact.callers.rows.len(), callers_capacity),
             );
             self.register_scroll_region(
                 ScrollRegionId::Downstream,
-                rows[2],
+                rows[1],
                 app.downstream_scroll,
                 scroll_max(snap.impact.downstream.rows.len(), downstream_capacity),
             );
             register_horizontal_sectional(
                 &mut self.dividers,
-                DividerId::SelectedCallers,
+                DividerId::CallersDownstream,
                 rows[0],
                 rows[1],
-            );
-            register_horizontal_sectional(
-                &mut self.dividers,
-                DividerId::CallersDownstream,
-                rows[1],
-                rows[2],
             );
 
             let generated = Rect::new(

@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use codescope_core::{AiStatus, ChangeScope, DiagramDraft, Epoch, LsStatus};
+use codescope_core::{
+    AiStatus, ChangeScope, DiagramDraft, Epoch, LsStatus, ValidationReport, VisualizationPlan,
+};
 
 /// Everything the interface needs to draw one frame.
 #[derive(Debug, Clone)]
@@ -27,6 +29,9 @@ pub struct UiSnapshot {
     pub agent_changeset_epoch: Epoch,
     /// Generation state for every selectable directory, file, and symbol summary.
     pub ai_summaries: HashMap<AiSummaryKey, AiSummaryState>,
+    /// Exact directory/file/symbol identity currently represented by the diff and generated pane.
+    /// The live-agent protocol uses this instead of reverse-engineering a possibly ambiguous label.
+    pub active_selection: Option<AiSummaryKey>,
     /// Center pane: the focused diff for the current selection.
     pub diff: DiffPane,
     /// Exact diff text the human most recently selected in the focused file. This is
@@ -100,6 +105,7 @@ impl Default for UiSnapshot {
             agent_changeset: None,
             agent_changeset_epoch: Epoch::ZERO,
             ai_summaries: HashMap::new(),
+            active_selection: None,
             diff: DiffPane::default(),
             selected_diff: None,
             semantic: SemanticPane::default(),
@@ -129,12 +135,16 @@ impl Default for UiSnapshot {
 }
 
 /// Dispatcher acknowledgement for one external-agent diagram command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentDiagramResult {
     /// Protocol-server request identity.
     pub request_id: u64,
     /// Monotonic diagram mutation result within this TUI session.
     pub revision: u64,
+    /// Repository epoch and selection that were addressed, independent of the visible cursor.
+    pub epoch: Epoch,
+    /// Exact directory/file/symbol whose draft was inspected or changed.
+    pub selection: AiSummaryKey,
     /// Whether the edit, or finish validation, succeeded.
     pub accepted: bool,
     /// Whether `finish` published a validated plan.
@@ -143,6 +153,12 @@ pub struct AgentDiagramResult {
     pub summary: Option<String>,
     /// Complete rejection or validation reason.
     pub error: Option<String>,
+    /// Current editable draft for the addressed selection.
+    pub draft: Option<DiagramDraft>,
+    /// Current validated plan for the addressed selection.
+    pub published_plan: Option<VisualizationPlan>,
+    /// Validation report paired with `published_plan`.
+    pub validation: Option<ValidationReport>,
 }
 
 /// Bounded, agent-readable copy of the human's retained diff selection.
@@ -372,6 +388,9 @@ pub struct DiffPane {
     /// on the first-file fallback). The full path stays in `title`; shortening a symbol
     /// label is render-only.
     pub focused_symbol: Option<String>,
+    /// Preferred logical diff row for the selected LSP object. The app uses this only to seed
+    /// that object's first session-local viewport; later visits restore its remembered location.
+    pub selection_focus_row: Option<usize>,
     /// Render-ready diff rows.
     pub rows: Vec<DiffRow>,
     /// 1-based index of the hunk the cursor is on (`n`/`N` navigation).

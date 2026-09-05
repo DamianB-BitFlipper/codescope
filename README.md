@@ -60,7 +60,7 @@ Codescope starts with the branch comparison. Then:
 2. Press `Enter` to center the selected code in the diff.
 3. Press `a` to generate a diagram for the current selection.
 4. Hover a diagram box to highlight its cited lines; click it or press `Space` to expand it.
-5. Press `v`, or click a review marker, to mark a file or directory reviewed.
+5. Press `v`, or click a review marker, to mark a directory, file, or symbol reviewed.
 
 Press `?` at any time for the complete in-app key reference.
 
@@ -74,32 +74,39 @@ Press `?` at any time for the complete in-app key reference.
 | `w` | all uncommitted changes |
 | `S` | cycle comparisons |
 | `b` | choose the branch base |
-| `g` | refresh repository state |
+| `g` | refresh repository state and clear session AI impacts |
 
 For branch comparisons, Codescope prefers a meaningful upstream and otherwise finds the nearest
 strict ancestor branch by Git topology. The base picker can override that choice. Pass `--watch`
 to refresh automatically when the worktree or Git state changes; otherwise refreshes are explicit.
 
+Completed AI impacts are retained while switching between branch, staged, unstaged, and working
+scopes during the session. Codescope restores them only when the returning parsed comparison is
+identical; press `g` to clear the session's generated impacts and rebuild from repository state.
+
 ## The review workspace
 
 ### Changed files
 
-The changed-files pane is a directory → file → symbol tree. Directories are expanded by default;
+The changed-files pane is a directory → file → LSP object tree. Directories are expanded by default;
 `Tab` collapses or expands the selected directory or file without starting AI work.
+Moving the selection onto an LSP object centers its first mapped changed row in the diff. Each
+object then retains that viewport independently for the rest of the session.
 
 Review marks are hierarchical and content-aware:
 
-- Marking a directory covers every current descendant.
-- Unmarking it removes only the directory override, preserving files marked independently.
+- Marking a directory or file covers every current descendant.
+- Unmarking it removes only that parent override, preserving files or LSP objects marked independently.
 - A changed file becomes unreviewed after refresh instead of inheriting a stale decision.
 - `●`, `↳`, `✓`, and `◐` distinguish explicit, inherited, complete, and partial review state.
 
 ### Diff
 
 The center pane renders exact old/new Git rows, with syntax colors when the language server
-supports them. Each file remembers its scroll position while you navigate elsewhere. Hovering a
-diagram box temporarily centers and highlights its cited lines; clicking the box keeps the jumped
-position.
+supports them. Codescope requests colors on first view and also fills a bounded syntax cache in the
+background; whichever path reaches a file first supplies the same cached result. Each file
+remembers its scroll position while you navigate elsewhere. Hovering a diagram box temporarily
+centers and highlights its cited lines; clicking the box keeps the jumped position.
 
 ### Impact and diagrams
 
@@ -180,17 +187,22 @@ A running TUI exposes a local control API on Unix:
 ```bash
 codescope agent . context
 codescope agent . focus --file src/server.rs --symbol run
-codescope agent . diff --file src/server.rs --hunk 0
-codescope agent . diagram inspect
+VIEW_ID='<result.view_id from context>'
+codescope agent . diff --view-id "$VIEW_ID" --file src/server.rs --hunk 0
+codescope agent . diagram inspect --view-id "$VIEW_ID"
 codescope agent . diagram schema
-codescope agent . diagram finish
+codescope agent . diagram finish --view-id "$VIEW_ID"
 codescope agent . refresh
 ```
 
-`context` returns the live selection and review state. `diff` returns the exact zero-based hunk
-identity and one-based source coordinates required by diagram evidence. Diagram edits use the same
-typed API and validator as Codescope's internal AI. The protocol cannot execute a shell command or
-write to Git.
+`context` returns the live selection and an opaque `view_id` tied to that exact selection, captured
+diff, and repository epoch. Pass it to every `diff`, diagram `inspect`/`edit`, and diagram `finish`
+command.
+Those commands continue targeting the captured view even if the user navigates elsewhere; they do
+not move or replace the active viewport. A refresh or comparison change invalidates old IDs with a
+clear stale-view error. `diff` returns the exact zero-based hunk identity and one-based source
+coordinates required by diagram evidence. Diagram edits use the same typed API and validator as
+Codescope's internal AI. The protocol cannot execute a shell command or write to Git.
 
 ### Essential controls
 
@@ -201,7 +213,7 @@ write to Git.
 | `Ctrl-d` / `Ctrl-u`, `PgDn` / `PgUp` | scroll the diff |
 | `n` / `N` | next / previous hunk |
 | `Enter` | jump to the selected symbol |
-| `Space`, `h` / `l` | expand / collapse the targeted item |
+| `Space`, `←` / `→` | toggle or explicitly collapse / expand the targeted item |
 | `a` / `A` | generate AI / toggle automatic generation |
 | `m` | choose model and reasoning effort |
 | `v` | toggle the selected change's reviewed state from any pane |
@@ -223,7 +235,7 @@ A minimal configuration looks like:
 version = 1
 
 [ai]
-# model = "openai/gpt-5-mini"
+# model = "openai/gpt-5.6-luna"
 # reasoning_effort = "default"
 # api_key_env = "OPENAI_API_KEY"
 
@@ -235,12 +247,13 @@ Command-line model and reasoning options override remembered provider choices, w
 global defaults:
 
 ```bash
-codescope --model openai/gpt-5-mini --reasoning-effort high .
+codescope --model openai/gpt-5.6-luna --reasoning-effort high .
 ```
 
 `CODESCOPE_AI_BASE_URL` configures a custom OpenAI-compatible endpoint. An arbitrary credential
 environment variable requires an explicit base URL so Codescope never sends it to a guessed
-provider.
+provider. The official OpenAI base uses the Responses API so reasoning and function tools work
+together; Prime and custom compatible providers continue to use Chat Completions.
 
 ## Privacy and telemetry
 
@@ -249,8 +262,11 @@ directory beside the global config. It is always on, local only, owner-readable 
 upload path.
 
 Telemetry records UI interactions, navigation, controller activity, and the provider envelopes
-needed to reconstruct LLM trajectories. Each comparison is stored once as a complete,
-content-addressed `diff.snapshot`; later events reference its `diff_snapshot_id`. Excluded files,
+needed to reconstruct LLM trajectories. Every record has an explicit `application`, `user`,
+`internal_agent`, or `external_agent` origin. External commands share a structured command ID,
+operation, view ID, phase, and status across their CLI and TUI streams. Each comparison is stored
+once as a complete, content-addressed `diff.snapshot`; later events reference its
+`diff_snapshot_id`. Excluded files,
 authorization headers, API keys, recognizable secrets, and absolute repository paths pass through
 the privacy and scrubbing pipeline before storage. See the [telemetry contract](docs/telemetry.md)
 for the complete event and correlation model.

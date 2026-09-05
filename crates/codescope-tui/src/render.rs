@@ -22,7 +22,7 @@ use crate::diagram::DiagramRole;
 use crate::divider::DividerId;
 use crate::intraline;
 use crate::layout::{
-    choose_tier, files_width, impact_left_width, impact_section_heights, Tier, MIN_DIFF_WIDTH,
+    choose_tier, files_width, impact_left_width, relationship_section_heights, Tier, MIN_DIFF_WIDTH,
 };
 use crate::review::{ReviewState, ReviewTarget};
 use crate::snapshot::{
@@ -489,6 +489,11 @@ fn render_files(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
                 symbol_row_line(
                     symbol,
                     *depth,
+                    app.review_state(&ReviewTarget::Symbol {
+                        file: file.path.clone(),
+                        name: symbol.name.clone(),
+                        position: symbol.position,
+                    }),
                     snap.ai_summary_state(&crate::snapshot::AiSummaryKey::Symbol {
                         file: file.path.clone(),
                         name: symbol.name.clone(),
@@ -642,7 +647,7 @@ fn review_marker(state: ReviewState) -> (&'static str, Style) {
         // A filled dot means this exact row owns the mark; inherited/derived states use
         // different shapes so unmarking a parent is predictable before the click.
         ReviewState::Explicit => ("●", Style::new().fg(ADD_FG).add_modifier(Modifier::BOLD)),
-        ReviewState::Inherited => ("↳", Style::new().fg(MUTED)),
+        ReviewState::Inherited => ("↳", Style::new().fg(ADD_FG)),
         ReviewState::Reviewed => ("✓", Style::new().fg(ADD_FG)),
         ReviewState::Partial => ("◐", Style::new().fg(WARN)),
         ReviewState::Unreviewed => ("○", Style::new().fg(MUTED)),
@@ -701,11 +706,12 @@ fn semantic_note_line(text: &str, depth: usize, inner_w: usize) -> Line<'static>
     line
 }
 
-/// One expanded symbol row: tree indent, change glyph, AI state, and name; diagnostics
-/// markers dim/red at the right when they fit.
+/// One expanded symbol row: tree indent, change glyph, AI state, name, semantic hints, and
+/// the hierarchy's right-aligned review marker.
 fn symbol_row_line(
     s: &crate::snapshot::SymbolRow,
     depth: usize,
+    review: ReviewState,
     ai: crate::snapshot::AiSummaryState,
     active: bool,
     inner_w: usize,
@@ -720,6 +726,20 @@ fn symbol_row_line(
     };
     let indent = "  ".repeat(depth.min(8));
     let (ai_marker, ai_style) = ai_summary_marker(ai);
+    let (review_marker, review_style) = review_marker(review);
+    let review_w = if inner_w > 1 { 2 } else { inner_w };
+    let available_w = inner_w.saturating_sub(review_w);
+    let mut right = String::new();
+    if !s.confidence.is_empty() {
+        right.push_str(s.confidence);
+    }
+    if s.has_diagnostic {
+        right.push('!');
+    }
+    let prefix_w = indent.width() + 4;
+    let show_right = !right.is_empty() && prefix_w + right.width() + 8 < available_w;
+    let right_w = usize::from(show_right) * (right.width() + 1);
+    let shown_name = truncate_cells(&s.name, available_w.saturating_sub(prefix_w + right_w));
     let mut spans = vec![
         Span::styled(indent.clone(), base),
         Span::styled(
@@ -734,20 +754,13 @@ fn symbol_row_line(
         Span::styled(" ", base),
         Span::styled(ai_marker, ai_style.bg(bg)),
         Span::styled(" ", base),
-        Span::styled(s.name.clone(), name_style),
+        Span::styled(shown_name.clone(), name_style),
     ];
     // Right-side markers: confidence + diagnostic, only when the row has room.
-    let mut right = String::new();
-    if !s.confidence.is_empty() {
-        right.push_str(s.confidence);
-    }
-    if s.has_diagnostic {
-        right.push('!');
-    }
-    let used = indent.width() + 1 + 1 + 1 + 1 + s.name.width();
-    let mut content_w = used;
-    if !right.is_empty() && used + right.width() < inner_w {
-        let pad = inner_w.saturating_sub(used + right.width());
+    let used = prefix_w + shown_name.width();
+    let mut rendered_w = used;
+    if show_right {
+        let pad = available_w.saturating_sub(used + right.width());
         spans.push(Span::styled(" ".repeat(pad), base));
         if !s.confidence.is_empty() {
             spans.push(Span::styled(s.confidence, Style::new().fg(MUTED).bg(bg)));
@@ -755,12 +768,18 @@ fn symbol_row_line(
         if s.has_diagnostic {
             spans.push(Span::styled("!", Style::new().fg(ERROR).bg(bg)));
         }
-        content_w = used + pad + right.width();
+        rendered_w = used + pad + right.width();
     }
     spans.push(Span::styled(
-        " ".repeat(inner_w.saturating_sub(content_w)),
+        " ".repeat(available_w.saturating_sub(rendered_w)),
         base,
     ));
+    if review_w > 1 {
+        spans.push(Span::styled(" ", base));
+    }
+    if review_w > 0 {
+        spans.push(Span::styled(review_marker, review_style.bg(bg)));
+    }
     Line::from(spans)
 }
 
@@ -1782,25 +1801,21 @@ fn render_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     }
 }
 
-/// The deterministic half of Impact: selected change above callers above downstream.
+/// The deterministic half of Impact: callers above downstream. Selection metadata remains in
+/// the snapshot for grounding and telemetry, but the generated diagram already identifies it.
 fn render_impact_body(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapshot) {
     let impact = &snap.impact;
-    let [selected_height, callers_height, downstream_height] = impact_section_heights(
-        app.dividers.get(DividerId::SelectedCallers),
-        app.dividers.get(DividerId::CallersDownstream),
-        area.height,
-    );
+    let [callers_height, downstream_height] =
+        relationship_section_heights(app.dividers.get(DividerId::CallersDownstream), area.height);
     let rows = Layout::vertical([
-        Constraint::Length(selected_height),
         Constraint::Length(callers_height),
         Constraint::Length(downstream_height),
     ])
     .split(area);
 
-    render_selected_change(frame, rows[0], impact, true);
     render_impact_list(
         frame,
-        rows[1],
+        rows[0],
         "CALLERS",
         &impact.callers,
         app.callers_scroll,
@@ -1808,7 +1823,7 @@ fn render_impact_body(frame: &mut Frame, area: Rect, app: &App, snap: &UiSnapsho
     );
     render_impact_list(
         frame,
-        rows[2],
+        rows[1],
         "DOWNSTREAM",
         &impact.downstream,
         app.downstream_scroll,
@@ -2252,57 +2267,6 @@ fn render_diagram_line(line: crate::diagram::DiagramLine) -> Line<'static> {
     )
 }
 
-/// The SELECTED CHANGE column: header, then the symbol label (ACCENT+BOLD) + badge, one
-/// deterministic interpretation line, and the pane note when space remains. A file-row
-/// selection shows the basename and the "select one to inspect impact" guidance.
-fn render_selected_change(
-    frame: &mut Frame,
-    area: Rect,
-    impact: &crate::snapshot::ImpactPane,
-    divider: bool,
-) {
-    let block = impact_section_block(divider);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let mut lines: Vec<Line> = vec![header_line("SELECTED CHANGE")];
-    match &impact.selected_change {
-        Some(sel) => {
-            let badge = if sel.change.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", sel.change)
-            };
-            let badge_color = match sel.change {
-                "added" => ADD_FG,
-                "removed" => DEL_FG,
-                _ => WARN,
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    basename(&sel.label).to_string(),
-                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(badge, Style::new().fg(badge_color)),
-            ]));
-            lines.push(Line::from(Span::styled(
-                truncate_cells(&sel.interpretation, inner.width as usize),
-                Style::new().fg(MUTED),
-            )));
-            if !impact.note.is_empty() && inner.height >= 4 {
-                lines.push(Line::from(Span::styled(
-                    truncate_cells(&impact.note, inner.width as usize),
-                    Style::new().fg(MUTED),
-                )));
-            }
-        }
-        None => lines.push(Line::from(Span::styled(
-            "select a changed file or symbol",
-            Style::new().fg(MUTED),
-        ))),
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
 /// A CALLERS / DOWNSTREAM section: header with a live count (`· …` while loading, never
 /// a false zero), then rows; when rows remain past the visible space the final visible
 /// row is `… +N more` in MUTED.
@@ -2635,11 +2599,11 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("  q / Ctrl-C      quit"),
         Line::from("  ? / Esc         this help / close"),
-        Line::from("  g               refresh repository state"),
+        Line::from("  g               refresh repository state; clear AI impacts"),
         Line::from("  a               generate AI for the current selection"),
         Line::from("  A               toggle manual / automatic AI generation"),
         Line::from("  Tab             expand / collapse directory or file"),
-        Line::from("  v / click ○     mark directory or file reviewed"),
+        Line::from("  v / click ○     mark directory, file, or LSP object reviewed"),
         Line::from("  Review marks    ● explicit · ↳ inherited · ✓ complete · ◐ partial"),
         Line::from("  AI summaries    ◆ ready · ◇ not generated · ◌ generating · ! failed"),
         Line::from("  1 / 2 / 3       focus files / diff / impact"),
@@ -2649,7 +2613,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  S               cycle scope"),
         Line::from("  b               pick comparison base (default: nearest ancestor)"),
         Line::from("  Enter           jump to symbol / re-center view"),
-        Line::from("  Space h l       expand / collapse"),
+        Line::from("  Space           expand / collapse selection"),
         Line::from("  mouse hover     jump to + highlight linked diff code"),
         Line::from("  click / Space   expand hovered impact-node details"),
         Line::from("  click arrow     expand / collapse clipped relationship text"),
@@ -2659,7 +2623,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  drag diff code  select code only; release copies · click clears"),
         Line::from("  n / N           next / previous diff hunk"),
         Line::from("  z               zoom the focused pane (Tab still switches)"),
-        Line::from("  W / 0           diff: toggle wrap / reset horizontal scroll"),
+        Line::from("  ←/→ · trackpad  diff horizontal · W wrap · 0 reset"),
         Line::from("  Home / G        top / bottom"),
     ]
 }
@@ -2942,6 +2906,13 @@ mod tests {
         (c.symbol().to_string(), c.fg, c.bg, c.modifier)
     }
 
+    #[test]
+    fn inherited_review_marker_uses_the_review_green() {
+        let (marker, style) = review_marker(ReviewState::Inherited);
+        assert_eq!(marker, "↳");
+        assert_eq!(style.fg, Some(ADD_FG));
+    }
+
     fn snap_with_base() -> UiSnapshot {
         let mut snap = UiSnapshot::default();
         snap.repo.repo_name = "demo".to_string();
@@ -2983,6 +2954,7 @@ mod tests {
         snap.diff = DiffPane {
             title: "internal/service/service.go".to_string(),
             focused_symbol: None,
+            selection_focus_row: None,
             rows: vec![
                 DiffRow::HunkHeader("@@ -10,3 +10,4 @@ func GetDisplayName".to_string()),
                 DiffRow::Context {
@@ -3373,8 +3345,8 @@ mod tests {
         assert!(row_text(&t, 2).contains('○'), "directory review control");
         assert!(row_text(&t, 3).contains('○'), "file review control");
         assert!(
-            !row_text(&t, 4).contains('○'),
-            "symbols reuse the file keybind but do not grow a second marker"
+            row_text(&t, 4).contains('○'),
+            "LSP objects have independent review controls"
         );
     }
 
@@ -3431,6 +3403,7 @@ mod tests {
         let diff = crate::snapshot::DiffPane {
             title: "src/main.rs".to_string(),
             focused_symbol: None,
+            selection_focus_row: None,
             rows: vec![
                 DiffRow::HunkHeader("@@ -10,2 +10,2 @@".to_string()),
                 DiffRow::Del {
@@ -3519,6 +3492,7 @@ mod tests {
         let diff = DiffPane {
             title: "src/main.rs".to_string(),
             focused_symbol: None,
+            selection_focus_row: None,
             rows: vec![
                 DiffRow::HunkHeader("@@ -1,1 +1,1 @@".to_string()),
                 DiffRow::Del {
@@ -3565,6 +3539,7 @@ mod tests {
         let mut diff = DiffPane {
             title: "src/main.rs".to_string(),
             focused_symbol: None,
+            selection_focus_row: None,
             rows: vec![DiffRow::Context {
                 old_ln: 1,
                 new_ln: 1,
@@ -3680,7 +3655,7 @@ mod tests {
         let mut app = app_with(&snap);
         app.focused = Pane::Diff;
         // Raw mode is the default; scroll right by 8.
-        app.apply(crate::action::Action::Expand);
+        app.apply(crate::action::Action::ScrollDiffHorizontal { delta: 8 });
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &snap)).unwrap();
         // The gutter columns are unchanged at hscroll x+08.
@@ -3895,20 +3870,25 @@ mod tests {
     }
 
     #[test]
-    fn impact_shows_selected_change_and_counts() {
+    fn impact_sidebar_starts_with_relationship_counts_and_hides_selection_card() {
         let mut snap = sample();
         snap.impact = impact_sample();
         let mut app = App::new();
         app.dividers.set(DividerId::WorkReview, 16);
-        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        t.draw(|f| render(f, &app, &snap)).unwrap();
+        let mut t = Terminal::new(TestBackend::new(140, 16)).unwrap();
+        t.draw(|frame| {
+            let area = frame.area();
+            render_impact(frame, area, &app, &snap);
+        })
+        .unwrap();
         let text = buffer_text(&t);
-        assert!(text.contains("GetDisplayName"), "symbol label: {text}");
-        assert!(text.contains("modified"), "badge: {text}");
+        assert!(!text.contains("SELECTED CHANGE"), "{text}");
+        assert!(!text.contains("GetDisplayName"), "selection label: {text}");
         assert!(
-            text.contains("Modified implementation across 1 hunk."),
-            "deterministic interpretation: {text}"
+            !text.contains("Modified implementation across 1 hunk."),
+            "selection interpretation: {text}"
         );
+        assert!(row_text(&t, 1).contains("CALLERS · 2"), "top row: {text}");
         assert!(text.contains("CALLERS · 2"), "callers count: {text}");
         assert!(text.contains("DOWNSTREAM · 1"), "downstream count: {text}");
         assert!(text.contains("Handler.HandleGetUser"), "caller row: {text}");
@@ -4895,7 +4875,7 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         t.draw(|f| render(f, &app, &snap)).unwrap();
         let text = buffer_text(&t);
-        assert!(text.contains("SELECTED CHANGE"), "{text}");
+        assert!(!text.contains("SELECTED CHANGE"), "{text}");
         assert!(text.contains("CALLERS ·"), "{text}");
         assert!(text.contains("DOWNSTREAM ·"), "{text}");
         assert!(text.contains("PlanStep0"), "generated half: {text}");
@@ -5074,9 +5054,18 @@ mod tests {
 
         let lines = help_lines();
         let popup = content_dialog(Rect::new(0, 0, 220, 100), &lines);
-        assert_eq!(popup.width, 71);
-        assert_eq!(popup.height, 32);
-        assert_eq!(popup, Rect::new(74, 34, 71, 32));
+        let content_width = lines.iter().map(Line::width).max().unwrap() as u16 + 2;
+        let content_height = lines.len() as u16 + 2;
+        assert_eq!(popup.width, content_width);
+        assert_eq!(popup.height, content_height);
+        assert!(
+            popup.width < 110,
+            "help must not scale with a wide viewport"
+        );
+        assert!(
+            popup.height < 50,
+            "help must not scale with a tall viewport"
+        );
 
         let constrained = content_dialog(Rect::new(0, 0, 60, 16), &lines);
         assert_eq!(constrained, Rect::new(2, 2, 56, 12));
@@ -5253,6 +5242,34 @@ mod tests {
                 .chars()
                 .any(|character| character.is_ascii_digit()),
             "no fake symbol count on unloaded row: {rendered_row:?}"
+        );
+    }
+
+    #[test]
+    fn lsp_object_row_reserves_and_renders_its_review_marker() {
+        let symbol = SymbolRow {
+            name: "(*Store).AssignCreate".to_string(),
+            change: "modified",
+            confidence: "~",
+            has_diagnostic: false,
+            position: Some((10, 4)),
+        };
+        let line = symbol_row_line(
+            &symbol,
+            2,
+            ReviewState::Explicit,
+            crate::snapshot::AiSummaryState::NotGenerated,
+            false,
+            40,
+        );
+        assert_eq!(line.width(), 40);
+        assert_eq!(
+            line.spans.last().map(|span| span.content.as_ref()),
+            Some("●")
+        );
+        assert!(
+            line.to_string().contains("~"),
+            "semantic hint remains visible"
         );
     }
 

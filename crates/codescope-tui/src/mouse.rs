@@ -141,12 +141,26 @@ pub fn map_mouse(
         K::Moved => route_hover(x, y, app, geometry),
         K::ScrollUp => route_wheel(x, y, -3, geometry),
         K::ScrollDown => route_wheel(x, y, 3, geometry),
+        K::ScrollLeft => route_horizontal_wheel(x, y, -8, app, geometry),
+        K::ScrollRight => route_horizontal_wheel(x, y, 8, app, geometry),
         K::Down(MouseButton::Left) => route_down(x, y, app, snap, geometry),
         // Non-left or non-primary kinds are inert.
         _ if !is_left => MouseOutcome::inert(drag),
         K::Drag(_) | K::Up(_) => MouseOutcome::inert(drag), // stray, not dragging
         _ => MouseOutcome::inert(drag),
     }
+}
+
+/// Horizontal trackpad/wheel input is hover-routed directly to an unwrapped diff. It does not
+/// focus the pane, so a gesture can inspect a long line without disturbing keyboard navigation.
+fn route_horizontal_wheel(x: u16, y: u16, delta: i16, app: &App, geo: &UiGeometry) -> MouseOutcome {
+    if app.diff_wrap
+        || geo.pane_at(x, y) != Some(Pane::Diff)
+        || (delta.is_negative() && app.diff_hscroll == 0)
+    {
+        return MouseOutcome::inert(DragState::Idle);
+    }
+    MouseOutcome::action(Action::ScrollDiffHorizontal { delta }, DragState::Idle)
 }
 
 /// Motion only redraws when the semantic node target changes. A steady stream inside
@@ -269,7 +283,7 @@ fn route_down(x: u16, y: u16, app: &App, snap: &UiSnapshot, geo: &UiGeometry) ->
 
     // 9. A dedicated review marker. It wins over the containing row so review can be toggled
     // without disrupting the current selection or retargeting the diff.
-    for (rect, target) in &geo.file_review_rects {
+    for (rect, target) in &geo.review_rects {
         if hit(*rect, x, y) {
             return MouseOutcome::action(
                 Action::ToggleReviewedTarget(target.clone()),
@@ -480,6 +494,12 @@ mod tests {
     fn wheel_up(x: u16, y: u16) -> MouseEvent {
         mouse(MouseEventKind::ScrollUp, x, y)
     }
+    fn wheel_left(x: u16, y: u16) -> MouseEvent {
+        mouse(MouseEventKind::ScrollLeft, x, y)
+    }
+    fn wheel_right(x: u16, y: u16) -> MouseEvent {
+        mouse(MouseEventKind::ScrollRight, x, y)
+    }
     /// A snapshot with two files: a collapsed one and an expanded one with two symbols.
     fn snap() -> UiSnapshot {
         UiSnapshot {
@@ -599,7 +619,7 @@ mod tests {
         let s = snap();
         let app = app_with(&s);
         let g = geo(&app, &s);
-        let (rect, target) = g.file_review_rects[1].clone();
+        let (rect, target) = g.review_rects[1].clone();
         assert_eq!(target, crate::review::ReviewTarget::File("b.go".into()));
         let out = map_mouse(down(rect.x, rect.y), &app, &s, &g, DragState::Idle);
         assert_eq!(
@@ -612,6 +632,22 @@ mod tests {
             app.file_sel, 0,
             "pure hit-testing cannot retarget selection"
         );
+    }
+
+    #[test]
+    fn lsp_object_has_its_own_clickable_review_marker() {
+        let s = snap();
+        let app = app_with(&s);
+        let g = geo(&app, &s);
+        let (rect, target) = g.review_rects[2].clone();
+        let expected = crate::review::ReviewTarget::Symbol {
+            file: "b.go".into(),
+            name: "B_one".into(),
+            position: Some((10, 2)),
+        };
+        assert_eq!(target, expected);
+        let out = map_mouse(down(rect.x, rect.y), &app, &s, &g, DragState::Idle);
+        assert_eq!(out.action, Some(Action::ToggleReviewedTarget(expected)));
     }
 
     #[test]
@@ -752,31 +788,34 @@ mod tests {
     }
 
     #[test]
-    fn every_internal_horizontal_sectional_uses_the_same_drag_path() {
+    fn callers_downstream_sectional_uses_the_shared_drag_path() {
         let s = relationship_snap();
         let app = app_with(&s);
         let g = geo(&app, &s);
-        for divider in [DividerId::SelectedCallers, DividerId::CallersDownstream] {
-            let handle = g.divider(divider).expect("internal sectional handle");
-            let rect = handle.rect;
-            let armed = map_mouse(down(rect.x + 2, rect.y), &app, &s, &g, DragState::Idle);
-            assert!(matches!(
-                armed.drag,
-                DragState::Dragging { divider: active, .. } if active == divider
-            ));
-            let start_extent = match armed.drag {
-                DragState::Dragging { start_extent, .. } => start_extent,
-                _ => unreachable!(),
-            };
-            let moved = map_mouse(drag(rect.x + 2, rect.y + 1), &app, &s, &g, armed.drag);
-            assert_eq!(
-                moved.action,
-                Some(Action::ResizeDivider {
-                    divider,
-                    extent: start_extent + 1,
-                })
-            );
-        }
+        assert!(
+            g.divider(DividerId::SelectedCallers).is_none(),
+            "the removed selected-change section has no hidden drag target"
+        );
+        let divider = DividerId::CallersDownstream;
+        let handle = g.divider(divider).expect("internal sectional handle");
+        let rect = handle.rect;
+        let armed = map_mouse(down(rect.x + 2, rect.y), &app, &s, &g, DragState::Idle);
+        assert!(matches!(
+            armed.drag,
+            DragState::Dragging { divider: active, .. } if active == divider
+        ));
+        let start_extent = match armed.drag {
+            DragState::Dragging { start_extent, .. } => start_extent,
+            _ => unreachable!(),
+        };
+        let moved = map_mouse(drag(rect.x + 2, rect.y + 1), &app, &s, &g, armed.drag);
+        assert_eq!(
+            moved.action,
+            Some(Action::ResizeDivider {
+                divider,
+                extent: start_extent + 1,
+            })
+        );
     }
 
     #[test]
@@ -959,6 +998,76 @@ mod tests {
         app.apply(out.action.unwrap());
         assert_eq!(app.focused, Pane::Files, "diff wheel does not steal focus");
         assert_eq!(app.diff_scroll, 3);
+    }
+
+    #[test]
+    fn horizontal_trackpad_scroll_targets_only_the_unwrapped_diff() {
+        let s = snap();
+        let mut app = app_with(&s);
+        app.focused = Pane::Files;
+        let g = geo(&app, &s);
+        let diff = g.diff.expect("diff");
+
+        let right = map_mouse(
+            wheel_right(diff.x + 3, diff.y + 3),
+            &app,
+            &s,
+            &g,
+            DragState::Idle,
+        );
+        assert_eq!(
+            right.action,
+            Some(Action::ScrollDiffHorizontal { delta: 8 })
+        );
+        app.apply(right.action.expect("horizontal scroll"));
+        assert_eq!(app.diff_hscroll, 8);
+        assert_eq!(
+            app.focused,
+            Pane::Files,
+            "trackpad scroll does not steal focus"
+        );
+
+        let left = map_mouse(
+            wheel_left(diff.x + 3, diff.y + 3),
+            &app,
+            &s,
+            &g,
+            DragState::Idle,
+        );
+        assert_eq!(
+            left.action,
+            Some(Action::ScrollDiffHorizontal { delta: -8 })
+        );
+        app.apply(left.action.expect("horizontal scroll"));
+        assert_eq!(app.diff_hscroll, 0);
+
+        let files = g.files.expect("files");
+        assert!(
+            map_mouse(
+                wheel_right(files.x + 2, files.y + 2),
+                &app,
+                &s,
+                &g,
+                DragState::Idle,
+            )
+            .action
+            .is_none(),
+            "horizontal gestures outside the diff are inert"
+        );
+
+        app.diff_wrap = true;
+        assert!(
+            map_mouse(
+                wheel_right(diff.x + 3, diff.y + 3),
+                &app,
+                &s,
+                &g,
+                DragState::Idle,
+            )
+            .action
+            .is_none(),
+            "wrapped diffs have no horizontal scroll"
+        );
     }
 
     #[test]

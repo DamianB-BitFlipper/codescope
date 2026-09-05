@@ -145,7 +145,7 @@ pub enum DispatchEvent {
         /// The per-file semantic result (stringified error keeps the event simple).
         result: Result<Box<codescope_analysis::FileSemanticResult>, String>,
     },
-    /// Optional syntax tokens for both sides of the currently visible file diff resolved.
+    /// Optional syntax tokens for both sides of a changed-file diff resolved.
     DiffSyntaxReady {
         /// Epoch whose file contents were queried.
         epoch: Epoch,
@@ -330,6 +330,14 @@ enum FileSemanticState {
     Failed,
 }
 
+/// Next unit of demand-prioritized or background syntax work. Unsupported files are cached as
+/// empty without asking the language service; queryable files use the shared single-flight lane.
+#[derive(Debug, Clone)]
+enum DiffSyntaxWork {
+    CacheEmpty(String),
+    Query(codescope_core::FileChange),
+}
+
 /// Lazily-expanded relations of the currently selected symbol.
 #[derive(Debug, Clone)]
 struct SelectedRelations {
@@ -353,6 +361,26 @@ pub(crate) enum AiSelectionKey {
 }
 
 impl AiSelectionKey {
+    fn from_summary_key(selection: AiSummaryKey) -> Result<Self, String> {
+        match selection {
+            AiSummaryKey::Directory(path) => Ok(Self::Directory(path)),
+            AiSummaryKey::File(path) => Ok(Self::File(path)),
+            AiSummaryKey::Symbol {
+                file,
+                name,
+                position: Some((line, col)),
+            } => Ok(Self::Symbol {
+                file,
+                name,
+                line,
+                col,
+            }),
+            AiSummaryKey::Symbol { .. } => {
+                Err("the captured symbol view has no stable source position".to_string())
+            }
+        }
+    }
+
     fn label(&self) -> &str {
         match self {
             Self::Directory(path) | Self::File(path) => path,
@@ -427,6 +455,44 @@ struct CachedAiPlan {
     report: codescope_core::ValidationReport,
 }
 
+struct AgentDiagramOutcome {
+    accepted: bool,
+    published: bool,
+    summary: Option<String>,
+    error: Option<String>,
+}
+
+impl AgentDiagramOutcome {
+    fn accepted(published: bool, summary: Option<String>) -> Self {
+        Self {
+            accepted: true,
+            published,
+            summary,
+            error: None,
+        }
+    }
+
+    fn rejected(error: String) -> Self {
+        Self {
+            accepted: false,
+            published: false,
+            summary: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Completed diagrams retained for one comparison mode during this process.
+///
+/// The captured `ChangeSet` is the validity boundary: returning to a scope restores these
+/// plans only when Git publishes the exact same parsed comparison again. This makes scope
+/// navigation lossless without ever rebinding a diagram to different code.
+#[derive(Debug, Clone)]
+struct ScopedAiPlans {
+    changeset: codescope_core::ChangeSet,
+    plans: std::collections::HashMap<AiSelectionKey, CachedAiPlan>,
+}
+
 #[derive(Debug, Clone)]
 struct AiRunningJob {
     selection: AiSelectionKey,
@@ -461,6 +527,13 @@ pub struct Dispatcher {
     /// Per-selection plan cache for this epoch. Arrowing back to a previously visited row
     /// restores its plan without another provider request.
     ai_cache: std::collections::HashMap<AiSelectionKey, CachedAiPlan>,
+    /// Completed plans retained across comparison-mode switches for this TUI session. An
+    /// explicit `g` refresh clears every entry; automatic refreshes and scope changes preserve
+    /// entries whose exact parsed comparison is unchanged.
+    ai_session_cache: std::collections::HashMap<ChangeScope, ScopedAiPlans>,
+    /// Plans rebound from an exact-match session comparison. Their selected file's ordinary
+    /// LSP reload must not invalidate them merely because the new epoch starts at `Loading`.
+    ai_session_restored: HashSet<AiSelectionKey>,
     /// Latest editable diagram per selection, shared with internal tools and controllers.
     ai_drafts: std::collections::HashMap<AiSelectionKey, DiagramDraft>,
     /// Drafts currently owned by the controller CLI rather than an internal provider job.
@@ -529,13 +602,18 @@ pub struct Dispatcher {
     analysis_in_flight: std::collections::HashMap<String, SemanticRunningJob>,
     /// FIFO queue for per-file analysis beyond the concurrency bound.
     analysis_queue: std::collections::VecDeque<String>,
-    /// Selected-file syntax results for this epoch. Empty results are cached too so an
+    /// Syntax results for changed files in this epoch. Empty results are cached too so an
     /// unsupported or temporarily unavailable highlighter never loops requests.
     diff_syntax: std::collections::HashMap<String, std::sync::Arc<codescope_core::DiffSyntax>>,
-    /// LRU order for the bounded selected-file syntax cache.
+    /// LRU order for the bounded syntax cache. A viewed file is promoted ahead of background
+    /// entries, so first-view demand and prefetch share one cache.
     diff_syntax_order: std::collections::VecDeque<String>,
+    /// Files already submitted or resolved by syntax work this epoch. This is separate from the
+    /// LRU so eviction cannot make the background scanner loop forever; first-view demand may
+    /// intentionally revisit an evicted entry.
+    diff_syntax_attempted: HashSet<String>,
     /// The single semantic-token job allowed across the service; rapid navigation coalesces
-    /// naturally to the selection visible when this slot frees.
+    /// naturally to the selection visible when this slot frees, ahead of more background work.
     diff_syntax_in_flight: std::collections::HashMap<String, Epoch>,
     output: std::sync::Arc<dyn BackendOutput>,
     /// Where completed jobs report back.
@@ -599,6 +677,8 @@ impl Dispatcher {
             analysis: None,
             ai_rows: None,
             ai_cache: std::collections::HashMap::new(),
+            ai_session_cache: std::collections::HashMap::new(),
+            ai_session_restored: HashSet::new(),
             ai_drafts: std::collections::HashMap::new(),
             agent_owned_drafts: HashSet::new(),
             ai_revision_cache: std::collections::HashMap::new(),
@@ -632,6 +712,7 @@ impl Dispatcher {
             analysis_queue: std::collections::VecDeque::new(),
             diff_syntax: std::collections::HashMap::new(),
             diff_syntax_order: std::collections::VecDeque::new(),
+            diff_syntax_attempted: HashSet::new(),
             diff_syntax_in_flight: std::collections::HashMap::new(),
             base_override: None,
             available_bases: Vec::new(),
@@ -840,7 +921,7 @@ impl Dispatcher {
                 self.schedule_all_file_analysis();
                 self.drain_analysis_queue();
                 self.drain_relation_queue();
-                self.schedule_selected_diff_syntax();
+                self.schedule_diff_syntax();
                 self.publish();
             }
             DispatchEvent::EngineUnavailable(reason) => {
@@ -952,7 +1033,13 @@ impl Dispatcher {
 
     fn on_action(&mut self, action: Action) {
         match action {
-            Action::RefreshGit => self.spawn_refresh(),
+            Action::RefreshGit => {
+                // `g` is the user's explicit invalidation boundary. Watcher refreshes and
+                // comparison-mode switches retain exact-match session plans; this command
+                // deliberately starts clean in every scope.
+                self.clear_session_ai_plans();
+                self.spawn_refresh();
+            }
             Action::GenerateAi => self.generate_ai_for_current_selection(),
             Action::ToggleAiGenerationMode => self.toggle_ai_generation_mode(),
             Action::SetFileExpanded { path, expanded } => self.set_file_expanded(&path, expanded),
@@ -995,15 +1082,24 @@ impl Dispatcher {
             Action::DirectorySelectionChanged { directory } => {
                 self.on_directory_selection_changed(directory)
             }
+            Action::AgentDiagramInspect {
+                request_id,
+                epoch,
+                selection,
+            } => self.inspect_agent_diagram(request_id, epoch, selection),
             Action::AgentDiagram {
                 request_id,
+                epoch,
+                selection,
                 command,
-            } => self.apply_agent_diagram(request_id, command),
+            } => self.apply_agent_diagram(request_id, epoch, selection, *command),
             Action::AgentDiagramRejected {
                 request_id,
+                epoch,
+                selection,
                 detail,
                 error,
-            } => self.reject_agent_diagram(request_id, detail, error),
+            } => self.reject_agent_diagram(request_id, epoch, selection, detail, error),
             Action::SetAgentDiffSelection(selected) => self.set_agent_diff_selection(selected),
             Action::BasePicker => self.spawn_list_bases(),
             Action::BaseSelected(name) => self.set_base(name),
@@ -1154,6 +1250,8 @@ impl Dispatcher {
     /// A model or reasoning-budget change invalidates outputs and in-flight work produced
     /// with the previous request settings, then prioritizes the current selection again.
     fn reset_ai_for_settings_change(&mut self) {
+        self.ai_session_cache.clear();
+        self.ai_session_restored.clear();
         self.ai_cache.clear();
         self.ai_drafts.clear();
         self.agent_owned_drafts.clear();
@@ -1232,57 +1330,42 @@ impl Dispatcher {
             // already moved this file to the front; draining lets it claim the focused lane.
             self.drain_analysis_queue();
         }
-        self.schedule_selected_diff_syntax();
+        self.schedule_diff_syntax();
         self.drain_relation_queue();
         self.publish();
     }
 
-    /// Request syntax only for the file shown in the diff pane. Waiting until its ordinary
-    /// symbol job has completed prevents a base overlay from racing another query for the same
-    /// document, and avoids repository-wide semantic-token traffic.
-    fn schedule_selected_diff_syntax(&mut self) {
-        if self.data_epoch != self.epoch || self.selected_directory.is_some() {
+    /// Fill the bounded syntax cache from two sources: first-view demand gets priority, then
+    /// changed files populate it asynchronously in the background. Both paths share one
+    /// in-flight slot because old/new-side LSP overlays must not race each other.
+    fn schedule_diff_syntax(&mut self) {
+        if self.data_epoch != self.epoch {
             return;
         }
         let Some(changeset) = &self.changeset else {
             return;
         };
-        let file = self
-            .selected_file
-            .as_deref()
-            .and_then(|path| {
-                changeset
-                    .files
-                    .iter()
-                    .find(|file| file.path.as_str() == path)
-            })
-            .or_else(|| changeset.files.first())
-            .cloned();
-        let Some(file) = file else {
+        let files = changeset.files.clone();
+        if files.is_empty() {
             return;
+        }
+
+        // A directory selection has no single diff file. Otherwise the explicit selection,
+        // or the first-file fallback the diff pane actually renders, is the demand candidate.
+        let selected_path = if self.selected_directory.is_some() {
+            None
+        } else {
+            self.selected_file
+                .as_deref()
+                .and_then(|path| files.iter().find(|file| file.path.as_str() == path))
+                .or_else(|| files.first())
+                .map(|file| file.path.to_string())
         };
-        let path = file.path.to_string();
-        if self.diff_syntax.contains_key(&path) {
-            if let Some(index) = self
-                .diff_syntax_order
-                .iter()
-                .position(|cached| cached == &path)
-            {
-                self.diff_syntax_order.remove(index);
-                self.diff_syntax_order.push_back(path);
-            }
-            return;
+        if let Some(path) = selected_path.as_deref() {
+            self.touch_diff_syntax(path);
         }
         if !self.diff_syntax_in_flight.is_empty() {
             return;
-        }
-        match self.file_semantics.get(&path) {
-            None | Some(FileSemanticState::Loading) => return,
-            Some(FileSemanticState::Unsupported) => {
-                self.cache_diff_syntax(path, codescope_core::DiffSyntax::default());
-                return;
-            }
-            Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Failed) => {}
         }
         let Some(engine) = self.engine.clone() else {
             return;
@@ -1295,13 +1378,34 @@ impl Dispatcher {
             .features()
             .is_supported(codescope_core::Feature::SemanticTokens)
         {
-            self.cache_diff_syntax(path, codescope_core::DiffSyntax::default());
+            if let Some(path) = selected_path {
+                if !self.diff_syntax.contains_key(&path) {
+                    self.diff_syntax_attempted.insert(path.clone());
+                    self.cache_diff_syntax(path, codescope_core::DiffSyntax::default());
+                }
+            }
             return;
         }
+
+        // Empty fallbacks are synchronous, so consume them until a real query is found or the
+        // bounded background scan is exhausted. This also lets prefetch continue past binary or
+        // otherwise unsupported files without another dispatcher event.
+        let file = loop {
+            match self.next_diff_syntax_work(&files, selected_path.as_deref()) {
+                Some(DiffSyntaxWork::CacheEmpty(path)) => {
+                    self.diff_syntax_attempted.insert(path.clone());
+                    self.cache_diff_syntax(path, codescope_core::DiffSyntax::default());
+                }
+                Some(DiffSyntaxWork::Query(file)) => break file,
+                None => return,
+            }
+        };
+        let path = file.path.to_string();
         let epoch = self.epoch;
         let scope = self.scope;
         let tx = self.job_tx.clone();
         let path_for_job = path.clone();
+        self.diff_syntax_attempted.insert(path.clone());
         self.diff_syntax_in_flight.insert(path, epoch);
         tokio::spawn(async move {
             let syntax = engine.diff_syntax(&file, scope, &repo_ctx).await;
@@ -1313,6 +1417,49 @@ impl Dispatcher {
                 })
                 .await;
         });
+    }
+
+    /// Pick visible-file work before background work. Demand deliberately ignores the attempted
+    /// ledger: a first view must be able to repopulate a file evicted from the bounded cache.
+    fn next_diff_syntax_work(
+        &self,
+        files: &[codescope_core::FileChange],
+        selected_path: Option<&str>,
+    ) -> Option<DiffSyntaxWork> {
+        if let Some(path) = selected_path.filter(|path| !self.diff_syntax.contains_key(*path)) {
+            if let Some(file) = files.iter().find(|file| file.path.as_str() == path) {
+                match self.file_semantics.get(path) {
+                    Some(FileSemanticState::Unsupported) => {
+                        return Some(DiffSyntaxWork::CacheEmpty(path.to_string()));
+                    }
+                    Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Failed) => {
+                        return Some(DiffSyntaxWork::Query(file.clone()));
+                    }
+                    None | Some(FileSemanticState::Loading) => {}
+                }
+            }
+        }
+
+        // Background work is intentionally bounded to the cache size. On-demand requests may
+        // still replace an LRU entry later, but prefetch never churns entries it just produced.
+        if self.diff_syntax_attempted.len() >= Self::MAX_DIFF_SYNTAX_CACHE {
+            return None;
+        }
+        files.iter().find_map(|file| {
+            let path = file.path.as_str();
+            if self.diff_syntax.contains_key(path) || self.diff_syntax_attempted.contains(path) {
+                return None;
+            }
+            match self.file_semantics.get(path) {
+                Some(FileSemanticState::Unsupported) => {
+                    Some(DiffSyntaxWork::CacheEmpty(path.to_string()))
+                }
+                Some(FileSemanticState::Ready(_)) | Some(FileSemanticState::Failed) => {
+                    Some(DiffSyntaxWork::Query(file.clone()))
+                }
+                None | Some(FileSemanticState::Loading) => None,
+            }
+        })
     }
 
     fn on_diff_syntax_ready(
@@ -1331,7 +1478,7 @@ impl Dispatcher {
         if epoch != self.epoch || self.data_epoch != self.epoch {
             // A newer epoch may already have finished its symbol prerequisite while it
             // waited behind this path's old overlay job.
-            self.schedule_selected_diff_syntax();
+            self.schedule_diff_syntax();
             return;
         }
         if !self.changeset.as_ref().is_some_and(|changeset| {
@@ -1340,16 +1487,33 @@ impl Dispatcher {
                 .iter()
                 .any(|item| item.path.as_str() == file)
         }) {
-            self.schedule_selected_diff_syntax();
+            self.schedule_diff_syntax();
             return;
         }
         self.cache_diff_syntax(file, syntax);
         // If navigation moved during this request, start only the latest visible file now.
-        self.schedule_selected_diff_syntax();
+        self.schedule_diff_syntax();
         self.publish();
     }
 
     const MAX_DIFF_SYNTAX_CACHE: usize = 16;
+
+    fn touch_diff_syntax(&mut self, file: &str) {
+        if !self.diff_syntax.contains_key(file) {
+            return;
+        }
+        if let Some(index) = self
+            .diff_syntax_order
+            .iter()
+            .position(|cached| cached == file)
+        {
+            let path = self
+                .diff_syntax_order
+                .remove(index)
+                .expect("syntax LRU index came from the same deque");
+            self.diff_syntax_order.push_back(path);
+        }
+    }
 
     fn cache_diff_syntax(&mut self, file: String, syntax: codescope_core::DiffSyntax) {
         if let Some(index) = self
@@ -1418,30 +1582,80 @@ impl Dispatcher {
         self.publish();
     }
 
-    /// Apply the controller's command to the exact same draft model exposed to the
-    /// provider. A controller mutation takes ownership of this selection's writer, so an
-    /// older internal request cannot subsequently overwrite it.
-    fn apply_agent_diagram(&mut self, request_id: u64, command: DiagramCommand) {
-        let Some(selection) = self.current_ai_selection() else {
-            let error = "diagram edit needs a selected directory, file, or function".to_string();
-            self.record_agent_diagram_result(request_id, false, false, None, Some(error.clone()));
-            self.set_status(error, StatusLevel::Warning);
-            self.publish();
+    /// Resolve a captured agent view defensively at the dispatcher boundary. The socket checks
+    /// first, but an epoch can change while its action is waiting in the TUI control queue.
+    fn resolve_agent_view(
+        &mut self,
+        request_id: u64,
+        target_epoch: Epoch,
+        selection: AiSummaryKey,
+    ) -> Option<AiSelectionKey> {
+        let result = if target_epoch != self.epoch {
+            Err(format!(
+                "view_id is stale: it belongs to epoch {target_epoch}, but Codescope is at epoch {}; run `codescope agent . context` and use its new view_id",
+                self.epoch
+            ))
+        } else if self.data_epoch != self.epoch || self.changeset.is_none() {
+            Err(
+                "view_id cannot be used while the repository comparison is refreshing; wait for `codescope agent . context` to return a current view_id"
+                    .to_string(),
+            )
+        } else {
+            AiSelectionKey::from_summary_key(selection.clone())
+        };
+        match result {
+            Ok(selection) => Some(selection),
+            Err(error) => {
+                self.record_agent_diagram_result(
+                    request_id,
+                    target_epoch,
+                    selection,
+                    AgentDiagramOutcome::rejected(error),
+                );
+                self.publish();
+                None
+            }
+        }
+    }
+
+    /// Return a target-scoped diagram acknowledgement without moving the visible cursor.
+    fn inspect_agent_diagram(
+        &mut self,
+        request_id: u64,
+        target_epoch: Epoch,
+        selection: AiSummaryKey,
+    ) {
+        let Some(selection) = self.resolve_agent_view(request_id, target_epoch, selection) else {
             return;
         };
+        let published = self.ai_cache.contains_key(&selection);
+        self.record_agent_diagram_result(
+            request_id,
+            target_epoch,
+            selection.summary_key(),
+            AgentDiagramOutcome::accepted(published, None),
+        );
+        self.publish();
+    }
+
+    /// Apply the controller's command to the draft named by its captured view, not whatever the
+    /// human currently has selected. A controller mutation takes ownership of only that view's
+    /// writer, so an older internal request cannot subsequently overwrite it.
+    fn apply_agent_diagram(
+        &mut self,
+        request_id: u64,
+        target_epoch: Epoch,
+        selection: AiSummaryKey,
+        command: DiagramCommand,
+    ) {
+        let Some(selection) = self.resolve_agent_view(request_id, target_epoch, selection) else {
+            return;
+        };
+        let visible = self.current_ai_selection().as_ref() == Some(&selection);
         // A controller may take over after Codescope's internal researcher has already made
         // useful calls. Snapshot that visible chain before cancelling its writer, then let each
         // independent CLI invocation append to the same selection-scoped activity.
         self.begin_agent_activity(&selection);
-        if self.data_epoch != self.epoch || self.changeset.is_none() {
-            let error = "diagram edit is waiting for the current Git snapshot".to_string();
-            self.record_agent_diagram_result(request_id, false, false, None, Some(error.clone()));
-            self.append_agent_activity(&selection, request_id, &command, Some(error.clone()));
-            self.set_status(error, StatusLevel::Warning);
-            self.publish();
-            return;
-        }
-
         self.cancel_ai_for_selection(&selection);
         let mut draft = self
             .ai_drafts
@@ -1460,16 +1674,17 @@ impl Dispatcher {
                 let error = error.to_string();
                 self.record_agent_diagram_result(
                     request_id,
-                    false,
-                    false,
-                    None,
-                    Some(error.clone()),
+                    target_epoch,
+                    selection.summary_key(),
+                    AgentDiagramOutcome::rejected(error.clone()),
                 );
                 self.append_agent_activity(&selection, request_id, &command, Some(error.clone()));
-                self.set_status(
-                    format!("diagram edit rejected: {error}"),
-                    StatusLevel::Warning,
-                );
+                if visible {
+                    self.set_status(
+                        format!("diagram edit rejected: {error}"),
+                        StatusLevel::Warning,
+                    );
+                }
                 self.publish();
                 return;
             }
@@ -1481,32 +1696,41 @@ impl Dispatcher {
         if matches!(command, DiagramCommand::Finish) {
             match self.validated_draft(&selection, &draft) {
                 Ok(cached) => {
+                    self.ai_session_restored.remove(&selection);
                     self.ai_cache.insert(selection.clone(), cached.clone());
                     self.ai_revision_cache
                         .insert(AiRevisionKey::from(&selection), cached.clone());
                     self.agent_owned_drafts.remove(&selection);
-                    self.ai_rows = Some((self.epoch, selection.clone(), cached));
-                    self.ai_status = AiStatus::Ready { epoch: self.epoch };
+                    if visible {
+                        self.ai_rows = Some((self.epoch, selection.clone(), cached));
+                        self.ai_status = AiStatus::Ready { epoch: self.epoch };
+                    }
                     self.record_agent_diagram_result(
                         request_id,
-                        true,
-                        true,
-                        Some("validated and published the diagram".to_string()),
-                        None,
+                        target_epoch,
+                        selection.summary_key(),
+                        AgentDiagramOutcome::accepted(
+                            true,
+                            Some("validated and published the diagram".to_string()),
+                        ),
                     );
                     self.append_agent_activity(&selection, request_id, &command, None);
-                    self.set_status("agent diagram validated and published", StatusLevel::Info);
+                    if visible {
+                        self.set_status("agent diagram validated and published", StatusLevel::Info);
+                    }
                 }
                 Err(error) => {
-                    self.ai_status = AiStatus::Failed {
-                        reason: error.clone(),
-                    };
+                    self.ai_failures.insert(selection.clone(), error.clone());
+                    if visible {
+                        self.ai_status = AiStatus::Failed {
+                            reason: error.clone(),
+                        };
+                    }
                     self.record_agent_diagram_result(
                         request_id,
-                        false,
-                        false,
-                        None,
-                        Some(error.clone()),
+                        target_epoch,
+                        selection.summary_key(),
+                        AgentDiagramOutcome::rejected(error.clone()),
                     );
                     self.append_agent_activity(
                         &selection,
@@ -1514,73 +1738,102 @@ impl Dispatcher {
                         &command,
                         Some(error.clone()),
                     );
-                    self.set_status_with_detail(
-                        format!(
-                            "agent diagram needs another edit: {}",
-                            truncate_chars(&error, 140)
-                        ),
-                        error,
-                        StatusLevel::Warning,
-                    );
+                    if visible {
+                        self.set_status_with_detail(
+                            format!(
+                                "agent diagram needs another edit: {}",
+                                truncate_chars(&error, 140)
+                            ),
+                            error,
+                            StatusLevel::Warning,
+                        );
+                    }
                 }
             }
         } else {
             self.ai_cache.remove(&selection);
-            self.ai_rows = None;
-            self.ai_status = AiStatus::Loading {
-                since_epoch: self.epoch,
-            };
-            self.record_agent_diagram_result(request_id, true, false, Some(summary.clone()), None);
+            if visible {
+                self.ai_rows = None;
+                self.ai_status = AiStatus::Loading {
+                    since_epoch: self.epoch,
+                };
+            }
+            self.record_agent_diagram_result(
+                request_id,
+                target_epoch,
+                selection.summary_key(),
+                AgentDiagramOutcome::accepted(false, Some(summary.clone())),
+            );
             self.append_agent_activity(&selection, request_id, &command, None);
-            self.set_status(format!("agent diagram: {summary}"), StatusLevel::Info);
+            if visible {
+                self.set_status(format!("agent diagram: {summary}"), StatusLevel::Info);
+            }
         }
         self.publish();
     }
 
     /// Surface a malformed controller edit through the same acknowledgement and activity paths
     /// as a well-shaped command rejected by [`DiagramDraft::apply`].
-    fn reject_agent_diagram(&mut self, request_id: u64, detail: String, error: String) {
+    fn reject_agent_diagram(
+        &mut self,
+        request_id: u64,
+        target_epoch: Epoch,
+        selection: AiSummaryKey,
+        detail: String,
+        error: String,
+    ) {
         let error = codescope_ai::scrub_secrets(&error);
-        let Some(selection) = self.current_ai_selection() else {
-            let selection_error = "diagram edit needs a selected directory, file, or function";
-            self.record_agent_diagram_result(
-                request_id,
-                false,
-                false,
-                None,
-                Some(selection_error.to_string()),
-            );
-            self.set_status(selection_error, StatusLevel::Warning);
-            self.publish();
+        let Some(selection) = self.resolve_agent_view(request_id, target_epoch, selection) else {
             return;
         };
+        let visible = self.current_ai_selection().as_ref() == Some(&selection);
         self.begin_agent_activity(&selection);
         self.cancel_ai_for_selection(&selection);
-        self.record_agent_diagram_result(request_id, false, false, None, Some(error.clone()));
-        self.append_agent_activity_row(&selection, request_id, detail, Some(error.clone()));
-        self.set_status(
-            format!("diagram edit rejected: {}", truncate_chars(&error, 140)),
-            StatusLevel::Warning,
+        self.record_agent_diagram_result(
+            request_id,
+            target_epoch,
+            selection.summary_key(),
+            AgentDiagramOutcome::rejected(error.clone()),
         );
+        self.append_agent_activity_row(&selection, request_id, detail, Some(error.clone()));
+        if visible {
+            self.set_status(
+                format!("diagram edit rejected: {}", truncate_chars(&error, 140)),
+                StatusLevel::Warning,
+            );
+        }
         self.publish();
     }
 
     fn record_agent_diagram_result(
         &mut self,
         request_id: u64,
-        accepted: bool,
-        published: bool,
-        summary: Option<String>,
-        error: Option<String>,
+        epoch: Epoch,
+        selection: AiSummaryKey,
+        outcome: AgentDiagramOutcome,
     ) {
         self.agent_diagram_revision = self.agent_diagram_revision.saturating_add(1);
+        let key = (epoch == self.epoch)
+            .then(|| AiSelectionKey::from_summary_key(selection.clone()).ok())
+            .flatten();
+        let draft = key
+            .as_ref()
+            .and_then(|selection| self.ai_drafts.get(selection).cloned());
+        let published_cache = key
+            .as_ref()
+            .and_then(|selection| self.ai_cache.get(selection));
         self.agent_diagram_result = Some(AgentDiagramResult {
             request_id,
             revision: self.agent_diagram_revision,
-            accepted,
-            published,
-            summary,
-            error,
+            epoch,
+            selection,
+            accepted: outcome.accepted,
+            published: outcome.published && published_cache.is_some(),
+            summary: outcome.summary,
+            error: outcome.error,
+            draft,
+            published_plan: published_cache.map(|cached| cached.plan.clone()),
+            validation: published_cache.map(|cached| cached.report.clone()),
         });
     }
 
@@ -1747,6 +2000,10 @@ impl Dispatcher {
         };
         if invalidate_cache {
             self.ai_cache.remove(&selection);
+            self.ai_session_restored.remove(&selection);
+            if let Some(saved) = self.ai_session_cache.get_mut(&self.scope) {
+                saved.plans.remove(&selection);
+            }
             self.ai_drafts.remove(&selection);
             self.agent_owned_drafts.remove(&selection);
             self.agent_activity.remove(&selection);
@@ -2076,6 +2333,7 @@ impl Dispatcher {
 
     fn set_scope(&mut self, scope: ChangeScope) {
         if self.scope != scope {
+            self.stash_current_ai_plans();
             self.scope = scope;
             // The scope swap replaces the whole file list (the TUI resets its selection to
             // the top row and re-reports it): the old symbol's relations must not linger.
@@ -2089,6 +2347,10 @@ impl Dispatcher {
 
     /// Spawn a git+analysis job tagged with the current epoch.
     fn spawn_refresh(&mut self) {
+        // Keep completed work available when an automatic repository refresh proves to be
+        // content-identical. During a scope change, `set_scope` already stashed the outgoing
+        // mode and this is a no-op because the retained changeset names the old scope.
+        self.stash_current_ai_plans();
         // Bump the epoch so a superseded in-flight refresh is dropped on apply (F4): the
         // newest base/scope/repo state always wins.
         self.epoch = self.epoch.next();
@@ -2101,9 +2363,10 @@ impl Dispatcher {
         self.abort_all_ai_requests();
         self.ai_failures.clear();
         self.ai_rows = None;
-        // Epoch-exact plans may no longer render after any repository refresh. Preserve
-        // their stable revision counterparts: once fresh facts land they become prompt
-        // seeds, never current UI state.
+        self.ai_session_restored.clear();
+        // Epoch-exact plans cannot render while the next comparison is unresolved. Their
+        // stable revision counterparts remain prompt seeds, and the session cache may restore
+        // completed plans after Git proves the parsed comparison is identical.
         self.ai_cache.clear();
         self.ai_drafts.clear();
         self.agent_owned_drafts.clear();
@@ -2145,6 +2408,7 @@ impl Dispatcher {
         self.analysis_queue.clear();
         self.diff_syntax.clear();
         self.diff_syntax_order.clear();
+        self.diff_syntax_attempted.clear();
         self.relation_cache.clear();
         self.relation_queue.clear();
         // Relations for the selected symbol are re-fetched in `on_analysis_done`, once the
@@ -2153,6 +2417,73 @@ impl Dispatcher {
         // rows describe the old state, so drop them: `build_impact` renders the lists as
         // Loading while a selection is set.
         self.selected_relations = None;
+    }
+
+    /// Save all completed plans from the current exact comparison before its epoch is retired.
+    fn stash_current_ai_plans(&mut self) {
+        if self.ai_cache.is_empty() || self.data_epoch != self.epoch {
+            return;
+        }
+        let Some(changeset) = self
+            .changeset
+            .as_ref()
+            .filter(|changeset| changeset.scope == self.scope)
+            .cloned()
+        else {
+            return;
+        };
+        match self.ai_session_cache.entry(self.scope) {
+            std::collections::hash_map::Entry::Occupied(mut entry)
+                if entry.get().changeset == changeset =>
+            {
+                entry.get_mut().plans.extend(self.ai_cache.clone());
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(ScopedAiPlans {
+                    changeset,
+                    plans: self.ai_cache.clone(),
+                });
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(ScopedAiPlans {
+                    changeset,
+                    plans: self.ai_cache.clone(),
+                });
+            }
+        }
+    }
+
+    /// Restore completed plans only after Git confirms the returning mode is unchanged.
+    fn restore_session_ai_plans(&mut self, changeset: &codescope_core::ChangeSet) {
+        let Some(saved) = self
+            .ai_session_cache
+            .get(&self.scope)
+            .filter(|saved| saved.changeset == *changeset)
+        else {
+            return;
+        };
+        self.ai_cache = saved.plans.clone();
+        for cached in self.ai_cache.values_mut() {
+            // Equality above includes every parsed hunk and canonical unified-diff section,
+            // so only the dispatcher epoch changed; the validated facts did not.
+            cached.plan.epoch = self.epoch;
+        }
+        self.ai_session_restored = self.ai_cache.keys().cloned().collect();
+        self.ai_drafts = self
+            .ai_cache
+            .iter()
+            .map(|(selection, cached)| (selection.clone(), DiagramDraft::from_plan(&cached.plan)))
+            .collect();
+    }
+
+    fn clear_session_ai_plans(&mut self) {
+        self.ai_session_cache.clear();
+        self.ai_session_restored.clear();
+        self.ai_cache.clear();
+        self.ai_drafts.clear();
+        self.agent_owned_drafts.clear();
+        self.agent_activity.clear();
+        self.ai_rows = None;
     }
 
     fn spawn_ai_job(&mut self, selection: AiSelectionKey) {
@@ -2452,10 +2783,14 @@ impl Dispatcher {
         file: String,
         result: Result<Box<codescope_analysis::FileSemanticResult>, String>,
     ) {
-        let selected_ai_file_changed = self
-            .current_ai_selection()
+        let selected_ai = self.current_ai_selection();
+        let selected_ai_file_changed = selected_ai
+            .as_ref()
             .and_then(|selection| selection.file().map(str::to_string))
             .is_some_and(|selected| selected == file);
+        let exact_session_plan_restored = selected_ai
+            .as_ref()
+            .is_some_and(|selection| self.ai_session_restored.contains(selection));
         // Ledger removal is epoch-exact: a stale completion never disturbs a newer job's
         // entry for the same path (review 18 M2).
         if self
@@ -2468,7 +2803,7 @@ impl Dispatcher {
         // Epoch + data-epoch gates: a refresh superseded this job or its inputs.
         if epoch != self.epoch || self.data_epoch != self.epoch {
             self.drain_analysis_queue();
-            self.schedule_selected_diff_syntax();
+            self.schedule_diff_syntax();
             return;
         }
         // The file must still be in the current changeset (scope switch can drop it).
@@ -2526,12 +2861,12 @@ impl Dispatcher {
                     .insert(file.clone(), FileSemanticState::Failed);
             }
         }
-        if selected_ai_file_changed {
+        if selected_ai_file_changed && !exact_session_plan_restored {
             // The deterministic Impact interpretation/symbol inventory changed while the
             // selection stayed put; its cached AI explanation is no longer current.
             self.retarget_ai_to_current_selection(true);
         }
-        self.schedule_selected_diff_syntax();
+        self.schedule_diff_syntax();
         self.publish();
         self.drain_analysis_queue();
     }
@@ -2636,6 +2971,9 @@ impl Dispatcher {
         // The git-fact bundle is now current: per-file analysis and AI digests may launch
         // against it. Replay expansion intent for files that survived the refresh.
         self.data_epoch = epoch;
+        if let Some(changeset) = self.changeset.clone() {
+            self.restore_session_ai_plans(&changeset);
+        }
         // Preserve expansion only for files that still exist. Independently schedule
         // every changed file so opening a row only reveals already-loading/ready symbols.
         if let Some(cs) = &self.changeset {
@@ -2677,6 +3015,7 @@ impl Dispatcher {
         self.file_semantics.clear();
         self.diff_syntax.clear();
         self.diff_syntax_order.clear();
+        self.diff_syntax_attempted.clear();
         self.ai_revision_cache.clear();
         self.abort_all_ai_requests();
         self.ai_failures.clear();
@@ -2862,6 +3201,7 @@ impl Dispatcher {
                 self.ai_revision_cache
                     .insert(AiRevisionKey::from(&selection), cached.clone());
                 if is_current_epoch {
+                    self.ai_session_restored.remove(&selection);
                     self.ai_cache.insert(selection.clone(), cached.clone());
                     self.ai_drafts.insert(selection.clone(), final_draft);
                     self.ai_failures.remove(&selection);
@@ -2957,6 +3297,9 @@ impl Dispatcher {
             agent_changeset: self.agent_changeset.clone(),
             agent_changeset_epoch: self.data_epoch,
             ai_summaries,
+            active_selection: self
+                .current_ai_selection()
+                .map(|selection| selection.summary_key()),
             diff,
             selected_diff: self.selected_diff_context.clone(),
             semantic,
@@ -3055,6 +3398,20 @@ impl Dispatcher {
             Some((file, name, _, _)) if *file == diff.title => Some(name.clone()),
             _ => None,
         };
+        diff.selection_focus_row =
+            self.selected_symbol
+                .as_ref()
+                .and_then(|(file, name, line, col)| {
+                    let FileSemanticState::Ready(result) = self.file_semantics.get(file)? else {
+                        return None;
+                    };
+                    let symbol = result.changed.iter().find(|symbol| {
+                        symbol.name == *name
+                            && symbol.selection.start_line == *line
+                            && symbol.selection.start_col == *col
+                    })?;
+                    symbol_diff_focus_row(&diff, symbol)
+                });
         diff.syntax = self
             .diff_syntax
             .get(&diff.title)
@@ -3889,11 +4246,93 @@ fn selected_diff(a: &codescope_core::ChangeSet, selected: Option<&str>) -> DiffP
         title: file.path.to_string(),
         // Set by the dispatcher, which owns the selection identity.
         focused_symbol: None,
+        selection_focus_row: None,
         rows,
         current_hunk: if hunk_no > 0 { 1 } else { 0 },
         total_hunks: hunk_no,
         syntax: std::sync::Arc::default(),
     }
+}
+
+/// Choose the first actual changed row owned by a selected LSP object. Hunk membership is the
+/// primary boundary; the symbol range distinguishes multiple objects mapped into one hunk.
+fn symbol_diff_focus_row(
+    diff: &DiffPane,
+    symbol: &codescope_analysis::ChangedSymbolInfo,
+) -> Option<usize> {
+    fn line_in_symbol(line: u32, symbol: &codescope_analysis::ChangedSymbolInfo) -> bool {
+        let zero_based = line.saturating_sub(1);
+        zero_based >= symbol.range.start_line && zero_based <= symbol.range.end_line
+    }
+
+    let target_hunk = symbol.record.hunks.first().map(|hunk| hunk.index);
+    if let Some(target_hunk) = target_hunk {
+        let mut current_hunk = None;
+        let mut header = None;
+        let mut first_changed = None;
+        let mut either_side_in_range = None;
+        for (index, row) in diff.rows.iter().enumerate() {
+            if matches!(row, DiffRow::HunkHeader(_)) {
+                current_hunk = Some(current_hunk.map_or(0, |hunk: u32| hunk.saturating_add(1)));
+                if current_hunk == Some(target_hunk) {
+                    header = Some(index);
+                } else if header.is_some() {
+                    break;
+                }
+                continue;
+            }
+            if current_hunk != Some(target_hunk) {
+                continue;
+            }
+            if matches!(row, DiffRow::Add { .. } | DiffRow::Del { .. }) {
+                first_changed.get_or_insert(index);
+            }
+            let preferred_line = match (symbol.revision, row) {
+                (codescope_core::Revision::Worktree, DiffRow::Add { new_ln, .. }) => Some(*new_ln),
+                (codescope_core::Revision::Base, DiffRow::Del { old_ln, .. }) => Some(*old_ln),
+                _ => None,
+            };
+            if preferred_line.is_some_and(|line| line_in_symbol(line, symbol)) {
+                return Some(index);
+            }
+            let changed_line = match row {
+                DiffRow::Add { new_ln, .. } => Some(*new_ln),
+                DiffRow::Del { old_ln, .. } => Some(*old_ln),
+                DiffRow::Context { .. } | DiffRow::HunkHeader(_) => None,
+            };
+            if either_side_in_range.is_none()
+                && changed_line.is_some_and(|line| line_in_symbol(line, symbol))
+            {
+                either_side_in_range = Some(index);
+            }
+        }
+        return either_side_in_range.or(first_changed).or(header);
+    }
+
+    // A tree-diff-only object may have no mapped hunk. Its identifier line is still a useful
+    // best-effort anchor among the changed rows in the file.
+    diff.rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            let line = match (symbol.revision, row) {
+                (codescope_core::Revision::Worktree, DiffRow::Add { new_ln, .. })
+                | (codescope_core::Revision::Worktree, DiffRow::Context { new_ln, .. }) => {
+                    Some(*new_ln)
+                }
+                (codescope_core::Revision::Base, DiffRow::Del { old_ln, .. })
+                | (codescope_core::Revision::Base, DiffRow::Context { old_ln, .. }) => {
+                    Some(*old_ln)
+                }
+                _ => None,
+            }?;
+            Some((
+                index,
+                line.saturating_sub(1).abs_diff(symbol.selection.start_line),
+            ))
+        })
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(index, _)| index)
 }
 
 /// The deterministic one-line interpretation of a changed symbol (spec §3.5). AI may
@@ -4411,9 +4850,13 @@ mod tests {
                 waiting_for_model: true,
             },
         );
+        let target_epoch = disp.epoch;
+        let target = selection.summary_key();
 
         disp.apply_agent_diagram(
             41,
+            target_epoch,
+            target.clone(),
             DiagramCommand::SetIntent {
                 intent: "Explain the selected change.".to_string(),
             },
@@ -4444,6 +4887,8 @@ mod tests {
 
         disp.apply_agent_diagram(
             42,
+            target_epoch,
+            target.clone(),
             DiagramCommand::SetIntent {
                 intent: " ".to_string(),
             },
@@ -4472,6 +4917,8 @@ mod tests {
 
         disp.reject_agent_diagram(
             43,
+            target_epoch,
+            target,
             "set_intent · form-1".to_string(),
             "diagram command is not valid shared editor JSON: unknown field `form_id`".to_string(),
         );
@@ -4485,6 +4932,77 @@ mod tests {
             snapshot.ai_activity.calls[3].state,
             AiToolCallActivityState::Failed
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn external_diagram_view_stays_pinned_when_human_navigates() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.ai_auto_generate = false;
+        disp.changeset = Some(two_file_changeset());
+        disp.agent_changeset = disp.changeset.clone().map(std::sync::Arc::new);
+        disp.data_epoch = disp.epoch;
+        disp.selected_file = Some("a.txt".to_string());
+        let captured = disp.current_ai_selection().unwrap().summary_key();
+        let captured_epoch = disp.epoch;
+
+        disp.on_selection_changed(Some("b.txt".to_string()), None);
+        assert_eq!(snapshot_rx.borrow().diff.title, "b.txt");
+
+        disp.apply_agent_diagram(
+            44,
+            captured_epoch,
+            captured.clone(),
+            DiagramCommand::SetIntent {
+                intent: "Explain the original file without moving the human.".to_string(),
+            },
+        );
+        {
+            let snapshot = snapshot_rx.borrow().clone();
+            assert_eq!(snapshot.diff.title, "b.txt");
+            assert_eq!(
+                snapshot.active_selection,
+                Some(AiSummaryKey::File("b.txt".to_string()))
+            );
+            assert!(snapshot.diagram_draft.is_none());
+            let result = snapshot.agent_diagram_result.unwrap();
+            assert_eq!(result.selection, captured);
+            assert_eq!(
+                result.draft.unwrap().intent,
+                "Explain the original file without moving the human."
+            );
+        }
+
+        disp.on_selection_changed(Some("a.txt".to_string()), None);
+        assert_eq!(
+            snapshot_rx
+                .borrow()
+                .diagram_draft
+                .as_ref()
+                .map(|draft| draft.intent.as_str()),
+            Some("Explain the original file without moving the human.")
+        );
+
+        // Recheck the epoch inside the dispatcher: a refresh can land after the socket has
+        // resolved the ID but before its queued action reaches this single writer.
+        disp.epoch = disp.epoch.next();
+        disp.apply_agent_diagram(
+            45,
+            captured_epoch,
+            captured,
+            DiagramCommand::SetIntent {
+                intent: "This stale edit must not land.".to_string(),
+            },
+        );
+        let result = snapshot_rx.borrow().agent_diagram_result.clone().unwrap();
+        assert!(!result.accepted);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("view_id is stale")));
+        assert!(result.draft.is_none());
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4885,6 +5403,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scope_switch_restores_exact_session_plans_until_manual_refresh() {
+        let root = scratch_repo();
+        let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        disp.ai_auto_generate = false;
+        let ctx = codescope_core::RepoContext {
+            toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
+            head: codescope_core::HeadState::Branch("feature".to_string()),
+            head_oid: None,
+            upstream: None,
+            base: None,
+        };
+        let branch = two_file_changeset();
+        disp.changeset = Some(branch.clone());
+        disp.data_epoch = disp.epoch;
+        disp.selected_file = Some("a.txt".to_string());
+        let selection = AiSelectionKey::File("a.txt".to_string());
+        let mut cached = cached_ai_plan("branch plan");
+        cached.plan.epoch = disp.epoch;
+        disp.ai_cache.insert(selection.clone(), cached.clone());
+        disp.ai_rows = Some((disp.epoch, selection.clone(), cached));
+
+        disp.handle(DispatchEvent::Work(Action::ScopeStaged)).await;
+        assert!(
+            disp.ai_cache.is_empty(),
+            "the unresolved scope never shows old rows"
+        );
+        assert!(disp.ai_session_cache.contains_key(&ChangeScope::Branch));
+        let staged = codescope_core::ChangeSet::new(ChangeScope::Staged, Vec::new());
+        disp.handle(DispatchEvent::ChangesetReady {
+            epoch: disp.epoch,
+            ctx: ctx.clone(),
+            changeset: staged,
+        })
+        .await;
+
+        disp.handle(DispatchEvent::Work(Action::ScopeBranch)).await;
+        disp.handle(DispatchEvent::ChangesetReady {
+            epoch: disp.epoch,
+            ctx: ctx.clone(),
+            changeset: {
+                let mut changed = branch.clone();
+                changed.files[0].hunks[0].lines[1] = codescope_core::DiffLine::add(1, "changed");
+                changed
+            },
+        })
+        .await;
+        assert!(
+            disp.ai_cache.is_empty(),
+            "a different diff in the same mode cannot inherit the saved plan"
+        );
+
+        disp.handle(DispatchEvent::Work(Action::ScopeStaged)).await;
+        disp.handle(DispatchEvent::ChangesetReady {
+            epoch: disp.epoch,
+            ctx: ctx.clone(),
+            changeset: codescope_core::ChangeSet::new(ChangeScope::Staged, Vec::new()),
+        })
+        .await;
+        disp.handle(DispatchEvent::Work(Action::ScopeBranch)).await;
+        disp.handle(DispatchEvent::ChangesetReady {
+            epoch: disp.epoch,
+            ctx: ctx.clone(),
+            changeset: branch.clone(),
+        })
+        .await;
+        let restored_epoch = disp.epoch;
+        assert_eq!(
+            disp.ai_cache
+                .get(&selection)
+                .map(|cached| cached.plan.epoch),
+            Some(restored_epoch),
+            "an exact returning comparison rebinds the completed plan to its new epoch"
+        );
+        let restored = snapshot_rx.borrow().clone();
+        assert!(restored.semantic.ai_generated);
+        assert_eq!(semantic_node_label(&restored), Some("branch plan"));
+
+        disp.handle(DispatchEvent::Work(Action::RefreshGit)).await;
+        assert!(
+            disp.ai_session_cache.is_empty(),
+            "g clears every scope's plans"
+        );
+        disp.handle(DispatchEvent::ChangesetReady {
+            epoch: disp.epoch,
+            ctx,
+            changeset: branch,
+        })
+        .await;
+        assert!(disp.ai_cache.is_empty());
+        assert!(snapshot_rx.borrow().semantic.plan.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn base_picker_loads_candidates() {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
@@ -5121,7 +5734,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_diff_syntax_cache_is_bounded() {
+    async fn diff_syntax_first_view_precedes_background_and_shares_its_cache() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let changeset = two_file_changeset();
+        for file in &changeset.files {
+            disp.file_semantics
+                .insert(file.path.to_string(), FileSemanticState::Failed);
+        }
+
+        // Even an earlier background attempt cannot suppress first-view demand after eviction.
+        disp.diff_syntax_attempted.insert("b.txt".to_string());
+        let work = disp
+            .next_diff_syntax_work(&changeset.files, Some("b.txt"))
+            .expect("selected file should claim the shared syntax lane");
+        assert!(matches!(
+            work,
+            DiffSyntaxWork::Query(file) if file.path.as_str() == "b.txt"
+        ));
+
+        // Once that demand result is cached, the same lane advances background population.
+        disp.cache_diff_syntax("b.txt".to_string(), codescope_core::DiffSyntax::default());
+        let work = disp
+            .next_diff_syntax_work(&changeset.files, Some("b.txt"))
+            .expect("uncached background file should follow");
+        assert!(matches!(
+            work,
+            DiffSyntaxWork::Query(file) if file.path.as_str() == "a.txt"
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn diff_syntax_background_runs_while_selected_analysis_loads() {
+        let root = scratch_repo();
+        let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+        let changeset = two_file_changeset();
+        disp.file_semantics
+            .insert("a.txt".to_string(), FileSemanticState::Failed);
+        disp.file_semantics
+            .insert("b.txt".to_string(), FileSemanticState::Loading);
+
+        let work = disp
+            .next_diff_syntax_work(&changeset.files, Some("b.txt"))
+            .expect("ready background file should use idle capacity");
+        assert!(matches!(
+            work,
+            DiffSyntaxWork::Query(file) if file.path.as_str() == "a.txt"
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn diff_syntax_cache_and_background_attempts_are_bounded() {
         let root = scratch_repo();
         let (mut disp, _snapshot_rx, _job_rx) = dispatcher_for(&root).await;
         for index in 0..=Dispatcher::MAX_DIFF_SYNTAX_CACHE {
@@ -5136,6 +5801,26 @@ mod tests {
             "src/file-{}.rs",
             Dispatcher::MAX_DIFF_SYNTAX_CACHE
         )));
+
+        let changeset = two_file_changeset();
+        disp.diff_syntax.clear();
+        disp.diff_syntax_order.clear();
+        disp.diff_syntax_attempted = (0..Dispatcher::MAX_DIFF_SYNTAX_CACHE)
+            .map(|index| format!("src/attempt-{index}.rs"))
+            .collect();
+        disp.file_semantics
+            .insert("a.txt".to_string(), FileSemanticState::Failed);
+        assert!(
+            disp.next_diff_syntax_work(&changeset.files, None).is_none(),
+            "background prefetch stops at the cache bound"
+        );
+        assert!(
+            matches!(
+                disp.next_diff_syntax_work(&changeset.files, Some("a.txt")),
+                Some(DiffSyntaxWork::Query(file)) if file.path.as_str() == "a.txt"
+            ),
+            "first-view demand bypasses the background bound"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -5429,6 +6114,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lsp_object_focus_row_uses_its_mapped_hunk_and_range() {
+        use codescope_core::{ChangeSet, DiffLine, FileChange, FileStatus, Hunk};
+
+        let changeset = ChangeSet::new(
+            ChangeScope::Branch,
+            vec![FileChange {
+                path: "a.txt".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                hunks: vec![
+                    Hunk {
+                        old_start: 3,
+                        old_len: 1,
+                        new_start: 3,
+                        new_len: 1,
+                        section: Some("first".to_string()),
+                        lines: vec![DiffLine::del(3, "old first"), DiffLine::add(3, "new first")],
+                    },
+                    Hunk {
+                        old_start: 20,
+                        old_len: 1,
+                        new_start: 20,
+                        new_len: 1,
+                        section: Some("second".to_string()),
+                        lines: vec![
+                            DiffLine::del(20, "old second"),
+                            DiffLine::add(20, "new second"),
+                        ],
+                    },
+                ],
+                binary: false,
+            }],
+        );
+        let diff = selected_diff(&changeset, Some("a.txt"));
+        let mut second = changed_symbol(
+            "a.txt",
+            "second",
+            codescope_core::SymbolKind::Function,
+            codescope_core::ChangeKind::Modified,
+            0,
+            false,
+        );
+        second.range = codescope_core::LineRange::new(19, 0, 30, 0);
+        second.selection = codescope_core::LineRange::new(19, 0, 19, 6);
+        second.record.hunks = vec![codescope_core::HunkId {
+            file: "a.txt".into(),
+            index: 1,
+        }];
+
+        assert_eq!(symbol_diff_focus_row(&diff, &second), Some(5));
+    }
+
     /// An asynchronous per-file cache entry wrapping `changed` symbols (the post-redesign home
     /// of what `analysis_with` used to carry for the impact pane).
     fn ready_semantics(
@@ -5702,6 +6440,11 @@ mod tests {
             snap.diff.focused_symbol.as_deref(),
             Some("sym0"),
             "the diff pane publishes the selected symbol's label"
+        );
+        assert_eq!(
+            snap.diff.selection_focus_row,
+            Some(1),
+            "the selected LSP object publishes its first mapped changed row"
         );
         assert_eq!(snap.impact.callers.state, ImpactLoadState::Unavailable);
         assert_eq!(snap.impact.downstream.state, ImpactLoadState::Unavailable);

@@ -1,11 +1,10 @@
 //! Content-aware review marks for the changed-files hierarchy.
 //!
-//! Files retain an explicit mark only while their parsed Git change is identical. A directory
-//! mark captures the exact revisions below it at that moment, so it can continue to cover
-//! unchanged descendants without accidentally reviewing new or edited work. Removing that
-//! directory mark never rewrites explicit child marks.
+//! Files and LSP symbols retain explicit marks only while their parsed Git change is identical.
+//! A directory or file mark overrides its current descendants without rewriting their independent
+//! marks, so removing the parent mark reveals the child state that existed underneath it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use codescope_core::ChangeScope;
 use sha2::{Digest, Sha256};
@@ -20,14 +19,23 @@ pub enum ReviewTarget {
     Directory(String),
     /// A changed repo-relative file.
     File(String),
+    /// A changed language-server object nested beneath its owning file.
+    Symbol {
+        /// Repo-relative owning file.
+        file: String,
+        /// Display name published by the language server.
+        name: String,
+        /// Optional identifier position used to disambiguate repeated names.
+        position: Option<(u32, u32)>,
+    },
 }
 
-/// Effective review state rendered beside a file or directory.
+/// Effective review state rendered beside a directory, file, or language-server object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewState {
     /// This entity has its own explicit review mark.
     Explicit,
-    /// Every descendant is covered by an ancestor directory mark.
+    /// This entity is covered by an explicit ancestor mark.
     Inherited,
     /// Every descendant is reviewed, but through child-level marks.
     Reviewed,
@@ -54,7 +62,8 @@ impl ReviewState {
 /// Effective changed-file review totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReviewProgress {
-    /// Files whose current revisions are explicitly or hierarchically reviewed.
+    /// Files whose current revisions are explicitly or hierarchically reviewed, including files
+    /// completed through all of their LSP objects.
     pub reviewed: usize,
     /// Changed files in the currently displayed snapshot.
     pub total: usize,
@@ -70,10 +79,21 @@ struct ComparisonKey {
     base: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SymbolKey {
+    file: String,
+    name: String,
+    position: Option<(u32, u32)>,
+}
+
 #[derive(Debug, Default)]
 struct ComparisonReview {
     revisions: HashMap<String, String>,
     explicit_files: HashMap<String, String>,
+    /// Current LSP objects by file. Inventories update only when that file is semantically ready.
+    symbols: HashMap<String, HashSet<SymbolKey>>,
+    /// Symbol marks retain the owning file revision so changed content invalidates them.
+    explicit_symbols: HashMap<SymbolKey, String>,
     /// Each directory stores the exact file revisions covered when it was marked.
     directory_coverage: HashMap<String, HashMap<String, String>>,
 }
@@ -104,6 +124,9 @@ impl ReviewLedger {
         }
         let key = comparison_key(snapshot);
         if self.last_source.as_ref() == Some(&(key.clone(), snapshot.agent_changeset_epoch)) {
+            if let Some(review) = self.comparisons.get_mut(&key) {
+                sync_symbols(review, snapshot);
+            }
             self.active = Some(key);
             return;
         }
@@ -160,6 +183,7 @@ impl ReviewLedger {
             !coverage.is_empty()
         });
         review.revisions = revisions;
+        sync_symbols(review, snapshot);
         self.active = Some(key.clone());
         self.last_source = Some((key, snapshot.agent_changeset_epoch));
     }
@@ -178,6 +202,32 @@ impl ReviewLedger {
                     review.explicit_files.remove(path);
                 } else {
                     review.explicit_files.insert(path.clone(), revision);
+                }
+            }
+            ReviewTarget::Symbol {
+                file,
+                name,
+                position,
+            } => {
+                let key = SymbolKey {
+                    file: file.clone(),
+                    name: name.clone(),
+                    position: *position,
+                };
+                if !review
+                    .symbols
+                    .get(file)
+                    .is_some_and(|symbols| symbols.contains(&key))
+                {
+                    return;
+                }
+                let Some(revision) = review.revisions.get(file).cloned() else {
+                    return;
+                };
+                if review.explicit_symbols.get(&key) == Some(&revision) {
+                    review.explicit_symbols.remove(&key);
+                } else {
+                    review.explicit_symbols.insert(key, revision);
                 }
             }
             ReviewTarget::Directory(directory) => {
@@ -209,6 +259,11 @@ impl ReviewLedger {
         match target {
             ReviewTarget::File(path) => self.file_state(path),
             ReviewTarget::Directory(directory) => self.directory_state(directory),
+            ReviewTarget::Symbol {
+                file,
+                name,
+                position,
+            } => self.symbol_state(file, name, *position),
         }
     }
 
@@ -243,13 +298,52 @@ impl ReviewLedger {
         };
         if review.explicit_files.get(path) == Some(revision) {
             ReviewState::Explicit
-        } else if directory_prefixes(path).iter().any(|directory| {
-            review
-                .directory_coverage
-                .get(directory)
-                .and_then(|coverage| coverage.get(path))
-                == Some(revision)
-        }) {
+        } else if has_directory_override(review, path, revision) {
+            ReviewState::Inherited
+        } else {
+            let Some(symbols) = review
+                .symbols
+                .get(path)
+                .filter(|symbols| !symbols.is_empty())
+            else {
+                return ReviewState::Unreviewed;
+            };
+            let reviewed = symbols
+                .iter()
+                .filter(|symbol| is_symbol_explicit(review, symbol, revision))
+                .count();
+            match reviewed {
+                0 => ReviewState::Unreviewed,
+                count if count == symbols.len() => ReviewState::Reviewed,
+                _ => ReviewState::Partial,
+            }
+        }
+    }
+
+    fn symbol_state(&self, file: &str, name: &str, position: Option<(u32, u32)>) -> ReviewState {
+        let Some(review) = self.active_review() else {
+            return ReviewState::Unreviewed;
+        };
+        let Some(revision) = review.revisions.get(file) else {
+            return ReviewState::Unreviewed;
+        };
+        let symbol = SymbolKey {
+            file: file.to_string(),
+            name: name.to_string(),
+            position,
+        };
+        if !review
+            .symbols
+            .get(file)
+            .is_some_and(|symbols| symbols.contains(&symbol))
+        {
+            return ReviewState::Unreviewed;
+        }
+        if is_symbol_explicit(review, &symbol, revision) {
+            ReviewState::Explicit
+        } else if review.explicit_files.get(file) == Some(revision)
+            || has_directory_override(review, file, revision)
+        {
             ReviewState::Inherited
         } else {
             ReviewState::Unreviewed
@@ -344,14 +438,71 @@ fn is_file_reviewed(review: &ComparisonReview, path: &str) -> bool {
     let Some(revision) = review.revisions.get(path) else {
         return false;
     };
-    review.explicit_files.get(path) == Some(revision)
-        || directory_prefixes(path).iter().any(|directory| {
-            review
-                .directory_coverage
-                .get(directory)
-                .and_then(|coverage| coverage.get(path))
-                == Some(revision)
-        })
+    if review.explicit_files.get(path) == Some(revision)
+        || has_directory_override(review, path, revision)
+    {
+        return true;
+    }
+    review.symbols.get(path).is_some_and(|symbols| {
+        !symbols.is_empty()
+            && symbols
+                .iter()
+                .all(|symbol| is_symbol_explicit(review, symbol, revision))
+    })
+}
+
+fn has_directory_override(review: &ComparisonReview, path: &str, revision: &str) -> bool {
+    directory_prefixes(path).iter().any(|directory| {
+        review
+            .directory_coverage
+            .get(directory)
+            .and_then(|coverage| coverage.get(path))
+            .is_some_and(|covered| covered == revision)
+    })
+}
+
+fn is_symbol_explicit(review: &ComparisonReview, symbol: &SymbolKey, revision: &str) -> bool {
+    review
+        .explicit_symbols
+        .get(symbol)
+        .is_some_and(|marked| marked == revision)
+}
+
+fn sync_symbols(review: &mut ComparisonReview, snapshot: &UiSnapshot) {
+    review
+        .symbols
+        .retain(|path, _| snapshot.files.iter().any(|file| file.path == *path));
+    for file in &snapshot.files {
+        match file.semantic {
+            crate::snapshot::FileSemanticLoad::Ready => {
+                review.symbols.insert(
+                    file.path.clone(),
+                    file.symbols
+                        .iter()
+                        .map(|symbol| SymbolKey {
+                            file: file.path.clone(),
+                            name: symbol.name.clone(),
+                            position: symbol.position,
+                        })
+                        .collect(),
+                );
+            }
+            crate::snapshot::FileSemanticLoad::Unsupported => {
+                review.symbols.remove(&file.path);
+            }
+            crate::snapshot::FileSemanticLoad::Unloaded
+            | crate::snapshot::FileSemanticLoad::Loading
+            | crate::snapshot::FileSemanticLoad::Failed => {}
+        }
+    }
+    let revisions = &review.revisions;
+    let symbols = &review.symbols;
+    review.explicit_symbols.retain(|symbol, revision| {
+        revisions.get(&symbol.file) == Some(revision)
+            && symbols
+                .get(&symbol.file)
+                .is_some_and(|current| current.contains(symbol))
+    });
 }
 
 #[cfg(test)]
@@ -361,7 +512,7 @@ mod tests {
     use codescope_core::{ChangeSet, Epoch, FileChange, FileStatus, UnifiedDiffSection};
 
     use super::*;
-    use crate::snapshot::{FileRow, FileSemanticLoad};
+    use crate::snapshot::{FileRow, FileSemanticLoad, SymbolRow};
 
     fn snapshot(files: &[(&str, &str)], epoch: u64) -> UiSnapshot {
         let rows = files
@@ -404,6 +555,152 @@ mod tests {
             base_ref: "main".to_string(),
             ..UiSnapshot::default()
         }
+    }
+
+    fn with_symbols(mut snapshot: UiSnapshot, file: &str, names: &[&str]) -> UiSnapshot {
+        let row = snapshot
+            .files
+            .iter_mut()
+            .find(|row| row.path == file)
+            .expect("symbol owner");
+        row.symbols = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| SymbolRow {
+                name: (*name).to_string(),
+                change: "modified",
+                confidence: "",
+                has_diagnostic: false,
+                position: Some((index as u32 + 1, 0)),
+            })
+            .collect();
+        row.changed_symbol_count = row.symbols.len();
+        row.expanded = true;
+        row.semantic = FileSemanticLoad::Ready;
+        snapshot
+    }
+
+    fn symbol(file: &str, name: &str, line: u32) -> ReviewTarget {
+        ReviewTarget::Symbol {
+            file: file.to_string(),
+            name: name.to_string(),
+            position: Some((line, 0)),
+        }
+    }
+
+    #[test]
+    fn lsp_objects_roll_up_to_files_without_losing_independent_marks() {
+        let snap = with_symbols(snapshot(&[("x/a.rs", "a1")], 1), "x/a.rs", &["one", "two"]);
+        let mut ledger = ReviewLedger::default();
+        ledger.sync(&snap);
+
+        ledger.toggle(&symbol("x/a.rs", "one", 1));
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "one", 1)),
+            ReviewState::Explicit
+        );
+        assert_eq!(
+            ledger.state(&ReviewTarget::File("x/a.rs".into())),
+            ReviewState::Partial
+        );
+        assert_eq!(ledger.progress(1).reviewed, 0);
+
+        ledger.toggle(&ReviewTarget::File("x/a.rs".into()));
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "one", 1)),
+            ReviewState::Explicit,
+            "an explicit object mark remains distinguishable under a file override"
+        );
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "two", 2)),
+            ReviewState::Inherited
+        );
+
+        ledger.toggle(&ReviewTarget::File("x/a.rs".into()));
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "one", 1)),
+            ReviewState::Explicit
+        );
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "two", 2)),
+            ReviewState::Unreviewed
+        );
+
+        ledger.toggle(&symbol("x/a.rs", "two", 2));
+        assert_eq!(
+            ledger.state(&ReviewTarget::File("x/a.rs".into())),
+            ReviewState::Reviewed
+        );
+        assert_eq!(
+            ledger.state(&ReviewTarget::Directory("x".into())),
+            ReviewState::Reviewed
+        );
+        assert_eq!(ledger.progress(1).reviewed, 1);
+    }
+
+    #[test]
+    fn directory_override_covers_lsp_objects_without_rewriting_them() {
+        let snap = with_symbols(snapshot(&[("x/a.rs", "a1")], 1), "x/a.rs", &["one", "two"]);
+        let mut ledger = ReviewLedger::default();
+        ledger.sync(&snap);
+        ledger.toggle(&symbol("x/a.rs", "one", 1));
+
+        ledger.toggle(&ReviewTarget::Directory("x".into()));
+        assert_eq!(
+            ledger.state(&ReviewTarget::File("x/a.rs".into())),
+            ReviewState::Inherited
+        );
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "one", 1)),
+            ReviewState::Explicit
+        );
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "two", 2)),
+            ReviewState::Inherited
+        );
+
+        ledger.toggle(&ReviewTarget::Directory("x".into()));
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "one", 1)),
+            ReviewState::Explicit
+        );
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "two", 2)),
+            ReviewState::Unreviewed
+        );
+        assert_eq!(
+            ledger.state(&ReviewTarget::File("x/a.rs".into())),
+            ReviewState::Partial
+        );
+    }
+
+    #[test]
+    fn same_epoch_lsp_arrival_registers_reviewable_objects() {
+        let loading = snapshot(&[("x/a.rs", "a1")], 1);
+        let ready = with_symbols(loading.clone(), "x/a.rs", &["run"]);
+        let mut ledger = ReviewLedger::default();
+        ledger.sync(&loading);
+        ledger.sync(&ready);
+        ledger.toggle(&symbol("x/a.rs", "run", 1));
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "run", 1)),
+            ReviewState::Explicit
+        );
+    }
+
+    #[test]
+    fn changed_file_content_invalidates_its_lsp_object_marks() {
+        let initial = with_symbols(snapshot(&[("x/a.rs", "a1")], 1), "x/a.rs", &["run"]);
+        let changed = with_symbols(snapshot(&[("x/a.rs", "a2")], 2), "x/a.rs", &["run"]);
+        let mut ledger = ReviewLedger::default();
+        ledger.sync(&initial);
+        ledger.toggle(&symbol("x/a.rs", "run", 1));
+
+        ledger.sync(&changed);
+        assert_eq!(
+            ledger.state(&symbol("x/a.rs", "run", 1)),
+            ReviewState::Unreviewed
+        );
     }
 
     #[test]

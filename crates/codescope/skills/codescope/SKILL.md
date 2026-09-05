@@ -17,6 +17,8 @@ codescope agent . context
 
 Successful live commands return `{protocol_version, ok, result}`. Treat `result.repository.root`, `result.live.epoch`, `result.live.scope`, `result.live.selection`, `result.changed_tree`, `result.focused_diff.selected`, and the current `result.ai.draft`/`result.ai.plan` as authoritative live state. A selected diff excerpt is an attention anchor, not complete evidence.
 
+Capture the non-null `result.view_id` immediately and keep it as `VIEW_ID` for this task. It names the exact directory/file/symbol selection and captured diff in this repository epoch. Human navigation after `context` does not retarget it, so do not replace it by rereading `context` merely because the visible viewport moved. If `view_id` is null, the comparison is not ready or has no selectable target; wait for a current context before doing selection-scoped work. In the examples below, `$VIEW_ID` means the captured literal; substitute it directly when shell variables do not persist between host-tool calls.
+
 If the user asks to change focus, use an exact directory, file, or loaded symbol from `context`, then read context again because focus is asynchronous:
 
 ```bash
@@ -24,6 +26,8 @@ codescope agent . focus --directory crates/codescope
 codescope agent . focus --file crates/codescope/src/main.rs --symbol main
 codescope agent . context
 ```
+
+After an intentional `focus`, capture the new context's `result.view_id`. Focus is the only command in this workflow that deliberately changes the human's viewport.
 
 Handle connection failures according to their cause:
 
@@ -44,8 +48,8 @@ Do not modify the repository merely because this skill is active. Repository wri
 Use CodeScope's captured diff after research to translate conclusions into validator-compatible citations. Omit `--file` to use the focused file, or pass any exact changed path from `changed_tree` without moving the TUI selection:
 
 ```bash
-codescope agent . diff --file crates/codescope/src/main.rs
-codescope agent . diff --file crates/codescope/src/main.rs --hunk 0
+codescope agent . diff --view-id "$VIEW_ID" --file crates/codescope/src/main.rs
+codescope agent . diff --view-id "$VIEW_ID" --file crates/codescope/src/main.rs --hunk 0
 ```
 
 The overview returns zero-based hunk ids. A hunk response returns exact one-based `old_line` and `new_line` coordinates. Use `side: "old"` for deleted lines and `side: "new"` for added or post-change context. Use `--offset N` to page a hunk when `next_offset` is present.
@@ -58,16 +62,16 @@ For file or symbol selections, cite that selected file; for a directory selectio
 Inspect before editing, especially when revising an existing draft:
 
 ```bash
-codescope agent . diagram inspect
+codescope agent . diagram inspect --view-id "$VIEW_ID"
 codescope agent . diagram schema
 ```
 
 `diagram schema` returns the exact `edit_visualization` and `inspect_visualization` schemas used by CodeScope's internal harness. Apply one `edit_visualization` command at a time:
 
 ```bash
-codescope agent . diagram edit '{"op":"set_intent","intent":"Show how the request crosses the queue boundary."}'
-codescope agent . diagram edit '{"op":"create_form","form_id":"main","kind":"sequence"}'
-codescope agent . diagram edit '{"op":"create_node","form_id":"main","node":{"id":"n1","label":"Queue request","detail":"Adds the request to the worker queue","code_refs":[{"file":"src/api.rs","hunk":0,"side":"new","start_line":42,"end_line":43}],"change":"added"}}'
+codescope agent . diagram edit --view-id "$VIEW_ID" '{"op":"set_intent","intent":"Show how the request crosses the queue boundary."}'
+codescope agent . diagram edit --view-id "$VIEW_ID" '{"op":"create_form","form_id":"main","kind":"sequence"}'
+codescope agent . diagram edit --view-id "$VIEW_ID" '{"op":"create_node","form_id":"main","node":{"id":"n1","label":"Queue request","detail":"Adds the request to the worker queue","code_refs":[{"file":"src/api.rs","hunk":0,"side":"new","start_line":42,"end_line":43}],"change":"added"}}'
 ```
 
 Edits are synchronous. Read `result.accepted`, `result.error`, `result.revision`, and `result.draft` before issuing the next edit. Use stable form/node ids from that draft rather than guessing them.
@@ -77,9 +81,11 @@ Prefer the smallest visual that makes the changed behavior clearer: normally one
 When the draft is complete:
 
 ```bash
-codescope agent . diagram finish
+codescope agent . diagram finish --view-id "$VIEW_ID"
 ```
 
-Finish is synchronous. Success returns `result.published: true` with the validated plan. On rejection, use `result.error`, `result.validation`, and `result.draft` to make only the needed correction, then finish again. If the epoch or selection changed during research, stop and read `context` before editing further.
+Finish is synchronous. Success returns `result.published: true` with the validated plan. On rejection, use `result.error`, `result.validation`, and `result.draft` to make only the needed correction, then finish again.
 
-Use `codescope agent . refresh` only when the user wants CodeScope to rescan Git and analysis state. It remains asynchronous; observe `result.live.refreshing` and `result.live.epoch` through `context`.
+If a command says `view_id is stale`, a refresh or comparison change invalidated the captured view. Stop rather than silently applying the work to the new visible selection. Read `context`; continue with its new ID only when its exact selection still matches the user's requested target, otherwise report that the original view was invalidated and needs to be selected again.
+
+Use `codescope agent . refresh` only when the user wants CodeScope to rescan Git and analysis state. It remains asynchronous; observe `result.live.refreshing` and `result.live.epoch` through `context`. Refresh invalidates the saved `VIEW_ID`.
