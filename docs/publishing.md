@@ -21,25 +21,18 @@ cargo package --workspace --no-verify
 Full package verification of a dependent crate becomes possible only after that crate's internal
 dependencies have been published.
 
-## Publish in dependency order
+## Publish
 
-For `0.1.0-alpha.1`, publish in these layers:
+The publishing script releases each crate in dependency order and waits for crates.io index
+propagation before continuing:
 
 ```bash
-cargo publish -p codescope-core
-cargo publish -p codescope-telemetry
-
-cargo publish -p codescope-git
-cargo publish -p codescope-lsp
-cargo publish -p codescope-testutil
-
-cargo publish -p codescope-ai
-cargo publish -p codescope-analysis
-cargo publish -p codescope-tui
-
-cargo publish -p codescope
+./scripts/publish.sh
 ```
 
-Wait for crates.io index propagation between each blank-line-separated layer. Before a later
-release, update `workspace.package.version` and every version in `workspace.dependencies`
-together, then regenerate `Cargo.lock`.
+It requires typing `publish` before the first upload. Use `./scripts/publish.sh --yes` only for an
+intentional non-interactive release. The script is resumable: packages already published at the
+workspace version are skipped.
+
+Before a later release, update `workspace.package.version` and every version in
+`workspace.dependencies` together, then regenerate `Cargo.lock`.
