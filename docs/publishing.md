@@ -23,16 +23,12 @@ dependencies have been published.
 
 ## Publish
 
-The publishing script releases each crate in dependency order and waits for crates.io index
-propagation before continuing:
+Cargo publishes the workspace crates in dependency order and waits for each upload to appear in
+the registry index before continuing:
 
 ```bash
-./scripts/publish.sh
+cargo publish --locked --workspace
 ```
-
-It requires typing `publish` before the first upload. Use `./scripts/publish.sh --yes` only for an
-intentional non-interactive release. The script is resumable: packages already published at the
-workspace version are skipped.
 
 Before a later release, update `workspace.package.version` and every version in
 `workspace.dependencies` together, then regenerate `Cargo.lock`.
