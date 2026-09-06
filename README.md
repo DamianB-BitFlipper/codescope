@@ -27,7 +27,7 @@ Git-only fallback.
 Codescope requires Rust 1.85 or newer. Install the prerelease from crates.io:
 
 ```bash
-cargo install codescope --version 0.1.0-alpha.1 --locked
+cargo install codescope --version 0.1.0-alpha.2 --locked
 ```
 
 Or install the latest source checkout:
