@@ -84,8 +84,19 @@ struct DiffViewportAnchor {
 struct SelectionViewState {
     diagram: crate::diagram::DiagramState,
     generated_scroll: usize,
+    generated_scroll_mode: GeneratedScrollMode,
     diff_anchor: DiffViewportAnchor,
     diff_hscroll: u16,
+}
+
+/// Whether the generated pane owns a fixed viewport or follows a growing AI activity tail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum GeneratedScrollMode {
+    /// Keep the newest tool activity visible as rows are appended.
+    #[default]
+    FollowTail,
+    /// Preserve the user's explicit scroll position while new activity arrives.
+    Detached,
 }
 
 /// Owns the active selection identity and every saved composite viewport state.
@@ -217,6 +228,10 @@ pub struct App {
     pub zoomed: bool,
     /// Vertical scroll offset of the generated Impact rows.
     pub ai_plan_scroll: usize,
+    /// Scroll behavior for the generated pane, retained with the selection viewport.
+    generated_scroll_mode: GeneratedScrollMode,
+    /// Width-dependent maximum from the last rendered generated viewport.
+    ai_plan_max_scroll: usize,
     /// Generated-plan node currently under the mouse. This is transient view state and
     /// drives both node emphasis and linked diff-row highlighting.
     pub hovered_plan_node: Option<PlanNodeTarget>,
@@ -325,6 +340,7 @@ impl App {
         SelectionViewState {
             diagram: self.diagram.clone(),
             generated_scroll: self.ai_plan_scroll,
+            generated_scroll_mode: self.generated_scroll_mode,
             diff_anchor: self.diff_viewport_anchor(),
             diff_hscroll: self.diff_hscroll,
         }
@@ -333,6 +349,8 @@ impl App {
     fn apply_selection_view(&mut self, restored: SelectionViewState) {
         self.diagram = restored.diagram;
         self.ai_plan_scroll = restored.generated_scroll;
+        self.generated_scroll_mode = restored.generated_scroll_mode;
+        self.ai_plan_max_scroll = 0;
         self.set_diff_viewport_anchor(restored.diff_anchor);
         self.diff_hscroll = restored.diff_hscroll;
     }
@@ -405,6 +423,16 @@ impl App {
             if let Some(plan) = self.snapshot.semantic.plan.as_ref() {
                 self.diagram.sync_plan(plan);
             }
+        }
+        if activity_started && !selection_retargeted {
+            self.generated_scroll_mode = GeneratedScrollMode::FollowTail;
+        }
+        if self.showing_ai_activity()
+            && self.generated_scroll_mode == GeneratedScrollMode::FollowTail
+        {
+            // The physical bottom depends on pane height and wrapped error rows. Rendering
+            // clamps this sentinel, then `sync_generated_viewport` retains the exact result.
+            self.ai_plan_scroll = usize::MAX;
         }
         if impact_retargeted {
             self.callers_scroll = 0;
@@ -878,8 +906,28 @@ impl App {
 
     fn scroll_ai_plan(&mut self, delta: i32) {
         const MAX_GENERATED_SCROLL: usize = 10_000;
-        if self.snapshot.semantic.plan.is_none() && self.snapshot.impact.selected_change.is_none() {
+        if !self.showing_ai_activity()
+            && self.snapshot.semantic.plan.is_none()
+            && self.snapshot.impact.selected_change.is_none()
+        {
             self.ai_plan_scroll = 0;
+            return;
+        }
+        if self.showing_ai_activity() {
+            let current = self.ai_plan_scroll.min(self.ai_plan_max_scroll);
+            let next = if delta < 0 {
+                current.saturating_sub(delta.unsigned_abs() as usize)
+            } else {
+                current
+                    .saturating_add(delta as usize)
+                    .min(self.ai_plan_max_scroll)
+            };
+            if next < current {
+                self.generated_scroll_mode = GeneratedScrollMode::Detached;
+            } else if delta > 0 && next == self.ai_plan_max_scroll {
+                self.generated_scroll_mode = GeneratedScrollMode::FollowTail;
+            }
+            self.ai_plan_scroll = next;
             return;
         }
         if delta < 0 {
@@ -895,6 +943,18 @@ impl App {
     }
 
     fn scroll_ai_plan_to(&mut self, pos: usize) {
+        if self.showing_ai_activity() {
+            if pos == usize::MAX {
+                self.generated_scroll_mode = GeneratedScrollMode::FollowTail;
+                self.ai_plan_scroll = self.ai_plan_max_scroll;
+            } else {
+                self.ai_plan_scroll = pos.min(self.ai_plan_max_scroll);
+                if self.ai_plan_scroll < self.ai_plan_max_scroll {
+                    self.generated_scroll_mode = GeneratedScrollMode::Detached;
+                }
+            }
+            return;
+        }
         self.ai_plan_scroll = if self.snapshot.semantic.plan.is_some()
             || self.snapshot.impact.selected_change.is_some()
         {
@@ -931,6 +991,13 @@ impl App {
             ScrollRegionId::Downstream => self.downstream_scroll = offset,
             ScrollRegionId::GeneratedImpact => {
                 self.ai_plan_scroll = offset;
+                if self.showing_ai_activity() {
+                    self.generated_scroll_mode = if offset >= self.ai_plan_max_scroll {
+                        GeneratedScrollMode::FollowTail
+                    } else {
+                        GeneratedScrollMode::Detached
+                    };
+                }
                 self.set_plan_hover(None);
             }
         }
@@ -1235,7 +1302,10 @@ impl App {
         self.base_sel = self
             .base_sel
             .min(self.filtered_bases().len().saturating_sub(1));
-        if self.snapshot.semantic.plan.is_none() && self.snapshot.impact.selected_change.is_none() {
+        if !self.showing_ai_activity()
+            && self.snapshot.semantic.plan.is_none()
+            && self.snapshot.impact.selected_change.is_none()
+        {
             self.ai_plan_scroll = 0;
         } else {
             self.ai_plan_scroll = self.ai_plan_scroll.min(10_000);
@@ -1246,6 +1316,32 @@ impl App {
         self.downstream_scroll = self
             .downstream_scroll
             .min(self.snapshot.impact.downstream.rows.len().saturating_sub(1));
+    }
+
+    fn showing_ai_activity(&self) -> bool {
+        self.snapshot.ai_activity.active
+            && !(self.snapshot.semantic.ai_generated
+                && self.snapshot.semantic.plan.is_some()
+                && matches!(self.snapshot.ai, codescope_core::AiStatus::Ready { .. }))
+    }
+
+    /// Reconcile the generated viewport with the exact width/height-dependent bounds used by
+    /// the last frame. This turns follow-tail's temporary sentinel into a usable keyboard offset.
+    pub(crate) fn sync_generated_viewport(&mut self, rendered_scroll: usize, max_scroll: usize) {
+        self.ai_plan_max_scroll = max_scroll;
+        self.ai_plan_scroll = if self.ai_activity_follows_tail() {
+            max_scroll
+        } else {
+            rendered_scroll.min(max_scroll)
+        };
+        if self.showing_ai_activity() && self.ai_plan_scroll == max_scroll {
+            self.generated_scroll_mode = GeneratedScrollMode::FollowTail;
+        }
+    }
+
+    /// Whether new AI activity will keep the generated viewport pinned to its tail.
+    pub(crate) fn ai_activity_follows_tail(&self) -> bool {
+        self.showing_ai_activity() && self.generated_scroll_mode == GeneratedScrollMode::FollowTail
     }
 }
 
@@ -2024,6 +2120,39 @@ mod tests {
         app
     }
 
+    fn ai_activity_snap(call_count: usize) -> UiSnapshot {
+        UiSnapshot {
+            ai: AiStatus::Loading {
+                since_epoch: Epoch(1),
+            },
+            ai_activity: crate::snapshot::AiActivity {
+                active: true,
+                waiting_for_model: false,
+                calls: (0..call_count)
+                    .map(|index| crate::snapshot::AiToolCallActivity {
+                        id: format!("call-{index}"),
+                        name: "git_diff_file".to_string(),
+                        detail: format!("src/service.rs · hunk {index}"),
+                        error: None,
+                        state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                    })
+                    .collect(),
+            },
+            impact: crate::snapshot::ImpactPane {
+                selected_change: Some(crate::snapshot::SelectedChange {
+                    file: "src/service.rs".to_string(),
+                    label: "service".to_string(),
+                    change: "modified",
+                    interpretation: "changed".to_string(),
+                    interpretation_source: crate::snapshot::InterpretationSource::Deterministic,
+                }),
+                ..crate::snapshot::ImpactPane::default()
+            },
+            epoch: Epoch(1),
+            ..UiSnapshot::default()
+        }
+    }
+
     #[test]
     fn plan_hover_restores_until_a_box_click_commits_the_linked_diff_position() {
         let mut snap = ai_plan_snap(AiStatus::Ready { epoch: Epoch(1) }, true, 2);
@@ -2169,6 +2298,45 @@ mod tests {
         assert_eq!(app.ai_plan_scroll, 0);
         app.apply(Action::Down);
         assert_eq!(app.ai_plan_scroll, 0);
+    }
+
+    #[test]
+    fn ai_activity_follows_tail_until_manual_scroll_returns_to_bottom() {
+        let mut app = App::new();
+        app.update(ai_activity_snap(12));
+        app.sync_generated_viewport(0, 5);
+        assert_eq!(app.ai_plan_scroll, 5, "new activity starts at the tail");
+        assert!(app.ai_activity_follows_tail());
+
+        app.update(ai_activity_snap(13));
+        app.sync_generated_viewport(6, 6);
+        assert_eq!(app.ai_plan_scroll, 6, "an appended call advances the tail");
+
+        app.focused = Pane::Impact;
+        app.apply(Action::Up);
+        assert_eq!(app.ai_plan_scroll, 5);
+        assert!(!app.ai_activity_follows_tail(), "manual scroll detaches");
+
+        app.update(ai_activity_snap(14));
+        app.sync_generated_viewport(5, 7);
+        assert_eq!(
+            app.ai_plan_scroll, 5,
+            "new calls preserve a detached viewport"
+        );
+
+        app.apply(Action::Down);
+        assert_eq!(app.ai_plan_scroll, 6);
+        assert!(!app.ai_activity_follows_tail());
+        app.apply(Action::Down);
+        assert_eq!(app.ai_plan_scroll, 7);
+        assert!(
+            app.ai_activity_follows_tail(),
+            "scrolling back to the bottom resumes following"
+        );
+
+        app.update(ai_activity_snap(15));
+        app.sync_generated_viewport(8, 8);
+        assert_eq!(app.ai_plan_scroll, 8);
     }
 
     #[test]

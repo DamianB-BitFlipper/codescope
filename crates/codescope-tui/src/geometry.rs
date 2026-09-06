@@ -56,6 +56,8 @@ pub struct UiGeometry {
     pub(crate) generated_content: Option<Rect>,
     /// Current vertical origin of the generated canvas in content-local rows.
     pub(crate) ai_plan_scroll: usize,
+    /// Maximum vertical origin for the generated viewport in the current frame.
+    pub(crate) ai_plan_max_scroll: usize,
     /// Base diagram geometry built once from the persistent diagram state for this frame.
     pub(crate) diagram_canvas: Option<crate::diagram::DiagramCanvas>,
     /// Expanded relationship overlay in screen geometry. It is registered separately so
@@ -578,7 +580,12 @@ impl UiGeometry {
                 usize::from(canvas.size.height),
                 usize::from(generated_inner.height),
             );
-            let first = app.ai_plan_scroll.min(max_scroll);
+            self.ai_plan_max_scroll = max_scroll;
+            let first = if app.ai_activity_follows_tail() {
+                max_scroll
+            } else {
+                app.ai_plan_scroll.min(max_scroll)
+            };
             self.ai_plan_scroll = first;
             for node in &canvas.nodes {
                 if let Some(rect) = canvas_rect_on_screen(node.rect, generated_inner, first) {
@@ -635,7 +642,12 @@ impl UiGeometry {
                 crate::render::generated_impact_content(snap, generated_inner.width);
             let viewport = usize::from(generated_inner.height);
             let max_scroll = scroll_max(generated_lines.len(), viewport);
-            let first = app.ai_plan_scroll.min(max_scroll);
+            self.ai_plan_max_scroll = max_scroll;
+            let first = if app.ai_activity_follows_tail() {
+                max_scroll
+            } else {
+                app.ai_plan_scroll.min(max_scroll)
+            };
             self.ai_plan_scroll = first;
             // Non-ready states render line content only. Canvas is the sole source of
             // Ready-plan hit geometry; retain just the failure banner's visible bounds.

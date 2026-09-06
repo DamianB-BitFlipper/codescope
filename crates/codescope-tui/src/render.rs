@@ -1892,7 +1892,11 @@ fn render_generated_impact(frame: &mut Frame, area: Rect, app: &App, snap: &UiSn
     let lines = generated_impact_content(snap, area.width);
     let height = usize::from(area.height);
     let max_scroll = lines.len().saturating_sub(height);
-    let start = app.ai_plan_scroll.min(max_scroll);
+    let start = if app.ai_activity_follows_tail() {
+        max_scroll
+    } else {
+        app.ai_plan_scroll.min(max_scroll)
+    };
     let end = (start + height).min(lines.len());
     let rendered = lines[start..end]
         .iter()
@@ -4377,6 +4381,37 @@ mod tests {
         assert!(
             !text.contains("earlier tool calls"),
             "no collapsed history: {text}"
+        );
+    }
+
+    #[test]
+    fn generated_progress_initially_renders_the_latest_tool_calls() {
+        let mut snap = sample();
+        snap.ai = AiStatus::Loading {
+            since_epoch: codescope_core::Epoch(3),
+        };
+        snap.ai_activity = crate::snapshot::AiActivity {
+            active: true,
+            waiting_for_model: false,
+            calls: (0..40)
+                .map(|index| crate::snapshot::AiToolCallActivity {
+                    id: format!("call-{index}"),
+                    name: "git_diff_file".to_string(),
+                    detail: format!("TAIL_MARKER_{index}"),
+                    error: None,
+                    state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                })
+                .collect(),
+        };
+        let mut app = App::new();
+        app.update(snap.clone());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &app, &snap)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("TAIL_MARKER_39"), "latest call: {text}");
+        assert!(
+            !text.contains("TAIL_MARKER_0"),
+            "overflowing activity should start at the tail: {text}"
         );
     }
 

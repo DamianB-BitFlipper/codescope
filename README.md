@@ -1,12 +1,12 @@
 # Codescope
 
-![Codescope AI review workspace](docs/assets/codescope-ai-review.png)
-
 AI can write your PR in minutes. Reviewing it should not take hours.
 
 Codescope builds a navigable map of any Git comparison: the changed files and symbols on the left,
-the exact diff in the center, and grounded AI-generated diagrams on the right. Together, they
+the exact diff on the right, and grounded AI-generated diagrams along the bottom. Together, they
 reveal what changed, how behavior flows, and where the change connects to the rest of the codebase.
+
+![Codescope AI review workspace](docs/assets/codescope-ai-review.png)
 
 ## Highlights
 

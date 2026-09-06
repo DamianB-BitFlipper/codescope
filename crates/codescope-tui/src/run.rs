@@ -55,6 +55,10 @@ pub async fn run(
                 render(frame, &app, &app.snapshot);
                 last_geometry = geo;
             })?;
+            app.sync_generated_viewport(
+                last_geometry.ai_plan_scroll,
+                last_geometry.ai_plan_max_scroll,
+            );
             dirty = false;
         }
         if app.should_quit {
@@ -397,6 +401,7 @@ fn telemetry_state(app: &App) -> Value {
             "callers": app.callers_scroll,
             "downstream": app.downstream_scroll,
             "generated_impact": app.ai_plan_scroll,
+            "generated_impact_follow_tail": app.ai_activity_follows_tail(),
         },
         "view": {
             "zoomed": app.zoomed,
@@ -741,6 +746,7 @@ mod tests {
         assert_eq!(state["scroll"]["callers"], 4);
         assert_eq!(state["scroll"]["downstream"], 5);
         assert_eq!(state["scroll"]["generated_impact"], 6);
+        assert_eq!(state["scroll"]["generated_impact_follow_tail"], false);
         assert_eq!(state["user_input"]["model_query"], "typed-model");
     }
 
