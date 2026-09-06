@@ -22,8 +22,8 @@
 
 use crate::error::{Result, TestutilError};
 use codescope_core::{
-    DiffSide, EntityRef, Epoch, FileId, FormKind, MAX_FORMS_PER_PLAN, MAX_PLAN_EVIDENCE,
-    PlanCodeRef, PlanNode, PlanNodeChange, VisualizationPlan, VizForm,
+    DiffSide, EntityRef, Epoch, FileId, FormKind, PlanCodeRef, PlanNode, PlanNodeChange,
+    VisualizationPlan, VizForm,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -261,6 +261,7 @@ impl RecordedRequest {
 }
 
 struct ProviderState {
+    fixture_shape: Mutex<(usize, usize)>,
     steps: Mutex<VecDeque<AiScriptStep>>,
     requests: Mutex<Vec<RecordedRequest>>,
     calls: AtomicU64,
@@ -294,6 +295,7 @@ impl ScriptedProvider {
             .local_addr()
             .map_err(|e| TestutilError::Net(format!("local_addr: {e}")))?;
         let state = Arc::new(ProviderState {
+            fixture_shape: Mutex::new((0, 0)),
             steps: Mutex::new(steps.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
             calls: AtomicU64::new(0),
@@ -404,7 +406,16 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
             lock_ignore_poison(&state.steps).push_front(AiScriptStep::AssistantText {
                 content: String::new(),
             });
-            let completion = diagram_plan_completion(call, plan);
+            let previous_shape = {
+                let mut shape = lock_ignore_poison(&state.fixture_shape);
+                let previous = *shape;
+                *shape = (
+                    plan["forms"].as_array().map_or(0, Vec::len),
+                    plan["evidence"].as_array().map_or(0, Vec::len),
+                );
+                previous
+            };
+            let completion = diagram_plan_completion(call, plan, previous_shape);
             write_json(&mut stream, 200, "OK", &completion).await
         }
         Some(AiScriptStep::ToolCallRaw { arguments }) => {
@@ -466,18 +477,20 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ProviderState>) -> 
 
 /// OpenAI-shaped completion that reconstructs a typed plan through the public incremental
 /// editor protocol. This keeps service tests representative without a one-shot back door.
-fn diagram_plan_completion(call: u64, plan: Value) -> Value {
+fn diagram_plan_completion(call: u64, plan: Value, previous_shape: (usize, usize)) -> Value {
     // A fixture may be used as a repair turn against an existing draft. Clear known draft
     // members through the same targeted deletion operations available to production models;
     // failed deletions are harmless when the draft is already empty.
-    let mut operations = (0..=MAX_FORMS_PER_PLAN)
+    // Delete only members the preceding fixture attempted, not every possible slot in
+    // the production caps. Large safety ceilings must not consume the test's tool budget.
+    let mut operations = (0..previous_shape.0)
         .map(|form_index| {
             (
                 DIAGRAM_EDIT_TOOL_NAME,
                 json!({"op": "delete_form", "form_id": format!("form-{form_index}")}),
             )
         })
-        .chain((0..MAX_PLAN_EVIDENCE).map(|_| {
+        .chain((0..previous_shape.1).map(|_| {
             (
                 DIAGRAM_EDIT_TOOL_NAME,
                 json!({"op": "delete_evidence", "index": 0}),
@@ -841,8 +854,11 @@ mod tests {
 
     #[test]
     fn completion_envelope_shape() {
-        let completion =
-            diagram_plan_completion(7, serde_json::to_value(sample_plan(Epoch(1))).unwrap());
+        let completion = diagram_plan_completion(
+            7,
+            serde_json::to_value(sample_plan(Epoch(1))).unwrap(),
+            (0, 0),
+        );
         assert_eq!(completion["object"], "chat.completion");
         assert_eq!(completion["created"], FAKE_CREATED);
         assert_eq!(completion["choices"][0]["finish_reason"], "tool_calls");

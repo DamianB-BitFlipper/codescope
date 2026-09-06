@@ -120,6 +120,14 @@ impl DiagramDraft {
                 });
                 Ok(format!("created form {form_id}"))
             }
+            DiagramCommand::SetFormKind { form_id, kind } => {
+                let form = self.form_mut(form_id)?;
+                for edge in &form.edges {
+                    ensure_flows_to_form(form_id, *kind, edge.kind)?;
+                }
+                form.kind = *kind;
+                Ok(format!("updated form {form_id} kind"))
+            }
             DiagramCommand::DeleteForm { form_id } => {
                 let before = self.forms.len();
                 self.forms.retain(|form| form.id != *form_id);
@@ -279,6 +287,13 @@ pub enum DiagramCommand {
         /// Stable editor id, such as `main`.
         form_id: String,
         /// Visual grammar used to render the form.
+        kind: FormKind,
+    },
+    /// Change a form's grammar while preserving its nodes, edges, and evidence.
+    SetFormKind {
+        /// Stable form id.
+        form_id: String,
+        /// Replacement visual grammar; full validation still applies.
         kind: FormKind,
     },
     /// Remove a form and all of its boxes/relationships.
@@ -479,15 +494,17 @@ fn ensure_form_kind(kind: FormKind) -> Result<(), DiagramEditError> {
     Ok(())
 }
 
-/// `flows_to` is renderer-native sequence grammar, never a relationship-flow graph fact.
+/// `flows_to` is explanatory sequence/relationship-flow grammar, never a graph fact.
 fn ensure_flows_to_form(
     form_id: &str,
     form_kind: FormKind,
     edge_kind: PlanEdgeKind,
 ) -> Result<(), DiagramEditError> {
-    if edge_kind == PlanEdgeKind::FlowsTo && form_kind != FormKind::Sequence {
+    if edge_kind == PlanEdgeKind::FlowsTo
+        && !matches!(form_kind, FormKind::Sequence | FormKind::RelationshipFlow)
+    {
         return Err(DiagramEditError::Invalid(format!(
-            "edge kind flows_to is only valid in sequence form {form_id:?}"
+            "edge kind flows_to requires sequence or relationship_flow form {form_id:?}"
         )));
     }
     Ok(())
@@ -609,10 +626,10 @@ mod tests {
     }
 
     #[test]
-    fn flows_to_is_sequence_only_and_rejected_edits_are_atomic() {
+    fn flows_to_rejects_tree_edits_atomically() {
         let mut draft = DiagramDraft::new(Epoch(1));
         for (form_id, kind) in [
-            ("flow", FormKind::RelationshipFlow),
+            ("flow", FormKind::ChangedSymbolTree),
             ("sequence", FormKind::Sequence),
         ] {
             draft
@@ -685,6 +702,45 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("flows_to"));
         assert_eq!(draft, before, "failed update must not mutate the draft");
+    }
+
+    #[test]
+    fn changing_form_kind_preserves_content_and_rejects_invalid_grammar_atomically() {
+        let mut draft = DiagramDraft::new(Epoch(1));
+        draft.forms.push(DiagramDraftForm {
+            id: "lifecycle".into(),
+            kind: FormKind::Sequence,
+            nodes: vec![
+                PlanNode::new("ready", "Ready", PlanNodeChange::Added),
+                PlanNode::new("worker", "Worker", PlanNodeChange::Added),
+            ],
+            edges: vec![PlanEdge {
+                from: "ready".into(),
+                to: "worker".into(),
+                kind: PlanEdgeKind::FlowsTo,
+                label: Some("claims work".into()),
+            }],
+        });
+        let previous = draft.clone();
+        draft
+            .apply(&DiagramCommand::SetFormKind {
+                form_id: "lifecycle".into(),
+                kind: FormKind::RelationshipFlow,
+            })
+            .unwrap();
+        assert_eq!(draft.forms[0].nodes, previous.forms[0].nodes);
+        assert_eq!(draft.forms[0].edges, previous.forms[0].edges);
+        assert_eq!(draft.forms[0].kind, FormKind::RelationshipFlow);
+        let valid = draft.clone();
+        assert!(
+            draft
+                .apply(&DiagramCommand::SetFormKind {
+                    form_id: "lifecycle".into(),
+                    kind: FormKind::ChangedSymbolTree
+                })
+                .is_err()
+        );
+        assert_eq!(draft, valid);
     }
 
     #[test]

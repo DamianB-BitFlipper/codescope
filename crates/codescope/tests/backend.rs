@@ -138,6 +138,7 @@ fn incremental_plan_request_count(plan: &VisualizationPlan) -> usize {
         + plan.forms.len() // create_form (the first one is the focused scaffold step)
         + plan.forms.iter().map(|form| form.nodes.len() + form.edges.len()).sum::<usize>()
         + plan.evidence.len() // canonical full-editor edits after the form exists
+        + 1 // natural completion after the complete file review
 }
 
 /// Number of nodes the controller requires before it accepts evidence for a form.
@@ -281,6 +282,9 @@ fn incremental_plan_script(plan: &VisualizationPlan) -> Vec<AiScriptStep> {
             }),
     );
 
+    script.push(AiScriptStep::AssistantText {
+        content: String::new(),
+    });
     assert_eq!(
         script.len(),
         incremental_plan_request_count(plan),
@@ -975,10 +979,11 @@ async fn debug_ai_prints_the_validated_dispatcher_plan_headlessly() {
 /// dispatcher/backend boundary: `debug-ai` JSON carries the full report (verdict,
 /// dropped items with reasons) next to the sanitized plan — never a silent omission.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
+async fn debug_ai_requires_explicit_repair_of_dropped_sequence_edges() {
     // A three-step sequence with both required consecutive edges plus one extra
     // back-edge (n3 -> n1): the validator keeps the chain, drops the back-edge, and
-    // records it — the plan is sanitized, not trusted.
+    // records it. A whole-file review must request an explicit repair, not publish
+    // a sanitized diagram that may have lost a meaningful lifecycle transition.
     // One initial repository refresh owns one epoch increment.
     let mut plan = VisualizationPlan::new(Epoch(1));
     plan.intent = "The middleware logs each request around the handled call.".to_string();
@@ -1041,9 +1046,16 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
         range: None,
         reason: "the middleware hunk that wraps the handler".to_string(),
     });
-    let provider = ScriptedProvider::start(incremental_plan_script(&plan))
-        .await
-        .unwrap();
+    let mut script = incremental_plan_script(&plan);
+    let repair_request = script.len();
+    script.extend([
+        AiScriptStep::tool_call(
+            "edit_visualization",
+            serde_json::json!({"op":"delete_edge", "form_id":"form-1", "from":"n3", "to":"n1"}),
+        ),
+        AiScriptStep::tool_call("edit_visualization", serde_json::json!({"op":"finish"})),
+    ]);
+    let provider = ScriptedProvider::start(script).await.unwrap();
     let (_fixture, root) = go_fixture();
     let config_dir = TempDir::new().unwrap();
     let config_path = config_dir.path().join("missing-config.toml");
@@ -1085,31 +1097,33 @@ async fn debug_ai_json_keeps_the_sanitizer_report_for_dropped_sequence_edges() {
         provider.requests()
     );
     let json = json_stdout(&out);
-    // The sanitizer's verdict and dropped items reach the JSON intact.
+    // The repair produces a complete plan with no silent sanitizer drops.
     assert_eq!(
-        json["report"]["verdict"], "valid_with_drops",
-        "sanitized plan keeps its report: {json}"
+        json["report"]["verdict"], "valid",
+        "repaired plan keeps its report: {json}"
     );
-    let dropped = json["report"]["dropped"].as_array().expect("dropped items");
-    assert_eq!(dropped.len(), 1, "exactly the extra back-edge: {json}");
-    assert_eq!(
-        dropped[0]["subject"], "edge n3 -> n1 in form 0",
-        "drop subject: {json}"
-    );
-    let reason = dropped[0]["reason"].as_str().unwrap_or_default();
     assert!(
-        reason.contains("nonconsecutive or duplicate sequence edge"),
-        "drop reason: {reason}"
+        json["report"]
+            .get("dropped")
+            .is_none_or(|items| items.as_array().is_some_and(Vec::is_empty)),
+        "no implicit drops: {json}"
     );
-    // The published plan itself was sanitized to the consecutive chain.
+    let requests = provider.requests();
+    assert!(
+        requests[repair_request]
+            .body
+            .contains("nonconsecutive or duplicate sequence edge")
+    );
+    assert!(requests[repair_request].body.contains("validation_report"));
+    // The model's explicit edit, not the sanitizer, removed the extra edge.
     let edges = json["plan"]["forms"][0]["edges"]
         .as_array()
         .expect("form edges");
     assert_eq!(edges.len(), 2, "the back-edge no longer renders: {json}");
     assert_eq!(
         provider.requests().len(),
-        incremental_plan_request_count(&plan),
-        "sanitization publishes without an extra repair loop"
+        incremental_plan_request_count(&plan) + 2,
+        "whole-file review requires the repair loop"
     );
 }
 

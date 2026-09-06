@@ -22,17 +22,17 @@ pub const MAX_FORM_NODES: usize = 12;
 /// Hard cap on tree depth within a form (Show Me rule S4).
 pub const MAX_FORM_DEPTH: usize = 3;
 
-/// Maximum forms per plan ("one form per plan, two max").
-pub const MAX_FORMS_PER_PLAN: usize = 2;
+/// Maximum independent behavior diagrams in one review.
+pub const MAX_FORMS_PER_PLAN: usize = 16;
 
 /// Maximum source references attached to a plan.
-pub const MAX_PLAN_EVIDENCE: usize = 6;
+pub const MAX_PLAN_EVIDENCE: usize = 64;
 
 /// Maximum exact diff ranges attached to one visual node.
 pub const MAX_NODE_CODE_REFS: usize = 2;
 
 /// Maximum inclusive source lines covered by one node code range.
-pub const MAX_CODE_REF_LINES: u32 = 12;
+pub const MAX_CODE_REF_LINES: u32 = 64;
 
 /// A visualization plan: the AI's answer to one focus question, as renderable forms.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -44,7 +44,7 @@ pub struct VisualizationPlan {
     pub epoch: Epoch,
     /// One concise sentence explaining the change's intent or resulting behavior.
     pub intent: String,
-    /// One or two forms ([`MAX_FORMS_PER_PLAN`]).
+    /// Independent behavior diagrams, bounded by [`MAX_FORMS_PER_PLAN`].
     #[serde(default)]
     pub forms: Vec<VizForm>,
     /// Typed source references supporting the visual, never the visual itself.

@@ -246,6 +246,183 @@ impl ToolExecutor for RecordingExecutor {
 #[derive(Default)]
 struct RequiredResearchExecutor(RecordingExecutor);
 
+/// Coverage-aware scopes may keep researching and add independent forms after a valid first form.
+#[derive(Default)]
+struct WholeScopeExecutor(Mutex<Vec<String>>);
+
+impl ToolExecutor for WholeScopeExecutor {
+    fn available_tools(&self) -> Vec<ToolDef> {
+        research_tools()
+    }
+    fn requires_research(&self) -> bool {
+        true
+    }
+    fn initial_research_tool(&self) -> Option<&'static str> {
+        Some("git_status_file")
+    }
+    fn review_coverage(&self, draft: &DiagramDraft) -> Option<codescope_ai::tools::ReviewCoverage> {
+        let reads = self.0.lock().unwrap();
+        let mut state = codescope_ai::tools::ReviewCoverage {
+            required_hunks: 2,
+            inspected_hunks: 0,
+            cited_hunks: 0,
+            next_reads: vec![],
+            uncited_hunks: vec![],
+        };
+        for file in [MIDDLEWARE_FILE, POSTGRES_FILE] {
+            if reads.iter().any(|path| path == file) {
+                state.inspected_hunks += 1;
+            } else {
+                state
+                    .next_reads
+                    .push(json!({"path":file, "hunk_index":0, "offset":0}));
+            }
+            if draft
+                .forms
+                .iter()
+                .flat_map(|form| &form.nodes)
+                .flat_map(|node| &node.code_refs)
+                .any(|reference| reference.file.as_path().as_str() == file)
+            {
+                state.cited_hunks += 1;
+            } else {
+                state.uncited_hunks.push(json!({"file":file, "hunk":0}));
+            }
+        }
+        Some(state)
+    }
+    fn execute<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: &'a Value,
+    ) -> BoxFuture<'a, Result<String, ToolExecError>> {
+        Box::pin(async move {
+            if name == "git_diff_file" {
+                let file = arguments["path"].as_str().unwrap();
+                self.0.lock().unwrap().push(file.into());
+                let line = if file == POSTGRES_FILE { 18 } else { 5 };
+                Ok(format!(
+                    "repo_path: {file}\nhunk_id: 0\n[old:- new:{line}] +changed behavior"
+                ))
+            } else {
+                Ok("BACKGROUND_RESEARCH_SENTINEL".into())
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn whole_scope_keeps_researching_after_first_form_and_builds_independent_diagrams() {
+    whole_scope_completion(false).await;
+}
+
+#[tokio::test]
+async fn explicit_finish_requires_whole_scope_coverage_then_publishes() {
+    whole_scope_completion(true).await;
+}
+
+async fn whole_scope_completion(explicit_finish: bool) {
+    let finish = || {
+        if explicit_finish {
+            diagram_step(&DiagramCommand::Finish)
+        } else {
+            AiScriptStep::AssistantText {
+                content: String::new(),
+            }
+        }
+    };
+    let epoch = Epoch(150);
+    let first = smallest_plan(FormKind::ChangedSymbolTree, epoch);
+    let commands = construction_commands(&first);
+    let mut steps = vec![
+        tool_call_step(&["git_status_file"]),
+        multi_tool_call_step(vec![("git_diff_file", json!({"path":MIDDLEWARE_FILE}))]),
+        diagram_step(&commands[0]),
+        diagram_step(&commands[1]),
+        diagram_batch_step(&commands[2..]),
+    ];
+    // The former three-edit finalization allowance must not publish the first behavior.
+    for _ in 0..6 {
+        steps.push(diagram_step(&DiagramCommand::UpdateNode {
+            form_id: "main".into(),
+            node_id: "n1".into(),
+            patch: DiagramNodePatch {
+                detail: Some("Explains the first changed behavior".into()),
+                ..Default::default()
+            },
+        }));
+    }
+    steps.extend([
+        finish(),
+        multi_tool_call_step(vec![("read_file", json!({"path":"support/helper.go"}))]),
+        multi_tool_call_step(vec![("git_diff_file", json!({"path":POSTGRES_FILE}))]),
+        diagram_batch_step(&[
+            DiagramCommand::CreateForm {
+                form_id: "independent".into(),
+                kind: FormKind::ChangedSymbolTree,
+            },
+            DiagramCommand::CreateNode {
+                form_id: "independent".into(),
+                node: sample_plan(epoch).forms[0].nodes[1].clone(),
+            },
+            DiagramCommand::AddEvidence {
+                evidence: PlanEvidence {
+                    file: FileId::new_unchecked(POSTGRES_FILE),
+                    hunk: Some(0),
+                    symbol: None,
+                    range: None,
+                    reason: "The second behavior handles database errors".into(),
+                },
+            },
+            DiagramCommand::CreateForm {
+                form_id: "third".into(),
+                kind: FormKind::ChangedSymbolTree,
+            },
+            DiagramCommand::CreateNode {
+                form_id: "third".into(),
+                node: first.forms[0].nodes[0].clone(),
+            },
+        ]),
+        finish(),
+    ]);
+    let provider = ScriptedProvider::start(steps).await.unwrap();
+    let tools = WholeScopeExecutor::default();
+    let outcome = service_for(&provider)
+        .request_plan(
+            "Review all selected behaviors",
+            &tools,
+            &FixtureFacts,
+            epoch,
+        )
+        .await;
+    let AiOutcome::Plan(plan, report) = outcome else {
+        panic!("expected full scope, got {outcome:?}")
+    };
+    assert_eq!(report.verdict, ValidationVerdict::Valid);
+    assert_eq!(plan.forms.len(), 3);
+    assert!(plan.forms.iter().all(|form| form.edges.is_empty()));
+    assert_eq!(
+        provider.remaining_steps(),
+        0,
+        "first-form completion must not end the review"
+    );
+    let requests = provider.requests();
+    let after_early_finish = requests[12].body_json().unwrap();
+    assert_eq!(after_early_finish["tool_choice"], "auto");
+    let messages = after_early_finish["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    let handoff = messages[1]["content"].as_str().unwrap();
+    assert!(handoff.contains("file/directory review is incomplete"));
+    assert!(handoff.contains("uncited_hunks"));
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .body
+            .contains("BACKGROUND_RESEARCH_SENTINEL")
+    );
+}
+
 impl ToolExecutor for RequiredResearchExecutor {
     fn available_tools(&self) -> Vec<ToolDef> {
         research_tools()
@@ -262,6 +439,115 @@ impl ToolExecutor for RequiredResearchExecutor {
     ) -> BoxFuture<'a, Result<String, ToolExecError>> {
         self.0.execute(name, arguments)
     }
+}
+
+#[tokio::test]
+async fn sanitized_plan_cannot_silently_lose_whole_scope_coverage() {
+    let epoch = Epoch(151);
+    let mut previous = sample_plan(epoch);
+    // Keep the invalid-node fraction below the validator's whole-form rejection
+    // threshold, so this exercises coverage AFTER a ValidWithDrops sanitization.
+    for index in 0..4 {
+        let mut valid = previous.forms[0].nodes[0].clone();
+        valid.id = format!("retained-{index}");
+        valid.children.clear();
+        previous.forms[0].nodes.push(valid);
+    }
+    previous.forms[0].nodes[1].code_refs = vec![PlanCodeRef::new(
+        FileId::new_unchecked(POSTGRES_FILE),
+        0,
+        DiffSide::New,
+        999,
+        999,
+    )];
+    let provider = ScriptedProvider::start([
+        tool_call_step(&["git_status_file"]),
+        multi_tool_call_step(vec![("git_diff_file", json!({"path":MIDDLEWARE_FILE}))]),
+        multi_tool_call_step(vec![("git_diff_file", json!({"path":POSTGRES_FILE}))]),
+        AiScriptStep::AssistantText {
+            content: String::new(),
+        },
+        AiScriptStep::AssistantText {
+            content: String::new(),
+        },
+        AiScriptStep::AssistantText {
+            content: String::new(),
+        },
+        AiScriptStep::AssistantText {
+            content: String::new(),
+        },
+    ])
+    .await
+    .unwrap();
+    let outcome = service_for(&provider)
+        .request_plan_with_previous(
+            "Review the complete selection",
+            Some(&previous),
+            &WholeScopeExecutor::default(),
+            &FixtureFacts,
+            epoch,
+        )
+        .await;
+    let AiOutcome::Failed(reason) = outcome else {
+        panic!("sanitization must not publish a partial review: {outcome:?}");
+    };
+    assert!(
+        reason.contains("does not cover the complete selection"),
+        "{reason}"
+    );
+    assert_eq!(provider.remaining_steps(), 0);
+}
+
+#[tokio::test]
+async fn complete_hunk_coverage_cannot_hide_a_dropped_lifecycle() {
+    let epoch = Epoch(152);
+    let mut previous = sample_plan(epoch);
+    let mut lifecycle = smallest_plan(FormKind::Sequence, epoch).forms.remove(0);
+    lifecycle.edges.clear();
+    previous.forms.push(lifecycle);
+    let provider = ScriptedProvider::start([
+        tool_call_step(&["git_status_file"]),
+        multi_tool_call_step(vec![("git_diff_file", json!({"path":MIDDLEWARE_FILE}))]),
+        multi_tool_call_step(vec![("git_diff_file", json!({"path":POSTGRES_FILE}))]),
+        diagram_step(&DiagramCommand::Finish),
+        diagram_step(&DiagramCommand::CreateEdge {
+            form_id: "form-2".into(),
+            edge: PlanEdge {
+                from: "n1".into(),
+                to: "n2".into(),
+                kind: PlanEdgeKind::FlowsTo,
+                label: Some("publishes result".into()),
+            },
+        }),
+        diagram_step(&DiagramCommand::Finish),
+    ])
+    .await
+    .unwrap();
+    let outcome = service_for(&provider)
+        .request_plan_with_previous(
+            "Explain every lifecycle, even within one hunk",
+            Some(&previous),
+            &WholeScopeExecutor::default(),
+            &FixtureFacts,
+            epoch,
+        )
+        .await;
+    let AiOutcome::Plan(plan, report) = outcome else {
+        panic!("expected repaired review: {outcome:?}")
+    };
+    assert_eq!(report.verdict, ValidationVerdict::Valid);
+    assert!(report.dropped.is_empty());
+    assert_eq!(plan.forms.len(), 2);
+    assert_eq!(
+        provider.remaining_steps(),
+        0,
+        "must repair rather than publish the overview alone"
+    );
+    assert!(
+        provider.requests()[4]
+            .body
+            .contains("relationship visual needs at least one labeled edge")
+    );
 }
 
 #[derive(Default)]
@@ -482,7 +768,7 @@ impl ToolExecutor for DiffPriorityExecutor {
                     "d".repeat(16 * 1024 - 40)
                 ));
             }
-            Ok("r".repeat(20 * 1024))
+            Ok("r".repeat(100 * 1024))
         })
     }
 }
@@ -871,9 +1157,9 @@ async fn previous_validated_design_is_sent_as_a_non_evidentiary_revision_seed() 
 
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.contains("previous validated design"));
-    assert!(system.contains("current research always wins"));
+    assert!(system.contains("Current research always wins"));
     assert!(system.contains("live draft is already preseeded"));
-    assert!(system.contains("never copy its old epoch"));
+    assert!(system.contains("never copy an old epoch"));
 }
 
 #[tokio::test]
@@ -931,7 +1217,7 @@ async fn no_tool_executor_advertises_only_incremental_diagram_tools() {
         ]
     );
     let system = body["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("Research before planning"));
+    assert!(system.contains("Inventory the whole selection before choosing diagrams"));
     assert!(!system.contains("No read-only tools are available"));
 }
 
@@ -2701,7 +2987,7 @@ async fn oversized_pre_diff_context_fails_before_provider_send() {
     let provider = ScriptedProvider::start([]).await.unwrap();
     let outcome = service_for(&provider)
         .request_plan(
-            &"x".repeat(128 * 1024),
+            &"x".repeat(384 * 1024),
             &NoToolExecutor,
             &FixtureFacts,
             Epoch(122),
@@ -3270,8 +3556,11 @@ async fn unqueried_symbol_entity_gets_entity_repair_then_validates() {
     );
     let first_body = requests[0].body_json().unwrap();
     let system = first_body["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("hunk-derived"));
-    assert!(system.contains("current symbol catalog"));
+    assert!(
+        system.contains("exact diff code_refs")
+            || system.contains("code_refs copied from git_diff_file")
+    );
+    assert!(system.contains("Do not invent paths, line numbers, symbols"));
     // The repair feedback is entity-specific.
     let messages = requests[2].body_json().unwrap()["messages"]
         .as_array()
@@ -3475,65 +3764,35 @@ async fn third_repair_succeeds_and_fourth_rejection_terminates() {
     );
 }
 
-/// Atomic edits reject a seventh node at the draft cap; natural completion then reports that
-/// the six accepted nodes still exceed the renderer's five-node contract, and a compact repair wins.
+/// Seven grounded boxes are valid: the former five-box ceiling lost behavior in large files.
 #[tokio::test]
-async fn seven_node_plan_gets_cap_repair_then_five_node_plan_validates() {
-    let mut oversized = drain_plan(Epoch(9), false);
-    // Four more conceptual steps: 3 fixture nodes + 4 = 7, well past the five-node ceiling.
-    for i in 3..7 {
-        let node = PlanNode::new(
-            format!("n{i}"),
-            format!("step {i}"),
-            PlanNodeChange::Unchanged,
-        )
-        .with_detail("an intermediate mechanics step that should be merged");
-        oversized.forms[0].nodes.push(node);
-        let last = i;
-        oversized.forms[0].edges.push(PlanEdge {
-            from: format!("n{}", last - 1),
-            to: format!("n{i}"),
+async fn seven_grounded_nodes_are_preserved() {
+    let mut expected = drain_plan(Epoch(9), false);
+    for index in 3..7 {
+        let mut node = expected.forms[0].nodes[2].clone();
+        node.id = format!("extra-{index}");
+        node.label = format!("Changed step {index}");
+        let previous = expected.forms[0].nodes.last().unwrap().id.clone();
+        expected.forms[0].edges.push(PlanEdge {
+            from: previous,
+            to: node.id.clone(),
             kind: PlanEdgeKind::FlowsTo,
-            label: Some("continues the shutdown path".into()),
+            label: Some("continues the inspected behavior".into()),
         });
+        expected.forms[0].nodes.push(node);
     }
-    let provider = ScriptedProvider::start([
-        AiScriptStep::from_plan(&oversized).unwrap(),
-        AiScriptStep::from_plan(&drain_plan(Epoch(9), false)).unwrap(),
-    ])
-    .await
-    .unwrap();
-    let service = service_for(&provider);
-    let digest = format!("changed file {MIDDLEWARE_FILE}: hunk 0 adds the readiness handler");
-
-    let outcome = service
-        .request_plan(&digest, &NoToolExecutor, &LazyFacts, Epoch(9))
+    let provider = ScriptedProvider::start([AiScriptStep::from_plan(&expected).unwrap()])
+        .await
+        .unwrap();
+    let outcome = service_for(&provider)
+        .request_plan("changed behavior", &NoToolExecutor, &LazyFacts, Epoch(9))
         .await;
     let AiOutcome::Plan(plan, report) = outcome else {
-        panic!("expected corrected plan, got {outcome:?}");
+        panic!("expected seven boxes, got {outcome:?}")
     };
     assert_eq!(report.verdict, ValidationVerdict::Valid);
-    assert_eq!(plan.forms[0].nodes.len(), 3, "fixture plan has 3 nodes");
-
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 4, "initial submission plus one cap repair");
-    let messages = requests[2].body_json().unwrap()["messages"]
-        .as_array()
-        .unwrap()
-        .clone();
-    let feedback = messages.last().unwrap()["content"].as_str().unwrap();
-    assert!(
-        feedback.contains("has 6 nodes"),
-        "observed count in feedback: {feedback}"
-    );
-    assert!(
-        feedback.contains("at most 5"),
-        "allowed count in feedback: {feedback}"
-    );
-    assert!(
-        feedback.contains("merge intermediate mechanics"),
-        "merge guidance: {feedback}"
-    );
+    assert_eq!(plan.forms[0].nodes.len(), 7);
+    assert_eq!(provider.requests().len(), 2);
 }
 
 /// A whole plan blob is no longer a hidden alternate protocol. It is rejected as an
@@ -3748,7 +4007,7 @@ async fn missing_code_refs_gets_named_repair_and_refs_survive_the_loop() {
         "named field in feedback: {feedback}"
     );
     assert!(
-        feedback.contains("1-2 exact ranges"),
+        feedback.contains("1-2 exact diff ranges"),
         "count contract taught: {feedback}"
     );
     assert!(
@@ -3892,7 +4151,7 @@ async fn repeated_toolless_empty_draft_repair_explicitly_requires_editor_call() 
 
 #[tokio::test]
 async fn tool_call_budget_enforced() {
-    // One message requesting 129 calls: the final call exceeds the configured budget of 128.
+    // One message requests one more call than the configured budget.
     let names: Vec<&str> =
         std::iter::repeat_n("list_directory", (MAX_TOOL_CALLS + 1) as usize).collect();
     let provider = ScriptedProvider::start([tool_call_step(&names)])
@@ -3917,10 +4176,10 @@ async fn tool_call_budget_enforced() {
 
 #[tokio::test]
 async fn budget_spans_multiple_turns() {
-    // 65 calls, then 64 more: the final call must trip the 128-operation budget.
+    // Split the budget across two turns; the final extra call must trip the cap.
     let provider = ScriptedProvider::start([
-        tool_call_step(&["list_directory"; 65]),
-        tool_call_step(&["read_file"; 64]),
+        tool_call_step(&vec!["list_directory"; (MAX_TOOL_CALLS / 2 + 1) as usize]),
+        tool_call_step(&vec!["read_file"; (MAX_TOOL_CALLS / 2) as usize]),
     ])
     .await
     .unwrap();

@@ -6,19 +6,20 @@
 
 use crate::error::AiError;
 use codescope_core::{
-    MAX_CODE_REF_LINES, MAX_FORMS_PER_PLAN, MAX_NODE_CODE_REFS, PLAN_VERSION, VisualizationPlan,
+    MAX_CODE_REF_LINES, MAX_FORM_NODES, MAX_FORMS_PER_PLAN, MAX_NODE_CODE_REFS, MAX_PLAN_EVIDENCE,
+    PLAN_VERSION, VisualizationPlan,
 };
 #[cfg(test)]
 use serde_json::Value;
 
 /// AI-facing hard cap on nodes per form.
-pub const MAX_AI_FORM_NODES: usize = 5;
+pub const MAX_AI_FORM_NODES: usize = MAX_FORM_NODES;
 
 /// AI-facing hard cap on edges per form.
-pub const MAX_AI_FORM_EDGES: usize = 8;
+pub const MAX_AI_FORM_EDGES: usize = 20;
 
 /// AI-facing hard cap on evidence entries.
-pub const MAX_AI_EVIDENCE: usize = 4;
+pub const MAX_AI_EVIDENCE: usize = MAX_PLAN_EVIDENCE;
 
 /// Parse the renderer plan projected from an incremental diagram draft.
 ///
@@ -49,14 +50,14 @@ pub fn parse_plan(arguments: &str) -> Result<VisualizationPlan, AiError> {
 fn enforce_ai_input_contract(plan: &VisualizationPlan) -> Result<(), AiError> {
     if plan.forms.is_empty() {
         return Err(AiError::MalformedPlan(
-            "plan has no forms; create exactly one structural form (two only for a distinct relationship)"
+            "plan has no forms; create a structural form for each independent changed behavior"
                 .into(),
         ));
     }
     if plan.forms.len() > MAX_FORMS_PER_PLAN {
         let observed = plan.forms.len();
         return Err(AiError::MalformedPlan(format!(
-            "plan has {observed} forms; the renderer contract allows at most {MAX_FORMS_PER_PLAN} - keep one form, two only for a distinct relationship"
+            "plan has {observed} forms; the renderer contract allows at most {MAX_FORMS_PER_PLAN} - group related behavior without omitting independent changes"
         )));
     }
     for (index, form) in plan.forms.iter().enumerate() {
@@ -76,9 +77,14 @@ fn enforce_ai_input_contract(plan: &VisualizationPlan) -> Result<(), AiError> {
         }
         for node in &form.nodes {
             let count = node.code_refs.len();
-            if count == 0 || count > MAX_NODE_CODE_REFS {
+            let source_context = node.change.is_unchanged()
+                && node
+                    .entity
+                    .as_ref()
+                    .is_some_and(|entity| entity.range.is_some());
+            if (count == 0 && !source_context) || count > MAX_NODE_CODE_REFS {
                 return Err(AiError::MalformedPlan(format!(
-                    "node {} in form {index} has {count} code_refs; every node requires 1-{MAX_NODE_CODE_REFS} exact ranges copied from an annotated git_diff_file result",
+                    "node {} in form {index} has {count} code_refs; changed behavior requires 1-{MAX_NODE_CODE_REFS} exact diff ranges from git_diff_file; a background node requires change: unchanged and an inspected entity.range from read_file",
                     node.id
                 )));
             }
@@ -247,6 +253,7 @@ mod tests {
     #[test]
     fn node_code_refs_are_required_bounded_and_non_reversed() {
         let mut missing = sample_json(1);
+        missing["forms"][0]["nodes"][0]["change"] = Value::from("added");
         missing["forms"][0]["nodes"][0]
             .as_object_mut()
             .unwrap()
@@ -266,7 +273,7 @@ mod tests {
         too_wide["forms"][0]["nodes"][0]["code_refs"][0]["end_line"] =
             Value::from(100 + MAX_CODE_REF_LINES);
         let error = parse_plan(&too_wide.to_string()).unwrap_err().to_string();
-        assert!(error.contains("at most 12 lines"), "{error}");
+        assert!(error.contains("at most 64 lines"), "{error}");
 
         let mut too_many = sample_json(1);
         let extra = too_many["forms"][0]["nodes"][0]["code_refs"][0].clone();
@@ -284,10 +291,9 @@ mod tests {
     /// point of the diagram).
     #[test]
     fn rejects_oversized_forms_nodes_and_evidence_with_counts() {
-        // 7 nodes in one form (round-3 live failure: 7 despite maxItems 6, since lowered
-        // to a five-node ceiling after round-3 attempt 2 also used 6 as a target).
+        // Oversized forms report their actual count rather than silently dropping behavior.
         let mut seven = sample_json(1);
-        for i in 2..7 {
+        for i in 2..=MAX_AI_FORM_NODES {
             seven["forms"][0]["nodes"]
                 .as_array_mut()
                 .unwrap()
@@ -301,13 +307,19 @@ mod tests {
         let err = parse_plan(&seven.to_string()).unwrap_err();
         assert!(matches!(err, AiError::MalformedPlan(_)), "{err}");
         let msg = err.to_string();
-        assert!(msg.contains("has 7 nodes"), "observed count: {msg}");
-        assert!(msg.contains("at most 5"), "allowed count: {msg}");
+        assert!(
+            msg.contains(&format!("has {} nodes", MAX_AI_FORM_NODES + 1)),
+            "observed count: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("at most {MAX_AI_FORM_NODES}")),
+            "allowed count: {msg}"
+        );
         assert!(msg.contains("merge intermediate mechanics"), "{msg}");
 
-        // Evidence cap: 5 entries exceeds MAX_AI_EVIDENCE (4).
+        // Evidence and independent forms retain explicit safety ceilings.
         let mut ev = sample_json(1);
-        for i in 0..4 {
+        for i in 0..MAX_AI_EVIDENCE {
             ev["evidence"]
                 .as_array_mut()
                 .unwrap()
@@ -317,21 +329,35 @@ mod tests {
                 }));
         }
         let err = parse_plan(&ev.to_string()).unwrap_err();
-        assert!(err.to_string().contains("5 evidence"), "{}", err);
+        assert!(
+            err.to_string()
+                .contains(&format!("{} evidence", MAX_AI_EVIDENCE + 1)),
+            "{}",
+            err
+        );
 
-        // Forms cap: 3 forms exceeds MAX_FORMS_PER_PLAN (2).
         let mut forms = sample_json(1);
         let extra = forms["forms"][0].clone();
-        for _ in 0..2 {
+        for _ in 0..MAX_FORMS_PER_PLAN {
             forms["forms"].as_array_mut().unwrap().push(extra.clone());
         }
         let err = parse_plan(&forms.to_string()).unwrap_err();
-        assert!(err.to_string().contains("3 forms"), "{}", err);
-        assert!(err.to_string().contains("at most 2"), "{}", err);
+        assert!(
+            err.to_string()
+                .contains(&format!("{} forms", MAX_FORMS_PER_PLAN + 1)),
+            "{}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("at most {MAX_FORMS_PER_PLAN}")),
+            "{}",
+            err
+        );
 
-        // Edges cap: 9 edges in one form exceeds MAX_AI_FORM_EDGES (8).
+        // Edge count is bounded independently of nodes.
         let mut many_edges = sample_json(1);
-        for i in 0..8 {
+        for i in 0..MAX_AI_FORM_EDGES {
             many_edges["forms"][0]["edges"]
                 .as_array_mut()
                 .unwrap()
@@ -344,8 +370,14 @@ mod tests {
         }
         let err = parse_plan(&many_edges.to_string()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("has 9 edges"), "observed count: {msg}");
-        assert!(msg.contains("at most 8"), "allowed count: {msg}");
+        assert!(
+            msg.contains(&format!("has {} edges", MAX_AI_FORM_EDGES + 1)),
+            "observed count: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("at most {MAX_AI_FORM_EDGES}")),
+            "allowed count: {msg}"
+        );
 
         // Empty evidence: a reviewer-first plan needs at least one typed source.
         let mut no_evidence = sample_json(1);
@@ -361,7 +393,7 @@ mod tests {
         let err = parse_plan(&no_forms.to_string()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no forms"), "{msg}");
-        assert!(msg.contains("exactly one structural form"), "{msg}");
+        assert!(msg.contains("each independent changed behavior"), "{msg}");
     }
 
     #[test]

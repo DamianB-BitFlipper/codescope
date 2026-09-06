@@ -84,6 +84,12 @@ pub trait FactView: Sync {
         true
     }
 
+    /// Whether an exact background source range was inspected in this generation.
+    /// Default denial keeps arbitrary entity ranges from becoming trusted citations.
+    fn source_range(&self, _file: &FileId, _range: &LineRange) -> Lookup<()> {
+        Lookup::Unknown
+    }
+
     /// Whether a one-based source `line` exists on `side` of hunk `index` in `file`.
     /// This exact lookup grounds hover highlights in diff rows rather than arbitrary source
     /// ranges that happen to fall inside a file.
@@ -391,7 +397,24 @@ fn node_invalid_reason(
     form_kind: FormClass,
     facts: &dyn FactView,
 ) -> Option<String> {
-    // AI-facing parsing requires at least one ref per node. Validator-only callers may
+    if node.code_refs.is_empty()
+        && node
+            .entity
+            .as_ref()
+            .is_some_and(|entity| entity.symbol.is_none())
+    {
+        if let Some(entity) = &node.entity {
+            if let Some(range) = &entity.range {
+                if !node.change.is_unchanged()
+                    || !matches!(facts.source_range(&entity.file, range), Lookup::Present(()))
+                {
+                    return Some("background node requires change: unchanged and an exact source range inspected with read_file".to_string());
+                }
+            }
+        }
+    }
+    // Changed AI nodes require diff refs; inspected background ranges are the exception.
+    // Validator-only callers may
     // still construct legacy/internal nodes without refs; any refs that are present must
     // be exact and fully valid before they can drive highlighting.
     if node.code_refs.len() > MAX_NODE_CODE_REFS {
@@ -602,14 +625,14 @@ fn sanitize_form(
         downgrade_unqueried_before_after_entities(form, form_idx, facts, dropped);
     }
 
-    if form.kind != FormKind::Sequence {
+    if !matches!(form.kind, FormKind::Sequence | FormKind::RelationshipFlow) {
         if let Some(edge) = form
             .edges
             .iter()
             .find(|edge| edge.kind == PlanEdgeKind::FlowsTo)
         {
             return Err(format!(
-                "flows_to edge {} -> {} is only valid in a sequence form",
+                "flows_to edge {} -> {} requires a sequence or relationship_flow form",
                 edge.from, edge.to
             ));
         }
@@ -931,17 +954,17 @@ fn sanitize_flow(
     if connected.len() != form.nodes.len() {
         return Err("relationship visual is disconnected".to_string());
     }
-    // `flows_to` is a presentational chronological transition, never a graph claim.
+    // `flows_to` is an explanatory transition or handoff, never a graph claim.
     // A Sequence may alternatively show a real, proven semantic relation; all other
     // Sequence semantic edges get repair guidance rather than an unverifiable-edge note.
-    // RelationshipFlow retains its existing graph-validation behavior.
+    // RelationshipFlow also permits explanatory handoffs; semantic kinds still require facts.
     for edge in &form.edges {
         if edge.kind == PlanEdgeKind::FlowsTo {
-            if form.kind == FormKind::Sequence {
+            if matches!(form.kind, FormKind::Sequence | FormKind::RelationshipFlow) {
                 continue;
             }
             return Err(format!(
-                "flows_to edge {} -> {} is only valid in a sequence form",
+                "flows_to edge {} -> {} requires a sequence or relationship_flow form",
                 edge.from, edge.to
             ));
         }
@@ -1642,12 +1665,11 @@ mod tests {
     }
 
     #[test]
-    fn nonsequence_flows_to_is_rejected_with_targeted_reason() {
+    fn nonflow_forms_reject_flows_to_with_targeted_reason() {
         for kind in [
             FormKind::ChangedSymbolTree,
             FormKind::CallTree,
             FormKind::TypeImplTree,
-            FormKind::RelationshipFlow,
             FormKind::BeforeAfter,
         ] {
             let mut plan = plan_with(vec![form(
@@ -1658,10 +1680,32 @@ mod tests {
             let report = validate(&mut plan, &StubFacts::default(), Epoch(1));
             assert_eq!(report.verdict, ValidationVerdict::Rejected, "{kind:?}");
             assert!(report.dropped.iter().any(|item| {
-                item.reason
-                    .contains("flows_to edge n1 -> n2 is only valid in a sequence form")
+                item.reason.contains(
+                    "flows_to edge n1 -> n2 requires a sequence or relationship_flow form",
+                )
             }));
         }
+    }
+
+    /// Explanatory relationship flows retain branches and cycles without asserting calls.
+    #[test]
+    fn relationship_flow_preserves_conditional_handoffs_and_retry_cycles() {
+        let mut plan = plan_with(vec![form(
+            FormKind::RelationshipFlow,
+            vec![
+                node("ready", None, &[]),
+                node("worker", None, &[]),
+                node("done", None, &[]),
+            ],
+            vec![
+                edge("ready", "worker", PlanEdgeKind::FlowsTo),
+                edge("worker", "ready", PlanEdgeKind::FlowsTo),
+                edge("worker", "done", PlanEdgeKind::FlowsTo),
+            ],
+        )]);
+        let report = validate(&mut plan, &StubFacts::default(), Epoch(1));
+        assert_eq!(report.verdict, ValidationVerdict::Valid);
+        assert_eq!(plan.forms[0].edges.len(), 3);
     }
 
     /// A presentational Sequence can describe lifecycle phases even when no node maps to
@@ -2073,15 +2117,17 @@ mod tests {
             vec![node("k1", Some(sym_entity("main.go", "C")), &[])],
             vec![],
         );
-        let mut plan = plan_with(vec![f0, f1, f2]);
+        let mut forms = vec![f0, f1];
+        forms.extend(std::iter::repeat_n(f2, MAX_FORMS_PER_PLAN - 1));
+        let mut plan = plan_with(forms);
         let report = validate(&mut plan, &abc_facts(), Epoch(1));
         assert_eq!(report.verdict, ValidationVerdict::ValidWithDrops);
         assert_eq!(plan.forms.len(), MAX_FORMS_PER_PLAN);
         assert_eq!(plan.forms[0].nodes.len(), MAX_FORM_NODES);
-        assert!(report
-            .dropped
-            .iter()
-            .any(|d| d.subject.starts_with("form 2") && d.reason.contains("MAX_FORMS_PER_PLAN")));
+        assert!(report.dropped.iter().any(|d| {
+            d.subject.starts_with(&format!("form {MAX_FORMS_PER_PLAN}"))
+                && d.reason.contains("MAX_FORMS_PER_PLAN")
+        }));
         assert!(
             report
                 .dropped

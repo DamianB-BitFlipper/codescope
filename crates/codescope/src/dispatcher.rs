@@ -2551,6 +2551,7 @@ impl Dispatcher {
             ),
             None => {
                 ScopedResearchTools::new(ctx.toplevel.clone(), &selection, scoped_changeset.clone())
+                    .with_source_facts(queried_lsp)
             }
         };
         let ai = self.ai.clone();
@@ -4503,6 +4504,10 @@ fn entity_key(e: &EntityRef) -> String {
 }
 
 impl FactView for SnapshotFacts {
+    fn source_range(&self, file: &codescope_core::FileId, range: &LineRange) -> Lookup<()> {
+        self.queried_lsp.source_range(file, range)
+    }
+
     fn is_focus_file(&self, file: &codescope_core::FileId) -> bool {
         self.focus.contains_file(file.as_path().as_str())
     }

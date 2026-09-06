@@ -1231,7 +1231,7 @@ fn cell_chunks(text: &str, width: usize) -> Vec<String> {
 const MIN_BOX_WIDTH: usize = 18;
 
 fn edge_verified(from: &PlanNode, to: &PlanNode, edge: &PlanEdge) -> bool {
-    // `flows_to` is renderer-native sequence grammar, so it has no fact-store proof.
+    // `flows_to` is an explanatory transition/handoff, so it has no fact-store proof.
     edge.kind != PlanEdgeKind::FlowsTo
         && from.entity.is_some()
         && to.entity.is_some()
@@ -1498,42 +1498,44 @@ mod canvas_tests {
 
     #[test]
     fn flows_to_renders_as_an_unverified_transition_with_a_fallback_overlay() {
-        let mut plan = VisualizationPlan::new(Epoch(7));
-        plan.forms.push(VizForm {
-            kind: FormKind::Sequence,
-            nodes: vec![
-                PlanNode::new("request", "request", PlanNodeChange::Modified).with_entity(
-                    EntityRef::for_file(FileId::new("src/request.rs").expect("valid file id")),
-                ),
-                PlanNode::new("handler", "handler", PlanNodeChange::Modified).with_entity(
-                    EntityRef::for_file(FileId::new("src/handler.rs").expect("valid file id")),
-                ),
-            ],
-            edges: vec![PlanEdge {
-                from: "request".into(),
-                to: "handler".into(),
-                kind: PlanEdgeKind::FlowsTo,
-                label: None,
-            }],
-        });
+        for kind in [FormKind::Sequence, FormKind::RelationshipFlow] {
+            let mut plan = VisualizationPlan::new(Epoch(7));
+            plan.forms.push(VizForm {
+                kind,
+                nodes: vec![
+                    PlanNode::new("request", "request", PlanNodeChange::Modified).with_entity(
+                        EntityRef::for_file(FileId::new("src/request.rs").expect("valid file id")),
+                    ),
+                    PlanNode::new("handler", "handler", PlanNodeChange::Modified).with_entity(
+                        EntityRef::for_file(FileId::new("src/handler.rs").expect("valid file id")),
+                    ),
+                ],
+                edges: vec![PlanEdge {
+                    from: "request".into(),
+                    to: "handler".into(),
+                    kind: PlanEdgeKind::FlowsTo,
+                    label: None,
+                }],
+            });
 
-        let canvas = built(&plan, &DiagramState::default(), 40);
-        let relationship = canvas
-            .relationships
-            .first()
-            .expect("flow transition renders");
-        assert!(
-            relationship.label.is_empty(),
-            "no compact label was supplied"
-        );
-        assert!(
-            !relationship.verified,
-            "renderer-native transitions are inferred and therefore dashed"
-        );
-        let overlay = canvas
-            .relationship_overlay(&plan, &relationship.target)
-            .expect("transition has a fallback overlay");
-        assert!(overlay.lines.join("\n").contains("flows to"));
+            let canvas = built(&plan, &DiagramState::default(), 40);
+            let relationship = canvas
+                .relationships
+                .first()
+                .expect("flow transition renders");
+            assert!(
+                relationship.label.is_empty(),
+                "no compact label was supplied"
+            );
+            assert!(
+                !relationship.verified,
+                "renderer-native transitions are inferred and therefore dashed"
+            );
+            let overlay = canvas
+                .relationship_overlay(&plan, &relationship.target)
+                .expect("transition has a fallback overlay");
+            assert!(overlay.lines.join("\n").contains("flows to"));
+        }
     }
 
     #[test]

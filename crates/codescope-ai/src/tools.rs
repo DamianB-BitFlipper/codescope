@@ -15,13 +15,13 @@ use serde_json::{Value, json};
 /// Hard budget of research and diagram-edit tool calls per plan. Incremental construction
 /// needs room to inspect, create, revise, and validate without turning one missed detail
 /// into a terminal failure.
-pub const MAX_TOOL_CALLS: u32 = 128;
+pub const MAX_TOOL_CALLS: u32 = 192;
 
 /// Mutate the in-progress renderer-native diagram with one [`codescope_core::DiagramCommand`].
 pub const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
 /// Read the complete in-progress diagram draft.
 pub const DIAGRAM_INSPECT_TOOL_NAME: &str = "inspect_visualization";
-/// Inspect language-server facts rooted at the current changed-file selection.
+/// Inspect language-server facts in selected or tracked repository files.
 pub const LSP_INSPECT_TOOL_NAME: &str = "inspect_language_server";
 
 /// One tool definition in OpenAI tool-calling format.
@@ -81,21 +81,25 @@ pub fn research_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "list_directory",
-            description: "List changed files and child directories at a path inside the current selection (like a bounded `ls`). Use `.` for the virtual cwd.".into(),
+            description: "Browse files and child directories. Default scope selection lists changed files relative to the virtual cwd. Use scope repository to discover tracked background source outside the diff; path is then repo-relative and `.` is the repository root. Follow next_offset for paginated repository listings.".into(),
             parameters: json!({
                 "type": "object",
-                "properties": {"path": path_prop},
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path; cwd-relative for selection scope, repo-relative for repository scope. No absolute paths or parent traversal."},
+                    "scope": {"type": "string", "enum": ["selection", "repository"], "default": "selection"},
+                    "offset": {"type": "integer", "minimum": 0, "description": "Repository listing offset copied from next_offset."}
+                },
                 "required": [],
                 "additionalProperties": false
             }),
         },
         ToolDef {
             name: "read_file",
-            description: "Read a numbered section of a changed file from the current worktree (like `sed -n`). Returns at most 200 lines and may be unavailable for deleted files.".into(),
+            description: "Read up to 200 numbered worktree lines for review background, including unchanged helpers, callers, types, and configuration outside the selected diff. Selected files accept cwd-relative paths; other repository files require an exact repo-relative path. Returns an entity with the inspected zero-based source range for an unchanged background box. Deleted files require the captured Git diff.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": file_path_prop,
+                    "path": {"type": "string", "description": "Selected-file path, or exact repo-relative path of a tracked background source file."},
                     "start_line": {"type": "integer", "minimum": 1, "default": 1,
                                    "description": "One-based first line."},
                     "end_line": {"type": "integer", "minimum": 1,
@@ -132,13 +136,15 @@ pub fn research_tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "git_diff_file",
-            description: "Read the captured unified diff for one changed file. First use git_status_file to identify the decisive hunk(s); never choose hunk 0 merely because it is first. Omit hunk_index for a bounded overview, or supply a status-derived zero-based hunk index for exact annotated lines used by plan code_refs.".into(),
+            description: "Read the captured unified diff for a selected changed file. Inventory with git_status_file, then inspect every changed hunk for a file review. Large hunks are paginated: follow next_hunk_index and next_offset until complete. Omit hunk_index to start at the first hunk. Copy exact annotated lines into code_refs.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": file_path_prop,
                     "hunk_index": {"type": "integer", "minimum": 0,
-                                   "description": "Optional zero-based hunk index from git_status_file."}
+                                   "description": "Zero-based hunk index from inventory or next_hunk_index."},
+                    "offset": {"type": "integer", "minimum": 0,
+                               "description": "Zero-based row offset within this hunk, copied from next_offset; defaults to 0."}
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -155,7 +161,7 @@ pub fn research_tools() -> Vec<ToolDef> {
 pub fn semantic_tools() -> Vec<ToolDef> {
     vec![ToolDef {
         name: LSP_INSPECT_TOOL_NAME,
-        description: "Explore bounded, read-only language-server facts for the current selection. Use capabilities to discover query names supported by the active adapter. Inspection can be anchored by the current Codescope selection, an exact symbol copied from a symbols result, or an explicit source position. Standard queries include symbols, references, callers, callees, implementations, supertypes, subtypes, diagnostics, hover, and semantic_tokens; future adapters may advertise more without changing this tool. Results identify worktree revision, epoch, completeness, truncation, and unavailable/unsupported states. Paths follow the same virtual-cwd rules as the Git tools."
+        description: "Explore bounded, read-only language-server facts across the repository, including tracked files NOT in the selected diff. Use capabilities to discover supported queries. Anchor inspection with path plus a symbol from symbols output or an explicit source position. Query symbols and follow next_offset to traverse a file's full nested symbol tree; follow repo-local references, callers, callees, implementations, supertypes, and subtypes into other files. Diagnostics, hover, and semantic_tokens are also capability-dependent. Use list_directory with scope repository to discover background source. Results identify worktree revision, epoch, completeness, truncation, and unsupported states. Background research does not expand the selected review scope."
             .into(),
         parameters: json!({
             "type": "object",
@@ -168,7 +174,7 @@ pub fn semantic_tools() -> Vec<ToolDef> {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional selected changed-file path, relative to the virtual cwd or copied from repo_path. Required for symbols and when there is no current file/symbol selection."
+                    "description": "Selected-file path or exact tracked repo-relative background file path, including outside the diff. Required when there is no current file/symbol selection."
                 },
                 "symbol": {
                     "type": "string",
@@ -183,6 +189,11 @@ pub fn semantic_tools() -> Vec<ToolDef> {
                     "type": "integer",
                     "minimum": 0,
                     "description": "Optional zero-based UTF-8 byte column; defaults to 0 when line is supplied."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "For symbols only: zero-based tree traversal offset copied from next_offset. Other queries do not support pagination."
                 },
                 "limit": {
                     "type": "integer",
@@ -262,7 +273,14 @@ pub fn diagram_tools() -> Vec<ToolDef> {
                 ("kind", diagram_form_kind_schema()),
             ],
             &["form_id", "kind"],
-            json!({"op": "create_form", "form_id": "main", "kind": "sequence"}),
+            json!({"op": "create_form", "form_id": "main", "kind": "relationship_flow"}),
+        ),
+        diagram_command_variant(
+            "set_form_kind",
+            "Change an existing form's visual grammar without losing its boxes or arrows. Use relationship_flow for branches, retries, or a caller discovered after sequence construction. Full source and connectivity validation still applies.",
+            vec![("form_id", form_id()), ("kind", diagram_form_kind_schema())],
+            &["form_id", "kind"],
+            json!({"op":"set_form_kind", "form_id":"main", "kind":"relationship_flow"}),
         ),
         diagram_command_variant(
             "delete_form",
@@ -386,21 +404,28 @@ pub fn diagram_tools() -> Vec<ToolDef> {
             &["index"],
             json!({"op": "delete_evidence", "index": 0}),
         ),
+        diagram_command_variant(
+            "finish",
+            "Request validation and publication after all selected behaviors and relevant background are explained. Coverage and source validation still apply; repair any feedback before requesting finish again.",
+            vec![],
+            &[],
+            json!({"op": "finish"}),
+        ),
     ];
 
     vec![
         ToolDef {
             name: DIAGRAM_EDIT_TOOL_NAME,
-            description: "Apply exactly one atomic diagram command. Choose the operation-specific schema branch matching `op`; every branch lists its complete required fields, nested types, and a valid example. Build in this order: set_intent, create_form, create_node, create_edge, add_evidence. For create_node, pass `form_id` beside `node`; use `change: \"added\"|...` and only booleans inside `hint`. The arguments are the same JSON accepted by `codescope agent diagram edit`. Use inspect_visualization when ids or current state are uncertain.".into(),
+            description: "Apply exactly one atomic diagram command. Choose the schema branch matching `op`; every branch lists required fields, nested types, and a valid example. Start with set_intent and create_form, then add nodes, supported edges, and evidence. Add separate forms for independent behaviors; completing one form does not finish a file review. For create_node, pass `form_id` beside `node`; use `change: \"added\"|...` and only booleans inside `hint`. The arguments are the same JSON accepted by `codescope agent diagram edit`. Use inspect_visualization when ids or current state are uncertain.".into(),
             parameters: json!({
                 "type": "object",
                 "description": "A discriminated union of DiagramCommand objects. Exactly one `oneOf` branch must match the selected `op`.",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["set_intent", "create_form", "delete_form",
+                        "enum": ["set_intent", "create_form", "set_form_kind", "delete_form",
                                  "create_node", "update_node", "delete_node", "create_edge",
-                                 "update_edge", "delete_edge", "add_evidence", "delete_evidence"],
+                                 "update_edge", "delete_edge", "add_evidence", "delete_evidence", "finish"],
                         "description": "Atomic edit operation."
                     }
                 },
@@ -463,7 +488,7 @@ fn diagram_form_kind_schema() -> Value {
 fn diagram_line_range_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Exact zero-based UTF-8 source range copied from a semantic tool result.",
+        "description": "Exact zero-based UTF-8 source range copied from a semantic result or read_file background_entity.",
         "properties": {
             "start_line": {"type": "integer", "minimum": 0},
             "start_col": {"type": "integer", "minimum": 0},
@@ -527,7 +552,7 @@ fn diagram_node_schema() -> Value {
             "label": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Short identifier or action displayed as the box title."},
             "detail": {"type": "string", "minLength": 1, "maxLength": 2000, "description": "Required concrete reviewer-facing preview; keep it to at most 8 words and 56 characters."},
             "expanded_detail": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "Optional self-contained deeper explanation shown when the box expands in place."},
-            "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": diagram_code_ref_schema(), "description": format!("One or two exact changed-line references, each at most {MAX_CODE_REF_LINES} inclusive lines.")},
+            "code_refs": {"type": "array", "minItems": 0, "maxItems": 2, "items": diagram_code_ref_schema(), "description": format!("Changed behavior: one or two exact diff references, at most {MAX_CODE_REF_LINES} lines each. Background: [] only with change: unchanged and an exact inspected entity.range from read_file.")},
             "change": {"type": "string", "enum": ["added", "modified", "removed", "unchanged", "diagnostic"], "description": "Optional change badge string."},
             "severity": {"type": "string", "enum": ["error", "warning", "information", "hint"], "description": "Optional diagnostic severity badge."},
             "children": {"type": "array", "maxItems": 12, "items": {"type": "string", "minLength": 1}, "description": "Child node ids for tree forms only."},
@@ -551,7 +576,7 @@ fn diagram_node_patch_schema() -> Value {
             "clear_expanded_detail": {"type": "boolean", "description": "Set true to remove expanded_detail; do not pass a string."},
             "entity": diagram_entity_schema(),
             "clear_entity": {"type": "boolean", "description": "Set true to remove entity; do not pass a string."},
-            "code_refs": {"type": "array", "minItems": 1, "maxItems": 2, "items": diagram_code_ref_schema()},
+            "code_refs": {"type": "array", "minItems": 0, "maxItems": 2, "items": diagram_code_ref_schema(), "description": "Changed behavior requires 1-2 diff references. Only unchanged background nodes with an inspected source entity may use an empty array."},
             "change": {"type": "string", "enum": ["added", "modified", "removed", "unchanged", "diagnostic"]},
             "severity": {"type": "string", "enum": ["error", "warning", "information", "hint"]},
             "clear_severity": {"type": "boolean", "description": "Set true to remove severity; do not pass a string."},
@@ -566,7 +591,7 @@ fn diagram_edge_kind_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["calls", "imports", "implements", "contains", "reads", "writes", "flows_to"],
-        "description": "Typed directed relationship. Use flows_to only for conceptual chronological adjacency in a Sequence form. Use semantic kinds only when supplied relationship evidence proves them; calls means only a proven actual call, never a generic next step."
+        "description": "Use flows_to for source-grounded lifecycle order in sequence, or for a labeled state/data handoff or conditional transition in relationship_flow. It is explanatory, not a graph-verified call. Use semantic kinds only when supplied relationship evidence proves them; calls means an actual call, never a generic next step."
     })
 }
 
@@ -708,6 +733,12 @@ impl ToolExecError {
 /// The trait returns a [`BoxFuture`] (instead of `async fn`) so it stays dyn-compatible
 /// for `&dyn ToolExecutor` wiring.
 pub trait ToolExecutor: Send + Sync {
+    /// File/directory review progress. Returning a value enables complete-scope review:
+    /// research and additional forms remain available until explicit completion.
+    fn review_coverage(&self, _draft: &codescope_core::DiagramDraft) -> Option<ReviewCoverage> {
+        None
+    }
+
     /// Read-only tools this executor can actually serve.
     ///
     /// The service advertises only this set to the model. The safe default is empty:
@@ -740,6 +771,30 @@ pub trait ToolExecutor: Send + Sync {
     ) -> BoxFuture<'a, Result<String, ToolExecError>>;
 }
 
+/// Controller-owned progress for a complete file or directory review. Pending paths are
+/// repository data and belong in the user handoff, never in system instructions.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReviewCoverage {
+    /// All changed hunks in the selection.
+    pub required_hunks: usize,
+    /// Hunks whose entire captured contents have been returned by research tools.
+    pub inspected_hunks: usize,
+    /// Hunks represented by changed-behavior boxes.
+    pub cited_hunks: usize,
+    /// Bounded list of next exact diff pages to inspect.
+    pub next_reads: Vec<Value>,
+    /// Bounded list of hunks still absent from the diagram.
+    pub uncited_hunks: Vec<Value>,
+}
+
+impl ReviewCoverage {
+    /// Mechanical completion floor; the model must also cover distinct behaviors within
+    /// each hunk and supply the background needed by a new reviewer.
+    pub fn complete(&self) -> bool {
+        self.inspected_hunks == self.required_hunks && self.cited_hunks == self.required_hunks
+    }
+}
+
 /// A [`ToolExecutor`] that fails every research call; the service still supplies its own
 /// incremental diagram editor, so the model can build from the brief alone.
 #[derive(Debug, Default, Clone, Copy)]
@@ -768,6 +823,7 @@ mod tests {
         for op in [
             "set_intent",
             "create_form",
+            "set_form_kind",
             "delete_form",
             "create_node",
             "update_node",
@@ -777,6 +833,7 @@ mod tests {
             "delete_edge",
             "add_evidence",
             "delete_evidence",
+            "finish",
         ] {
             let tool = diagram_tool_for_op(op).expect("canonical operation");
             assert_eq!(tool.name, DIAGRAM_EDIT_TOOL_NAME);
@@ -858,8 +915,10 @@ mod tests {
         assert_eq!(tool.parameters["properties"]["column"]["minimum"], 0);
         assert!(
             tool.description
-                .contains("future adapters may advertise more")
+                .contains("tracked files NOT in the selected diff")
         );
+        assert_eq!(tool.parameters["properties"]["offset"]["minimum"], 0);
+        assert!(tool.description.contains("full nested symbol tree"));
     }
 
     #[test]
@@ -896,7 +955,7 @@ mod tests {
             "strict editor schema regressed to {wire_bytes} bytes"
         );
         let variants = edit.parameters["oneOf"].as_array().unwrap();
-        assert_eq!(variants.len(), 11);
+        assert_eq!(variants.len(), 13);
         for variant in variants {
             assert_eq!(variant["type"], "object");
             assert_eq!(variant["additionalProperties"], false);
@@ -960,7 +1019,8 @@ mod tests {
             edge_kind["description"]
                 .as_str()
                 .is_some_and(|description| {
-                    description.contains("conceptual chronological adjacency in a Sequence form")
+                    description.contains("source-grounded lifecycle order in sequence")
+                        && description.contains("conditional transition in relationship_flow")
                         && description.contains("supplied relationship evidence proves")
                         && !description.contains("required normal")
                 })
@@ -1006,7 +1066,7 @@ mod tests {
         assert!(!is_read_only_tool("rm_rf"));
         assert!(is_diagram_tool(DIAGRAM_EDIT_TOOL_NAME));
         assert!(is_diagram_tool(DIAGRAM_INSPECT_TOOL_NAME));
-        assert_eq!(MAX_TOOL_CALLS, 128);
+        assert_eq!(MAX_TOOL_CALLS, 192);
     }
 
     #[tokio::test]
