@@ -80,7 +80,7 @@ pub fn detect_languages(root: &Utf8Path) -> Vec<Language> {
                 seen.insert(Language::TypeScript);
             }
             _ => {
-                if name.ends_with(".py") {
+                if name.ends_with(".py") || name.ends_with(".pyi") {
                     seen.insert(Language::Python);
                 }
             }
@@ -152,6 +152,61 @@ pub fn rust_project_root(root: &Utf8Path) -> Option<Utf8PathBuf> {
         }
     }
     first
+}
+
+/// Find the Python project root Pyright should serve.
+///
+/// The shallowest `pyrightconfig.json` or `pyproject.toml` containing `[tool.pyright]`
+/// wins, with `pyrightconfig.json` preferred when both are beside each other.
+/// Repositories without either configuration are served from the Git root.
+#[must_use]
+pub fn python_project_root(root: &Utf8Path) -> Utf8PathBuf {
+    let mut candidates = Vec::new();
+    let walker = WalkBuilder::new(root.as_std_path()).build();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        let Some(parent) = entry.path().parent() else {
+            continue;
+        };
+        let Ok(dir) = Utf8PathBuf::from_path_buf(parent.to_path_buf()) else {
+            continue;
+        };
+        match name {
+            "pyrightconfig.json" => candidates.push((dir, 0_u8)),
+            "pyproject.toml"
+                if std::fs::read_to_string(entry.path())
+                    .is_ok_and(|text| text.contains("[tool.pyright]")) =>
+            {
+                candidates.push((dir, 1_u8));
+            }
+            _ => {}
+        }
+    }
+
+    candidates.sort_by(|(left, left_kind), (right, right_kind)| {
+        project_root_depth(root, left)
+            .cmp(&project_root_depth(root, right))
+            .then_with(|| left_kind.cmp(right_kind))
+            .then_with(|| left.cmp(right))
+    });
+    candidates
+        .into_iter()
+        .map(|(directory, _)| directory)
+        .next()
+        .unwrap_or_else(|| root.to_path_buf())
+}
+
+fn project_root_depth(root: &Utf8Path, candidate: &Utf8Path) -> usize {
+    candidate
+        .strip_prefix(root)
+        .map(Utf8Path::components)
+        .map(Iterator::count)
+        .unwrap_or(usize::MAX)
 }
 
 fn is_workspace_root(cargo_toml: &std::path::Path) -> bool {
@@ -278,5 +333,46 @@ mod tests {
             rust_project_root(&root),
             Some(Utf8PathBuf::from_path_buf(tmp.path().join("packages/rootfs")).unwrap())
         );
+    }
+
+    #[test]
+    fn python_project_root_prefers_pyright_config() {
+        let tmp = scratch();
+        write(
+            tmp.path(),
+            "packages/app/pyproject.toml",
+            "[tool.pyright]\ntypeCheckingMode = \"basic\"\n",
+        );
+        write(tmp.path(), "packages/app/pyrightconfig.json", "{}\n");
+        write(tmp.path(), "packages/app/app.py", "value = 1\n");
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(
+            python_project_root(&root),
+            Utf8PathBuf::from_path_buf(tmp.path().join("packages/app")).unwrap()
+        );
+    }
+
+    #[test]
+    fn python_project_root_uses_shallowest_config_and_falls_back_to_repo() {
+        let tmp = scratch();
+        write(
+            tmp.path(),
+            "packages/app/pyproject.toml",
+            "[tool.pyright]\ntypeCheckingMode = \"basic\"\n",
+        );
+        write(
+            tmp.path(),
+            "packages/app/nested/pyproject.toml",
+            "[tool.pyright]\ntypeCheckingMode = \"strict\"\n",
+        );
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(
+            python_project_root(&root),
+            Utf8PathBuf::from_path_buf(tmp.path().join("packages/app")).unwrap()
+        );
+
+        let other = scratch();
+        let other_root = Utf8PathBuf::from_path_buf(other.path().to_path_buf()).unwrap();
+        assert_eq!(python_project_root(&other_root), other_root);
     }
 }

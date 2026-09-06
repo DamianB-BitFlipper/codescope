@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
     }
 
     // Start the language server in the BACKGROUND: the TUI and git view come up immediately
-    // (LsStatus::Starting); when gopls finishes initializing, the engine is handed to the
+    // (LsStatus::Starting); when the selected LSP finishes initializing, the engine is handed to the
     // dispatcher via DispatchEvent::EngineReady and semantic analysis begins (rv-perf H2).
 
     let ai_config = config_store

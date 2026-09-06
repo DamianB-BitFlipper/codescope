@@ -1,13 +1,13 @@
 //! `LanguageService`: the language-neutral semantic boundary (research 01).
 //!
-//! Enum dispatch over per-server adapters. Callers get `codescope-core` domain types
+//! Dispatch over per-server adapters. Callers get `codescope-core` domain types
 //! wrapped in [`codescope_core::Evidence`]; every relationship query is gated on the
 //! [`codescope_core::FeatureSet`] resolved at initialize, so unsupported features fail
 //! fast with [`SemanticError::Unsupported`] before anything goes on the wire.
 //!
-//! Adding a server (rust-analyzer, clangd, pyright, tsls, …) means: a new adapter module
-//! owning spawn/initialize/enrichment specifics, and a new variant here. Nothing above
-//! this enum changes.
+//! Conventional servers implement [`crate::standard::StandardAdapter`] and inherit the
+//! shared overlay/query/cache implementation. Bespoke adapters can still own additional
+//! enrichment, as gopls does. Nothing above this service changes.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use codescope_core::{
@@ -19,24 +19,30 @@ use crate::detect::{Language, detect_languages};
 use crate::error::SemanticError;
 use crate::gopls::GoplsService;
 use crate::options::LanguageServiceOptions;
-use crate::rust_analyzer::RustAnalyzerService;
+use crate::pyright::PyrightAdapter;
+use crate::rust_analyzer::RustAnalyzerAdapter;
+use crate::standard::StandardLspService;
 
 /// One running language-server session behind the common semantic surface.
 #[derive(Debug)]
 pub enum LanguageService {
     /// gopls (Go). The prototype's production adapter.
     Gopls(GoplsService),
-    /// rust-analyzer (Rust). Proves the adapter-pluggability claim.
-    RustAnalyzer(RustAnalyzerService),
+    /// A conventional stdio LSP powered by the shared adapter contract.
+    Standard {
+        /// Source language served by this session.
+        language: Language,
+        /// Shared capability-gated semantic implementation.
+        service: StandardLspService,
+    },
 }
 
 impl LanguageService {
     /// Start the language service(s) appropriate for `root` (the git toplevel).
     ///
-    /// Detection for the prototype: if any `go.mod`/`go.work` is present under `root`,
-    /// gopls is started in multi-root mode (Go wins ties). If no Go is detected but a
-    /// `Cargo.toml` is found under `root`, rust-analyzer is started at the Cargo
-    /// package/workspace root. If no supported language is detected, a clear
+    /// Detection precedence is Go, Rust, then Python. Go uses gopls in multi-root mode;
+    /// Rust uses rust-analyzer at the Cargo root; Python uses Pyright at the nearest
+    /// configured Python project root. If no supported language is detected, a clear
     /// [`SemanticError::NoSupportedLanguage`] error is returned so the binary can
     /// distinguish "no language" from a real language-server failure.
     pub async fn start(root: &Utf8Path) -> Result<Self, SemanticError> {
@@ -55,9 +61,16 @@ impl LanguageService {
             ));
         }
         if languages.contains(&Language::Rust) {
-            return Ok(LanguageService::RustAnalyzer(
-                RustAnalyzerService::start_with_options(root, options).await?,
-            ));
+            return Ok(LanguageService::Standard {
+                language: Language::Rust,
+                service: StandardLspService::start::<RustAnalyzerAdapter>(root, options).await?,
+            });
+        }
+        if languages.contains(&Language::Python) {
+            return Ok(LanguageService::Standard {
+                language: Language::Python,
+                service: StandardLspService::start::<PyrightAdapter>(root, options).await?,
+            });
         }
         Err(SemanticError::NoSupportedLanguage(languages))
     }
@@ -67,7 +80,7 @@ impl LanguageService {
     pub fn features(&self) -> &FeatureSet {
         match self {
             LanguageService::Gopls(s) => s.features(),
-            LanguageService::RustAnalyzer(s) => s.features(),
+            LanguageService::Standard { service, .. } => service.features(),
         }
     }
 
@@ -76,7 +89,7 @@ impl LanguageService {
     pub fn language_name(&self) -> &'static str {
         match self {
             LanguageService::Gopls(_) => Language::Go.as_str(),
-            LanguageService::RustAnalyzer(_) => Language::Rust.as_str(),
+            LanguageService::Standard { language, .. } => language.as_str(),
         }
     }
 
@@ -85,7 +98,7 @@ impl LanguageService {
     pub fn root(&self) -> &Utf8Path {
         match self {
             LanguageService::Gopls(s) => s.repo_root(),
-            LanguageService::RustAnalyzer(s) => s.repo_root(),
+            LanguageService::Standard { service, .. } => service.repo_root(),
         }
     }
 
@@ -94,7 +107,7 @@ impl LanguageService {
     pub fn is_alive(&self) -> bool {
         match self {
             LanguageService::Gopls(s) => s.is_alive(),
-            LanguageService::RustAnalyzer(s) => s.is_alive(),
+            LanguageService::Standard { service, .. } => service.is_alive(),
         }
     }
 
@@ -104,7 +117,7 @@ impl LanguageService {
     pub fn diagnostics(&self, file: &FileId) -> Vec<Diagnostic> {
         match self {
             LanguageService::Gopls(s) => s.diagnostics(file),
-            LanguageService::RustAnalyzer(s) => s.diagnostics(file),
+            LanguageService::Standard { service, .. } => service.diagnostics(file),
         }
     }
 
@@ -115,7 +128,7 @@ impl LanguageService {
     ) -> Result<Evidence<SymbolTree>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.document_symbols(file).await,
-            LanguageService::RustAnalyzer(s) => s.document_symbols(file).await,
+            LanguageService::Standard { service, .. } => service.document_symbols(file).await,
         }
     }
 
@@ -129,7 +142,9 @@ impl LanguageService {
     ) -> Result<Evidence<SymbolTree>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.base_document_symbols(file, content).await,
-            LanguageService::RustAnalyzer(s) => s.base_document_symbols(file, content).await,
+            LanguageService::Standard { service, .. } => {
+                service.base_document_symbols(file, content).await
+            }
         }
     }
 
@@ -140,7 +155,7 @@ impl LanguageService {
     ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.semantic_tokens(file).await,
-            LanguageService::RustAnalyzer(s) => s.semantic_tokens(file).await,
+            LanguageService::Standard { service, .. } => service.semantic_tokens(file).await,
         }
     }
 
@@ -152,7 +167,9 @@ impl LanguageService {
     ) -> Result<Evidence<Vec<SyntaxToken>>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.semantic_tokens_for_content(file, content).await,
-            LanguageService::RustAnalyzer(s) => s.semantic_tokens_for_content(file, content).await,
+            LanguageService::Standard { service, .. } => {
+                service.semantic_tokens_for_content(file, content).await
+            }
         }
     }
 
@@ -164,7 +181,7 @@ impl LanguageService {
     ) -> Result<Evidence<Vec<Location>>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.references(file, pos).await,
-            LanguageService::RustAnalyzer(s) => s.references(file, pos).await,
+            LanguageService::Standard { service, .. } => service.references(file, pos).await,
         }
     }
 
@@ -176,7 +193,7 @@ impl LanguageService {
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.incoming_calls(file, pos).await,
-            LanguageService::RustAnalyzer(s) => s.incoming_calls(file, pos).await,
+            LanguageService::Standard { service, .. } => service.incoming_calls(file, pos).await,
         }
     }
 
@@ -188,7 +205,7 @@ impl LanguageService {
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.outgoing_calls(file, pos).await,
-            LanguageService::RustAnalyzer(s) => s.outgoing_calls(file, pos).await,
+            LanguageService::Standard { service, .. } => service.outgoing_calls(file, pos).await,
         }
     }
 
@@ -201,7 +218,7 @@ impl LanguageService {
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.implementations(file, pos).await,
-            LanguageService::RustAnalyzer(s) => s.implementations(file, pos).await,
+            LanguageService::Standard { service, .. } => service.implementations(file, pos).await,
         }
     }
 
@@ -213,7 +230,7 @@ impl LanguageService {
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.type_supertypes(file, pos).await,
-            LanguageService::RustAnalyzer(s) => s.type_supertypes(file, pos).await,
+            LanguageService::Standard { service, .. } => service.type_supertypes(file, pos).await,
         }
     }
 
@@ -225,7 +242,7 @@ impl LanguageService {
     ) -> Result<Evidence<Vec<SymbolRef>>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.type_subtypes(file, pos).await,
-            LanguageService::RustAnalyzer(s) => s.type_subtypes(file, pos).await,
+            LanguageService::Standard { service, .. } => service.type_subtypes(file, pos).await,
         }
     }
 
@@ -238,7 +255,7 @@ impl LanguageService {
     ) -> Result<Option<String>, SemanticError> {
         match self {
             LanguageService::Gopls(s) => s.hover(file, pos).await,
-            LanguageService::RustAnalyzer(s) => s.hover(file, pos).await,
+            LanguageService::Standard { service, .. } => service.hover(file, pos).await,
         }
     }
 
@@ -248,7 +265,7 @@ impl LanguageService {
     pub fn file_id(&self, abs: &Utf8Path) -> Option<FileId> {
         match self {
             LanguageService::Gopls(s) => s.file_id(abs),
-            LanguageService::RustAnalyzer(s) => s.file_id(abs),
+            LanguageService::Standard { service, .. } => service.file_id(abs),
         }
     }
 
@@ -257,7 +274,7 @@ impl LanguageService {
     pub fn abs_path(&self, file: &FileId) -> Utf8PathBuf {
         match self {
             LanguageService::Gopls(s) => s.abs_path(file),
-            LanguageService::RustAnalyzer(s) => s.abs_path(file),
+            LanguageService::Standard { service, .. } => service.abs_path(file),
         }
     }
 
@@ -266,7 +283,7 @@ impl LanguageService {
     pub fn handles(&self, file: &FileId) -> bool {
         match self {
             LanguageService::Gopls(s) => s.handles(file),
-            LanguageService::RustAnalyzer(s) => s.handles(file),
+            LanguageService::Standard { service, .. } => service.handles(file),
         }
     }
 
@@ -274,7 +291,7 @@ impl LanguageService {
     pub async fn shutdown(self) {
         match self {
             LanguageService::Gopls(s) => s.shutdown().await,
-            LanguageService::RustAnalyzer(s) => s.shutdown().await,
+            LanguageService::Standard { service, .. } => service.shutdown().await,
         }
     }
 }

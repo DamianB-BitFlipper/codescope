@@ -716,13 +716,13 @@ impl ScopeCounts {
 /// Language-server availability summary (a cheap binary probe, not a full session).
 #[derive(Serialize)]
 struct LanguageServerView {
-    /// The language a session would serve (Go wins ties, then Rust — the same
-    /// precedence as [`LanguageService::start`]). TypeScript/Python are detected but
-    /// have no adapter, so a repo with only those reports `language_server: null`.
+    /// The language a session would serve (Go wins ties, then Rust, then Python — the
+    /// same precedence as [`LanguageService::start`]). TypeScript is detected but has
+    /// no adapter, so a TypeScript-only repo reports `language_server: null`.
     language: &'static str,
     /// The server binary that was probed (env override honored).
     server: String,
-    /// `true` when the server binary runs successfully.
+    /// `true` when the server binary is available.
     available: bool,
 }
 
@@ -839,28 +839,67 @@ struct DebugAiSelection {
 /// binary probe (`<server> version`-style) instead of a full initialize handshake.
 /// `None` when no detected language has an adapter (matching [`LanguageService::start`]).
 fn language_server_view(languages: &[Language]) -> Option<LanguageServerView> {
-    let (language, program, probe_args): (Language, String, &[&str]) =
-        if languages.contains(&Language::Go) {
-            (
-                Language::Go,
-                std::env::var("CODESCOPE_GOPLS").unwrap_or_else(|_| "gopls".to_string()),
-                &["version"],
-            )
-        } else if languages.contains(&Language::Rust) {
-            (
-                Language::Rust,
-                std::env::var("CODESCOPE_RUST_ANALYZER")
-                    .unwrap_or_else(|_| "rust-analyzer".to_string()),
-                &["--version"],
-            )
-        } else {
-            return None;
-        };
-    let available = binary_runs(&program, probe_args);
+    let (language, program, probe_args): (Language, String, Option<&[&str]>) = if languages
+        .contains(&Language::Go)
+    {
+        (
+            Language::Go,
+            std::env::var("CODESCOPE_GOPLS").unwrap_or_else(|_| "gopls".to_string()),
+            Some(&["version"]),
+        )
+    } else if languages.contains(&Language::Rust) {
+        (
+            Language::Rust,
+            std::env::var("CODESCOPE_RUST_ANALYZER")
+                .unwrap_or_else(|_| "rust-analyzer".to_string()),
+            Some(&["--version"]),
+        )
+    } else if languages.contains(&Language::Python) {
+        (
+            Language::Python,
+            std::env::var("CODESCOPE_PYRIGHT").unwrap_or_else(|_| "pyright-langserver".to_string()),
+            None,
+        )
+    } else {
+        return None;
+    };
+    let available = probe_args.map_or_else(
+        || binary_exists(&program),
+        |args| binary_runs(&program, args),
+    );
     Some(LanguageServerView {
         language: language.as_str(),
         server: program,
         available,
+    })
+}
+
+/// `true` when `program` names an existing file or can be found on `PATH`.
+///
+/// Pyright's language-server executable intentionally has no version/help probe,
+/// so spawning it would either block on stdio or report a false negative.
+fn binary_exists(program: &str) -> bool {
+    let program_path = std::path::Path::new(program);
+    if program_path.components().count() > 1 {
+        return program_path.is_file();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        if directory.join(program).is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            let extensions = std::env::var_os("PATHEXT").unwrap_or_else(|| ".EXE;.CMD;.BAT".into());
+            return extensions
+                .to_string_lossy()
+                .split(';')
+                .any(|extension| directory.join(format!("{program}{extension}")).is_file());
+        }
+        #[cfg(not(windows))]
+        false
     })
 }
 

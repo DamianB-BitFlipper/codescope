@@ -13,7 +13,7 @@ relationships because of:
 - **generated code** (stringer, mockgen, protobuf) not present or not indexed
 - **build tags / conditional compilation** — gopls indexes the default build configuration
 - **dependency injection and runtime registration** — wiring that only exists at runtime
-- **language-server limits** — gopls or rust-analyzer can return partial/no results while
+- **language-server limits** — gopls, rust-analyzer, or Pyright can return partial/no results while
   indexing, under complex build/configuration matrices, or for some cross-module references
 
 codescope surfaces this as `Evidence` completeness and `~`/`?` confidence markers rather than
@@ -21,8 +21,9 @@ claiming a complete project graph. There is no runtime data-flow analysis in v0.
 
 ## Prototype-scope limitations
 
-- **Go and Rust language-server adapters.** clangd, pyright, and tsls are designed for but not
-  implemented.
+- **Go, Rust, and Python language-server adapters.** clangd and tsls are designed for but not
+  implemented. Pyright does not provide semantic tokens or type hierarchy, so those features
+  degrade through normal capability gating.
 - **Language-server document sync** uses close+reopen with full text (correct, simple; not
   incremental).
 - **AI plan entities** for implementation/reference results carry range-derived placeholder

@@ -308,7 +308,6 @@ impl AiService {
                 tool_defs.push(diagram_tool);
             }
         }
-        let read_only_tools_available = tool_defs.iter().any(|tool| is_read_only_tool(tool.name));
         let semantic_tools_available = tool_defs
             .iter()
             .any(|tool| tool.name == crate::tools::LSP_INSPECT_TOOL_NAME);
@@ -316,7 +315,6 @@ impl AiService {
             ChatMessage::system(build_system_prompt(
                 epoch,
                 self.config.max_tool_calls,
-                read_only_tools_available,
                 semantic_tools_available,
             )),
             ChatMessage::user(user_prompt.clone()),
@@ -2603,7 +2601,6 @@ pub fn redact_repo_root(text: &str, root: &Utf8Path) -> String {
 fn build_system_prompt(
     epoch: Epoch,
     max_tool_calls: u32,
-    read_only_tools_available: bool,
     semantic_tools_available: bool,
 ) -> String {
     let semantic_research = if semantic_tools_available {
@@ -2616,9 +2613,8 @@ fn build_system_prompt(
     } else {
         " No language-server inspection tool is available in this session; do not infer semantic relationships that the Git/source tools do not establish."
     };
-    let research = if read_only_tools_available {
-        format!(
-            "Research before planning. You have a virtual cwd and may make at most {max_tool_calls} total research and diagram operations. For a directory, use list_directory to find \
+    let research = format!(
+        "Research before planning. You have a virtual cwd and may make at most {max_tool_calls} total research and diagram operations. For a directory, use list_directory to find \
              changed files. File tools accept paths relative to that cwd, exact repo_path values, \
              or an unambiguous repo-path suffix. For a file or symbol selection, start with \
              git_status_file to see every changed hunk, then inspect the decisive hunk or hunks \
@@ -2627,10 +2623,7 @@ fn build_system_prompt(
              or search_changed_files only when surrounding context is necessary.{semantic_research} Copy repo_path, \
              hunk_id, side, and line numbers from results exactly. \
              You must call at least one research tool before completing the draft."
-        )
-    } else {
-        "No read-only tools are available in this session. Treat the supplied current-revision facts as the complete evidence boundary; do not invent missing source facts.".to_string()
-    };
+    );
 
     let completion = "Once an accepted edit completes the required structure, make at most one \
         targeted finalization edit; Codescope then validates automatically. Do not keep polishing, \
@@ -3032,7 +3025,7 @@ mod tests {
 
     #[test]
     fn concise_agent_prompt_requires_bounded_research_and_exact_evidence() {
-        let prompt = build_system_prompt(Epoch(42), 8, true, true);
+        let prompt = build_system_prompt(Epoch(42), 8, true);
         assert!(prompt.contains("server owns plan_version"));
         assert!(prompt.contains("epoch 42"));
         assert!(prompt.contains("at most 8 total research and diagram operations"));
@@ -3055,15 +3048,11 @@ mod tests {
             "prompt regressed to {} bytes",
             prompt.len()
         );
-
-        let direct = build_system_prompt(Epoch(42), 8, false, false);
-        assert!(direct.contains("No read-only tools are available"));
-        assert!(!direct.contains("You must call at least one research tool"));
     }
 
     #[test]
     fn incremental_prompt_edits_the_live_draft_instead_of_submitting_a_plan_blob() {
-        let prompt = build_system_prompt(Epoch(42), crate::MAX_TOOL_CALLS, true, true);
+        let prompt = build_system_prompt(Epoch(42), crate::MAX_TOOL_CALLS, true);
         assert!(prompt.contains("at most 128 total research and diagram operations"));
         assert!(prompt.contains(DIAGRAM_EDIT_TOOL_NAME));
         assert!(prompt.contains(DIAGRAM_INSPECT_TOOL_NAME));

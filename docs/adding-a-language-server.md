@@ -1,59 +1,58 @@
 # Adding another language server
 
-codescope's design goal: a new language server is **one adapter module + one enum variant**.
-Nothing in git analysis, change mapping, visualization, or the TUI changes.
+Codescope's design goal: a conventional language server is a small descriptor implementing
+`StandardAdapter`. Nothing in overlays, semantic queries, Git analysis, mapping, visualization,
+or the TUI is copied.
 
 ## The boundary
 
-`codescope-lsp` exposes a single enum, [`LanguageService`], dispatching to per-server adapters:
+`StandardAdapter` is the plug-in boundary:
 
 ```rust
-pub enum LanguageService {
-    Gopls(GoplsService),
-    RustAnalyzer(RustAnalyzerService),
-    // Add the next adapter variant here.
+pub trait StandardAdapter {
+    const SERVER_NAME: &'static str;
+    const LANGUAGE_ID: &'static str;
+    const FILE_EXTENSIONS: &'static [&'static str];
+
+    fn project_root(repo_root: &Utf8Path) -> Result<Utf8PathBuf, SemanticError>;
+    fn command(repo_root: &Utf8Path, project_root: &Utf8Path,
+               options: LanguageServiceOptions) -> Command;
+    fn initialization_options(options: LanguageServiceOptions) -> Value;
 }
 ```
 
-All adapters share one generic [`LspClient`] (Content-Length framing, request-id matching,
-push-diagnostics cache, shutdown→exit→kill teardown). An adapter only owns:
+`StandardLspService` supplies initialize, document overlays, capability gating, position
+conversion, symbols, references, call and type hierarchy, implementations, hover, semantic
+tokens, diagnostics, caches, and graceful shutdown. It uses the server's advertised capabilities
+and never calls an unsupported method. A descriptor owns only:
 
-1. **Spawn + initialize** — the command, `rootUri`/`workspaceFolders` conventions,
-   `initializationOptions`, and the client capabilities to advertise.
-2. **Capability resolution** — map the raw `capabilities` object into the shared
-   `FeatureSet` (see `capabilities.rs`; it already handles bool / object / bare-int / null).
-3. **Optional language enrichment** — e.g. gopls turns `(Greeter).Hello` into a method of
-   `Greeter`; keep this server-specific and contained.
+1. server name, LSP language ID, and owned file extension;
+2. project-root selection;
+3. command construction and resource options;
+4. server-specific `initializationOptions`.
 
-Everything above the enum speaks `codescope-core` types (`SymbolTree`, `Evidence<T>`,
-`Location`, `SymbolRef`, `FeatureSet`) — a new server never touches them.
+Servers requiring nonstandard workspace layout or response enrichment can use a bespoke service;
+gopls does this for multi-module workspaces and Go receiver names. Both paths still share
+`LspClient` framing, request matching, diagnostics, and teardown.
 
 ## Position encoding
 
 The internal model is **utf-8** (`Position.col` = byte offset). LSP servers default to
-**utf-16** unless they negotiate otherwise (only rust-analyzer does, of the servers we probed).
-Conversion lives **only** in the adapter at the wire boundary, via `encoding.rs`
+**utf-16** unless they negotiate otherwise. Conversion lives **only** in the shared session at the
+wire boundary, via `encoding.rs`
 (`position_to_wire` / `position_from_wire`), driven by the `positionEncoding` the server
 returned at initialize. Do not convert anywhere else.
 
 ## Steps
 
-1. Create `crates/codescope-lsp/src/<server>.rs` with a struct holding
-   `{ client: LspClient, root, features: FeatureSet, encoding, versions }` — copy `gopls.rs`
-   as the template.
-2. In `start()`: find the server's project root (using its manifest/workspace markers), spawn
-   the server, send `initialize` with
-   `hierarchicalDocumentSymbolSupport` + `positionEncodings: ["utf-8","utf-16"]`, resolve
-   features (returns `SemanticError::BrokenSession` on all-null capabilities — e.g. tsls with
-   TS 7), send `initialized`.
-3. Implement the query methods you can support; for the rest, return
-   `SemanticError::Unsupported(feature)` (the `require()` helper gates before sending). The
-   impact graph silently skips unsupported relations and notes it.
-4. Add the enum variant and extend `LanguageService::start` detection for the new marker.
-   Current production adapters are gopls and rust-analyzer; one active service is selected, with
-   Go winning ties in mixed repositories. Supporting simultaneous services requires a separate
-   orchestration change rather than only a new enum variant.
-5. Add a live integration test in `tests/` that skips gracefully when the server is absent.
+1. Add language detection and project-root selection in `detect.rs`.
+2. Implement `StandardAdapter` in a small `<server>.rs` descriptor.
+3. Register its detection precedence in `LanguageService::start` and its cheap availability probe
+   in the binary.
+4. Add a live integration test that skips when the server is absent.
+
+Current precedence is Go, Rust, then Python. One active service is selected; simultaneous services
+require orchestration beyond the adapter interface.
 
 ## Verified capability notes (docs/research/01)
 
@@ -62,7 +61,7 @@ returned at initialize. Do not convert anywhere else.
 | gopls 0.21 | ✓ | ✓ (interfaces) | utf-16 (no negotiation) | push-only diagnostics; serverInfo.version is a build-info blob |
 | rust-analyzer | ✓ | ✗ | **utf-8** (negotiated) | production Rust adapter |
 | clangd 17 | — | ✓ | utf-16 | probe wanted didSave; no adapter yet |
-| pyright | — | ✗ | utf-16 | providers are objects; no adapter yet |
+| pyright | ✓ | ✗ | utf-16 | object-shaped providers; call hierarchy; no semantic tokens |
 | tsls + TS 5.9 | — | ✗ | utf-16 | all-null capabilities with TS 7; no adapter yet |
 
 Treat every capability as `Option<Value>`; "supported" = present and not false/null.

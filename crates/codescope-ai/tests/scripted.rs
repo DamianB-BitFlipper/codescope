@@ -931,7 +931,8 @@ async fn no_tool_executor_advertises_only_incremental_diagram_tools() {
         ]
     );
     let system = body["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("No read-only tools are available"));
+    assert!(system.contains("Research before planning"));
+    assert!(!system.contains("No read-only tools are available"));
 }
 
 #[tokio::test]
@@ -3267,10 +3268,8 @@ async fn unqueried_symbol_entity_gets_entity_repair_then_validates() {
         4,
         "initial edits/completion plus repaired edits/completion"
     );
-    // The no-tool session contract ships in the system prompt.
     let first_body = requests[0].body_json().unwrap();
     let system = first_body["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("No read-only tools are available"));
     assert!(system.contains("hunk-derived"));
     assert!(system.contains("current symbol catalog"));
     // The repair feedback is entity-specific.

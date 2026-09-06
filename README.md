@@ -1,5 +1,7 @@
 # Codescope
 
+![Codescope AI review workspace](docs/assets/codescope-ai-review.png)
+
 AI can write your PR in minutes. Reviewing it should not take hours.
 
 Codescope builds a navigable map of any Git comparison: the changed files and symbols on the left,
@@ -17,7 +19,8 @@ reveal what changed, how behavior flows, and where the change connects to the re
 - **Jump straight to the source.** Navigate from diagram nodes to code, references,
   implementations, callers, and callees through built-in LSP support.
 
-LSP navigation supports Go (`gopls`) and Rust (`rust-analyzer`), with a Git-only fallback.
+LSP navigation supports Go (`gopls`), Rust (`rust-analyzer`), and Python (`pyright`), with a
+Git-only fallback.
 
 ## Installation
 
@@ -40,6 +43,7 @@ For semantic navigation, install the language server for the repository you want
 ```bash
 go install golang.org/x/tools/gopls@latest   # Go
 rustup component add rust-analyzer           # Rust
+npm install --global pyright                  # Python
 ```
 
 The interactive application also requires an AI provider. Set one of `PRIME_API_KEY`,

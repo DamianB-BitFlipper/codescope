@@ -1,6 +1,6 @@
 //! The semantic query surface the analysis layer consumes.
 //!
-//! `codescope-lsp`'s `LanguageService` (enum-dispatch over the gopls adapter) is the
+//! `codescope-lsp`'s `LanguageService` (dispatch over the active language adapter) is the
 //! runtime implementation; [`SemanticSource`] narrows it to exactly what analysis needs so
 //! that unit tests can script responses without any server process (research 08) and the
 //! analysis algorithms stay decoupled from transport details.

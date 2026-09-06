@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "codescope LSP layer: generic stdio JSON-RPC client + gopls adapter"
+description = "Codescope LSP layer with reusable Go, Rust, and Python adapters"
 
 [features]
 # Exposes `FakeService` to downstream crates' tests (unit tests inside this

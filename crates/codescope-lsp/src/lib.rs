@@ -1,4 +1,4 @@
-//! `codescope-lsp` — generic LSP client with gopls and rust-analyzer adapters.
+//! `codescope-lsp` — generic LSP client with Go, Rust, and Python adapters.
 //!
 //! Layering (research 01):
 //!
@@ -17,6 +17,8 @@
 //!   `codescope-core` domain types wrapped in [`codescope_core::Evidence`].
 //! - [`gopls`]: `GoplsService` — Go adapter (spawn, initialize, overlays, feature gating).
 //! - [`rust_analyzer`]: `RustAnalyzerService` — Rust adapter over the same semantic boundary.
+//! - [`pyright`]: `PyrightService` — Python adapter using the shared standard-LSP session.
+//! - [`standard`]: reusable adapter contract and semantic query implementation.
 //!
 //! Every relationship query is gated on the resolved [`codescope_core::FeatureSet`]
 //! *before* anything is sent on the wire; unsupported features fail fast with
@@ -35,9 +37,11 @@ pub mod framing;
 pub mod gopls;
 pub mod jsonrpc;
 pub mod options;
+pub mod pyright;
 pub mod rust_analyzer;
 mod semantic_tokens;
 pub mod service;
+pub mod standard;
 pub mod uri;
 
 pub use client::{LspClient, ShutdownOutcome};
@@ -46,5 +50,7 @@ pub use encoding::PositionEncoding;
 pub use error::{LspError, SemanticError};
 pub use gopls::GoplsService;
 pub use options::LanguageServiceOptions;
+pub use pyright::PyrightService;
 pub use rust_analyzer::RustAnalyzerService;
 pub use service::LanguageService;
+pub use standard::{StandardAdapter, StandardLspService};

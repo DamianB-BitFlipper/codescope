@@ -30,9 +30,10 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 
 1. **Git via CLI subprocess**, `--porcelain=v2 -z`, `--no-optional-locks` everywhere.
    Why: exact user-git semantics, no C build. (research 02)
-2. **Enum-dispatch LanguageService** over one generic `LspClient`; gopls and rust-analyzer
-   adapters. Capabilities resolve at initialize into a `FeatureSet`; utf-16 default position encoding,
-   converted at wire boundary only. Why: verified cross-server quirks (research 01).
+2. **Adapter-driven LanguageService** over one generic `LspClient`; gopls is bespoke, while
+   rust-analyzer and Pyright share the `StandardAdapter` session. Capabilities resolve at initialize
+   into a `FeatureSet`; utf-16 positions are converted only at the wire boundary. Why: verified
+   cross-server quirks without duplicating protocol machinery (research 01).
 3. **Hunks → symbols via hierarchical DocumentSymbols**; worktree tree for new-side hunks,
    base-revision overlay for pure deletions; confidence Exact/Approximate/Unmapped end-to-end.
    (research 03)
@@ -201,7 +202,7 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 ## Vertical slice order (each independently testable)
 
 1. core types + git → ChangeSets (fixture-backed tests)
-2. lsp client + gopls/rust-analyzer → symbols/references/call hierarchy (fixture-backed,
+2. lsp client + gopls/rust-analyzer/Pyright → symbols/references/call hierarchy (fixture-backed,
    skip when the relevant server is unavailable)
 3. analysis → ChangedSymbols + ImpactGraph (pure tests + fixture)
 4. tui → renders UiSnapshot headless (TestBackend), keymap actions
@@ -210,7 +211,7 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
 
 ## Explicit non-goals for v0
 
-- tree-sitter fallback, runtime data flow, language adapters beyond Go and Rust,
+- tree-sitter fallback, runtime data flow, language adapters beyond Go, Rust, and Python,
   `$/cancelRequest` to language servers, and writing anything to the repo.
 
 ## Lead decisions recorded during implementation

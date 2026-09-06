@@ -402,7 +402,7 @@ fn scan_fixture_reports_context_scopes_and_languages() {
 }
 
 #[test]
-fn scan_scratch_repo_has_no_language_server() {
+fn scan_scratch_python_repo_reports_pyright() {
     let (_tmp, root) = scratch_repo();
     let out = codescope(&["scan", &root.to_string_lossy()]);
     let json = json_stdout(&out);
@@ -412,8 +412,9 @@ fn scan_scratch_repo_has_no_language_server() {
     assert!(json["scopes"]["branch_working"].as_u64().is_some());
     assert_eq!(json["scopes"]["working"], 1);
     assert_eq!(json["languages"], serde_json::json!(["Python"]));
-    // Python is detected but has no adapter.
-    assert!(json["language_server"].is_null());
+    assert_eq!(json["language_server"]["language"], "Python");
+    assert_eq!(json["language_server"]["server"], "pyright-langserver");
+    assert!(json["language_server"]["available"].is_boolean());
     assert_repo_relative(&stdout(&out), &root);
 }
 
