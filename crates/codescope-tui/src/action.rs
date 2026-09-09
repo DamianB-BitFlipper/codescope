@@ -471,11 +471,11 @@ fn picker_key(key: KeyEvent, close: Action, select: Action) -> Action {
 #[must_use]
 pub fn next_scope(scope: ChangeScope) -> ChangeScope {
     match scope {
-        ChangeScope::Branch => ChangeScope::BranchWorking,
-        ChangeScope::BranchWorking => ChangeScope::Staged,
-        ChangeScope::Staged => ChangeScope::Unstaged,
-        ChangeScope::Unstaged => ChangeScope::Working,
-        ChangeScope::Working => ChangeScope::Branch,
+        ChangeScope::BranchWorking => ChangeScope::Branch,
+        ChangeScope::Branch => ChangeScope::Working,
+        ChangeScope::Working => ChangeScope::Unstaged,
+        ChangeScope::Unstaged => ChangeScope::Staged,
+        ChangeScope::Staged => ChangeScope::BranchWorking,
     }
 }
 
@@ -483,11 +483,11 @@ pub fn next_scope(scope: ChangeScope) -> ChangeScope {
 #[must_use]
 pub fn previous_scope(scope: ChangeScope) -> ChangeScope {
     match scope {
-        ChangeScope::Branch => ChangeScope::Working,
-        ChangeScope::BranchWorking => ChangeScope::Branch,
-        ChangeScope::Staged => ChangeScope::BranchWorking,
-        ChangeScope::Unstaged => ChangeScope::Staged,
-        ChangeScope::Working => ChangeScope::Unstaged,
+        ChangeScope::BranchWorking => ChangeScope::Staged,
+        ChangeScope::Branch => ChangeScope::BranchWorking,
+        ChangeScope::Working => ChangeScope::Branch,
+        ChangeScope::Unstaged => ChangeScope::Working,
+        ChangeScope::Staged => ChangeScope::Unstaged,
     }
 }
 
@@ -805,11 +805,11 @@ mod tests {
 
     #[test]
     fn scope_cycle_order() {
-        assert_eq!(next_scope(ChangeScope::Branch), ChangeScope::BranchWorking);
-        assert_eq!(next_scope(ChangeScope::BranchWorking), ChangeScope::Staged);
-        assert_eq!(next_scope(ChangeScope::Staged), ChangeScope::Unstaged);
-        assert_eq!(next_scope(ChangeScope::Unstaged), ChangeScope::Working);
-        assert_eq!(next_scope(ChangeScope::Working), ChangeScope::Branch);
+        assert_eq!(next_scope(ChangeScope::BranchWorking), ChangeScope::Branch);
+        assert_eq!(next_scope(ChangeScope::Branch), ChangeScope::Working);
+        assert_eq!(next_scope(ChangeScope::Working), ChangeScope::Unstaged);
+        assert_eq!(next_scope(ChangeScope::Unstaged), ChangeScope::Staged);
+        assert_eq!(next_scope(ChangeScope::Staged), ChangeScope::BranchWorking);
         for scope in [
             ChangeScope::Branch,
             ChangeScope::BranchWorking,

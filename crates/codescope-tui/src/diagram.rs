@@ -467,6 +467,92 @@ impl DiagramCanvas {
                 ));
             }
         }
+        // Route returns and long edges around intervening cards, never through the
+        // primary path. Each edge gets a stable exterior lane when space permits.
+        for relationship in &mut relationships {
+            let form = &plan.forms[relationship.target.form];
+            if !matches!(form.kind, FormKind::Sequence | FormKind::RelationshipFlow)
+                || positions
+                    .keys()
+                    .any(|target| target.form == relationship.target.form)
+            {
+                continue;
+            }
+            let source = nodes
+                .iter()
+                .find(|n| {
+                    n.target.form == relationship.target.form
+                        && n.target.id == relationship.target.from
+                })
+                .unwrap();
+            let destination = nodes
+                .iter()
+                .find(|n| {
+                    n.target.form == relationship.target.form
+                        && n.target.id == relationship.target.to
+                })
+                .unwrap();
+            let blocked = nodes
+                .iter()
+                .filter(|n| n.target != source.target && n.target != destination.target)
+                .any(|n| {
+                    relationship
+                        .path
+                        .windows(2)
+                        .any(|s| segment_intersects_rect(s[0], s[1], n.rect))
+                });
+            if source.rect.y <= destination.rect.y && !blocked {
+                continue;
+            }
+            let left = nodes
+                .iter()
+                .filter(|n| n.target.form == source.target.form)
+                .map(|n| n.rect.x)
+                .min()
+                .unwrap_or(0);
+            let lane = left.saturating_sub(2 + 2 * relationship.target.edge as u16);
+            let start = DiagramPosition {
+                x: source.rect.x + source.rect.width / 2,
+                y: source.rect.bottom().saturating_add(1),
+            };
+            let turn_y = start.y.saturating_add(relationship.target.edge as u16);
+            let end = DiagramPosition {
+                x: destination.rect.x + destination.rect.width / 2,
+                y: destination.rect.y.saturating_sub(1),
+            };
+            let approach_y = end.y.saturating_sub(1);
+            relationship.path = vec![
+                start,
+                DiagramPosition {
+                    x: start.x,
+                    y: turn_y,
+                },
+                DiagramPosition { x: lane, y: turn_y },
+                DiagramPosition {
+                    x: lane,
+                    y: approach_y,
+                },
+                DiagramPosition {
+                    x: end.x,
+                    y: approach_y,
+                },
+                end,
+            ];
+            let full_label = normalized_edges(&plan.forms[relationship.target.form])
+                [relationship.target.edge]
+                .label
+                .clone();
+            let budget = usize::from(viewport.width.saturating_sub(start.x + 2)).max(1);
+            relationship.label = truncate(full_label.trim(), budget);
+            relationship.has_hidden_label =
+                relationship.label != full_label.trim() || full_label.trim().is_empty();
+            relationship.label_rect = DiagramRect {
+                x: (start.x + 2).min(viewport.width.saturating_sub(1)),
+                y: turn_y,
+                width: (relationship.label.width() as u16).max(1),
+                height: 1,
+            };
+        }
         let mut max_x = viewport.width;
         let mut max_y = viewport.height.max(annotations.len() as u16);
         for node in &nodes {
@@ -773,13 +859,16 @@ fn automatic_positions(
     } else {
         1
     };
-    // In two columns put the second card at the viewport's right edge. The complete middle
-    // lane belongs to its directed connector rather than being wasted after the cards.
-    let stride = if columns == 2 {
-        viewport.width.saturating_sub(card_width)
+    // Bound the drawing's width independently of the terminal. Spare space is a margin,
+    // not an ever-growing connector between two tiny cards.
+    let gap = viewport.width.saturating_sub(2 * card_width).min(36);
+    let stride = card_width.saturating_add(gap);
+    let drawing_width = if columns == 2 {
+        card_width + stride
     } else {
-        card_width.saturating_add(4)
+        card_width
     };
+    let origin_x = viewport.width.saturating_sub(drawing_width) / 2;
     let mut positions = HashMap::new();
     let mut form_y = annotation_height;
     for (form_index, form) in plan.forms.iter().enumerate() {
@@ -799,8 +888,17 @@ fn automatic_positions(
                     .collect::<Vec<_>>()
             },
         );
-        let mut row_y = form_y;
-        for row in layout_rows {
+        let node_rows: HashMap<_, _> = layout_rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row, indices)| {
+                indices
+                    .iter()
+                    .map(move |&index| (form.nodes[index].id.as_str(), row))
+            })
+            .collect();
+        let mut row_y = form_y.saturating_add(if directed_layers.is_some() { 2 } else { 0 });
+        for (row_index, row) in layout_rows.iter().enumerate() {
             let row_height = row
                 .iter()
                 .filter_map(|index| form.nodes.get(*index))
@@ -827,13 +925,28 @@ fn automatic_positions(
                         x: if centered_single {
                             viewport.width.saturating_sub(card_width) / 2
                         } else {
-                            (column as u16).saturating_mul(stride)
+                            origin_x.saturating_add((column as u16).saturating_mul(stride))
                         },
                         y: row_y,
                     },
                 );
             }
-            row_y = row_y.saturating_add(row_height.saturating_add(2));
+            let gap = if directed_layers.is_some() {
+                normalized_edges(form)
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, edge)| {
+                        let from = *node_rows.get(edge.from.as_str())?;
+                        let to = *node_rows.get(edge.to.as_str())?;
+                        (from == row_index && (to <= from || to > from + 1))
+                            .then_some(index as u16 + 3)
+                    })
+                    .max()
+                    .unwrap_or(2)
+            } else {
+                2
+            };
+            row_y = row_y.saturating_add(row_height.saturating_add(gap));
         }
         form_y = row_y;
     }
@@ -842,8 +955,8 @@ fn automatic_positions(
 
 /// Topological layers for forms whose edges describe directional flow. Keeping every edge aimed
 /// from an earlier row to a later row avoids the ambiguous left-right / right-left zigzag produced
-/// by a document-order grid. Cycles fall back to that neutral grid because they have no truthful
-/// top-to-bottom ordering.
+/// by a document-order grid. Break cycles for placement only: the actual edges retain their
+/// direction and return paths are routed outside the forward flow.
 fn directed_form_layers(form: &VizForm) -> Option<Vec<Vec<usize>>> {
     if !matches!(form.kind, FormKind::Sequence | FormKind::RelationshipFlow) || form.nodes.len() < 3
     {
@@ -882,9 +995,37 @@ fn directed_form_layers(form: &VizForm) -> Option<Vec<Vec<usize>>> {
         .collect::<VecDeque<_>>();
     let mut ranks = vec![0_usize; form.nodes.len()];
     let mut visited = 0_usize;
-    while let Some(from) = queue.pop_front() {
+    let mut placed = vec![false; form.nodes.len()];
+    while visited < form.nodes.len() {
+        if queue.is_empty() {
+            // Prefer an explicit caller as the entry into a cycle. Otherwise choose the
+            // strongest remaining source, with stable node IDs breaking ties.
+            let from = (0..form.nodes.len())
+                .filter(|&i| !placed[i])
+                .max_by_key(|&i| {
+                    let caller = form.edges.iter().any(|edge| {
+                        edge.from == form.nodes[i].id && edge.kind == PlanEdgeKind::Calls
+                    });
+                    let outgoing_count = outgoing[i].iter().filter(|&&to| !placed[to]).count();
+                    (
+                        caller,
+                        outgoing_count as isize - indegree[i] as isize,
+                        std::cmp::Reverse(form.nodes[i].id.as_str()),
+                    )
+                })
+                .expect("unplaced node exists");
+            queue.push_back(from);
+        }
+        let from = queue.pop_front().expect("cycle entry or source queued");
+        if placed[from] {
+            continue;
+        }
+        placed[from] = true;
         visited = visited.saturating_add(1);
         for &to in &outgoing[from] {
+            if placed[to] {
+                continue;
+            }
             ranks[to] = ranks[to].max(ranks[from].saturating_add(1));
             indegree[to] = indegree[to].saturating_sub(1);
             if indegree[to] == 0 {
@@ -892,15 +1033,26 @@ fn directed_form_layers(form: &VizForm) -> Option<Vec<Vec<usize>>> {
             }
         }
     }
-    if visited != form.nodes.len() {
-        return None;
-    }
 
     let mut layers = vec![Vec::new(); ranks.iter().copied().max().unwrap_or(0) + 1];
     for (node, rank) in ranks.into_iter().enumerate() {
         layers[rank].push(node);
     }
     Some(layers)
+}
+
+fn segment_intersects_rect(a: DiagramPosition, b: DiagramPosition, rect: DiagramRect) -> bool {
+    if a.x == b.x {
+        a.x >= rect.x
+            && a.x <= rect.right()
+            && a.y.min(b.y) <= rect.bottom()
+            && a.y.max(b.y) >= rect.y
+    } else {
+        a.y >= rect.y
+            && a.y <= rect.bottom()
+            && a.x.min(b.x) <= rect.right()
+            && a.x.max(b.x) >= rect.x
+    }
 }
 
 fn canvas_node_lines(node: &PlanNode, viewport_width: u16, expanded: bool) -> Vec<String> {
@@ -1741,6 +1893,75 @@ mod canvas_tests {
                 && relationship.path[0].x == relationship.path[1].x
                 && relationship.path[0].y < relationship.path[1].y
         }));
+    }
+
+    #[test]
+    fn cyclic_flow_keeps_caller_first_and_routes_returns_outside_cards() {
+        let mut plan = VisualizationPlan::new(Epoch(7));
+        plan.forms.push(VizForm {
+            kind: FormKind::RelationshipFlow,
+            nodes: ["decode", "scan", "caller", "validate", "filter"]
+                .into_iter()
+                .map(|id| PlanNode::new(id, id, PlanNodeChange::Modified))
+                .collect(),
+            edges: [
+                ("caller", "validate"),
+                ("validate", "scan"),
+                ("scan", "filter"),
+                ("filter", "decode"),
+                ("decode", "caller"),
+            ]
+            .into_iter()
+            .map(|(from, to)| PlanEdge {
+                from: from.into(),
+                to: to.into(),
+                kind: if from == "caller" {
+                    PlanEdgeKind::Calls
+                } else {
+                    PlanEdgeKind::FlowsTo
+                },
+                label: Some(format!("{from} to {to}")),
+            })
+            .collect(),
+        });
+        for width in [40, 96, 300] {
+            let canvas = built(&plan, &DiagramState::default(), width);
+            assert_eq!(canvas, built(&plan, &DiagramState::default(), width));
+            let rect = |id: &str| {
+                canvas
+                    .nodes
+                    .iter()
+                    .find(|n| n.target.id == id)
+                    .unwrap()
+                    .rect
+            };
+            let order = ["caller", "validate", "scan", "filter", "decode"];
+            assert!(order.windows(2).all(|p| rect(p[0]).y < rect(p[1]).y));
+            for edge in &canvas.relationships {
+                for node in &canvas.nodes {
+                    assert!(
+                        !edge
+                            .path
+                            .windows(2)
+                            .any(|s| segment_intersects_rect(s[0], s[1], node.rect)),
+                        "edge {:?} intersects {} at width {width}",
+                        edge.target,
+                        node.target.id
+                    );
+                }
+            }
+            let back = canvas.relationships.last().unwrap();
+            assert!(back.path.iter().any(|p| p.x < rect("caller").x));
+        }
+    }
+
+    #[test]
+    fn wide_grid_has_bounded_gaps() {
+        let canvas = built(&live_shape(), &DiagramState::default(), 300);
+        let left = canvas.nodes.iter().map(|n| n.rect.x).min().unwrap();
+        let right = canvas.nodes.iter().map(|n| n.rect.right()).max().unwrap();
+        assert!(right - left < 110);
+        assert!(left > 80);
     }
 
     #[test]

@@ -229,9 +229,14 @@ impl DiagramDraft {
                 Ok(format!("deleted edge {from} -> {to}"))
             }
             DiagramCommand::AddEvidence { evidence } => {
+                if self.evidence.contains(evidence) {
+                    return Err(DiagramEditError::Invalid(
+                        "evidence item already exists; do not add it again. Missing hunk coverage requires node code_refs, not additional evidence notes".into(),
+                    ));
+                }
                 if self.evidence.len() >= MAX_PLAN_EVIDENCE {
                     return Err(DiagramEditError::Invalid(format!(
-                        "a draft supports at most {MAX_PLAN_EVIDENCE} evidence items"
+                        "a draft supports at most {MAX_PLAN_EVIDENCE} evidence items; delete redundant evidence by index if space is needed. Missing hunk coverage requires node code_refs, not additional evidence notes"
                     )));
                 }
                 ensure_text("evidence.reason", &evidence.reason, 2_000)?;
@@ -741,6 +746,29 @@ mod tests {
                 .is_err()
         );
         assert_eq!(draft, valid);
+    }
+
+    #[test]
+    fn duplicate_evidence_does_not_consume_capacity() {
+        let mut draft = DiagramDraft::new(Epoch(1));
+        let evidence = PlanEvidence {
+            file: crate::FileId::new_unchecked("src/main.rs"),
+            hunk: Some(0),
+            symbol: None,
+            range: None,
+            reason: "Supports initialization".into(),
+        };
+        draft
+            .apply(&DiagramCommand::AddEvidence {
+                evidence: evidence.clone(),
+            })
+            .unwrap();
+        let before = draft.clone();
+        let error = draft
+            .apply(&DiagramCommand::AddEvidence { evidence })
+            .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(draft, before);
     }
 
     #[test]

@@ -11,24 +11,31 @@ Start from a clean checkout and run:
 
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 git diff --check
-cargo package --workspace --no-verify
+cargo publish --locked --workspace --dry-run
 ```
 
-`cargo package --workspace --no-verify` validates every archive and normalized manifest together.
-Full package verification of a dependent crate becomes possible only after that crate's internal
-dependencies have been published.
+The workspace dry run validates every archive and verifies dependent crates against Cargo's
+temporary local registry without uploading anything.
 
 ## Publish
 
-Cargo publishes the workspace crates in dependency order and waits for each upload to appear in
-the registry index before continuing:
+Use the resumable publishing script:
 
 ```bash
-cargo publish --locked --workspace
+./scripts/publish.sh
 ```
+
+It publishes one crate at a time in dependency order, skips versions already present on crates.io,
+and automatically waits until the server-provided retry time after an HTTP 429 response. This
+avoids leaving a rate-limited workspace release that cannot be resumed with
+`cargo publish --locked --workspace`, because Cargo stops when it reaches a crate uploaded by the
+previous attempt.
+
+The script requires typing `publish` before the first upload. For an intentional non-interactive
+release, use `./scripts/publish.sh --yes`.
 
 Before a later release, update `workspace.package.version` and every version in
 `workspace.dependencies` together, then regenerate `Cargo.lock`.

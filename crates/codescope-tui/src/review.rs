@@ -549,6 +549,7 @@ mod tests {
             })
             .collect();
         UiSnapshot {
+            scope: ChangeScope::Branch,
             files: rows,
             agent_changeset: Some(Arc::new(
                 ChangeSet::new(ChangeScope::Branch, changes).with_diff_sections(sections),

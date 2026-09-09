@@ -73,7 +73,7 @@ Press `?` at any time for the complete in-app key reference.
 
 | Key | Comparison |
 |---|---|
-| `s` | next: branch → branch+working → staged → unstaged → working |
+| `s` | next: branch+working (default) → branch → working → unstaged → staged |
 | `S` | previous comparison |
 | `b` | choose the branch base |
 | `g` | refresh repository state and clear session AI impacts |

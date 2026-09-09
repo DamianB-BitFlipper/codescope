@@ -253,7 +253,7 @@ pub struct RelationRows {
 const AUTO_BASE: &str = "(auto / inferred)";
 
 /// Appended to AI failures while automatic generation is enabled.
-const AUTO_AI_FAILURE_SUFFIX: &str = "m change model · retries automatically when the selection or file changes · deterministic impact remains available";
+const AUTO_AI_FAILURE_SUFFIX: &str = "a retry current selection · m change model · retries automatically when the file changes · deterministic impact remains available";
 /// Appended to AI failures while generation requires an explicit user trigger.
 const MANUAL_AI_FAILURE_SUFFIX: &str =
     "a retry current selection · m change model · deterministic impact remains available";
@@ -671,7 +671,7 @@ impl Dispatcher {
             repo,
             engine,
             ai,
-            scope: ChangeScope::Branch,
+            scope: ChangeScope::BranchWorking,
             epoch: Epoch::ZERO,
             ls_status,
             ai_status: AiStatus::Idle,
@@ -2012,6 +2012,11 @@ impl Dispatcher {
         } else if let Some(plan) = self.ai_cache.get(&selection).cloned() {
             self.ai_rows = Some((self.epoch, selection, plan));
             self.ai_status = AiStatus::Ready { epoch: self.epoch };
+            return;
+        } else if let Some(reason) = self.ai_failures.get(&selection).cloned() {
+            // Navigation must restore the diagnostic, including failures completed in
+            // the background. Only an explicit retry/invalidation clears this state.
+            self.ai_status = AiStatus::Failed { reason };
             return;
         } else if self.agent_owned_drafts.contains(&selection) {
             self.ai_status = AiStatus::Loading {
@@ -5406,7 +5411,7 @@ mod tests {
     async fn scope_action_updates_published_scope() {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, mut job_rx) = dispatcher_for(&root).await;
-        assert_eq!(snapshot_rx.borrow().scope, ChangeScope::Branch);
+        assert_eq!(snapshot_rx.borrow().scope, ChangeScope::BranchWorking);
 
         disp.handle(DispatchEvent::Work(Action::ScopeStaged)).await;
         assert_eq!(disp.scope, ChangeScope::Staged);
@@ -5433,6 +5438,7 @@ mod tests {
         let root = scratch_repo();
         let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
         disp.ai_auto_generate = false;
+        disp.scope = ChangeScope::Branch;
         let ctx = codescope_core::RepoContext {
             toplevel: camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap(),
             head: codescope_core::HeadState::Branch("feature".to_string()),
@@ -6355,7 +6361,7 @@ mod tests {
         assert_eq!(snap.status.level, StatusLevel::Warning);
         assert_eq!(
             snap.status.text,
-            "AI: ai request timed out after 20s · m change model · retries automatically when the selection or file changes · deterministic impact remains available"
+            "AI: ai request timed out after 20s · a retry current selection · m change model · retries automatically when the file changes · deterministic impact remains available"
         );
         assert_eq!(
             snap.message, snap.status.text,
@@ -6364,11 +6370,68 @@ mod tests {
         assert_eq!(
             snap.status.detail.as_deref(),
             Some(
-                "AI generation failed\n\nai request timed out after 20s\n\nRecovery: m change model · retries automatically when the selection or file changes · deterministic impact remains available"
+                "AI generation failed\n\nai request timed out after 20s\n\nRecovery: a retry current selection · m change model · retries automatically when the file changes · deterministic impact remains available"
             )
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn navigation_restores_background_failure_details_until_explicit_retry() {
+        for automatic in [false, true] {
+            let root = scratch_repo();
+            let (mut disp, snapshot_rx, _job_rx) = dispatcher_for(&root).await;
+            disp.ai_auto_generate = automatic;
+            disp.selected_file = Some("b.txt".into());
+            let selection = AiSelectionKey::File("a.txt".into());
+            let generation = disp.ai_request_seq;
+            disp.ai_running.insert(
+                generation,
+                AiRunningJob {
+                    selection: selection.clone(),
+                    epoch: disp.epoch,
+                    generation,
+                },
+            );
+            let reason = "Validation failed\n\nMissing citation: exact diagnostic tail";
+            disp.handle(DispatchEvent::AiDone {
+                epoch: disp.epoch,
+                selection: selection.clone(),
+                generation,
+                outcome: AiOutcome::Failed(reason.into()),
+            })
+            .await;
+            assert!(!matches!(snapshot_rx.borrow().ai, AiStatus::Failed { .. }));
+            for file in ["a.txt", "b.txt", "a.txt"] {
+                disp.handle(DispatchEvent::Work(Action::SelectionChanged {
+                    file: Some(file.into()),
+                    symbol: None,
+                }))
+                .await;
+                if file == "a.txt" {
+                    let snap = snapshot_rx.borrow().clone();
+                    assert_eq!(
+                        snap.ai,
+                        AiStatus::Failed {
+                            reason: reason.into()
+                        }
+                    );
+                    let detail = snap.ai_failure_status().expect("clickable failure banner");
+                    assert_eq!(detail.detail.as_deref(), Some(reason));
+                    assert!(
+                        !disp
+                            .ai_running
+                            .values()
+                            .any(|job| job.selection == selection)
+                    );
+                }
+            }
+            disp.generate_ai_for_current_selection();
+            assert!(!disp.ai_failures.contains_key(&selection));
+            assert!(!matches!(disp.ai_status, AiStatus::Failed { .. }));
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     #[test]

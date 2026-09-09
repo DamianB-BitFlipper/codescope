@@ -1429,6 +1429,7 @@ mod tests {
             .collect();
         let mut app = App::new();
         app.update(UiSnapshot {
+            scope: ChangeScope::Branch,
             files,
             agent_changeset: Some(Arc::new(
                 ChangeSet::new(ChangeScope::Branch, changes).with_diff_sections(sections),
@@ -1626,7 +1627,7 @@ mod tests {
     #[test]
     fn scope_cycle_visits_all_scopes() {
         let mut app = App::new();
-        assert_eq!(app.snapshot.scope, ChangeScope::Branch);
+        assert_eq!(app.snapshot.scope, ChangeScope::BranchWorking);
         let mut seen = vec![app.snapshot.scope];
         for _ in 0..5 {
             app.apply(Action::ScopeCycle);
@@ -1635,17 +1636,17 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ChangeScope::Branch,
                 ChangeScope::BranchWorking,
-                ChangeScope::Staged,
-                ChangeScope::Unstaged,
-                ChangeScope::Working,
                 ChangeScope::Branch,
+                ChangeScope::Working,
+                ChangeScope::Unstaged,
+                ChangeScope::Staged,
+                ChangeScope::BranchWorking,
             ]
         );
 
         app.apply(Action::ScopeCycleReverse);
-        assert_eq!(app.snapshot.scope, ChangeScope::Working);
+        assert_eq!(app.snapshot.scope, ChangeScope::Staged);
     }
 
     #[test]

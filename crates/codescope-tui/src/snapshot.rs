@@ -99,7 +99,7 @@ impl Default for UiSnapshot {
     fn default() -> Self {
         UiSnapshot {
             repo: RepoBar::default(),
-            scope: ChangeScope::Branch,
+            scope: ChangeScope::BranchWorking,
             scope_counts: ScopeCounts::default(),
             files: Vec::new(),
             agent_changeset: None,

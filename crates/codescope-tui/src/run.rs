@@ -1328,14 +1328,14 @@ mod tests {
             &mut SelectionTracker::default(),
         )
         .await;
-        assert_eq!(app.snapshot.scope, ChangeScope::BranchWorking);
+        assert_eq!(app.snapshot.scope, ChangeScope::Branch);
         assert_eq!(rx.recv().await, Some(Action::ScopeCycle));
-        assert_eq!(pending.0, Some(ChangeScope::BranchWorking));
+        assert_eq!(pending.0, Some(ChangeScope::Branch));
 
-        let mut stale = UiSnapshot::default(); // scope: Branch
+        let mut stale = UiSnapshot::default(); // scope: BranchWorking
         pending.reconcile(&mut stale);
         app.update(stale);
-        assert_eq!(app.snapshot.scope, ChangeScope::BranchWorking);
+        assert_eq!(app.snapshot.scope, ChangeScope::Branch);
 
         dispatch(
             &mut app,
@@ -1345,8 +1345,8 @@ mod tests {
             &mut SelectionTracker::default(),
         )
         .await;
-        assert_eq!(app.snapshot.scope, ChangeScope::Branch);
+        assert_eq!(app.snapshot.scope, ChangeScope::BranchWorking);
         assert_eq!(rx.recv().await, Some(Action::ScopeCycleReverse));
-        assert_eq!(pending.0, Some(ChangeScope::Branch));
+        assert_eq!(pending.0, Some(ChangeScope::BranchWorking));
     }
 }
