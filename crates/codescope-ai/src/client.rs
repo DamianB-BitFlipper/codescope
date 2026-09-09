@@ -474,9 +474,17 @@ impl AiClient {
                     if reasoning_effort == ReasoningEffort::Default
                         && self.endpoint.contains("pinference.ai")
                     {
-                        // Prime's GLM route requires reasoning to remain enabled, but accepts
-                        // Chat Completions' minimal effort that leaves room for the tool call.
-                        body["reasoning_effort"] = json!("minimal");
+                        // Prime's GLM route requires reasoning to remain enabled and translates
+                        // Chat Completions `reasoning_effort` per hosted model. Full GLM
+                        // (e.g. `z-ai/glm-5.3`) honors `minimal`: reasoning stays off and the
+                        // tool call follows directly. The fast tier (e.g. `internal/glm-5.3-fast`)
+                        // ignores `minimal` (and `none`) and runs unbounded default thinking
+                        // that overflows `max_tokens` before any tool call — every such turn
+                        // ends `finish_reason: "length"` and must be discarded. Its honored
+                        // short-thinking level is `low`, which keeps bounded reasoning, batched
+                        // editor calls, and multi-second turns (measured on the live route).
+                        body["reasoning_effort"] =
+                            json!(if is_glm_fast_tier_model(&model) { "low" } else { "minimal" });
                     } else if reasoning_effort == ReasoningEffort::Default {
                         // Native Z.AI-compatible GLM endpoints use the family-specific knob.
                         body["thinking"] = json!({"type": "disabled"});
@@ -910,6 +918,18 @@ fn is_glm_model(model: &str) -> bool {
         .rsplit('/')
         .next()
         .is_some_and(|name| name.to_ascii_lowercase().starts_with("glm-"))
+}
+
+/// Prime's fast-tier GLM deployment (short name such as `glm-5.3-fast`).
+///
+/// The fast tier translates Chat Completions reasoning efforts differently from full GLM:
+/// only `low` (short thinking) and `high` (medium thinking) change its behavior, while
+/// `minimal`/`none` fall back to unbounded default thinking. See `build_body`.
+fn is_glm_fast_tier_model(model: &str) -> bool {
+    model
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.to_ascii_lowercase().contains("fast"))
 }
 
 fn lock_breaker(breaker: &Mutex<BreakerState>) -> std::sync::MutexGuard<'_, BreakerState> {
@@ -1625,6 +1645,22 @@ mod tests {
         assert!(body.get("reasoning").is_none());
         assert!(body.get("thinking").is_none());
         assert_eq!(body["max_tokens"], GLM_PLAN_MAX_TOKENS);
+
+        // The fast tier ignores `minimal` (unbounded default thinking overflows the output
+        // budget before the tool call), so its default is the honored `low` effort.
+        cfg.model = "internal/glm-5.3-fast".into();
+        cfg.base_url = "https://api.pinference.ai/api/v1".into();
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["max_tokens"], GLM_PLAN_MAX_TOKENS);
+
+        // An explicit effort still wins on the fast tier.
+        cfg.reasoning_effort = ReasoningEffort::High;
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
+        assert_eq!(body["reasoning_effort"], "high");
+        cfg.reasoning_effort = ReasoningEffort::Default;
 
         cfg.base_url = "https://api.z.ai/api/paas/v4".into();
         let client = AiClient::new(&cfg).unwrap();

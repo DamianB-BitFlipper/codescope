@@ -786,6 +786,14 @@ impl Dispatcher {
 
     /// Mark a dispatcher whose language-server startup already failed before the actor
     /// starts (the headless path). The TUI reports the same state later through an event.
+    /// Start the first refresh in an explicit scope instead of the TUI default
+    /// (`ChangeScope::BranchWorking`). Headless debug-ai passes its CLI `--scope` here so the
+    /// dispatcher performs exactly one initial refresh and publishes that scope immediately.
+    pub(crate) fn with_initial_scope(mut self, scope: ChangeScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
     pub(crate) fn with_engine_unavailable(mut self, reason: impl Into<String>) -> Self {
         self.apply_engine_unavailable(reason.into());
         self
