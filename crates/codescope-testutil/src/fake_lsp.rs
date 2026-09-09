@@ -114,6 +114,12 @@ pub struct FakeLspConfig {
     /// `initialize`/`shutdown`) gets [`ScriptedResponse::method_not_found`].
     #[serde(default)]
     pub responses: BTreeMap<String, ScriptedResponse>,
+    /// Ordered per-method answers consumed (front first) before [`FakeLspConfig::responses`]
+    /// is consulted. Once a method's queue is empty it falls back to the static map, so a
+    /// test can script a server whose answer *changes* across requests — e.g. `null` while
+    /// a cold-starting server has no analysis for the file yet, then real symbols.
+    #[serde(default)]
+    pub response_sequences: BTreeMap<String, Vec<ScriptedResponse>>,
     /// Delay applied before **every** response frame, in milliseconds.
     #[serde(default)]
     pub response_delay_ms: u64,
@@ -133,6 +139,7 @@ impl Default for FakeLspConfig {
         FakeLspConfig {
             initialize_result: gopls_like_initialize_result(),
             responses: BTreeMap::new(),
+            response_sequences: BTreeMap::new(),
             response_delay_ms: 0,
             diagnostics: Vec::new(),
             diagnostics_trigger: "initialized".to_string(),
@@ -183,6 +190,18 @@ impl FakeLspConfig {
     #[must_use]
     pub fn with_response(mut self, method: impl Into<String>, response: ScriptedResponse) -> Self {
         self.responses.insert(method.into(), response);
+        self
+    }
+
+    /// Script an ordered sequence of answers for one request method, consumed before the
+    /// static [`FakeLspConfig::responses`] fallback.
+    #[must_use]
+    pub fn with_response_sequence(
+        mut self,
+        method: impl Into<String>,
+        scripted: Vec<ScriptedResponse>,
+    ) -> Self {
+        self.response_sequences.insert(method.into(), scripted);
         self
     }
 
@@ -269,15 +288,27 @@ impl ReceivedMessage {
 pub struct FakeLspServer {
     config: Arc<FakeLspConfig>,
     received: Arc<Mutex<Vec<ReceivedMessage>>>,
+    pending: Arc<Mutex<BTreeMap<String, std::collections::VecDeque<ScriptedResponse>>>>,
 }
 
 impl FakeLspServer {
     /// Create a server with `config`.
     #[must_use]
     pub fn new(config: FakeLspConfig) -> Self {
+        let pending = config
+            .response_sequences
+            .iter()
+            .map(|(method, scripted)| {
+                (
+                    method.clone(),
+                    scripted.iter().cloned().collect::<std::collections::VecDeque<_>>(),
+                )
+            })
+            .collect();
         FakeLspServer {
             config: Arc::new(config),
             received: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(pending)),
         }
     }
 
@@ -370,6 +401,13 @@ impl FakeLspServer {
 
     /// Resolve the scripted response for `method`.
     fn response_for(&self, method: &str) -> ScriptedResponse {
+        // Ordered sequences answer first; the static map is the steady-state fallback.
+        let mut pending = lock_ignore_poison(&self.pending);
+        if let Some(queue) = pending.get_mut(method) {
+            if let Some(next) = queue.pop_front() {
+                return next;
+            }
+        }
         if let Some(scripted) = self.config.responses.get(method) {
             return scripted.clone();
         }
