@@ -246,6 +246,14 @@ pub struct AiToolCallActivity {
     pub error: Option<String>,
     /// Current call lifecycle.
     pub state: AiToolCallActivityState,
+    /// Agent session that owns this row, when available.
+    pub agent_id: Option<String>,
+    /// Parent agent session for delegated-agent header rows.
+    pub parent_agent_id: Option<String>,
+    /// Zero-based recursive agent depth.
+    pub agent_depth: u32,
+    /// `true` when this row represents an agent session rather than an ordinary tool.
+    pub is_agent_session: bool,
 }
 
 /// Display lifecycle for one AI tool call.

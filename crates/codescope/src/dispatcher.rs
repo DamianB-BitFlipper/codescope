@@ -1913,6 +1913,10 @@ impl Dispatcher {
                 AiToolCallActivityState::Succeeded
             },
             error: error.map(|error| truncate_chars(&codescope_ai::scrub_secrets(&error), 320)),
+            agent_id: None,
+            parent_agent_id: None,
+            agent_depth: 0,
+            is_agent_session: false,
         });
     }
 
@@ -3155,12 +3159,49 @@ impl Dispatcher {
         });
         match update {
             AiActivityUpdate::WaitingForModel => activity.waiting_for_model = true,
+            AiActivityUpdate::AgentSession {
+                id,
+                parent_id,
+                depth,
+                kind,
+                worker_id,
+                detail,
+                state,
+            } => {
+                activity.waiting_for_model = false;
+                let state = match state {
+                    AiToolActivityState::Running => AiToolCallActivityState::Running,
+                    AiToolActivityState::Succeeded => AiToolCallActivityState::Succeeded,
+                    AiToolActivityState::Failed => AiToolCallActivityState::Failed,
+                };
+                if let Some(session) = activity.calls.iter_mut().find(|call| {
+                    call.is_agent_session && call.agent_id.as_deref() == Some(id.as_str())
+                }) {
+                    session.name = format!("{worker_id}: {kind}");
+                    session.detail = detail;
+                    session.state = state;
+                } else {
+                    activity.calls.push(AiToolCallActivity {
+                        id: format!("agent:{id}"),
+                        name: format!("{worker_id}: {kind}"),
+                        detail,
+                        error: None,
+                        state,
+                        agent_id: Some(id),
+                        parent_agent_id: parent_id,
+                        agent_depth: depth,
+                        is_agent_session: true,
+                    });
+                }
+            }
             AiActivityUpdate::ToolCall {
                 id,
                 name,
                 detail,
                 error,
                 state,
+                agent_depth,
+                agent_id,
             } => {
                 activity.waiting_for_model = false;
                 let state = match state {
@@ -3173,6 +3214,8 @@ impl Dispatcher {
                     call.detail = detail;
                     call.error = error;
                     call.state = state;
+                    call.agent_depth = agent_depth;
+                    call.agent_id = agent_id;
                 } else {
                     activity.calls.push(AiToolCallActivity {
                         id,
@@ -3180,6 +3223,10 @@ impl Dispatcher {
                         detail,
                         error,
                         state,
+                        agent_id,
+                        parent_agent_id: None,
+                        agent_depth,
+                        is_agent_session: false,
                     });
                 }
             }
@@ -4878,6 +4925,10 @@ mod tests {
                     detail: "a.txt · hunk 0".to_string(),
                     error: None,
                     state: AiToolCallActivityState::Succeeded,
+                    agent_id: None,
+                    parent_agent_id: None,
+                    agent_depth: 0,
+                    is_agent_session: false,
                 }],
                 waiting_for_model: true,
             },
@@ -6315,6 +6366,8 @@ mod tests {
                     detail: "a.txt · hunk 0".to_string(),
                     error: None,
                     state,
+                    agent_depth: 0,
+                    agent_id: None,
                 },
             })
             .await;
@@ -6943,6 +6996,8 @@ mod tests {
                 detail: "b.txt · hunk 0".to_string(),
                 error: None,
                 state: AiToolActivityState::Running,
+                agent_depth: 0,
+                agent_id: None,
             },
         })
         .await;

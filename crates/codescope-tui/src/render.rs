@@ -2193,24 +2193,54 @@ fn ai_progress_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::Diagr
         truncate_cells("AI in progress", width.into()),
         DiagramRole::Title,
     )];
+    let has_worker_sessions = snap
+        .ai_activity
+        .calls
+        .iter()
+        .any(|call| call.is_agent_session);
     for call in &snap.ai_activity.calls {
-        let (marker, role) = match call.state {
+        if has_worker_sessions
+            && !call.is_agent_session
+            && call.state != AiToolCallActivityState::Failed
+            && matches!(
+                call.name.as_str(),
+                "investigate" | "continue_investigation" | "investigate_many"
+            )
+        {
+            continue;
+        }
+        let (marker, mut role) = match call.state {
             AiToolCallActivityState::Running => ("…", DiagramRole::Warning),
             AiToolCallActivityState::Succeeded => ("✓", DiagramRole::Evidence),
             AiToolCallActivityState::Failed => ("×", DiagramRole::Warning),
         };
+        if call.is_agent_session && call.state != AiToolCallActivityState::Failed {
+            role = DiagramRole::Arrow;
+        }
+        let indent_depth = if call.is_agent_session {
+            call.agent_depth.saturating_sub(1)
+        } else {
+            call.agent_depth
+        };
+        let indent = "  ".repeat(usize::try_from(indent_depth.min(8)).unwrap_or(8));
         let detail = if call.detail.is_empty() {
             String::new()
         } else {
             format!(" · {}", call.detail)
         };
+        let label = call.name.clone();
+        let marker = if call.is_agent_session { "" } else { marker };
+        let marker_gap = if marker.is_empty() { "" } else { " " };
         lines.push(crate::diagram::DiagramLine::plain(
-            truncate_cells(&format!("{marker} {}{detail}", call.name), width.into()),
+            truncate_cells(
+                &format!("{indent}{marker}{marker_gap}{label}{detail}"),
+                width.into(),
+            ),
             role,
         ));
         if call.state == AiToolCallActivityState::Failed {
             if let Some(error) = call.error.as_deref().filter(|error| !error.is_empty()) {
-                lines.extend(ai_tool_error_lines(error, width));
+                lines.extend(ai_tool_error_lines(error, width, &indent));
             }
         }
     }
@@ -2237,15 +2267,15 @@ fn ai_progress_lines(snap: &UiSnapshot, width: u16) -> Vec<crate::diagram::Diagr
     lines
 }
 
-fn ai_tool_error_lines(error: &str, width: u16) -> Vec<crate::diagram::DiagramLine> {
-    const PREFIX: &str = "  ↳ ";
+fn ai_tool_error_lines(error: &str, width: u16, indent: &str) -> Vec<crate::diagram::DiagramLine> {
+    let prefix = format!("{indent}  ↳ ");
     let width = usize::from(width);
-    let body_width = width.saturating_sub(measured_cells(PREFIX)).max(1);
+    let body_width = width.saturating_sub(measured_cells(&prefix)).max(1);
     wrap_body(error, body_width)
         .into_iter()
         .map(|part| {
             crate::diagram::DiagramLine::plain(
-                truncate_cells(&format!("{PREFIX}{part}"), width),
+                truncate_cells(&format!("{prefix}{part}"), width),
                 DiagramRole::Warning,
             )
         })
@@ -4288,6 +4318,10 @@ mod tests {
                     detail: "service.go".to_string(),
                     error: None,
                     state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                    agent_id: None,
+                    parent_agent_id: None,
+                    agent_depth: 0,
+                    is_agent_session: false,
                 },
                 crate::snapshot::AiToolCallActivity {
                     id: "call-2".to_string(),
@@ -4295,6 +4329,10 @@ mod tests {
                     detail: "service.go · hunk 0".to_string(),
                     error: None,
                     state: crate::snapshot::AiToolCallActivityState::Running,
+                    agent_id: None,
+                    parent_agent_id: None,
+                    agent_depth: 0,
+                    is_agent_session: false,
                 },
                 crate::snapshot::AiToolCallActivity {
                     id: "call-3".to_string(),
@@ -4305,6 +4343,10 @@ mod tests {
                             .to_string(),
                     ),
                     state: crate::snapshot::AiToolCallActivityState::Failed,
+                    agent_id: None,
+                    parent_agent_id: None,
+                    agent_depth: 0,
+                    is_agent_session: false,
                 },
             ],
         };
@@ -4350,6 +4392,63 @@ mod tests {
     }
 
     #[test]
+    fn delegated_agent_activity_has_a_distinct_role_and_indented_child_calls() {
+        let mut snap = sample();
+        snap.ai = AiStatus::Loading {
+            since_epoch: codescope_core::Epoch(3),
+        };
+        snap.ai_activity = crate::snapshot::AiActivity {
+            active: true,
+            waiting_for_model: false,
+            calls: vec![
+                crate::snapshot::AiToolCallActivity {
+                    id: "provider-call-1".to_string(),
+                    name: "investigate".to_string(),
+                    detail: "What happens when startup fails?".to_string(),
+                    error: None,
+                    state: crate::snapshot::AiToolCallActivityState::Running,
+                    agent_id: Some("root-1".to_string()),
+                    parent_agent_id: None,
+                    agent_depth: 0,
+                    is_agent_session: false,
+                },
+                crate::snapshot::AiToolCallActivity {
+                    id: "agent:child-1".to_string(),
+                    name: "worker-1: investigate".to_string(),
+                    detail: "What happens when startup fails?".to_string(),
+                    error: None,
+                    state: crate::snapshot::AiToolCallActivityState::Running,
+                    agent_id: Some("child-1".to_string()),
+                    parent_agent_id: Some("root-1".to_string()),
+                    agent_depth: 1,
+                    is_agent_session: true,
+                },
+                crate::snapshot::AiToolCallActivity {
+                    id: "read-1".to_string(),
+                    name: "read_file".to_string(),
+                    detail: "src/service.rs".to_string(),
+                    error: None,
+                    state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                    agent_id: Some("child-1".to_string()),
+                    parent_agent_id: None,
+                    agent_depth: 1,
+                    is_agent_session: false,
+                },
+            ],
+        };
+
+        let lines = generated_impact_content(&snap, 80);
+        assert_eq!(
+            lines[1].text(),
+            "worker-1: investigate · What happens when startup fails?"
+        );
+        assert!(!lines.iter().any(|line| line.text().starts_with('✓')));
+        assert!(!lines.iter().any(|line| line.text().starts_with('…')));
+        assert_eq!(lines[1].spans[0].role, DiagramRole::Arrow);
+        assert_eq!(lines[2].text(), "  ✓ read_file · src/service.rs");
+    }
+
+    #[test]
     fn generated_progress_keeps_every_tool_call_for_vertical_scrolling() {
         let mut snap = sample();
         snap.ai = AiStatus::Loading {
@@ -4365,6 +4464,10 @@ mod tests {
                     detail: format!("service.go · hunk {index}"),
                     error: None,
                     state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                    agent_id: None,
+                    parent_agent_id: None,
+                    agent_depth: 0,
+                    is_agent_session: false,
                 })
                 .collect(),
         };
@@ -4400,6 +4503,10 @@ mod tests {
                     detail: format!("TAIL_MARKER_{index}"),
                     error: None,
                     state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                    agent_id: None,
+                    parent_agent_id: None,
+                    agent_depth: 0,
+                    is_agent_session: false,
                 })
                 .collect(),
         };

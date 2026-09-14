@@ -4,7 +4,9 @@
 //! [`ToolExecutor`] boundary the binary implements against the fact store. The semantic
 //! Fact tools expose language-server facts; research tools provide a deliberately small,
 //! bash-like view of the selected diff. Those tools are read-only, repo-root-sandboxed, and
-//! result-capped. Diagram tools mutate only a bounded in-memory [`codescope_core::DiagramDraft`].
+//! result-capped. `investigate` uses the shared agent harness to isolate a focused research task
+//! behind one ordinary bounded result. Diagram tools mutate only a bounded in-memory
+//! [`codescope_core::DiagramDraft`].
 //!
 //! The per-plan budget is [`MAX_TOOL_CALLS`]; [`AiService`](crate::AiService) enforces it.
 
@@ -23,6 +25,12 @@ pub const DIAGRAM_EDIT_TOOL_NAME: &str = "edit_visualization";
 pub const DIAGRAM_INSPECT_TOOL_NAME: &str = "inspect_visualization";
 /// Inspect language-server facts in selected or tracked repository files.
 pub const LSP_INSPECT_TOOL_NAME: &str = "inspect_language_server";
+/// Delegate one focused repository-research task to an isolated same-model session.
+pub const INVESTIGATE_TOOL_NAME: &str = "investigate";
+/// Continue a previously created isolated research worker.
+pub const CONTINUE_INVESTIGATION_TOOL_NAME: &str = "continue_investigation";
+/// Run several fresh isolated research workers concurrently.
+pub const INVESTIGATE_MANY_TOOL_NAME: &str = "investigate_many";
 
 /// One tool definition in OpenAI tool-calling format.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -61,6 +69,120 @@ pub fn read_only_tools() -> Vec<ToolDef> {
         .into_iter()
         .chain(semantic_tools())
         .collect()
+}
+
+/// Isolated research delegation available to a parent review agent.
+///
+/// The contract is deliberately task-shaped rather than review-schema-shaped: the parent gives
+/// the child a natural-language objective and optional starting hints, and receives the child's
+/// bounded response as an ordinary tool result. The harness supplies repository selection and
+/// snapshot context independently, so the model cannot override those authority boundaries.
+#[must_use]
+pub fn investigation_tool() -> ToolDef {
+    ToolDef {
+        name: INVESTIGATE_TOOL_NAME,
+        description: "Create a fresh isolated research worker using the same model and give it one focused repository question. Prefer this when answering requires several Git, filesystem, or language-server steps whose raw transcript would distract from review synthesis. The result includes a worker_id that continue_investigation can resume."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000,
+                    "description": "One focused, answerable natural-language research task. State what must be determined, not how the child should format its answer."
+                },
+                "focus": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "description": "Optional files, symbols, scenarios, or concepts that are useful starting points. These are hints, not a restriction on relevant repository research."
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Resume one request-scoped investigation worker with a follow-up objective.
+#[must_use]
+pub fn continue_investigation_tool() -> ToolDef {
+    ToolDef {
+        name: CONTINUE_INVESTIGATION_TOOL_NAME,
+        description: "Continue an existing isolated research worker by worker_id. Use this when an earlier investigation exposed uncertainty, a missing branch, or a follow-up question that benefits from the worker's retained findings. The worker keeps its isolated memory and uses the same model and read-only repository tools."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "worker_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "Opaque worker_id returned by investigate or investigate_many in this review request."
+                },
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000,
+                    "description": "One concrete follow-up objective. State what remains to determine."
+                },
+                "focus": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "description": "Optional new files, symbols, scenarios, or concepts to investigate first."
+                }
+            },
+            "required": ["worker_id", "task"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// Run independent fresh investigations concurrently.
+#[must_use]
+pub fn investigate_many_tool() -> ToolDef {
+    ToolDef {
+        name: INVESTIGATE_MANY_TOOL_NAME,
+        description: "Create several independent isolated research workers and run them concurrently with the same model. Use this when two or more questions are independent—for example separate lifecycles, failure paths, files, or competing explanations. Results remain isolated, are returned in input order, and each includes a worker_id for follow-up."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Independent research objectives. Do not split a sequential follow-up into parallel tasks.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task": {"type": "string", "minLength": 1, "maxLength": 4000},
+                            "focus": {
+                                "type": "array",
+                                "maxItems": 12,
+                                "items": {"type": "string", "minLength": 1, "maxLength": 512}
+                            }
+                        },
+                        "required": ["task"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["tasks"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// All ordinary delegation tools offered to the root review agent.
+#[must_use]
+pub fn investigation_tools() -> Vec<ToolDef> {
+    vec![
+        investigation_tool(),
+        continue_investigation_tool(),
+        investigate_many_tool(),
+    ]
 }
 
 /// Bash-like research tools used by the interactive diff summarizer.
@@ -694,7 +816,16 @@ pub(crate) fn diagram_command_example(op: Option<&str>) -> Value {
 /// `true` when `name` is one of the read-only research tools.
 #[must_use]
 pub fn is_read_only_tool(name: &str) -> bool {
-    read_only_tools().into_iter().any(|tool| tool.name == name)
+    is_investigation_tool(name) || read_only_tools().into_iter().any(|tool| tool.name == name)
+}
+
+/// `true` only for the isolated-research delegation tool.
+#[must_use]
+pub fn is_investigation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        INVESTIGATE_TOOL_NAME | CONTINUE_INVESTIGATION_TOOL_NAME | INVESTIGATE_MANY_TOOL_NAME
+    )
 }
 
 /// `true` when `name` is part of the shared incremental diagram API.
@@ -745,6 +876,14 @@ pub trait ToolExecutor: Send + Sync {
     /// implementations must opt in only to tools they can actually serve.
     fn available_tools(&self) -> Vec<ToolDef> {
         Vec::new()
+    }
+
+    /// Whether the surrounding harness may offer isolated same-model research delegation.
+    ///
+    /// This opt-in prevents lightweight/test executors from advertising a child workflow whose
+    /// underlying repository evidence boundary they do not implement.
+    fn supports_investigation(&self) -> bool {
+        false
     }
 
     /// Whether this executor represents a research workflow that must inspect at least one
@@ -923,7 +1062,11 @@ mod tests {
 
     #[test]
     fn every_definition_is_an_object_schema() {
-        for tool in read_only_tools().into_iter().chain(diagram_tools()) {
+        for tool in read_only_tools()
+            .into_iter()
+            .chain(std::iter::once(investigation_tool()))
+            .chain(diagram_tools())
+        {
             assert_eq!(
                 tool.parameters["type"], "object",
                 "{} parameters must be an object schema",
@@ -1062,11 +1205,43 @@ mod tests {
         assert!(is_read_only_tool("read_file"));
         assert!(is_read_only_tool("git_status_file"));
         assert!(is_read_only_tool(LSP_INSPECT_TOOL_NAME));
+        assert!(is_read_only_tool(INVESTIGATE_TOOL_NAME));
+        assert!(is_read_only_tool(CONTINUE_INVESTIGATION_TOOL_NAME));
+        assert!(is_read_only_tool(INVESTIGATE_MANY_TOOL_NAME));
+        assert!(is_investigation_tool(INVESTIGATE_TOOL_NAME));
+        assert!(!is_investigation_tool("read_file"));
         assert!(!is_read_only_tool("removed_read_only_tool"));
         assert!(!is_read_only_tool("rm_rf"));
         assert!(is_diagram_tool(DIAGRAM_EDIT_TOOL_NAME));
         assert!(is_diagram_tool(DIAGRAM_INSPECT_TOOL_NAME));
         assert_eq!(MAX_TOOL_CALLS, 192);
+    }
+
+    #[test]
+    fn investigation_contract_stays_generic_and_bounded() {
+        let tool = investigation_tool();
+        assert_eq!(tool.name, INVESTIGATE_TOOL_NAME);
+        assert_eq!(tool.parameters["required"], json!(["task"]));
+        assert_eq!(tool.parameters["additionalProperties"], false);
+        assert_eq!(tool.parameters["properties"]["task"]["maxLength"], 4000);
+        assert_eq!(tool.parameters["properties"]["focus"]["maxItems"], 12);
+        assert!(tool.parameters["properties"].get("verdict").is_none());
+        assert!(tool.parameters["properties"].get("output_schema").is_none());
+
+        let continuation = continue_investigation_tool();
+        assert_eq!(
+            continuation.parameters["required"],
+            json!(["worker_id", "task"])
+        );
+        let many = investigate_many_tool();
+        assert_eq!(many.parameters["required"], json!(["tasks"]));
+        assert!(
+            many.parameters["properties"]["tasks"]
+                .get("maxItems")
+                .is_none(),
+            "fan-out uses the ordinary review budget, not an arbitrary worker cap"
+        );
+        assert_eq!(investigation_tools().len(), 3);
     }
 
     #[tokio::test]

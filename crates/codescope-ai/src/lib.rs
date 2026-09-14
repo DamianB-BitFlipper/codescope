@@ -27,6 +27,7 @@
 mod client;
 mod config;
 mod error;
+mod harness;
 mod plan;
 pub mod scrub;
 mod service;
@@ -50,8 +51,10 @@ pub use service::{
     DiagramObserver, RetryPolicy, redact_repo_root,
 };
 pub use tools::{
-    DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, LSP_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
-    NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, diagram_tools, is_diagram_tool,
-    is_read_only_tool, read_only_tools, research_tools, semantic_tools,
+    CONTINUE_INVESTIGATION_TOOL_NAME, DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME,
+    INVESTIGATE_MANY_TOOL_NAME, INVESTIGATE_TOOL_NAME, LSP_INSPECT_TOOL_NAME, MAX_TOOL_CALLS,
+    NoToolExecutor, ToolDef, ToolExecError, ToolExecutor, continue_investigation_tool,
+    diagram_tools, investigate_many_tool, investigation_tool, investigation_tools, is_diagram_tool,
+    is_investigation_tool, is_read_only_tool, read_only_tools, research_tools, semantic_tools,
 };
 pub use validator::{FactView, IMPACT_SUMMARY_MAX_BULLETS, Lookup, validate};

@@ -210,6 +210,10 @@ fn ai_plan_renders_after_loading_to_ready_transition() {
             detail: "service.go · hunk 0".to_string(),
             error: None,
             state: codescope_tui::snapshot::AiToolCallActivityState::Succeeded,
+            agent_id: None,
+            parent_agent_id: None,
+            agent_depth: 0,
+            is_agent_session: false,
         }],
     };
     app.update(loading.clone());

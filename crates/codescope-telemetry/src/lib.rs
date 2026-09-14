@@ -24,11 +24,97 @@ use sha2::{Digest, Sha256};
 const SCHEMA_VERSION: u32 = 1;
 static SINK: OnceLock<Mutex<TelemetrySink>> = OnceLock::new();
 static SESSION_NONCE: AtomicU64 = AtomicU64::new(1);
+static AGENT_SPAN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 tokio::task_local! {
     /// Request-scoped correlation overrides the process-global active comparison. This prevents a
     /// response from an older in-flight LLM task from being attributed to a newer diff snapshot.
     static DIFF_SNAPSHOT_CONTEXT: Option<String>;
+    /// Recursive model-session lineage. Unlike the diff context, this is derived for every child
+    /// so arbitrarily deep and concurrently executing agent trees remain distinguishable.
+    static AGENT_TRACE_CONTEXT: Option<AgentTraceContext>;
+}
+
+/// Immutable lineage for one model-driven agent session.
+///
+/// A trace groups the complete recursive agent tree. Each session has its own span and points to
+/// its immediate parent; `depth` is included for convenient rendering but is never used as the
+/// identity. Cloning a context preserves identity, while [`AgentTraceContext::child`] creates a
+/// new child span suitable for sequential or concurrent delegation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTraceContext {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
+    depth: u32,
+    kind: String,
+}
+
+impl AgentTraceContext {
+    /// Create the root of a new recursive agent trace.
+    #[must_use]
+    pub fn root(kind: impl Into<String>) -> Self {
+        let span_id = new_agent_span_id();
+        Self {
+            trace_id: span_id.clone(),
+            span_id,
+            parent_span_id: None,
+            depth: 0,
+            kind: kind.into(),
+        }
+    }
+
+    /// Derive a uniquely identified child session from this session.
+    #[must_use]
+    pub fn child(&self, kind: impl Into<String>) -> Self {
+        Self {
+            trace_id: self.trace_id.clone(),
+            span_id: new_agent_span_id(),
+            parent_span_id: Some(self.span_id.clone()),
+            depth: self.depth.saturating_add(1),
+            kind: kind.into(),
+        }
+    }
+
+    /// ID shared by every session in this recursive agent tree.
+    #[must_use]
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
+    }
+
+    /// ID unique to this agent session.
+    #[must_use]
+    pub fn span_id(&self) -> &str {
+        &self.span_id
+    }
+
+    /// Immediate parent span, or `None` for the root.
+    #[must_use]
+    pub fn parent_span_id(&self) -> Option<&str> {
+        self.parent_span_id.as_deref()
+    }
+
+    /// Zero-based depth in the recursive agent tree.
+    #[must_use]
+    pub const fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    /// Controller-defined, generic session classification.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "trace_id": self.trace_id,
+            "span_id": self.span_id,
+            "parent_span_id": self.parent_span_id,
+            "depth": self.depth,
+            "kind": self.kind,
+        })
+    }
 }
 
 struct TelemetrySink {
@@ -158,6 +244,9 @@ impl TelemetrySink {
         if let (Some(id), Some(object)) = (diff_snapshot_id, record.as_object_mut()) {
             object.insert("diff_snapshot_id".to_string(), Value::String(id));
         }
+        if let (Some(agent), Some(object)) = (current_agent_trace(), record.as_object_mut()) {
+            object.insert("agent_trace".to_string(), agent.as_json());
+        }
         // Serialize first so a complete record reaches the append-only session file in one write
         // in the overwhelmingly common case, minimizing partial tail records after interruption.
         let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
@@ -209,6 +298,11 @@ fn new_session_id() -> String {
     let timestamp = unix_millis();
     let nonce = SESSION_NONCE.fetch_add(1, Ordering::Relaxed);
     format!("{timestamp}-{}-{nonce}", std::process::id())
+}
+
+fn new_agent_span_id() -> String {
+    let nonce = AGENT_SPAN_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!("agent-{}-{nonce}", std::process::id())
 }
 
 /// Initialize a process-global append-only telemetry session file inside `directory`.
@@ -315,6 +409,23 @@ where
     F: Future,
 {
     DIFF_SNAPSHOT_CONTEXT.scope(diff_snapshot_id, future).await
+}
+
+/// Run an asynchronous operation inside one recursive agent session.
+///
+/// Scopes nest safely: on completion, the caller's context is restored. Separate spawned futures
+/// may therefore carry sibling child contexts without overwriting one another.
+pub async fn scope_agent_trace<F>(context: AgentTraceContext, future: F) -> F::Output
+where
+    F: Future,
+{
+    AGENT_TRACE_CONTEXT.scope(Some(context), future).await
+}
+
+/// Return the active agent lineage, if the caller is inside an agent session.
+#[must_use]
+pub fn current_agent_trace() -> Option<AgentTraceContext> {
+    AGENT_TRACE_CONTEXT.try_with(Clone::clone).ok().flatten()
 }
 
 /// Append one structured event to the active process telemetry file.
@@ -543,6 +654,75 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(records[0]["diff_snapshot_id"], "old");
         assert!(records[1].get("diff_snapshot_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn recursive_agent_scopes_emit_stable_lineage_and_restore_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.jsonl");
+        let mut sink = TelemetrySink::open(&path).unwrap();
+        let root = AgentTraceContext::root("review");
+        let child = root.child("investigation");
+        let grandchild = child.child("verification");
+
+        scope_agent_trace(root.clone(), async {
+            sink.write(
+                "agent.session",
+                json!({"state": "started"}),
+                TelemetryOrigin::InternalAgent,
+                None,
+            )
+            .unwrap();
+            scope_agent_trace(child.clone(), async {
+                sink.write(
+                    "llm.request",
+                    json!({"attempt": 1}),
+                    TelemetryOrigin::InternalAgent,
+                    None,
+                )
+                .unwrap();
+                scope_agent_trace(grandchild.clone(), async {
+                    sink.write(
+                        "llm.tool",
+                        json!({"name": "read_file"}),
+                        TelemetryOrigin::InternalAgent,
+                        None,
+                    )
+                    .unwrap();
+                })
+                .await;
+            })
+            .await;
+            sink.write(
+                "agent.session",
+                json!({"state": "succeeded"}),
+                TelemetryOrigin::InternalAgent,
+                None,
+            )
+            .unwrap();
+        })
+        .await;
+
+        let records = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["agent_trace"]["trace_id"], root.trace_id());
+        assert_eq!(records[0]["agent_trace"]["span_id"], root.span_id());
+        assert_eq!(records[0]["agent_trace"]["depth"], 0);
+        assert!(records[0]["agent_trace"]["parent_span_id"].is_null());
+        assert_eq!(records[1]["agent_trace"]["trace_id"], root.trace_id());
+        assert_eq!(records[1]["agent_trace"]["span_id"], child.span_id());
+        assert_eq!(records[1]["agent_trace"]["parent_span_id"], root.span_id());
+        assert_eq!(records[1]["agent_trace"]["depth"], 1);
+        assert_eq!(records[2]["agent_trace"]["span_id"], grandchild.span_id());
+        assert_eq!(records[2]["agent_trace"]["depth"], 2);
+        assert_eq!(
+            records[3]["agent_trace"]["span_id"],
+            root.span_id(),
+            "leaving nested scopes restores the root"
+        );
     }
 
     #[cfg(unix)]

@@ -40,6 +40,16 @@ misattributed to a newer comparison.
 Provider requests, responses, errors, and tool activity emitted by Codescope's built-in model use
 `origin: "internal_agent"`. Direct keyboard and mouse events use `origin: "user"`.
 
+Every record emitted inside a built-in agent session also has a top-level `agent_trace` object.
+`trace_id` groups the complete recursive agent tree; `span_id` identifies one session;
+`parent_span_id` identifies its immediate caller; `depth` is a zero-based rendering convenience;
+and `kind` is the controller-defined session classification. Root and delegated sessions emit
+`agent.session` lifecycle records. Provider requests, responses, retries, errors, and `llm.tool`
+records inherit the same immutable context automatically. Child contexts are task-local and may be
+nested or run as concurrent siblings without overwriting one another. Investigation lifecycle data
+also includes the stable request-scoped `worker_id` and invocation number, so repeated
+`continue_investigation` calls can be joined while parallel workers remain distinct.
+
 Every `codescope agent` invocation creates structured `agent.command` records with
 `origin: "external_agent"`. The short-lived CLI stream records client start and completion; the
 running TUI stream records server receipt and completion for commands that connect to it, including

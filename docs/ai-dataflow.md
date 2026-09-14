@@ -43,7 +43,7 @@ remain explicit rather than being replaced by deterministic summary content.
    coordinator retains at most 16 active requests; a
    17th request aborts the oldest active generation and takes its place. Aborted work is not
    requeued. The TUI and headless backend use this same selection-only policy. Each job returns
-   a reviewer-first `DiagramDraft` through a bounded agentic loop (at most 128 total research and
+   a reviewer-first `DiagramDraft` through a bounded agentic loop (at most 192 total research and
    diagram operations). `edit_visualization` applies atomic intent/form/node/edge/evidence
    create-update-delete commands, and `inspect_visualization` returns the current draft. The model
    never needs to resend the complete plan after each correction. Production research first
@@ -74,6 +74,17 @@ remain explicit rather than being replaced by deterministic summary content.
    rather than unfinished boxes. Failed rows include a bounded, scrubbed error reason.
    Final diagram publication still requires full validation. No shell command is executed and no
    repository state is mutated.
+   The main agent has three ordinary delegation tools. `investigate` starts a fresh worker,
+   `continue_investigation` resumes that worker by its returned request-scoped ID, and
+   `investigate_many` runs independent fresh workers concurrently while returning results in input
+   order. A shared agent harness uses the same configured model, reasoning effort, retry policy,
+   epoch, diff snapshot, repository boundary, and provider admission controls. The call accepts a
+   focused natural-language task plus optional file/symbol/concept hints; it deliberately imposes
+   no review-specific output schema. Workers receive only Git/filesystem/LSP research tools—no
+   diagram mutation or delegation. A worker retains bounded compact findings between continuations,
+   never its raw assistant/tool transcript. Each scrubbed response returns as an ordinary tool
+   result. Parallel fan-out is charged one existing review operation per worker rather than using a
+   separate worker-count cap; provider admission controls bound actual concurrency.
    A completed,
    validated plan is cached by stable directory/file/symbol identity. After that selection changes, its
    old plan is sent as an explicitly untrusted design seed: incremental revisions preserve
@@ -202,6 +213,11 @@ Anthropic credentials retain provider-native defaults.
   scrubbed. These records carry `origin: "internal_agent"`; external `codescope agent` commands
   carry `origin: "external_agent"` plus a cross-process command ID and structured operation.
   Headers and key material are excluded, and Codescope does not upload the file.
+- Every recursive harness session contributes an `agent_trace` (`trace_id`, unique `span_id`,
+  immediate `parent_span_id`, `depth`, and generic `kind`) to all telemetry it produces. Delegated
+  session lifecycle and tool activity are also sent to the progress pane, where agent rows use a
+  distinct color and their tools are indented by depth; identities keep interleaved sibling agents
+  unambiguous if concurrent delegation is added.
 - After the dispatcher accepts a parsed comparison, a deduplicated `diff.snapshot` stores its
   complete privacy-filtered unified patch, resolved scope/base/head, and file/hunk byte mappings.
   Its SHA-256 `diff_snapshot_id` hashes the exact stored payload and correlates later UI,

@@ -132,7 +132,18 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    ceiling. The initial context is an assignment-only research brief. After a retained exact diff,
    every later compact handoff is rebuilt from that assignment, retained exact diffs first,
    bounded tool-tagged supplementary reads, the current draft, and controller feedback—never an
-   old tool transcript. Up to eight current research/editor tools share the 128-operation loop.
+   old tool transcript. Current research/editor tools share the 192-operation loop. The ordinary
+   delegation tools use the same shared agent harness and model configuration: `investigate`
+   creates a fresh request-scoped worker, `continue_investigation` resumes its bounded compact
+   findings, and `investigate_many` runs independent sibling workers concurrently. Each inherits the
+   pinned epoch/diff snapshot and repository privacy boundary, but its tool profile contains only
+   Git/filesystem/LSP reads—no diagram mutation and no recursive delegation. Its private transcript
+   is reduced to scrubbed, bounded natural-language results for the parent. Parallel workers are
+   charged against the ordinary review-operation budget and actual HTTP concurrency remains under
+   the provider semaphore. Harness mechanics
+   (provider turns, retry, tool assembly/dispatch, budgets, redaction, and snapshot context) are
+   shared; review-diagram and investigation completion policies remain explicit rather than forcing
+   either output into a common domain schema.
    The headless backend uses the same policy.
    External-agent diagram edits cancel only an older internal writer for the addressed selection.
    If that selection is no longer visible, its draft/cache/activity update in place without
@@ -152,7 +163,10 @@ Dependency direction: core ← {git, lsp} ← analysis ← {ai, tui} ← codesco
    identifiers, and byte-addressable file/hunk metadata. Its SHA-256 `diff_snapshot_id` is attached
    to later UI, controller, snapshot, and LLM records; identical payloads are stored once per
    session stream. Every record also carries an explicit application/user/internal-agent/external-
-   agent origin. External commands propagate a client-session-derived command ID, stable operation,
+   agent origin. Recursive internal-agent work additionally carries immutable trace/span/parent
+   lineage and depth on session, provider, retry, error, and tool records; task-local child scopes
+   support arbitrary nesting and concurrent siblings. External commands propagate a
+   client-session-derived command ID, stable operation,
    and captured view ID across the CLI stream, socket server events, and resulting TUI control
    event, including read-only context/diff calls. An epoch bump clears correlation before stale UI
    is republished, and each LLM future

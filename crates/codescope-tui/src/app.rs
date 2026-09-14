@@ -2136,6 +2136,10 @@ mod tests {
                         detail: format!("src/service.rs · hunk {index}"),
                         error: None,
                         state: crate::snapshot::AiToolCallActivityState::Succeeded,
+                        agent_id: None,
+                        parent_agent_id: None,
+                        agent_depth: 0,
+                        is_agent_session: false,
                     })
                     .collect(),
             },

@@ -1833,6 +1833,10 @@ impl ToolExecutor for ScopedResearchTools {
         tools
     }
 
+    fn supports_investigation(&self) -> bool {
+        true
+    }
+
     fn requires_research(&self) -> bool {
         true
     }

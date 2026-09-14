@@ -1138,6 +1138,10 @@ fn context_view(repo_root: &Utf8Path, snapshot: &UiSnapshot, max_diff_lines: usi
                     "name": call.name,
                     "detail": call.detail,
                     "error": call.error,
+                    "agent_id": call.agent_id,
+                    "parent_agent_id": call.parent_agent_id,
+                    "agent_depth": call.agent_depth,
+                    "is_agent_session": call.is_agent_session,
                     "state": match call.state {
                         AiToolCallActivityState::Running => "running",
                         AiToolCallActivityState::Succeeded => "succeeded",
@@ -1724,6 +1728,10 @@ mod tests {
                 detail: "api.rs".to_string(),
                 error: Some("not a changed file".to_string()),
                 state: AiToolCallActivityState::Failed,
+                agent_id: None,
+                parent_agent_id: None,
+                agent_depth: 0,
+                is_agent_session: false,
             });
         let view = context_view(camino::Utf8Path::new("/tmp/example/repo"), &snapshot, 20);
         assert_eq!(

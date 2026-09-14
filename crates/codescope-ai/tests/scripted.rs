@@ -5,9 +5,10 @@
 
 use codescope_ai::{
     AiActivityObserver, AiActivityUpdate, AiClient, AiClientOptions, AiConfig, AiError, AiOutcome,
-    AiService, AiToolActivityState, ChatMessage, DIAGRAM_EDIT_TOOL_NAME, DiagramObserver, FactView,
-    Lookup, MAX_TOOL_CALLS, NoToolExecutor, ReasoningEffort, RetryPolicy, ToolDef, ToolExecError,
-    ToolExecutor, diagram_tools, research_tools,
+    AiService, AiToolActivityState, CONTINUE_INVESTIGATION_TOOL_NAME, ChatMessage,
+    DIAGRAM_EDIT_TOOL_NAME, DiagramObserver, FactView, INVESTIGATE_MANY_TOOL_NAME,
+    INVESTIGATE_TOOL_NAME, Lookup, MAX_TOOL_CALLS, NoToolExecutor, ReasoningEffort, RetryPolicy,
+    ToolDef, ToolExecError, ToolExecutor, diagram_tools, research_tools,
 };
 use codescope_core::{
     DiagramCommand, DiagramDraft, DiagramNodePatch, DiffSide, EntityRef, Epoch, FileId, FormKind,
@@ -212,6 +213,27 @@ impl FactView for LazyFacts {
 struct RecordingExecutor {
     calls: Mutex<Vec<(String, Value)>>,
     count: AtomicU32,
+}
+
+#[derive(Default)]
+struct InvestigationExecutor(RecordingExecutor);
+
+impl ToolExecutor for InvestigationExecutor {
+    fn available_tools(&self) -> Vec<ToolDef> {
+        self.0.available_tools()
+    }
+
+    fn supports_investigation(&self) -> bool {
+        true
+    }
+
+    fn execute<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: &'a Value,
+    ) -> BoxFuture<'a, Result<String, ToolExecError>> {
+        self.0.execute(name, arguments)
+    }
 }
 
 impl ToolExecutor for RecordingExecutor {
@@ -1813,6 +1835,268 @@ async fn tool_loop_executes_reads_and_finishes_diagram() {
         "tool result leaked absolute path: {tool_content}"
     );
     assert!(tool_content.contains(MIDDLEWARE_FILE));
+}
+
+#[tokio::test]
+async fn investigate_is_an_ordinary_tool_with_an_isolated_same_model_harness() {
+    let provider = ScriptedProvider::start([
+        AiScriptStep::tool_call(
+            INVESTIGATE_TOOL_NAME,
+            json!({
+                "task": "Determine how language-server startup failure reaches the user.",
+                "focus": ["LanguageService::start", "EngineUnavailable"]
+            }),
+        ),
+        AiScriptStep::tool_call(
+            "read_file",
+            json!({"path": MIDDLEWARE_FILE, "start_line": 1, "end_line": 20}),
+        ),
+        AiScriptStep::AssistantText {
+            content: format!(
+                "Startup failures are surfaced through EngineUnavailable; see {MIDDLEWARE_FILE}:1-15. No retry path was found."
+            ),
+        },
+        AiScriptStep::valid_plan(Epoch(5)).unwrap(),
+    ])
+    .await
+    .unwrap();
+    let service = service_for(&provider);
+    let executor = InvestigationExecutor::default();
+    let activities = Arc::new(Mutex::new(Vec::new()));
+    let activity_sink = Arc::clone(&activities);
+    let observer: AiActivityObserver = Arc::new(move |update| {
+        activity_sink.lock().unwrap().push(update);
+    });
+    let outcome = service
+        .request_plan_with_observers(
+            "selection_kind: file",
+            None,
+            &executor,
+            &FixtureFacts,
+            Epoch(5),
+            None,
+            Some(observer),
+        )
+        .await;
+    assert!(matches!(outcome, AiOutcome::Plan(..)), "got {outcome:?}");
+    assert_eq!(executor.0.count.load(Ordering::SeqCst), 1);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5);
+    for request in &requests {
+        assert_eq!(
+            request.body_json().unwrap()["model"],
+            "codescope-test/model"
+        );
+    }
+
+    let parent_body = requests[0].body_json().unwrap();
+    let parent_tools = parent_body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(parent_tools.contains(&INVESTIGATE_TOOL_NAME));
+    assert!(parent_tools.contains(&CONTINUE_INVESTIGATION_TOOL_NAME));
+    assert!(parent_tools.contains(&INVESTIGATE_MANY_TOOL_NAME));
+
+    let child_body = requests[1].body_json().unwrap();
+    let child_tools = child_body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(child_tools.contains(&"read_file"));
+    assert!(!child_tools.contains(&INVESTIGATE_TOOL_NAME));
+    assert!(!child_tools.contains(&CONTINUE_INVESTIGATION_TOOL_NAME));
+    assert!(!child_tools.contains(&INVESTIGATE_MANY_TOOL_NAME));
+    assert!(!child_tools.contains(&DIAGRAM_EDIT_TOOL_NAME));
+    assert!(
+        child_body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("isolated repository investigator")
+    );
+
+    let parent_resume = requests[3].body_json().unwrap();
+    let messages = parent_resume["messages"].as_array().unwrap();
+    let delegated_result = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("ordinary investigate result returned to parent");
+    assert!(delegated_result.contains("Startup failures are surfaced"));
+    assert!(delegated_result.contains("research_operations"));
+    assert!(delegated_result.contains("worker-1"));
+    assert!(!delegated_result.contains("read_file\""));
+
+    let activities = activities.lock().unwrap();
+    let child = activities.iter().find_map(|activity| match activity {
+        AiActivityUpdate::AgentSession {
+            id,
+            parent_id: Some(parent_id),
+            depth: 1,
+            kind,
+            worker_id,
+            detail,
+            state: AiToolActivityState::Running,
+        } if kind == INVESTIGATE_TOOL_NAME
+            && worker_id == "worker-1"
+            && detail == "Determine how language-server startup failure reaches the user." =>
+        {
+            Some((id.clone(), parent_id.clone()))
+        }
+        _ => None,
+    });
+    let (child_id, _root_id) = child.expect("child agent lifecycle is observable");
+    assert!(activities.iter().any(|activity| matches!(
+        activity,
+        AiActivityUpdate::ToolCall {
+            name,
+            state: AiToolActivityState::Succeeded,
+            agent_depth: 1,
+            agent_id: Some(agent_id),
+            ..
+        } if name == "read_file" && agent_id == &child_id
+    )));
+    assert!(activities.iter().any(|activity| matches!(
+        activity,
+        AiActivityUpdate::AgentSession {
+            id,
+            depth: 1,
+            state: AiToolActivityState::Succeeded,
+            ..
+        } if id == &child_id
+    )));
+}
+
+#[tokio::test]
+async fn continue_investigation_resumes_the_same_workers_compact_findings() {
+    let provider = ScriptedProvider::start([
+        AiScriptStep::tool_call(
+            INVESTIGATE_TOOL_NAME,
+            json!({"task": "Find the startup failure path."}),
+        ),
+        AiScriptStep::tool_call(
+            "read_file",
+            json!({"path": MIDDLEWARE_FILE, "start_line": 1, "end_line": 10}),
+        ),
+        AiScriptStep::AssistantText {
+            content: format!("The failure enters EngineUnavailable; {MIDDLEWARE_FILE}:1-10."),
+        },
+        AiScriptStep::tool_call(
+            CONTINUE_INVESTIGATION_TOOL_NAME,
+            json!({"worker_id": "worker-1", "task": "Now verify whether it retries."}),
+        ),
+        AiScriptStep::tool_call(
+            "read_file",
+            json!({"path": MIDDLEWARE_FILE, "start_line": 11, "end_line": 20}),
+        ),
+        AiScriptStep::AssistantText {
+            content: format!("No retry is present in the inspected path; {MIDDLEWARE_FILE}:11-20."),
+        },
+        AiScriptStep::valid_plan(Epoch(5)).unwrap(),
+    ])
+    .await
+    .unwrap();
+    let outcome = service_for(&provider)
+        .request_plan(
+            "selection_kind: file",
+            &InvestigationExecutor::default(),
+            &FixtureFacts,
+            Epoch(5),
+        )
+        .await;
+    assert!(matches!(outcome, AiOutcome::Plan(..)), "{outcome:?}");
+
+    let requests = provider.requests();
+    let continuation = requests
+        .iter()
+        .map(|request| request.body_json().unwrap())
+        .find(|body| {
+            body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("Now verify whether it retries"))
+                })
+            })
+        })
+        .expect("continuation provider request");
+    let input = continuation["messages"][1]["content"].as_str().unwrap();
+    assert!(input.contains("prior_findings"));
+    assert!(input.contains("EngineUnavailable"));
+    assert_eq!(continuation["model"], "codescope-test/model");
+}
+
+#[tokio::test]
+async fn investigate_many_runs_isolated_siblings_and_returns_ordered_handles() {
+    let provider = ScriptedProvider::start([
+        AiScriptStep::tool_call(
+            INVESTIGATE_MANY_TOOL_NAME,
+            json!({"tasks": [
+                {"task": "Trace startup behavior."},
+                {"task": "Trace shutdown behavior."}
+            ]}),
+        ),
+        AiScriptStep::tool_call(
+            "read_file",
+            json!({"path": MIDDLEWARE_FILE, "start_line": 1, "end_line": 10}),
+        ),
+        AiScriptStep::tool_call(
+            "read_file",
+            json!({"path": MIDDLEWARE_FILE, "start_line": 11, "end_line": 20}),
+        ),
+        AiScriptStep::AssistantText {
+            content: format!("Startup result; {MIDDLEWARE_FILE}:1-10."),
+        },
+        AiScriptStep::AssistantText {
+            content: format!("Shutdown result; {MIDDLEWARE_FILE}:11-20."),
+        },
+        AiScriptStep::valid_plan(Epoch(5)).unwrap(),
+    ])
+    .await
+    .unwrap();
+    let outcome = service_for(&provider)
+        .request_plan(
+            "selection_kind: file",
+            &InvestigationExecutor::default(),
+            &FixtureFacts,
+            Epoch(5),
+        )
+        .await;
+    assert!(matches!(outcome, AiOutcome::Plan(..)), "{outcome:?}");
+
+    let requests = provider.requests();
+    let parent_resume = requests
+        .iter()
+        .map(|request| request.body_json().unwrap())
+        .find(|body| {
+            body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("worker-2"))
+                })
+            })
+        })
+        .expect("ordered parallel result returned to parent");
+    let result = parent_resume["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    let result: Value = serde_json::from_str(result).unwrap();
+    assert_eq!(result["results"][0]["index"], 0);
+    assert_eq!(result["results"][0]["worker_id"], "worker-1");
+    assert_eq!(result["results"][1]["index"], 1);
+    assert_eq!(result["results"][1]["worker_id"], "worker-2");
 }
 
 #[tokio::test]

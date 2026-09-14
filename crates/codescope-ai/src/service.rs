@@ -23,10 +23,13 @@ use crate::client::{
 };
 use crate::config::{AiConfig, ReasoningEffort};
 use crate::error::AiError;
+use crate::harness::{AgentHarness, AgentProfile};
 use crate::plan::{MAX_AI_EVIDENCE, MAX_AI_FORM_EDGES, MAX_AI_FORM_NODES, parse_plan};
 use crate::tools::{
-    DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME, LSP_INSPECT_TOOL_NAME, ToolDef,
-    ToolExecutor, diagram_command_example, diagram_tool_for_op, is_read_only_tool,
+    CONTINUE_INVESTIGATION_TOOL_NAME, DIAGRAM_EDIT_TOOL_NAME, DIAGRAM_INSPECT_TOOL_NAME,
+    INVESTIGATE_MANY_TOOL_NAME, INVESTIGATE_TOOL_NAME, LSP_INSPECT_TOOL_NAME, ToolDef,
+    ToolExecutor, diagram_command_example, diagram_tool_for_op, is_investigation_tool,
+    is_read_only_tool,
 };
 use crate::validator::{FactView, validate};
 use backon::{ExponentialBuilder, Retryable};
@@ -100,6 +103,23 @@ pub enum AiToolActivityState {
 pub enum AiActivityUpdate {
     /// Tool results have been returned and Codescope is waiting for the model's next turn.
     WaitingForModel,
+    /// A recursively delegated agent session started or reached a terminal state.
+    AgentSession {
+        /// Controller-assigned session span, unique within the process.
+        id: String,
+        /// Immediate parent agent span.
+        parent_id: Option<String>,
+        /// Zero-based depth in the recursive agent tree.
+        depth: u32,
+        /// Generic controller-defined session classification.
+        kind: String,
+        /// Stable request-scoped worker handle exposed to the parent model.
+        worker_id: String,
+        /// Short, scrubbed question assigned to this invocation.
+        detail: String,
+        /// Current execution state.
+        state: AiToolActivityState,
+    },
     /// A tool call started or reached a terminal state.
     ToolCall {
         /// Provider-assigned call id, stable across start and finish updates.
@@ -112,6 +132,10 @@ pub enum AiActivityUpdate {
         error: Option<String>,
         /// Current execution state.
         state: AiToolActivityState,
+        /// Agent depth that produced this call, for hierarchical presentation.
+        agent_depth: u32,
+        /// Agent session span that produced this call.
+        agent_id: Option<String>,
     },
 }
 
@@ -191,6 +215,11 @@ impl AiService {
     #[must_use]
     pub fn client(&self) -> &AiClient {
         &self.client
+    }
+
+    /// Repository root used by the shared agent harness for redaction only.
+    pub(crate) fn repo_root(&self) -> &Utf8Path {
+        &self.repo_root
     }
 
     /// The model currently in use.
@@ -299,23 +328,68 @@ impl AiService {
         diagram_observer: Option<DiagramObserver>,
         activity_observer: Option<AiActivityObserver>,
     ) -> AiOutcome {
+        let trace = codescope_telemetry::AgentTraceContext::root("review");
+        codescope_telemetry::scope_agent_trace(trace, async {
+            codescope_telemetry::record_with_origin(
+                codescope_telemetry::TelemetryOrigin::InternalAgent,
+                "agent.session",
+                serde_json::json!({ "state": "started" }),
+            );
+            let outcome = self
+                .request_plan_with_observers_inner(
+                    brief,
+                    previous,
+                    tools,
+                    facts,
+                    epoch,
+                    diagram_observer,
+                    activity_observer,
+                )
+                .await;
+            let state = match &outcome {
+                AiOutcome::Plan(_, _) => "succeeded",
+                AiOutcome::Stale => "stale",
+                AiOutcome::Failed(_) => "failed",
+                AiOutcome::Unavailable => "unavailable",
+            };
+            codescope_telemetry::record_with_origin(
+                codescope_telemetry::TelemetryOrigin::InternalAgent,
+                "agent.session",
+                serde_json::json!({ "state": state }),
+            );
+            outcome
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_plan_with_observers_inner(
+        &self,
+        brief: &str,
+        previous: Option<&VisualizationPlan>,
+        tools: &dyn ToolExecutor,
+        facts: &dyn FactView,
+        epoch: Epoch,
+        diagram_observer: Option<DiagramObserver>,
+        activity_observer: Option<AiActivityObserver>,
+    ) -> AiOutcome {
         let user_prompt = build_user_prompt(epoch, brief, previous);
         let user_prompt =
             crate::scrub::scrub_secrets(&redact_repo_root(&user_prompt, &self.repo_root));
-        let mut tool_defs = tools.available_tools();
-        for diagram_tool in crate::tools::diagram_tools() {
-            if !tool_defs.iter().any(|tool| tool.name == diagram_tool.name) {
-                tool_defs.push(diagram_tool);
-            }
-        }
+        let harness = AgentHarness::root(self, tools, epoch);
+        let tool_defs = harness.available_tools(AgentProfile::Review);
         let semantic_tools_available = tool_defs
             .iter()
             .any(|tool| tool.name == crate::tools::LSP_INSPECT_TOOL_NAME);
+        let investigation_available = tool_defs
+            .iter()
+            .any(|tool| tool.name == INVESTIGATE_TOOL_NAME);
         let mut messages = vec![
             ChatMessage::system(build_system_prompt(
                 epoch,
                 self.config.max_tool_calls,
                 semantic_tools_available,
+                investigation_available,
             )),
             ChatMessage::user(user_prompt.clone()),
         ];
@@ -324,7 +398,7 @@ impl AiService {
             &user_prompt,
             &tool_defs,
             previous,
-            tools,
+            &harness,
             facts,
             epoch,
             diagram_observer.as_ref(),
@@ -344,12 +418,13 @@ impl AiService {
         assignment: &str,
         tool_defs: &[ToolDef],
         previous: Option<&VisualizationPlan>,
-        tools: &dyn ToolExecutor,
+        harness: &AgentHarness<'_>,
         facts: &dyn FactView,
         epoch: Epoch,
         observer: Option<&DiagramObserver>,
         activity_observer: Option<&AiActivityObserver>,
     ) -> AiOutcome {
+        let tools = harness.tools;
         let mut draft = previous
             .map(DiagramDraft::from_plan)
             .unwrap_or_else(|| DiagramDraft::new(epoch));
@@ -367,6 +442,11 @@ impl AiService {
         let mut research_calls = 0_usize;
         let initial_research_tool = tools.initial_research_tool();
         let mut initial_research_complete = initial_research_tool.is_none();
+        let delegation_available = tool_defs
+            .iter()
+            .any(|tool| tool.name == INVESTIGATE_TOOL_NAME);
+        let mut delegation_used = false;
+        let mut delegation_checkpoint = false;
         // The first complete shape gets a small bounded finalization window. A tool-less response
         // validates immediately, while repeated accepted polish edits eventually validate before
         // another provider turn. This permits optional evidence without allowing endless churn.
@@ -554,7 +634,7 @@ impl AiService {
                 .filter(|tool| inspected_draft.is_none() || tool.name != DIAGRAM_INSPECT_TOOL_NAME)
                 .cloned()
                 .collect::<Vec<_>>();
-            let response = match self
+            let response = match harness
                 .chat_turn(
                     request_messages,
                     &available_tools,
@@ -947,14 +1027,15 @@ impl AiService {
                     // response still run and consume their normal budget.
                     continue;
                 }
-                if remaining == 0 {
+                let operation_cost = tool_operation_cost(call);
+                if remaining < operation_cost {
                     let error = AiError::ToolBudgetExceeded {
                         max: self.config.max_tool_calls,
                     };
                     tracing::warn!(%error, "aborting incremental diagram request");
                     return AiOutcome::Failed(error.to_string());
                 }
-                remaining -= 1;
+                remaining -= operation_cost;
                 observe_tool_activity(
                     activity_observer,
                     call,
@@ -1113,12 +1194,20 @@ impl AiService {
                         }
                     }
                     _ if is_read_only_tool(&call.name) => {
-                        let (result, researched) =
-                            self.execute_tool(tools, &call.name, &call.arguments).await;
+                        let (result, researched) = harness
+                            .execute_tool(
+                                &call.name,
+                                &call.arguments,
+                                assignment,
+                                activity_observer,
+                            )
+                            .await;
                         research_calls += usize::from(researched);
                         if researched {
+                            delegation_used |= is_investigation_tool(&call.name);
                             if initial_research_tool == Some(call.name.as_str()) {
                                 initial_research_complete = true;
+                                delegation_checkpoint = delegation_available;
                                 required_miss_op = None;
                                 required_misses = 0;
                                 required_retry = None;
@@ -1466,6 +1555,13 @@ impl AiService {
             if !diff_researched {
                 messages.push(ChatMessage::assistant_raw(response.message));
                 messages.extend(tool_messages);
+                if delegation_checkpoint && !delegation_used {
+                    messages.push(ChatMessage::user(
+                        "DELEGATION CHECKPOINT: inventory is complete. Before diagram construction, identify unresolved multi-step questions. Use investigate for one, investigate_many for independent questions, or continue_investigation only with an existing worker_id. Skip delegation only when every remaining fact is answerable in one or two direct operations; then proceed to exact diff research."
+                            .to_string(),
+                    ));
+                    delegation_checkpoint = false;
+                }
                 if diff_retention_failed_this_turn {
                     messages.push(ChatMessage::user(
                         "The git_diff_file result was not retained as a usable exact changed diff for the bounded compact handoff. Call git_diff_file again with the smallest exact selected diff. Its result must include a column-zero repo_path, hunk_id, and changed [old:... new:...] + or - row; do not edit until it is retained."
@@ -1481,7 +1577,7 @@ impl AiService {
     }
 
     /// One chat turn with retry (429/5xx/timeout/connect only), honoring `Retry-After`.
-    async fn chat_turn(
+    pub(crate) async fn chat_turn(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDef],
@@ -1519,7 +1615,7 @@ impl AiService {
     }
 
     /// Execute one read-only tool call; failures become error results the model can see.
-    async fn execute_tool(
+    pub(crate) async fn execute_tool(
         &self,
         tools: &dyn ToolExecutor,
         name: &str,
@@ -2202,7 +2298,7 @@ fn completion_failure(completion: DraftCompletion, repo_root: &Utf8Path) -> AiOu
     }
 }
 
-fn observe_tool_activity(
+pub(crate) fn observe_tool_activity(
     observer: Option<&AiActivityObserver>,
     call: &RawToolCall,
     state: AiToolActivityState,
@@ -2229,16 +2325,19 @@ fn observe_tool_activity(
         }),
     );
     let Some(observe) = observer else { return };
+    let agent = codescope_telemetry::current_agent_trace();
     observe(AiActivityUpdate::ToolCall {
         id: call.id.clone(),
         name: call.name.clone(),
         detail: cap_activity_detail(&detail, 96),
         error: None,
         state,
+        agent_depth: agent.as_ref().map_or(0, |trace| trace.depth()),
+        agent_id: agent.map(|trace| trace.span_id().to_owned()),
     });
 }
 
-fn observe_tool_failure(
+pub(crate) fn observe_tool_failure(
     observer: Option<&AiActivityObserver>,
     call: &RawToolCall,
     error: &str,
@@ -2264,12 +2363,15 @@ fn observe_tool_failure(
         }),
     );
     let Some(observe) = observer else { return };
+    let agent = codescope_telemetry::current_agent_trace();
     observe(AiActivityUpdate::ToolCall {
         id: call.id.clone(),
         name: call.name.clone(),
         detail: cap_activity_detail(&detail, 96),
         error: Some(cap_activity_detail(&error, 320)),
         state: AiToolActivityState::Failed,
+        agent_depth: agent.as_ref().map_or(0, |trace| trace.depth()),
+        agent_id: agent.map(|trace| trace.span_id().to_owned()),
     });
 }
 
@@ -2283,6 +2385,20 @@ fn tool_error_detail(result: &str) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| result.to_owned())
+}
+
+/// A parallel delegation consumes one ordinary review operation per requested worker. This keeps
+/// fan-out inside the existing review budget without introducing a separate worker-count limit.
+fn tool_operation_cost(call: &RawToolCall) -> u32 {
+    if call.name != INVESTIGATE_MANY_TOOL_NAME {
+        return 1;
+    }
+    serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .ok()
+        .and_then(|value| value.get("tasks")?.as_array().map(Vec::len))
+        .and_then(|count| u32::try_from(count).ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(1)
 }
 
 fn tool_activity_detail(call: &RawToolCall) -> String {
@@ -2319,6 +2435,23 @@ fn tool_activity_detail(call: &RawToolCall) -> String {
         };
     }
 
+    if matches!(
+        call.name.as_str(),
+        INVESTIGATE_TOOL_NAME | CONTINUE_INVESTIGATION_TOOL_NAME
+    ) {
+        return arguments
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .map(|task| cap_activity_detail(task, 96))
+            .unwrap_or_default();
+    }
+    if call.name == INVESTIGATE_MANY_TOOL_NAME {
+        return arguments
+            .get("tasks")
+            .and_then(serde_json::Value::as_array)
+            .map(|tasks| format!("{} parallel tasks", tasks.len()))
+            .unwrap_or_default();
+    }
     let subject = ["path", "file", "symbol"]
         .into_iter()
         .find_map(|key| arguments.get(key).and_then(serde_json::Value::as_str));
@@ -2815,17 +2948,24 @@ fn build_system_prompt(
     epoch: Epoch,
     max_tool_calls: u32,
     semantic_tools_available: bool,
+    investigation_available: bool,
 ) -> String {
     let semantic_research = if semantic_tools_available {
         "Use inspect_language_server for symbols, references, callers/callees, types, and diagnostics. Start with capabilities when support is uncertain. Respect completeness, notes, and truncation; language-server results are worktree semantic evidence, while Git is authoritative for the diff."
     } else {
         "No language-server inspection tool is available in this session; establish background with read_file and relationships with inspected source."
     };
+    let delegation = if investigation_available {
+        "DELEGATION IS A PRIMARY RESEARCH PATH. After inventory, explicitly identify unresolved multi-step questions. The investigate tool creates one fresh worker using the same model; investigate_many runs independent questions in parallel; continue_investigation resumes a returned worker_id for ambiguity or deeper verification. Prefer workers for cross-file behavior, callers, failures/retries, language boundaries, and separate lifecycles. Do not skip delegation merely because direct tools exist; use direct calls for facts needing only one or two operations. Worker responses are research leads: reconcile them with the authoritative diff and validator."
+    } else {
+        "No isolated investigation tool is available in this session."
+    };
     let limits = review_limits();
     format!(
         "You are Codescope's visual code-review agent. Explain the selected change to a reviewer seeing this code for the first time.\n\n\
          You have a virtual cwd and may make at most {max_tool_calls} total research and diagram operations. File tools accept paths relative to that cwd, exact repo_path values, or an unambiguous repo-path suffix for selected files. Background reads outside the selection require an exact tracked repo-relative path. You must call at least one research tool before completing the draft.\n\n\
          {semantic_research}\n\n\
+         {delegation}\n\n\
          {REVIEW_GUIDANCE}\n\n\
          LIMITS\n\
          The server owns plan_version {PLAN_VERSION} and epoch {}. Use a concise intent sentence. {limits}\n\n\
@@ -2884,6 +3024,25 @@ mod tests {
             .to_string(),
         };
         assert_eq!(tool_activity_detail(&semantic), "callers · Service::run");
+        let investigation = RawToolCall {
+            id: "call-4".to_string(),
+            name: INVESTIGATE_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({
+                "task": "Determine whether startup failure is recoverable without restarting the application"
+            })
+            .to_string(),
+        };
+        assert_eq!(
+            tool_activity_detail(&investigation),
+            "Determine whether startup failure is recoverable without restarting the application"
+        );
+        let many = RawToolCall {
+            id: "call-5".to_string(),
+            name: INVESTIGATE_MANY_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({"tasks": [{"task": "one"}, {"task": "two"}]}).to_string(),
+        };
+        assert_eq!(tool_activity_detail(&many), "2 parallel tasks");
+        assert_eq!(tool_operation_cost(&many), 2);
         assert_eq!(
             cap_activity_detail(&"x".repeat(120), 96).chars().count(),
             97
@@ -3149,11 +3308,15 @@ mod tests {
 
     #[test]
     fn concise_agent_prompt_requires_bounded_research_and_exact_evidence() {
-        let prompt = build_system_prompt(Epoch(42), crate::MAX_TOOL_CALLS, true);
+        let prompt = build_system_prompt(Epoch(42), crate::MAX_TOOL_CALLS, true, true);
         for required in [
             "git_status_file",
             "git_diff_file",
             "inspect_language_server",
+            "investigate tool",
+            "investigate_many",
+            "continue_investigation",
+            "same model",
             "worktree semantic evidence",
             "completeness",
             "exact tracked repo-relative path",
@@ -3167,7 +3330,7 @@ mod tests {
             assert!(prompt.contains(required), "missing {required}");
         }
         assert!(
-            prompt.len() < 13_000,
+            prompt.len() < 14_000,
             "prompt grew to {} bytes",
             prompt.len()
         );
@@ -3175,7 +3338,7 @@ mod tests {
     #[test]
     fn incremental_prompt_edits_the_live_draft_instead_of_submitting_a_plan_blob() {
         for prompt in [
-            build_system_prompt(Epoch(42), crate::MAX_TOOL_CALLS, true),
+            build_system_prompt(Epoch(42), crate::MAX_TOOL_CALLS, true, true),
             COMPACT_CONTROLLER_CONTRACT.to_string(),
         ] {
             for required in [

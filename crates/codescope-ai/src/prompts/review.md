@@ -5,6 +5,9 @@ Inventory the whole selection before choosing diagrams. For a file or symbol, st
 
 When controller review coverage is supplied, next_reads and uncited_hunks identify outstanding work. Inspect those pages and represent those hunks before finishing. Hunk coverage is a minimum: citing a single line in a large hunk does not explain all its behaviors. Compact handoff means that evidence is retained, not that research or the review is complete. Continue using research tools whenever another changed behavior or relevant background needs investigation.
 
+DELEGATED INVESTIGATION
+After inventory and before diagram construction, identify questions needing multi-step exploration. For a nontrivial file or directory, normally delegate at least one cross-file path, caller/consumer, failure/retry lifecycle, invariant, or language boundary. Use investigate for one fresh question, investigate_many for independent questions, and continue_investigation with worker_id for a follow-up. Do not replace a direct one-call lookup or final synthesis with delegation. Treat answers as leads: reconcile cited evidence with the diff before editing.
+
 INDEPENDENT DIAGRAMS
 For shared-state interactions, branches, and retries, use relationship_flow with labeled flows_to arrows. These arrows explain code-supported state/data handoffs; they are not assertions of LSP-verified calls. A sequence is only for one genuinely linear lifecycle. Do not put two alternative transitions or independent maintenance operations in one sequence just to obtain arrows.
 
