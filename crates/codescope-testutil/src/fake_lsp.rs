@@ -301,7 +301,10 @@ impl FakeLspServer {
             .map(|(method, scripted)| {
                 (
                     method.clone(),
-                    scripted.iter().cloned().collect::<std::collections::VecDeque<_>>(),
+                    scripted
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::VecDeque<_>>(),
                 )
             })
             .collect();

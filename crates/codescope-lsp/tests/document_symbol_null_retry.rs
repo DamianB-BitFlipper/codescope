@@ -103,7 +103,11 @@ async fn document_symbol_null_answers_are_retried_not_cached() {
     let wrapper = dir.path().join("fake-lsp-wrapper.sh");
     std::fs::write(
         &wrapper,
-        format!("#!/bin/sh\nexec '{}' '{}'\n", fake.display(), script_path.display()),
+        format!(
+            "#!/bin/sh\nexec '{}' '{}'\n",
+            fake.display(),
+            script_path.display()
+        ),
     )
     .unwrap();
     {
@@ -115,7 +119,8 @@ async fn document_symbol_null_answers_are_retried_not_cached() {
     // any assertion runs; the test binary runs each file in its own process.
     let previous = std::env::var_os("CODESCOPE_RUST_ANALYZER");
     unsafe { std::env::set_var("CODESCOPE_RUST_ANALYZER", &wrapper) };
-    let started = tokio::time::timeout(Duration::from_secs(30), LanguageService::start(&root)).await;
+    let started =
+        tokio::time::timeout(Duration::from_secs(30), LanguageService::start(&root)).await;
     // The adapter resolves the program at spawn time; restore the environment before any
     // assertion can fail and leak the override into other tests.
     match previous {
@@ -139,7 +144,12 @@ async fn document_symbol_null_answers_are_retried_not_cached() {
         "retry produced real symbols, but notes remain: {:?}",
         evidence.notes
     );
-    let names: Vec<&str> = evidence.value.roots.iter().map(|s| s.name.as_str()).collect();
+    let names: Vec<&str> = evidence
+        .value
+        .roots
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
     assert!(names.contains(&"double"), "roots: {names:?}");
     assert!(names.contains(&"main"), "roots: {names:?}");
 
