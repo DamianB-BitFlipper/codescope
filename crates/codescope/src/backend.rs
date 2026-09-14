@@ -367,7 +367,8 @@ async fn debug_ai_session(args: &DebugAiArgs) -> Result<DebugAiOut> {
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<UiSnapshot>();
     let (action_tx, action_rx) = mpsc::channel::<Action>(32);
     let (event_tx, event_rx) = mpsc::channel::<DispatchEvent>(64);
-    let mut dispatcher = Dispatcher::new(repo, engine, ai, output_tx, event_tx.clone());
+    let mut dispatcher = Dispatcher::new(repo, engine, ai, output_tx, event_tx.clone())
+        .with_initial_scope(args.scope.into());
     if let Some(reason) = engine_unavailable {
         dispatcher = dispatcher.with_engine_unavailable(reason);
     }
@@ -397,12 +398,6 @@ async fn drive_debug_ai(
     notes: Vec<String>,
 ) -> Result<DebugAiOut> {
     let started = Instant::now();
-    if !matches!(args.scope, Scope::Branch) {
-        actions
-            .send(scope_action(args.scope))
-            .await
-            .context("dispatcher stopped before accepting the requested scope")?;
-    }
 
     // Wait until the chosen scope has completed its git phase. `refreshing == false` is
     // important for an honestly empty change-set: `files.is_empty()` alone cannot tell an
@@ -578,16 +573,6 @@ async fn next_snapshot(snapshots: &mut mpsc::UnboundedReceiver<UiSnapshot>) -> R
         .recv()
         .await
         .context("backend output closed before the requested state was published")
-}
-
-fn scope_action(scope: Scope) -> Action {
-    match scope {
-        Scope::Branch => Action::ScopeBranch,
-        Scope::BranchWorking => Action::ScopeBranchWorking,
-        Scope::Staged => Action::ScopeStaged,
-        Scope::Unstaged => Action::ScopeUnstaged,
-        Scope::Working => Action::ScopeWorking,
-    }
 }
 
 fn status_suffix(snapshot: &UiSnapshot) -> String {

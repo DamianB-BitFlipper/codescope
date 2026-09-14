@@ -51,15 +51,15 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(20_000);
 
 /// Reasoning budget requested from a reasoning-capable provider model.
 ///
-/// [`ReasoningEffort::Default`] selects Codescope's automatic provider/model behavior,
-/// which normally omits the provider field (Prime-hosted GLM is the compatibility exception: it
-/// uses `minimal`). The remaining variants are sent as `reasoning.effort` to OpenAI's Responses
-/// API, `reasoning_effort` to compatible Chat Completions APIs, or `output_config.effort` to
-/// Anthropic Messages. Anthropic does not define `none` or `minimal`. Providers and models support
-/// different subsets, so an explicit choice can still be rejected honestly by the upstream API.
+/// [`ReasoningEffort::Default`] omits the provider field and lets the selected model use its
+/// provider-defined default. The remaining variants are sent as `reasoning.effort` to OpenAI's
+/// Responses API, `reasoning_effort` to compatible Chat Completions APIs, or
+/// `output_config.effort` to Anthropic Messages. Anthropic does not define `none` or `minimal`.
+/// Providers and models support different subsets, so an explicit choice can still be rejected
+/// honestly by the upstream API.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
-    /// Use Codescope's automatic provider/model behavior.
+    /// Omit the effort field and use the provider-defined model default.
     #[default]
     Default,
     /// Disable reasoning where the model supports it.

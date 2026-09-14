@@ -471,16 +471,6 @@ impl AiClient {
                 }
                 if is_glm_model(&model) {
                     body["max_tokens"] = json!(max_tokens_override.unwrap_or(GLM_PLAN_MAX_TOKENS));
-                    if reasoning_effort == ReasoningEffort::Default
-                        && self.endpoint.contains("pinference.ai")
-                    {
-                        // Prime's GLM route requires reasoning to remain enabled, but accepts
-                        // Chat Completions' minimal effort that leaves room for the tool call.
-                        body["reasoning_effort"] = json!("minimal");
-                    } else if reasoning_effort == ReasoningEffort::Default {
-                        // Native Z.AI-compatible GLM endpoints use the family-specific knob.
-                        body["thinking"] = json!({"type": "disabled"});
-                    }
                 } else if let Some(max_tokens) = max_tokens_override {
                     body["max_tokens"] = json!(max_tokens);
                 }
@@ -1615,23 +1605,38 @@ mod tests {
     }
 
     #[test]
-    fn glm_requests_bound_reasoning_and_plan_output() {
+    fn glm_requests_bound_plan_output_and_respect_reasoning_selection() {
         let mut cfg = enabled_config();
         cfg.model = "z-ai/glm-5.3".into();
         cfg.base_url = "https://api.pinference.ai/api/v1".into();
         let client = AiClient::new(&cfg).unwrap();
         let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
-        assert_eq!(body["reasoning_effort"], "minimal");
         assert!(body.get("reasoning").is_none());
+        assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());
         assert_eq!(body["max_tokens"], GLM_PLAN_MAX_TOKENS);
+
+        // Default has the same provider-defined meaning for fast-tier models.
+        cfg.model = "internal/glm-5.3-fast".into();
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], GLM_PLAN_MAX_TOKENS);
+
+        // An explicit effort is still sent unchanged.
+        cfg.reasoning_effort = ReasoningEffort::High;
+        let client = AiClient::new(&cfg).unwrap();
+        let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
+        assert_eq!(body["reasoning_effort"], "high");
+        cfg.reasoning_effort = ReasoningEffort::Default;
 
         cfg.base_url = "https://api.z.ai/api/paas/v4".into();
         let client = AiClient::new(&cfg).unwrap();
         let body = client.build_body(&[ChatMessage::user("digest")], &[], false, None);
-        assert_eq!(body["thinking"]["type"], "disabled");
         assert!(body.get("reasoning").is_none());
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
 
         cfg.reasoning_effort = ReasoningEffort::High;
         let client = AiClient::new(&cfg).unwrap();

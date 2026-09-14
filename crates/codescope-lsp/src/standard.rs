@@ -30,6 +30,12 @@ use crate::semantic_tokens::{
 };
 use crate::uri::{path_from_uri, uri_from_path};
 
+/// A cold-starting server answers `textDocument/documentSymbol` with JSON `null` while
+/// the file's project is still being linked (observed: rust-analyzer until its crate graph
+/// reaches the file's crate). Unlike an empty array — a real "no symbols" answer — `null`
+/// means "no analysis yet", so it is retried with bounded exponential backoff.
+const DOCUMENT_SYMBOL_NULL_RETRIES: u32 = 6;
+
 /// Deadline for the first request while the server indexes its workspace.
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Steady-state request deadline.
@@ -321,6 +327,45 @@ impl StandardLspService {
 
     // -- queries ----------------------------------------------------------------
 
+    /// Request `textDocument/documentSymbol`, retrying while the server answers `null`.
+    ///
+    /// Returns `Ok(Some(value))` for a real answer (including an empty array) and
+    /// `Ok(None)` only after [`DOCUMENT_SYMBOL_NULL_RETRIES`] retries, meaning the server
+    /// consistently reports no analysis for the open document. Callers must not cache an
+    /// `Ok(None)` answer: once the server finishes loading, a later query can still
+    /// produce real symbols for the same content.
+    async fn document_symbol_response(
+        &self,
+        uri: &lsp_types::Uri,
+    ) -> Result<Option<Value>, SemanticError> {
+        for attempt in 0..=DOCUMENT_SYMBOL_NULL_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(document_symbol_null_backoff(attempt - 1)).await;
+            }
+            let result = self
+                .client
+                .request(
+                    "textDocument/documentSymbol",
+                    json!({ "textDocument": { "uri": uri.as_str() } }),
+                    self.timeout(),
+                )
+                .await?;
+            if !result.is_null() {
+                return Ok(Some(result));
+            }
+            tracing::debug!(
+                attempt,
+                file = uri.as_str(),
+                "documentSymbol returned null (server analysis not ready); retrying"
+            );
+        }
+        tracing::debug!(
+            file = uri.as_str(),
+            "documentSymbol stayed null after bounded retries"
+        );
+        Ok(None)
+    }
+
     /// Hierarchical symbol tree of the worktree content of `file`.
     #[tracing::instrument(err, skip(self))]
     pub async fn document_symbols(
@@ -338,14 +383,11 @@ impl StandardLspService {
             return Ok(tree);
         }
         let uri = uri_from_path(&snapshot.abs)?;
-        let result = self
-            .client
-            .request(
-                "textDocument/documentSymbol",
-                json!({ "textDocument": { "uri": uri.as_str() } }),
-                self.timeout(),
-            )
-            .await?;
+        let response = self.document_symbol_response(&uri).await?;
+        let result = match &response {
+            Some(value) => value.clone(),
+            None => Value::Null,
+        };
         let tree = self.symbol_tree(
             file.clone(),
             Revision::Worktree,
@@ -353,6 +395,17 @@ impl StandardLspService {
             &snapshot.text,
             &snapshot.abs,
         )?;
+        if response.is_none() {
+            // `null` means "no analysis yet", never a final "no symbols": keep it out of
+            // the cache so a later query (warmer server) can still map this snapshot.
+            return Ok(Evidence::partial(
+                tree.value,
+                vec![
+                    "document symbols unavailable: the language server returned no analysis"
+                        .to_string(),
+                ],
+            ));
+        }
         self.symbol_cache.lock().await.insert(
             snapshot.abs,
             Revision::Worktree,
@@ -390,14 +443,7 @@ impl StandardLspService {
         };
         self.sync_content(&abs, content, base_hash).await?;
         let uri = uri_from_path(&abs)?;
-        let result = self
-            .client
-            .request(
-                "textDocument/documentSymbol",
-                json!({ "textDocument": { "uri": uri.as_str() } }),
-                self.timeout(),
-            )
-            .await;
+        let response = self.document_symbol_response(&uri).await;
         let restore = match (was_open, &disk) {
             (true, Some(snapshot)) => self
                 .sync_content(&abs, &snapshot.text, snapshot.hash)
@@ -405,9 +451,24 @@ impl StandardLspService {
                 .map(|_| ()),
             _ => self.close(&abs).await,
         };
-        let result = result?;
+        let response = response?;
         restore?;
+        let result = match &response {
+            Some(value) => value.clone(),
+            None => Value::Null,
+        };
         let tree = self.symbol_tree(file.clone(), Revision::Base, result, content, &abs)?;
+        if response.is_none() {
+            // Same cold-start contract as the worktree query: never cache "no analysis
+            // yet", so a later base overlay of the same content can still map symbols.
+            return Ok(Evidence::partial(
+                tree.value,
+                vec![
+                    "document symbols unavailable: the language server returned no analysis"
+                        .to_string(),
+                ],
+            ));
+        }
         self.symbol_cache
             .lock()
             .await
@@ -914,6 +975,10 @@ fn is_content_modified(error: &SemanticError) -> bool {
 
 fn content_modified_backoff(attempt: u32) -> Duration {
     Duration::from_millis(50_u64 << attempt)
+}
+
+fn document_symbol_null_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(250_u64 << attempt).min(Duration::from_millis(2_000))
 }
 
 fn hover_text(contents: &lsp_types::HoverContents) -> String {
